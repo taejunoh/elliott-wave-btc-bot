@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a backtest-only research core that recognises Elliott Wave structure on BTC 4h candles, trades four setups long/short with 1h CHoCH entries under fixed-fractional risk, and answers — via walk-forward and a one-shot holdout against baselines — whether Elliott counting adds value.
+**Goal:** Build a backtest-only research core that recognises Elliott Wave structure on BTC 4h candles, trades four setups long/short with 1h breakout entries (E-bar neighbourhood, spec 5.2) under fixed-fractional risk, and answers — via walk-forward and a one-shot holdout against baselines — whether Elliott counting adds value.
 
 **Architecture:** One event-driven engine (`TradingEngine`) processes closed 1h bars: PaperBroker fills → WaveEngine (ATR ZigZag → count enumeration → hard rules → Fibonacci scoring → hysteresis/S_rev) → ChochDetector → position management → circuit breakers → strategy signal → sizing → queued market entry at next open. Backtest runner, walk-forward grid, holdout lock and HTML report sit on top. Live/paper runtime (Plan 2) and Telegram/dashboard (Plan 3) are out of scope and will reuse this engine unchanged.
 
@@ -16,12 +16,12 @@
 - Package `ewbot`, src layout `src/ewbot/`, tests in `tests/` mirroring modules.
 - Timestamps are int epoch seconds UTC = bar OPEN time. Directions are ints: +1 long/bull/up, −1 short/bear/down.
 - Decisions only on CLOSED bars. A pivot may be used at 4h index t only if `confirmed_at <= t` (no lookahead) — enforced by T10 property tests.
-- Defaults (spec §11): K4=3.0, K1=2.0, ATR 14, M=12, σ=0.12, w0=1, T=0.05, h=0.05, top-k=5, Q_MIN=0.6, S_MIN=0.25, R gate 1.5, TP split 50/50, time stop 1.5× leg clipped [12, 60] 4h bars, setup ③ risk ×0.5, stop buffers 0.25/0.5 ATR4h, wick clip 6×ATR1h, warmup 200 4h bars.
-- Risk profiles: conservative 1% / 3x (default), aggressive 3% / 10x. Breakers: daily −3% (reset at America/New_York midnight), total −15% from peak (latched), 5 consecutive losses → 24h pause, max 1 position.
+- Defaults (spec §11): K4=3.0, ATR 14, trigger bars N=3, M=12, σ=0.12, w0=1, T=0.05, h=0.05, top-k=5, Q_MIN=0.6, S_MIN=0.25, R gate 1.5, TP split 50/50, time stop 1.5× leg clipped [12, 60] 4h bars, setup ③ risk ×0.5, stop buffers 0.25/0.5 ATR4h, wick clip 6×ATR1h, warmup 200 4h bars.
+- Risk profiles: conservative 1% / 3x (default), aggressive 3% / 10x. Breakers: daily −3% (reset at America/New_York midnight), total −15% from peak (latched), 5 consecutive losses → 24h pause, max 1 position. Breakers are on in every backtest and in the holdout; only the walk-forward grid runs switch them off (`breakers.enabled=False`, T21).
 - Costs (backtest): fee 0.05%/side of notional (no $0.15 minimum in backtests), slippage 0.05%, funding 10% APR long pays / short receives (hourly), contract 0.01 BTC, integer contracts.
 - Coinbase futures weekly close Fri 17:00–18:00 America/New_York: pending fills wait for reopen; no new entries decided or filled Fri 16:00–18:00 ET.
 - Fill simulation: market entry at next 1h open ± slippage; stop gap-through fills at open; stop beats TP on same bar; TP requires strict cross.
-- Walk-forward: 2017-01-01 → 2024-01-01 only; 60-combo grid (K4 × Q_MIN × S_MIN); plateau selection; holdout [2024-01-01, end) runs ONCE behind a lock file.
+- Walk-forward: 2017-01-01 → 2024-01-01 only; 60-combo grid (K4 × Q_MIN × S_MIN); a combo needs ≥ 12 trades in a 24-month training window; plateau selection; holdout [2024-01-01, end) runs ONCE behind a lock file. Go-live needs ≥ 50 out-of-sample trades with frozen parameters (holdout + later paper); the holdout report states the count.
 - Tests never hit the network (except explicitly marked manual steps).
 
 ## Plan Structure
@@ -61,7 +61,12 @@ Conventions fixed here for the whole plan:
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `ewbot.types.Bar`, `H1`, `H4`; `ewbot.config.{WaveParams, StrategyParams, RiskProfile, CONSERVATIVE, AGGRESSIVE, BreakerParams, CostParams, BotConfig, SETUPS, load_config, with_overrides}` exactly as in the contract. Behaviour details the contract leaves open:
+- Produces: `ewbot.types.Bar`, `H1`, `H4`; `ewbot.config.{WaveParams, StrategyParams, RiskProfile, CONSERVATIVE, AGGRESSIVE, BreakerParams, CostParams, BotConfig, SETUPS, load_config, with_overrides}` as in the contract, with three amendments from the trigger study (2017–2023 mechanics only):
+  - `WaveParams` has no `K1`: the 1h trigger (T11) uses no 1h ZigZag.
+  - `StrategyParams.choch_bars: int = 3` (spec 5.2: the trigger level is the high/low of the 3 1h bars before the E bar). It replaces `choch_fallback_bars`.
+  - `BreakerParams.enabled: bool = True`. Only the walk-forward grid (T21) sets it to `False`; `CircuitBreakers` (T16) is then a no-op.
+
+  Behaviour details the contract leaves open:
   - `load_config` / `with_overrides` raise `KeyError` for any unknown section, field or risk-profile name.
   - `risk` may be `"conservative"` / `"aggressive"` or a mapping (`{risk_pct, max_leverage[, name]}` merged over CONSERVATIVE, `name` defaults to `"custom"`). In `with_overrides`, `risk="aggressive"`, `risk=RiskProfile(...)` and `**{"risk.risk_pct": 0.02}` are all accepted.
   - YAML ints are coerced to float where the default is a float; YAML lists to tuples where the default is a tuple.
@@ -185,16 +190,17 @@ DEFAULT_YAML = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
 def test_defaults():
     cfg = load_config(None)
     assert cfg == BotConfig()
-    assert cfg.wave.K4 == 3.0 and cfg.wave.K1 == 2.0 and cfg.wave.atr_len == 14
+    assert cfg.wave.K4 == 3.0 and cfg.wave.atr_len == 14 and not hasattr(cfg.wave, "K1")
     assert cfg.wave.M == 12 and cfg.wave.warmup_4h == 200 and cfg.wave.top_k == 5
     assert cfg.strategy.mode == "A"
     assert cfg.strategy.setups_enabled == SETUPS == ("W3", "W5", "W5_REV", "C_END")
-    assert cfg.strategy.Q_MIN == 0.6 and cfg.strategy.S_MIN == 0.25
+    assert cfg.strategy.Q_MIN == 0.6 and cfg.strategy.S_MIN == 0.25 and cfg.strategy.choch_bars == 3
     assert cfg.risk == CONSERVATIVE
     assert cfg.risk.risk_pct == 0.01 and cfg.risk.max_leverage == 3.0
     assert AGGRESSIVE.risk_pct == 0.03 and AGGRESSIVE.max_leverage == 10.0
     assert cfg.costs.apply_min_fee is False and cfg.costs.fee_rate == 0.0005
     assert cfg.breakers.daily_loss == 0.03 and cfg.breakers.max_consec_losses == 5
+    assert cfg.breakers.enabled is True
     assert cfg.initial_equity == 10_000.0 and cfg.seed == 0
 
 
@@ -213,7 +219,7 @@ def test_yaml_override(tmp_path):
         "seed: 42\n"
     )
     cfg = load_config(p)
-    assert cfg.wave.K4 == 2.5 and cfg.wave.K1 == 2.0  # untouched keys keep defaults
+    assert cfg.wave.K4 == 2.5 and cfg.wave.atr_len == 14  # untouched keys keep defaults
     assert cfg.strategy.mode == "HYBRID" and cfg.strategy.Q_MIN == 0.55
     assert cfg.strategy.setups_enabled == ("W3", "W5")  # list -> tuple
     assert cfg.risk == AGGRESSIVE
@@ -248,7 +254,7 @@ def test_with_overrides():
     base = BotConfig()
     cfg = with_overrides(base, **{"wave.K4": 2.5, "strategy.Q_MIN": 0.55, "costs.slippage": 0.001})
     assert cfg.wave.K4 == 2.5 and cfg.strategy.Q_MIN == 0.55 and cfg.costs.slippage == 0.001
-    assert cfg.wave.K1 == base.wave.K1
+    assert cfg.wave.atr_len == base.wave.atr_len
     assert base.wave.K4 == 3.0  # original is untouched (frozen)
     assert cfg is not base
 
@@ -261,6 +267,9 @@ def test_with_overrides():
 
     cfg4 = with_overrides(base, **{"strategy.setups_enabled": ["W3"], "wave.M": 8})
     assert cfg4.strategy.setups_enabled == ("W3",) and cfg4.wave.M == 8
+
+    cfg5 = with_overrides(base, **{"breakers.enabled": False})
+    assert cfg5.breakers.enabled is False and base.breakers.enabled is True
 
     assert with_overrides(base) == base  # no overrides -> equal copy
 
@@ -318,7 +327,6 @@ import yaml
 @dataclass(frozen=True, slots=True)
 class WaveParams:
     K4: float = 3.0
-    K1: float = 2.0
     atr_len: int = 14
     M: int = 12
     sigma: float = 0.12
@@ -347,7 +355,7 @@ class StrategyParams:
     setup3_risk_mult: float = 0.5
     buf_struct_atr: float = 0.25  # setups W3, W5, FIB, trailing
     buf_ext_atr: float = 0.5  # setups W5_REV, C_END
-    choch_fallback_bars: int = 6
+    choch_bars: int = 3  # spec 5.2: trigger level = high/low of the 3 1h bars before the E bar
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +377,7 @@ class BreakerParams:
     total_dd: float = 0.15
     max_consec_losses: int = 5
     consec_pause_hours: int = 24
+    enabled: bool = True  # False only in walk-forward grid runs (T21); holdout and backtests keep them on
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,7 +508,6 @@ def with_overrides(cfg: BotConfig, **dotted: Any) -> BotConfig:
 # Mirrors the dataclass defaults in src/ewbot/config.py (a test enforces this).
 wave:
   K4: 3.0
-  K1: 2.0
   atr_len: 14
   M: 12
   sigma: 0.12
@@ -523,7 +531,7 @@ strategy:
   setup3_risk_mult: 0.5
   buf_struct_atr: 0.25    # setups W3, W5, FIB, trailing
   buf_ext_atr: 0.5        # setups W5_REV, C_END
-  choch_fallback_bars: 6
+  choch_bars: 3           # spec 5.2 trigger: high/low of the 3 1h bars before the E bar
 
 # Either a profile name ("conservative" | "aggressive") or a mapping
 # {name, risk_pct, max_leverage}.
@@ -534,6 +542,7 @@ breakers:
   total_dd: 0.15
   max_consec_losses: 5
   consec_pause_hours: 24
+  enabled: true           # walk-forward grid runs switch this off in code (T21)
 
 costs:
   fee_rate: 0.0005
@@ -1737,7 +1746,7 @@ Tasks T5–T10 build `ewbot.waves`: 4h ZigZag → count enumeration with hard ru
 
 **Interfaces:**
 - Consumes: `ewbot.types.Bar, H1, H4`, `ewbot.indicators.ATR` (`update(h, l, c) -> float | None`)
-- Produces: `Pivot(i, sub_ts, price, kind, confirmed_at)` and `ZigZag(k, atr_len)` with `.update(i, bar, sub_bars) -> Pivot | None`, `.pivots`, `.leg_dir`, `.E`, `.E_i`, `.E_sub_ts`, `.atr`. Used by T8/T9 and by B2's `ChochDetector` (1h ZigZag, `sub_bars=None`).
+- Produces: `Pivot(i, sub_ts, price, kind, confirmed_at)` and `ZigZag(k, atr_len)` with `.update(i, bar, sub_bars) -> Pivot | None`, `.pivots`, `.leg_dir`, `.E`, `.E_i`, `.E_sub_ts`, `.atr`. Used by T8/T9. (The 1h trigger in B2 needs no ZigZag; `sub_bars=None` still works for plain single-timeframe use and in tests.)
 - Semantics:
   - Extremes are taken on high/low, strictly beyond, so the first occurrence wins ties.
   - A pivot is confirmed when `leg_dir * (E - close) >= k * ATR`, with the ATR including the current bar. At most one pivot is confirmed per bar.
@@ -1885,7 +1894,7 @@ Expected: FAIL with "ModuleNotFoundError: No module named 'ewbot.waves'"
 
 `src/ewbot/waves/zigzag.py`:
 ```python
-"""Close-confirmed ATR ZigZag (spec 4.1). Shared by the 4h structure engine and the 1h CHoCH trigger.
+"""Close-confirmed ATR ZigZag (spec 4.1). Used by the 4h structure engine (WaveEngine).
 
 Rules implemented here:
 - threshold thr_t = k * ATR(atr_len) computed on this ZigZag's own bars up to and including bar t;
@@ -4246,21 +4255,17 @@ git commit -m "test(waves): synthetic Elliott paths, recovery curve, no-lookahea
 ## Part B2 — Strategies
 
 Tasks T11–T14 add `ewbot.strategy`, which turns each `WaveState` into an optional `Signal`:
-- `choch.py` has the 1h CHoCH trigger.
+- `choch.py` has the 1h trigger (breakout of the E-bar neighbourhood, spec 5.2; the code keeps the name `ChochDetector`).
 - `base.py` has `Signal`, the R gate, the time stop and the `Strategy` protocol.
 - `elliott.py` has strategy A.
 - `fib_swing.py` has baseline C.
 - `hybrid.py` has the A+C hybrid and `make_strategy`.
 
-Every strategy is a pure function of `(bar, ws, choch)` and keeps no state between bars. Tests build `WaveState`/`Count`/`Pivot` objects by hand and use a fake CHoCH, so the strategy tests stay unit-level. Only the `ChochDetector` tests run the real T5 `ZigZag`, on 1h series designed so that any close-confirmed ZigZag with threshold `2*ATR14` confirms the same pivots.
+Every strategy is a pure function of `(bar, ws, choch)` and keeps no state between bars. Tests build `WaveState`/`Count`/`Pivot` objects by hand and use a fake CHoCH, so the strategy tests stay unit-level. Only the `ChochDetector` tests feed real bars, on hand-made 1h series.
 
 ### Decisions this part fixes (gaps in the contract/spec, binding for T11–T14)
 
-1. **CHoCH level (spec 5.2).** For a long, H1 is the price of the **last** 1h pivot of kind `+1` that meets both conditions:
-   - `pivot.sub_ts > leg_start_ts`. The pivot must lie strictly inside the in-progress leg, so a 1h pivot at the leg-start extreme does not count.
-   - It was confirmed on a 1h bar strictly **before** the E bar (`ts[confirmed_at] < E_ts`).
-
-   If no such pivot exists (V-reversal), H1 is `max(high)` of the `fallback_bars` 1h bars immediately before the E bar. This window is taken literally from the spec and is not limited to the leg. If no bar precedes E, the level is `None` and nothing triggers. The trigger is `close_t > H1 and close_{t-1} <= H1`. Shorts are the mirror image.
+1. **Trigger level (spec 5.2).** For a long, H1 is `max(high)` of the `choch_bars = 3` 1h bars immediately **before** the E bar (the 1h bar where `E_live` occurred, `E_ts`). The E bar itself and later bars are excluded. With fewer than 3 earlier bars the available ones are used; with none, the level is `None` and nothing triggers. When `E_live` moves to a new bar the level is recomputed from the new E bar. The trigger is `close_t > H1 and close_{t-1} <= H1`. Shorts are the mirror image (`min(low)`, close below). No 1h ZigZag is used. Why: the earlier rule (last 1h pivot of a K1 = 2 ZigZag) put the level a median 2.9–3.7 ATR4h from E on 2017–2023 BTC, at or beyond the 4h confirmation threshold (K4 × ATR4h, K4 = 2–4), so the 4h pivot usually confirmed first, the count's phase advanced and the setup expired untriggered (A: about 3 trades/year). The 3-bar level sits a median 1.4–1.9 ATR4h from E at every grid K4, below the 4h confirmation. This choice used trade mechanics only, no performance metric. "CHoCH" in names and comments below means this trigger.
 
    Every strategy passes `leg_start_ts = ws.leg_start.sub_ts` and `E_ts = ws.E_live_ts`.
 2. **Trade direction.** `W3` (IMP W2) and `W5` (IMP W4) trade `+d`. `W5_REV` (IMP W5) and `C_END` (ABC C) trade `-d`. The in-progress leg always runs against the trade, so a strategy returns `None` unless `ws.leg_dir == -direction`. It does not depend on `Count.leg_dir`.
@@ -4281,9 +4286,9 @@ Every strategy is a pure function of `(bar, ws, choch)` and keeps no state betwe
 8. **`blended_r`** returns `R_TP1` when `tp2 is None`, and `-inf` when risk is ≤ 0.
 9. **Hybrid.** The states are checked in the order CONFIDENT → CONTRARY → UNCERTAIN. CONTRARY needs an alive top count: with no counts, `S_rev` carries no Elliott opinion, so the state is UNCERTAIN. This matters for `S_MIN = 0` in the walk-forward grid, where `0 <= -0` would otherwise block C whenever no count is alive. The emitted `reason` is prefixed with the state.
 10. **`make_strategy`** is defined in `ewbot/strategy/hybrid.py` and re-exported from `ewbot.strategy`, so both `from ewbot.strategy import make_strategy` and `from ewbot.strategy.hybrid import make_strategy` work.
-11. **Engine wiring (for T17).** Construct `ChochDetector(cfg.wave.K1, cfg.wave.atr_len, cfg.strategy.choch_fallback_bars)`. Call `choch.update(bar)` exactly once per closed 1h bar, in increasing `ts` order (it raises otherwise), before `strategy.on_bar`. `Signal.ts` is the trigger bar's `ts`, and `Signal.entry_ref` is its close.
+11. **Engine wiring (for T17).** Construct `ChochDetector(cfg.strategy.choch_bars)`. Call `choch.update(bar)` exactly once per closed 1h bar, in increasing `ts` order (it raises otherwise), before `strategy.on_bar`. `Signal.ts` is the trigger bar's `ts`, and `Signal.entry_ref` is its close.
 
-### Task 11: CHoCH detector (1h trigger)
+### Task 11: 1h trigger detector (E-bar neighbourhood breakout)
 
 **Files:**
 - Create (only if T1 did not already create it): `src/ewbot/strategy/__init__.py`
@@ -4291,8 +4296,8 @@ Every strategy is a pure function of `(bar, ws, choch)` and keeps no state betwe
 - Test: `tests/strategy/test_choch.py`
 
 **Interfaces:**
-- Consumes: `ewbot.types.Bar`, `ewbot.types.H1`; `ewbot.waves.zigzag.ZigZag(k, atr_len)` with `.update(i, bar, None)` and `.pivots: list[Pivot]`; `ewbot.waves.zigzag.Pivot(i, sub_ts, price, kind, confirmed_at)`.
-- Produces: `ChochDetector(k1: float, atr_len: int = 14, fallback_bars: int = 6)` with `update(bar1h) -> None`, `level(direction, leg_start_ts, E_ts) -> float | None` and `triggered(direction, leg_start_ts, E_ts) -> bool`. It also produces the module-private pure helper `_choch_level(...)`, which is unit-tested directly.
+- Consumes: `ewbot.types.Bar`, `ewbot.types.H1`. No ZigZag: the trigger needs only the raw 1h history.
+- Produces: `ChochDetector(n_bars: int = 3)` with `update(bar1h) -> None`, `level(direction, leg_start_ts, E_ts) -> float | None` and `triggered(direction, leg_start_ts, E_ts) -> bool`. `leg_start_ts` is accepted and ignored, so the strategies' call `choch.triggered(direction, ws.leg_start.sub_ts, ws.E_live_ts)` is the same as with the old pivot rule. It also produces the module-private pure helper `_choch_level(ts, highs, lows, direction, E_ts, n_bars)`, which is unit-tested directly. T17 builds it as `ChochDetector(cfg.strategy.choch_bars)` (`choch_bars = 3`, T1).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4304,69 +4309,48 @@ import pytest
 
 from ewbot.strategy.choch import ChochDetector, _choch_level
 from ewbot.types import H1, Bar
-from ewbot.waves.zigzag import Pivot
 
 T0 = 1_700_000_000 - (1_700_000_000 % H1)
 
-
-# ---------------------------------------------------------------- pure level logic (no ZigZag)
+# ---------------------------------------------------------------- pure level logic
 
 TS = [T0 + k * H1 for k in range(20)]
 HIGHS = [100.0 + k for k in range(20)]
 LOWS = [90.0 + k for k in range(20)]
 
 
-def _p(i: int, price: float, kind: int, confirmed_at: int) -> Pivot:
-    return Pivot(i=i, sub_ts=TS[i], price=price, kind=kind, confirmed_at=confirmed_at)
+def test_level_is_max_high_of_n_bars_strictly_before_e_bar() -> None:
+    assert _choch_level(TS, HIGHS, LOWS, 1, TS[15], 3) == 114.0  # max(HIGHS[12:15])
 
 
-PIVOTS = [
-    _p(3, 150.0, 1, 5),
-    _p(7, 80.0, -1, 9),
-    _p(10, 140.0, 1, 12),
-    _p(13, 135.0, 1, 15),  # confirmed ON the E bar (index 15) in the tests below -> must be ignored
-]
+def test_level_ignores_the_e_bar_and_later_bars() -> None:
+    highs = list(HIGHS)
+    highs[15] = highs[16] = 10_000.0
+    assert _choch_level(TS, highs, LOWS, 1, TS[15], 3) == 114.0
 
 
-def test_level_last_pivot_high_confirmed_before_e_bar() -> None:
-    assert _choch_level(PIVOTS, TS, HIGHS, LOWS, 1, TS[2], TS[15], 6) == 140.0
+def test_level_short_side_is_min_low() -> None:
+    assert _choch_level(TS, HIGHS, LOWS, -1, TS[15], 3) == 102.0  # min(LOWS[12:15])
 
 
-def test_level_counts_pivot_confirmed_one_bar_before_e() -> None:
-    assert _choch_level(PIVOTS, TS, HIGHS, LOWS, 1, TS[2], TS[16], 6) == 135.0
-
-
-def test_level_excludes_pivot_at_leg_start_and_falls_back_to_six_bar_max() -> None:
-    # pivot i=10 sits exactly on the leg start -> outside the leg -> V fallback: max(HIGHS[9:15])
-    assert _choch_level(PIVOTS, TS, HIGHS, LOWS, 1, TS[10], TS[15], 6) == 114.0
-
-
-def test_level_fallback_uses_fewer_bars_when_history_is_short() -> None:
-    assert _choch_level([], TS, HIGHS, LOWS, 1, TS[0], TS[3], 6) == 102.0
+def test_level_uses_fewer_bars_when_history_is_short() -> None:
+    assert _choch_level(TS, HIGHS, LOWS, 1, TS[2], 3) == 101.0
 
 
 def test_level_none_when_no_bar_precedes_e() -> None:
-    assert _choch_level([], TS, HIGHS, LOWS, 1, TS[0] - H1, TS[0], 6) is None
-
-
-def test_level_short_side_uses_pivot_lows_and_min_low() -> None:
-    assert _choch_level(PIVOTS, TS, HIGHS, LOWS, -1, TS[2], TS[15], 6) == 80.0
-    assert _choch_level(PIVOTS, TS, HIGHS, LOWS, -1, TS[10], TS[15], 6) == 99.0  # min(LOWS[9:15])
+    assert _choch_level(TS, HIGHS, LOWS, 1, TS[0], 3) is None
 
 
 def test_level_rejects_bad_direction() -> None:
     with pytest.raises(ValueError):
-        _choch_level(PIVOTS, TS, HIGHS, LOWS, 0, TS[2], TS[15], 6)
+        _choch_level(TS, HIGHS, LOWS, 0, TS[15], 3)
 
 
-# ---------------------------------------------------------------- real 1h ZigZag on hand-made series
+# ---------------------------------------------------------------- detector on hand-made series
 
 
 def build_series(segments: list[tuple[str, int]], start: float = 1000.0) -> list[Bar]:
-    """Every bar has true range 6 -> ATR14 == 6 and the K1=2 threshold is exactly 12.
-
-    flat: O=C=c, H=c+3, L=c-3 | up: O=L=c, C=c+5, H=c+6 | down: O=H=c, C=c-5, L=c-6
-    """
+    """flat: O=C=c, H=c+3, L=c-3 | up: O=L=c, C=c+5, H=c+6 | down: O=H=c, C=c-5, L=c-6"""
     bars: list[Bar] = []
     c = start
     for kind, n in segments:
@@ -4389,15 +4373,14 @@ def mirror(bars: list[Bar], m: float = 1000.0) -> list[Bar]:
     return [Bar(b.ts, 2 * m - b.open, 2 * m - b.low, 2 * m - b.high, 2 * m - b.close, b.volume) for b in bars]
 
 
-# idx 0-19 flat 1000 | 20-39 up to 1100 (H 1101 @39) | 40-49 down to 1050 (L 1049 @49)
-# | 50-53 up to 1070 (H 1071 @53, the lower high) | 54-75 down to 960 (L 959 @75 = E) | 76-105 up
+# idx 0-19 flat | 20-39 up | 40-49 down | 50-53 up (lower high) | 54-75 down (L 959 @75 = E) | 76-105 up
 LOWER_HIGH = [("flat", 20), ("up", 20), ("down", 10), ("up", 4), ("down", 22), ("up", 30)]
-# idx 0-19 flat | 20-39 up (H 1101 @39) | 40-69 straight down to 950 (L 949 @69 = E) | 70-99 up
+# idx 0-19 flat | 20-39 up | 40-69 straight down (L 949 @69 = E) | 70-99 up
 V_SHAPE = [("flat", 20), ("up", 20), ("down", 30), ("up", 30)]
 
 
 def run(bars: list[Bar], direction: int, leg_start_idx: int, e_idx: int) -> tuple[list[float | None], list[bool]]:
-    det = ChochDetector(k1=2.0, atr_len=14, fallback_bars=6)
+    det = ChochDetector(n_bars=3)
     levels: list[float | None] = []
     fired: list[bool] = []
     for k, b in enumerate(bars):
@@ -4411,43 +4394,34 @@ def run(bars: list[Bar], direction: int, leg_start_idx: int, e_idx: int) -> tupl
     return levels, fired
 
 
-def test_long_level_is_last_lower_high_and_triggers_once_on_cross() -> None:
+def test_long_level_is_three_bar_high_before_e_and_triggers_once_on_cross() -> None:
     bars = build_series(LOWER_HIGH)
-    assert bars[53].high == 1071.0 and bars[75].low == 959.0
+    assert bars[75].low == 959.0 and bars[72].high == 980.0
     levels, fired = run(bars, 1, leg_start_idx=39, e_idx=75)
-    assert levels[75] == 1071.0 and levels[105] == 1071.0
-    assert bars[97].close == 1070.0 and bars[98].close == 1075.0
-    assert [k for k, f in enumerate(fired) if f] == [98]
+    assert levels[75] == 980.0 and levels[105] == 980.0  # the lower high (1071) is not used
+    assert bars[79].close == 980.0 and bars[80].close == 985.0
+    assert [k for k, f in enumerate(fired) if f] == [80]  # 980 is not > 980; prev 980 <= 980 counts
 
 
-def test_long_leg_start_on_the_lower_high_uses_v_fallback() -> None:
-    bars = build_series(LOWER_HIGH)
-    levels, _ = run(bars, 1, leg_start_idx=53, e_idx=75)
-    assert levels[75] == 995.0  # max high of bars 69..74 (bar 69 opens at 995)
-
-
-def test_v_reversal_falls_back_to_six_bar_high_and_triggers_on_close_above() -> None:
+def test_v_reversal_same_rule() -> None:
     bars = build_series(V_SHAPE)
     assert bars[69].low == 949.0
     levels, fired = run(bars, 1, leg_start_idx=39, e_idx=69)
-    assert levels[69] == 985.0  # max(high[63..68]) = bar 63 open
-    assert bars[76].close == 985.0 and bars[77].close == 990.0
-    assert [k for k, f in enumerate(fired) if f] == [77]  # 985 is not > 985; prev 985 <= 985 counts
+    assert levels[69] == 970.0  # max(high[66..68]) = bar 66 open
+    assert [k for k, f in enumerate(fired) if f] == [74]
 
 
 def test_short_side_is_mirror_image() -> None:
-    bars = mirror(build_series(LOWER_HIGH))
-    levels, fired = run(bars, -1, leg_start_idx=39, e_idx=75)
-    assert levels[75] == 929.0  # 2000 - 1071
-    assert [k for k, f in enumerate(fired) if f] == [98]
-    vbars = mirror(build_series(V_SHAPE))
-    vlevels, vfired = run(vbars, -1, leg_start_idx=39, e_idx=69)
-    assert vlevels[69] == 1015.0  # 2000 - 985
-    assert [k for k, f in enumerate(vfired) if f] == [77]
+    levels, fired = run(mirror(build_series(LOWER_HIGH)), -1, leg_start_idx=39, e_idx=75)
+    assert levels[75] == 1020.0  # 2000 - 980
+    assert [k for k, f in enumerate(fired) if f] == [80]
+    vlevels, vfired = run(mirror(build_series(V_SHAPE)), -1, leg_start_idx=39, e_idx=69)
+    assert vlevels[69] == 1030.0  # 2000 - 970
+    assert [k for k, f in enumerate(vfired) if f] == [74]
 
 
 def test_triggered_false_before_two_bars_and_rejects_out_of_order_bars() -> None:
-    det = ChochDetector(k1=2.0)
+    det = ChochDetector()
     b0 = Bar(T0, 100.0, 101.0, 99.0, 100.0, 1.0)
     det.update(b0)
     assert det.triggered(1, T0 - H1, T0) is False
@@ -4455,12 +4429,9 @@ def test_triggered_false_before_two_bars_and_rejects_out_of_order_bars() -> None
         det.update(b0)
 
 
-def test_detector_feeds_its_own_1h_zigzag() -> None:
-    det = ChochDetector(k1=2.0)
-    for b in build_series(LOWER_HIGH)[:60]:
-        det.update(b)
-    highs = [p.price for p in det._zz.pivots if p.kind == 1]
-    assert highs[-2:] == [1101.0, 1071.0]
+def test_n_bars_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        ChochDetector(n_bars=0)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -4479,19 +4450,17 @@ Then create `src/ewbot/strategy/choch.py`:
 
 ```python
 # src/ewbot/strategy/choch.py
-"""1h change-of-character (CHoCH) trigger, spec 5.2.
+"""1h trigger, spec 5.2: breakout of the E-bar neighbourhood ("CHoCH" in names and comments).
 
-The detector owns its own 1h ZigZag (k = K1) plus the raw 1h history it needs.
-
-* ``level(+1, leg_start_ts, E_ts)`` = H1: price of the LAST 1h pivot HIGH that lies inside the
-  in-progress 4h leg (pivot bar ts strictly after ``leg_start_ts``) and whose confirmation bar is
-  strictly BEFORE the 1h bar where E_live occurred (``E_ts``). If no such pivot exists
-  (V-reversal), H1 = max high of the ``fallback_bars`` 1h bars immediately preceding the E bar.
-* ``level(-1, leg_start_ts, E_ts)`` = L1: the mirror image (pivot LOW, min low).
+* ``level(+1, leg_start_ts, E_ts)`` = H1: max HIGH of the ``n_bars`` 1h bars immediately BEFORE the
+  1h bar where E_live occurred (``E_ts``); the E bar itself and later bars are excluded. Fewer bars
+  are used if the history is shorter; with no bar before E the level is None.
+* ``level(-1, ...)`` = L1: the mirror image (min LOW).
 * ``triggered()``: close_t beyond the level and close_{t-1} not beyond it, where t is the last
   bar fed to ``update()``.
 
-Only bars already fed are used, so the detector cannot look ahead.
+``leg_start_ts`` is accepted for interface stability but unused. Only bars already fed are used,
+so the detector cannot look ahead.
 """
 
 from __future__ import annotations
@@ -4500,31 +4469,21 @@ from bisect import bisect_left
 from collections.abc import Sequence
 
 from ewbot.types import Bar
-from ewbot.waves.zigzag import Pivot, ZigZag
 
 
 def _choch_level(
-    pivots: Sequence[Pivot],
     ts: Sequence[int],
     highs: Sequence[float],
     lows: Sequence[float],
     direction: int,
-    leg_start_ts: int,
     E_ts: int,
-    fallback_bars: int,
+    n_bars: int,
 ) -> float | None:
-    """Pure core of ``ChochDetector.level``; ``pivots[*].i``/``confirmed_at`` index into ``ts``."""
+    """Pure core of ``ChochDetector.level``."""
     if direction not in (1, -1):
         raise ValueError(f"direction must be +1 or -1, got {direction}")
     e_idx = bisect_left(ts, E_ts)  # == number of bars strictly before the E bar
-    for p in reversed(pivots):
-        if p.confirmed_at >= e_idx:
-            continue  # confirmed on/after the E bar -> not "confirmed before E"
-        if p.sub_ts <= leg_start_ts:
-            break  # pivots are time-ordered: everything further back is outside the leg
-        if p.kind == direction:
-            return p.price
-    lo = max(0, e_idx - fallback_bars)
+    lo = max(0, e_idx - n_bars)
     if lo >= e_idx:
         return None
     if direction == 1:
@@ -4533,13 +4492,12 @@ def _choch_level(
 
 
 class ChochDetector:
-    """Owns a 1h ZigZag(k=K1); call ``update`` once per closed 1h bar before ``triggered``."""
+    """Keeps the raw 1h history; call ``update`` once per closed 1h bar before ``triggered``."""
 
-    def __init__(self, k1: float, atr_len: int = 14, fallback_bars: int = 6) -> None:
-        if fallback_bars < 1:
-            raise ValueError("fallback_bars must be >= 1")
-        self._zz = ZigZag(k1, atr_len)
-        self._fallback = fallback_bars
+    def __init__(self, n_bars: int = 3) -> None:
+        if n_bars < 1:
+            raise ValueError("n_bars must be >= 1")
+        self._n = n_bars
         self._ts: list[int] = []
         self._high: list[float] = []
         self._low: list[float] = []
@@ -4548,17 +4506,13 @@ class ChochDetector:
     def update(self, bar1h: Bar) -> None:
         if self._ts and bar1h.ts <= self._ts[-1]:
             raise ValueError(f"1h bars must arrive in increasing ts order: {bar1h.ts} after {self._ts[-1]}")
-        self._zz.update(len(self._ts), bar1h, None)
         self._ts.append(bar1h.ts)
         self._high.append(bar1h.high)
         self._low.append(bar1h.low)
         self._close.append(bar1h.close)
 
     def level(self, direction: int, leg_start_ts: int, E_ts: int) -> float | None:
-        return _choch_level(
-            self._zz.pivots, self._ts, self._high, self._low,
-            direction, leg_start_ts, E_ts, self._fallback,
-        )
+        return _choch_level(self._ts, self._high, self._low, direction, E_ts, self._n)
 
     def triggered(self, direction: int, leg_start_ts: int, E_ts: int) -> bool:
         if len(self._close) < 2:
@@ -4574,14 +4528,14 @@ class ChochDetector:
 
 - [ ] **Step 4: Run test to verify it passes**
 Run: `uv run pytest tests/strategy/test_choch.py -v`
-Expected: PASS (13 tests).
+Expected: PASS (11 tests).
 
-If the integration tests fail while the `_choch_level` tests pass, print the `pivots` list of `det._zz` for the `LOWER_HIGH` series. Its highs must end with `1101.0` (bar 39) and `1071.0` (bar 53), confirmed at bars 42 and 56. If they do not, the T5 ZigZag deviates from spec 4.1 (close-confirmed, `k*ATR14`, extremes by high/low). Fix it there, not here.
+If the series tests fail while the `_choch_level` tests pass, print `det.level(1, 0, bars[75].ts)` after feeding the whole `LOWER_HIGH` series. It must be `980.0`, the high of bar 72, which opens at 980. Any other value means the window is off by one: it must be the 3 bars strictly before the E bar, `[e_idx - 3, e_idx)` with `e_idx = bisect_left(ts, E_ts)`.
 
 - [ ] **Step 5: Commit**
 ```bash
 git add src/ewbot/strategy/__init__.py src/ewbot/strategy/choch.py tests/strategy/test_choch.py
-git commit -m "feat(strategy): 1h CHoCH detector with V-reversal fallback (spec 5.2)"
+git commit -m "feat(strategy): 1h E-bar neighbourhood breakout trigger (spec 5.2)"
 ```
 
 ### Task 12: Strategy base (Signal, R gate, time stop, Strategy protocol)
@@ -5533,7 +5487,7 @@ git commit -m "feat(strategy): Elliott setups W3/W5/W5_REV/C_END, bull+bear symm
 **Interfaces:**
 - Consumes: `WaveState` (`ready`, `top`, `s_rev`, `E_live`, `E_live_ts`, `leg_dir`, `leg_start`, `pivots4h`, `atr4h`), `Pivot`, `StrategyParams` (`mode`, `Q_MIN`, `S_MIN`, `buf_struct_atr`, R-gate and time-stop fields), `ChochDetector.triggered`, `base._finalize`, `base.time_stop_bars`, `ElliottStrategy`.
 - Produces:
-  - `FibSwingStrategy(sp)` with `name = "C"`. Its signals have `setup="FIB"`, `risk_mult=1.0`, `instance=None` and `lineage=None`.
+  - `FibSwingStrategy(sp)` with `name = "C"`. Its signals have `setup="FIB"`, `risk_mult=1.0`, `instance=None` and `lineage=None`. Stop `L − buf_struct_atr·ATR4h`, `TP1 = E + 1.0·(H − L)`, `TP2 = E + 1.618·(H − L)` (spec 5.5). This is setup ① (W3) geometry with S → L and P1 → H, so A versus C isolates the Elliott count filter. The earlier targets (`TP1 = H`, `TP2 = E + (H − L)`) give blended R ≤ 0.5·(1 + r)/(1 − r), which is below the 1.5 gate for every r < 0.5 before any entry distance, so C almost never traded (1–3 trades in 2017–2023).
   - `HybridStrategy(sp)` with `name = "HYBRID"`, `classify(ws) -> "CONFIDENT" | "CONTRARY" | "UNCERTAIN"` and `on_bar`.
   - `make_strategy(sp) -> Strategy`, chosen by `sp.mode` from `"A"`, `"C"` and `"HYBRID"`. Any other mode raises `ValueError`.
   - Package re-exports from `ewbot.strategy`.
@@ -5574,15 +5528,16 @@ def scen(
 
 
 def test_long_in_uptrend_pullback(sb: SimpleNamespace) -> None:
-    # H=300 (i24), L=150 (i14), E=185 -> r = 115/150 = 0.767; stop = 150 - 0.25*8; TP2 = 185 + 150
+    # H=300 (i24), L=150 (i14), E=185 -> r = 115/150 = 0.767; stop = 150 - 0.25*8;
+    # TP1 = 185 + 1.0*150, TP2 = 185 + 1.618*150 (setup W3 geometry)
     ws, bar = scen(sb)
     choch = sb.FakeChoch()
     sig = FIB.on_bar(bar, ws, choch)
     assert sig is not None
     assert (sig.setup, sig.direction, sig.entry_ref) == ("FIB", 1, 192.0)
     assert sig.stop == pytest.approx(148.0)
-    assert sig.tp1 == pytest.approx(300.0)
-    assert sig.tp2 == pytest.approx(335.0)
+    assert sig.tp1 == pytest.approx(335.0)
+    assert sig.tp2 == pytest.approx(427.7)
     assert sig.time_stop_4h == 15  # 1.5 * (24 - 14)
     assert sig.risk_mult == 1.0
     assert sig.instance is None and sig.lineage is None
@@ -5590,16 +5545,16 @@ def test_long_in_uptrend_pullback(sb: SimpleNamespace) -> None:
 
 
 def test_short_in_downtrend_rally_is_mirror(sb: SimpleNamespace) -> None:
-    # mirror around 200: highs 300 -> 250 (LH), lows 200 -> 100 (LL); E = 215
-    down = [(0, 300.0, 1), (8, 200.0, -1), (14, 250.0, 1), (24, 100.0, -1)]
-    ws, bar = scen(sb, pivots=down, E=215.0, close=208.0, leg_dir=1)
+    # highs 1300 -> 1250 (LH), lows 1200 -> 1100 (LL); E = 1215 (prices high enough that TP2 stays > 0)
+    down = [(0, 1300.0, 1), (8, 1200.0, -1), (14, 1250.0, 1), (24, 1100.0, -1)]
+    ws, bar = scen(sb, pivots=down, E=1215.0, close=1208.0, leg_dir=1)
     choch = sb.FakeChoch()
     sig = FIB.on_bar(bar, ws, choch)
     assert sig is not None
     assert (sig.setup, sig.direction) == ("FIB", -1)
-    assert sig.stop == pytest.approx(252.0)
-    assert sig.tp1 == pytest.approx(100.0)
-    assert sig.tp2 == pytest.approx(65.0)
+    assert sig.stop == pytest.approx(1252.0)
+    assert sig.tp1 == pytest.approx(1065.0)  # 1215 - 1.0*150
+    assert sig.tp2 == pytest.approx(972.3)  # 1215 - 1.618*150
     assert sig.time_stop_4h == 15
     assert choch.calls[0][0] == -1
 
@@ -5644,9 +5599,9 @@ def test_zone_gate(sb: SimpleNamespace, E: float, close: float) -> None:
 def test_choch_and_r_gates(sb: SimpleNamespace) -> None:
     ws, bar = scen(sb)
     assert FIB.on_bar(bar, ws, sb.FakeChoch(fire=False)) is None
-    # blended R = 0.5*108/44 + 0.5*143/44 = 2.852
-    assert FibSwingStrategy(StrategyParams(r_gate=2.85)).on_bar(bar, ws, sb.FakeChoch()) is not None
-    assert FibSwingStrategy(StrategyParams(r_gate=2.9)).on_bar(bar, ws, sb.FakeChoch()) is None
+    # blended R = 0.5*143/44 + 0.5*235.7/44 = 4.303
+    assert FibSwingStrategy(StrategyParams(r_gate=4.30)).on_bar(bar, ws, sb.FakeChoch()) is not None
+    assert FibSwingStrategy(StrategyParams(r_gate=4.31)).on_bar(bar, ws, sb.FakeChoch()) is None
 
 
 def test_not_ready_or_no_atr(sb: SimpleNamespace) -> None:
@@ -5672,8 +5627,9 @@ Expected: FAIL with collection error `ModuleNotFoundError: No module named 'ewbo
 
 Trend from the last two confirmed 4h highs and lows: HH+HL = up (+1), LH+LL = down (-1), else none.
 Up-trend with the in-progress leg falling: anchor H = last confirmed high, base L = the confirmed
-low before it; long when r = (H - E)/(H - L) in [0.382, 0.786], E > L, 1h CHoCH up and the R gate
-pass. Stop = L - buf_struct_atr*ATR4h, TP1 = H, TP2 = E + (H - L). Down-trend is the mirror image.
+low before it; long when r = (H - E)/(H - L) in [0.382, 0.786], E > L, the 1h trigger up and the R
+gate pass. Stop = L - buf_struct_atr*ATR4h, TP1 = E + 1.0*(H - L), TP2 = E + 1.618*(H - L) (setup W3
+geometry with S->L, P1->H, so A vs C isolates the Elliott count filter). Down-trend is the mirror image.
 Time-stop reference leg = the swing L -> H (base.i -> anchor.i).
 """
 
@@ -5692,6 +5648,8 @@ if TYPE_CHECKING:
     from ewbot.waves.zigzag import Pivot
 
 _FIB_ZONE = (0.382, 0.786)
+_FIB_TP1_SWING = 1.0  # TP1 = E + 1.0 * (H - L)   (same geometry as Elliott setup W3)
+_FIB_TP2_SWING = 1.618  # TP2 = E + 1.618 * (H - L)
 
 
 def _last_of_kind(pivots: Sequence[Pivot], kind: int, n: int, before_i: int | None = None) -> list[Pivot]:
@@ -5759,8 +5717,8 @@ class FibSwingStrategy:
             direction=t,
             entry_ref=bar.close,
             stop=base.price - t * sp.buf_struct_atr * ws.atr4h,
-            tp1=anchor.price,
-            tp2=e + swing,
+            tp1=e + _FIB_TP1_SWING * swing,
+            tp2=e + _FIB_TP2_SWING * swing,
             risk_mult=1.0,
             time_stop_4h=time_stop_bars(anchor.i - base.i, sp),
             instance=None,
@@ -5855,7 +5813,7 @@ def test_uncertain_uses_fib_only(sb: SimpleNamespace) -> None:
     sig = HYB.on_bar(bar, ws, sb.FakeChoch())
     assert sig is not None
     assert sig.setup == "FIB"
-    assert (sig.stop, sig.tp1, sig.tp2) == (pytest.approx(148.0), pytest.approx(300.0), pytest.approx(335.0))
+    assert (sig.stop, sig.tp1, sig.tp2) == (pytest.approx(148.0), pytest.approx(335.0), pytest.approx(427.7))  # same geometry as W3
     assert sig.instance is None and sig.lineage is None
     assert sig.reason.startswith("UNCERTAIN: FIB ")
 
@@ -5983,7 +5941,7 @@ __all__ = [
 
 - [ ] **Step 8: Run tests to verify they pass**
 Run: `uv run pytest tests/strategy -v`
-Expected: PASS (80 tests: 13 choch, 17 base, 28 elliott, 10 fib_swing, 12 hybrid)
+Expected: PASS (78 tests: 11 choch, 17 base, 28 elliott, 10 fib_swing, 12 hybrid)
 
 - [ ] **Step 9: Commit**
 ```bash
@@ -6056,8 +6014,7 @@ Additive extensions to the contract. No public contract name is changed.
 2. `PaperBroker.close_now(ts, price) -> Fill | None` closes the whole position immediately at
    `price` ± slippage plus fee. It is used for the `END` close.
 3. `TradingEngine(cfg, strategy, *, wave_engine=None, choch=None)`. When an argument is `None`, a
-   fresh real `WaveEngine(cfg.wave)` or
-   `ChochDetector(cfg.wave.K1, cfg.wave.atr_len, cfg.strategy.choch_fallback_bars)` is built per
+   fresh real `WaveEngine(cfg.wave)` or `ChochDetector(cfg.strategy.choch_bars)` is built per
    `run()`.
 4. `Trade.exit_reason == "TP1"` happens only for a one-contract trade, where TP1 closes everything
    and TP2 is unused.
@@ -6665,6 +6622,9 @@ git commit -m "feat: cost model and PaperBroker fill simulator (next-open fills,
     halt lasts until the date changes: `can_enter` compares dates itself, so the halt ends even if
     `on_equity` is not called.
   - **TOTAL_HALT** latches forever.
+  - **Switch.** With `BreakerParams.enabled = False` every method is a no-op: `on_equity` and
+    `on_trade_closed` return `[]` and change no state, so `can_enter` is always `True` and `halted`
+    stays `False`. Only the walk-forward grid uses this (T21); everything else runs with breakers on.
   - **CONSEC_PAUSE.** A pnl `>= 0` resets the loss streak. A pause blocks entries for
     `consec_pause_hours` from the closing trade's `ts`, and the streak restarts from 0.
 
@@ -6893,6 +6853,17 @@ def test_win_resets_loss_streak() -> None:
     assert cb.on_trade_closed(t + 4 * H, 5.0) == []
     assert cb.on_trade_closed(t + 5 * H, -10.0) == []
     assert cb.can_enter(t + 5 * H)
+
+
+def test_disabled_breakers_are_a_no_op() -> None:
+    cb = CircuitBreakers(BreakerParams(enabled=False), 10_000.0)
+    t = NY_MIDNIGHT_MAR10
+    assert cb.on_equity(t, 10_000.0) == []
+    assert cb.on_equity(t + H, 5_000.0) == []  # -50%: neither DAILY_HALT nor TOTAL_HALT
+    for k in range(10):
+        assert cb.on_trade_closed(t + (2 + k) * H, -10.0) == []  # no CONSEC_PAUSE
+    assert not cb.halted
+    assert cb.can_enter(t + 12 * H)
 ```
 
 - [ ] **Step 6: Run test to verify it fails**
@@ -6911,6 +6882,7 @@ Expected: FAIL with "ModuleNotFoundError: No module named 'ewbot.risk.breakers'"
   Blocks new entries until the next NY midnight; open positions are kept.
 - TOTAL_HALT: equity <= running peak * (1 - total_dd). Latched forever in backtests (the engine flattens).
 - CONSEC_PAUSE: max_consec_losses losing trades in a row -> no new entries for consec_pause_hours; streak resets.
+- enabled=False (walk-forward grid runs only): every method is a no-op; can_enter is always True.
 
 `ts` arguments are observation instants (epoch s UTC). The engine passes the bar CLOSE instant
 (bar.ts + H1) so that the observation at exactly 00:00 New York opens the new day.
@@ -6941,6 +6913,8 @@ class CircuitBreakers:
         self._pause_until: int | None = None
 
     def on_equity(self, ts: int, equity: float) -> list[str]:
+        if not self.p.enabled:
+            return []
         events: list[str] = []
         day = _ny_date(ts)
         if day != self._day:
@@ -6957,6 +6931,8 @@ class CircuitBreakers:
         return events
 
     def on_trade_closed(self, ts: int, pnl: float) -> list[str]:
+        if not self.p.enabled:
+            return []
         if pnl >= 0.0:
             self._consec = 0
             return []
@@ -6984,13 +6960,13 @@ class CircuitBreakers:
 - [ ] **Step 8: Run tests to verify they pass**
 
 Run: `uv run pytest tests/risk -v`
-Expected: PASS — 15 passed (9 in `test_sizing.py`, 6 in `test_breakers.py`).
+Expected: PASS — 16 passed (9 in `test_sizing.py`, 7 in `test_breakers.py`).
 
 - [ ] **Step 9: Commit**
 
 ```bash
 git add src/ewbot/risk/__init__.py src/ewbot/risk/sizing.py src/ewbot/risk/breakers.py tests/risk/test_sizing.py tests/risk/test_breakers.py
-git commit -m "feat: risk sizing (slippage-aware, leverage cap, liquidation check) and NY-day circuit breakers"
+git commit -m "feat: risk sizing (slippage-aware, leverage cap, liquidation check) and NY-day circuit breakers with enable switch"
 ```
 
 ---
@@ -7803,7 +7779,7 @@ class TradingEngine:
         choch = (
             self._choch_in
             if self._choch_in is not None
-            else ChochDetector(self.cfg.wave.K1, self.cfg.wave.atr_len, self.cfg.strategy.choch_fallback_bars)
+            else ChochDetector(self.cfg.strategy.choch_bars)
         )
         run = _Run(self.cfg, self.strategy, wave, choch, start_ts)
         return run.execute(to_bars(df), to_bars(clipped), n_clipped)
@@ -8006,7 +7982,7 @@ Run: `uv run pytest tests/engine -v`
 Expected: PASS — 27 passed (11 in `test_position_mgr.py`, 16 in `test_engine_loop.py`).
 
 Then run the whole suite to check that nothing upstream broke: `uv run pytest -q`. Expected: all
-tests pass. Part C1 alone contributes 69 tests.
+tests pass. Part C1 alone contributes 70 tests.
 
 Accounting sanity check (optional, about 1 s). Over a random run, the sum of trade P&L must equal
 the final equity minus the initial equity, to float precision:
@@ -8063,8 +8039,11 @@ Tasks **T18–T23**. Everything here lives in `src/ewbot/backtest/`, `src/ewbot/
 - `RandomEntryStrategy` pre-draws its whole plan at construction (times, directions, reference trade) from `seed`; the stop distance is stored as a **fraction of price** (so a 2017 stop of 5% stays 5% in 2021), TP multiples in R, and the time stop comes from `time_stop_bars(reference holding time in 4h bars)`. Times in the blackout (`entry_blackout(t)` or `entry_blackout(t+H1)`) are never eligible, matching the engine's own gate. The engine still decides whether a planned signal is usable (flat / breakers / cooldown), so realised random trades can be slightly fewer than `n_signals`.
 - `compare()` gains an optional trailing `workers: int = 1` (parallel A/C/HYBRID and RANDOM runs). `n_signals` for RANDOM = number of **A trades** in the window (A's actual entries), geometry sampled from those trades, seeds `cfg.seed + k`.
 - `Trade.snapshot` is only specified as "top-5 counts (pattern,d,phase,points[(ts,price)],q), q_top, s_rev, E_live, reason". The report looks for the counts list under `"counts"` (also accepts `"top5"` / `"top_counts"`), items as dicts with `pattern, d, phase, q, points`; `q_top` is read by `reliability_by_q`. If Part C1 names the key differently, change the single tuple in `report._snapshot_view`.
-- Walk-forward runs each of the 60 combos **once** over `[2017-01-01, 2024-01-01)` and slices that continuous run into train/test windows (state such as circuit breakers and compounding therefore carries across folds; this is the approximation the contract asks for). The first ~33 days of 2017 are engine warm-up (200 4h bars), so the first training window is slightly shorter than 24 months of trading.
+- Walk-forward runs each of the 60 combos **once** over `[2017-01-01, 2024-01-01)` and slices that continuous run into train/test windows (compounding therefore carries across folds; this is the approximation the contract asks for). The first ~33 days of 2017 are engine warm-up (200 4h bars), so the first training window is slightly shorter than 24 months of trading.
+- Circuit breakers are **disabled** in those grid runs: `run_grid` applies `breakers.enabled = False` itself. Breakers are a risk overlay validated in the holdout and in paper mode. In one continuous 2017–2023 run a TOTAL_HALT latched in an early year would zero the trades of every later fold and disqualify the combo there for reasons unrelated to that fold. The holdout, `compare` and plain backtests keep breakers on.
+- A combo is eligible in a fold only with `>= MIN_TRAIN_TRADES = 12` trades in the 24-month training window (spec 9.3). This floor only keeps a handful of trades from producing a degenerate Calmar; it is not a statistical-power criterion. On 2017–2023 the strategy makes about 8–13 trades a year (K4 4.0 → 2.0), so a floor of 30 left most folds with no eligible combo.
 - The holdout is run through `compare()` so that A / HYBRID can be judged against C, buy&hold and the random control on the same window (spec 9.6); only `[2024-01-01, last bar]` is reported. The lock file is written **before** the run.
+- Go-live trade count (spec 9.6 criterion 3): **50 out-of-sample trades with the frozen parameters**, counted over the holdout plus later paper trading (Plan 2). At the measured frequency the holdout alone yields roughly 21–35 trades, so the holdout report states each candidate's `n_trades` and, below 50, prints `<name>: 표본 외 거래 N/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족`. These lines are counts only, never performance claims. Plan 1 does not implement the paper accumulation.
 - `pyproject.toml` must expose the console script `ewbot = "ewbot.cli:main"` (T22 checks/adds it).
 
 ---
@@ -9492,15 +9471,18 @@ git commit -m "feat(backtest): runner, A/C/HYBRID/BH/EMA/random comparison with 
 - Test: `tests/backtest/test_walkforward.py`, `tests/backtest/test_holdout.py`
 
 **Interfaces:**
-- Consumes: T18 `compute_metrics`; T20 `run_backtest, compare, utc_ts`; `ewbot.config.with_overrides`; `ewbot.engine.loop.EngineResult, EquityPoint`.
-- Produces (walkforward): `GRID` (60 combos, key order `wave.K4, strategy.Q_MIN, strategy.S_MIN`), `grid_combos()`, `config_for(cfg, combo)`, `run_grid(cfg, df1h, start_ts, end_ts, workers) -> {combo: EngineResult}`, `folds(...)`, `pick_plateau(calmar, n_trades, min_trades)`, `select_plateau(results, train_start, train_end, min_trades=30)`, `oos_returns`, `evaluate_folds(results, fold_list, equity0, min_trades)`, `walk_forward(cfg, df1h, workers) -> dict`.
-- Produces (holdout): `HOLDOUT_START`, `HoldoutError`, `params_digest`, `evaluate_criteria`, `run_holdout(cfg, df1h, params, lock_path=Path("holdout.lock"), confirm=False, *, random_runs=100, workers=1)`.
+- Consumes: T18 `compute_metrics`; T20 `run_backtest, compare, utc_ts`; `ewbot.config.with_overrides` and T1 `BreakerParams.enabled`; T16 `CircuitBreakers` (a no-op when disabled); `ewbot.engine.loop.EngineResult, EquityPoint`.
+- Produces (walkforward): `GRID` (60 combos, key order `wave.K4, strategy.Q_MIN, strategy.S_MIN`), `MIN_TRAIN_TRADES = 12`, `grid_combos()`, `config_for(cfg, combo)`, `run_grid(cfg, df1h, start_ts, end_ts, workers) -> {combo: EngineResult}` (always runs with `breakers.enabled = False`), `folds(...)`, `pick_plateau(calmar, n_trades, min_trades=MIN_TRAIN_TRADES)`, `select_plateau(results, train_start, train_end, min_trades=MIN_TRAIN_TRADES)`, `oos_returns`, `evaluate_folds(results, fold_list, equity0, min_trades=MIN_TRAIN_TRADES)`, `walk_forward(cfg, df1h, workers) -> dict`.
+- Produces (holdout): `HOLDOUT_START`, `GO_LIVE_MIN_TRADES = 50`, `HoldoutError`, `params_digest`, `trade_count_lines(comp, required=GO_LIVE_MIN_TRADES) -> list[str]`, `evaluate_criteria` (also returns `n_trades` per candidate and the `trade_count` lines), `run_holdout(cfg, df1h, params, lock_path=Path("holdout.lock"), confirm=False, *, random_runs=100, workers=1)`.
 
 Rules implemented:
 - **Folds** (24-month train, 6-month test, rolling 6 months, first test 2019-01-01, last test end 2024-01-01) give exactly 10 folds; boundaries are listed literally in `test_folds_exact_boundaries` (fold 0: train `2017-01-01 .. 2019-01-01`, test `2019-01-01 .. 2019-07-01`; fold 9: train `2021-07-01 .. 2023-07-01`, test `2023-07-01 .. 2024-01-01`).
 - **Plateau**: score of a combo = mean Calmar over every combo whose grid index differs by at most 1 on each axis (itself included), counting only combos with `>= min_trades` trades in the training window. Highest score wins; ties go to the higher own Calmar, then the smallest grid index. The test grid is 4x5x3 with a plateau block of Calmar 2.0, an isolated corner spike of 5.0 (neighbourhood mean `14/8 = 1.75`) and everything else 1.0: naive argmax picks the spike, the plateau rule picks `(3.0, 0.6, 0.0)`.
 - **Stitching**: for each fold the chosen combo's single-run equity is sliced to the test window, hourly returns are compounded onto a running equity that starts at `initial_equity`; a fold with no eligible combo stays flat (`chosen = None`).
 - **Holdout lock**: JSON `{keys, params, sha256, runs}` written before the run; identical params may be re-run, different params raise `HoldoutError`; `confirm=False` raises before anything is written.
+- **Training floor**: `MIN_TRAIN_TRADES = 12` trades per 24-month training window is the default of `pick_plateau`, `select_plateau` and `evaluate_folds` (spec 9.3). It is a degeneracy guard for the Calmar objective, not a power criterion. On 2017–2023 the strategy makes about 8–13 trades a year (K4 4.0 → 2.0); at 12, between 24 and 60 of the 60 combos are eligible in every fold, while a floor of 30 leaves most folds with none.
+- **Breakers off in grid runs**: `run_grid` applies `with_overrides(cfg, **{"breakers.enabled": False})` before running anything, so the pool workers and the in-process path both get it and the caller's config is unchanged. The reason: a TOTAL_HALT latched early in the single 2017–2023 run would zero every later fold. The holdout (`compare`) and plain backtests keep breakers on.
+- **Go-live trade count**: `GO_LIVE_MIN_TRADES = 50` out-of-sample trades with frozen params, counted over the holdout plus later paper trading (Plan 2, not implemented here). `trade_count_lines` gives one line per candidate (A, HYBRID) with its holdout count. Below 50 the line is `<name>: 표본 외 거래 N/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족`, otherwise `<name>: 표본 외 거래 N/50 — 거래 수 기준 충족`. The lines are counts only; the CLI prints them and puts them at the top of the holdout report (T22).
 
 - [ ] **Step 1: Write the failing test (walk-forward)**
 
@@ -9509,10 +9491,13 @@ Rules implemented:
 ```python
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
+from ewbot.backtest import walkforward
 from ewbot.backtest.walkforward import (
     GRID,
+    MIN_TRAIN_TRADES,
     config_for,
     evaluate_folds,
     folds,
@@ -9586,6 +9571,30 @@ def test_pick_plateau_raises_when_nothing_qualifies():
     calmar, _ = _score_grid()
     with pytest.raises(ValueError):
         pick_plateau(calmar, {c: 1 for c in calmar}, min_trades=30)
+
+
+def test_min_train_trades_default_is_12():
+    calmar, _ = _score_grid()
+    assert MIN_TRAIN_TRADES == 12
+    assert pick_plateau(calmar, {c: 12 for c in calmar}) == (3.0, 0.6, 0.0)  # default floor
+    with pytest.raises(ValueError):
+        pick_plateau(calmar, {c: 11 for c in calmar})
+
+
+def test_run_grid_disables_breakers_without_touching_the_input(monkeypatch):
+    seen = []
+
+    def fake_run_backtest(cfg, df1h, start_ts, end_ts):
+        seen.append(cfg)
+        return EngineResult(trades=(), equity=(), signals=(), events=())
+
+    monkeypatch.setattr(walkforward, "run_backtest", fake_run_backtest)
+    base = BotConfig()
+    out = walkforward.run_grid(base, pd.DataFrame(), 0, H, workers=1)
+    assert list(out) == grid_combos() and len(seen) == 60
+    assert all(c.breakers.enabled is False for c in seen)
+    assert {(c.wave.K4, c.strategy.Q_MIN, c.strategy.S_MIN) for c in seen} == set(grid_combos())
+    assert base.breakers.enabled is True  # the caller's config is untouched
 
 
 def _result(value_fn, n_points, trade_hours, mk_trade):
@@ -9667,6 +9676,9 @@ GRID: dict[str, tuple[float, ...]] = {
 }
 WF_START = "2017-01-01"
 WF_END = "2024-01-01"  # holdout starts here; nothing at/after this date is touched
+# spec 9.3: a combo needs this many trades in a 24-month training window. A degeneracy floor for
+# the Calmar objective, not a power criterion (2017-2023: about 8-13 trades/year).
+MIN_TRAIN_TRADES = 12
 
 Combo = tuple[float, ...]
 
@@ -9697,7 +9709,12 @@ def _run_combo(combo: Combo) -> tuple[Combo, EngineResult]:
 def run_grid(
     cfg: BotConfig, df1h: pd.DataFrame, start_ts: int, end_ts: int, workers: int
 ) -> dict[Combo, EngineResult]:
-    """Run every combo ONCE over [start_ts, end_ts); folds later slice these single runs."""
+    """Run every combo ONCE over [start_ts, end_ts); folds later slice these single runs.
+
+    Circuit breakers are DISABLED here (breakers.enabled = False): they are a risk overlay validated
+    in the holdout and in paper mode, and a TOTAL_HALT latched early in this single continuous run
+    would zero the trades of every later fold. The caller's cfg is not modified."""
+    cfg = with_overrides(cfg, **{"breakers.enabled": False})
     combos = grid_combos()
     out: dict[Combo, EngineResult] = {}
     initargs = (cfg, df1h, start_ts, end_ts)
@@ -9751,7 +9768,7 @@ def _grid_index(combo: Combo) -> tuple[int, ...]:
 
 
 def pick_plateau(
-    calmar: Mapping[Combo, float], n_trades: Mapping[Combo, int], min_trades: int = 30
+    calmar: Mapping[Combo, float], n_trades: Mapping[Combo, int], min_trades: int = MIN_TRAIN_TRADES
 ) -> Combo:
     """Score(c) = mean Calmar over c's grid neighbours (Chebyshev index distance <= 1 on every
     axis, c included), counting only combos with >= min_trades trades. Highest score wins; ties
@@ -9785,7 +9802,7 @@ def _train_scores(
 
 
 def select_plateau(
-    results: Mapping[Combo, EngineResult], train_start: int, train_end: int, min_trades: int = 30
+    results: Mapping[Combo, EngineResult], train_start: int, train_end: int, min_trades: int = MIN_TRAIN_TRADES
 ) -> Combo:
     calmar, ntr = _train_scores(results, train_start, train_end)
     return pick_plateau(calmar, ntr, min_trades)
@@ -9814,7 +9831,7 @@ def evaluate_folds(
     results: Mapping[Combo, EngineResult],
     fold_list: Sequence[tuple[int, int, int, int]],
     equity0: float,
-    min_trades: int = 30,
+    min_trades: int = MIN_TRAIN_TRADES,
 ) -> dict[str, Any]:
     """Pick the plateau combo on each training window, then stitch each fold's OOS slice of
     that combo's (single-run) equity returns into one compounded equity curve. A fold with no
@@ -9861,7 +9878,8 @@ def evaluate_folds(
 
 
 def walk_forward(cfg: BotConfig, df1h: pd.DataFrame, workers: int) -> dict[str, Any]:
-    """Full walk-forward over [2017-01-01, 2024-01-01). Nothing from the holdout is used."""
+    """Full walk-forward over [2017-01-01, 2024-01-01). Nothing from the holdout is used.
+    Grid runs have circuit breakers disabled (see run_grid); folds need MIN_TRAIN_TRADES trades."""
     start_ts, end_ts = utc_ts(WF_START), utc_ts(WF_END)
     results = run_grid(cfg, df1h, start_ts, end_ts, workers)
     out = evaluate_folds(results, folds(), cfg.initial_equity)
@@ -9875,7 +9893,7 @@ def walk_forward(cfg: BotConfig, df1h: pd.DataFrame, workers: int) -> dict[str, 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/backtest/test_walkforward.py -v`
-Expected: 7 passed.
+Expected: 9 passed.
 
 - [ ] **Step 5: Write the failing test (holdout)**
 
@@ -9890,7 +9908,14 @@ import pandas as pd
 import pytest
 
 from ewbot.backtest import holdout
-from ewbot.backtest.holdout import HOLDOUT_START, HoldoutError, evaluate_criteria, params_digest, run_holdout
+from ewbot.backtest.holdout import (
+    HOLDOUT_START,
+    HoldoutError,
+    evaluate_criteria,
+    params_digest,
+    run_holdout,
+    trade_count_lines,
+)
 from ewbot.config import BotConfig
 
 H = 3600
@@ -9982,6 +10007,20 @@ def test_criteria(tmp_path, df, monkeypatch):
     assert evaluate_criteria(cmp)["n_trades_ok"] is False
     cmp["comparison"]["A"].update(n_trades=60, sharpe=0.05)  # below random-control mean
     assert evaluate_criteria(cmp)["winners"] == []
+
+
+def test_trade_count_lines_state_out_of_sample_progress():
+    comp = {"A": _m(1.0, 2.0, n=27), "HYBRID": _m(0.4, 0.5, n=50), "C": _m(0.5, 1.0, n=3)}
+    assert trade_count_lines(comp) == [
+        "A: 표본 외 거래 27/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족",
+        "HYBRID: 표본 외 거래 50/50 — 거래 수 기준 충족",
+    ]
+    cmp = _fake_compare_factory([])(None, None, 0, 1)
+    cmp["comparison"]["A"]["n_trades"] = 27
+    crit = evaluate_criteria(cmp)
+    assert crit["n_trades"] == {"A": 27, "HYBRID": 60}
+    assert crit["trade_count"][0] == "A: 표본 외 거래 27/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족"
+    assert crit["n_trades_ok"] is False and crit["automatic_criteria_met"] is False
 ```
 
 - [ ] **Step 6: Run test to verify it fails**
@@ -10012,6 +10051,8 @@ from ewbot.config import BotConfig
 from ewbot.types import H1
 
 HOLDOUT_START = utc_ts("2024-01-01")
+GO_LIVE_MIN_TRADES = 50  # spec 9.6 criterion 3: out-of-sample trades with frozen params (holdout + paper)
+_CANDIDATES = ("A", "HYBRID")
 
 
 class HoldoutError(RuntimeError):
@@ -10023,11 +10064,30 @@ def params_digest(params: Sequence[float]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def trade_count_lines(comp: dict[str, Any], required: int = GO_LIVE_MIN_TRADES) -> list[str]:
+    """One line per go-live candidate in `comp`: its out-of-sample trade count against the spec 9.6
+    minimum. Counts only, no performance statement. Below the minimum the holdout alone cannot meet
+    criterion 3 and trades must keep accumulating in paper mode (Plan 2)."""
+    lines: list[str] = []
+    for name in _CANDIDATES:
+        if name not in comp:
+            continue
+        n = int(comp[name]["n_trades"])
+        if n < required:
+            lines.append(f"{name}: 표본 외 거래 {n}/{required} — paper 모드로 누적 필요; 실거래 전환 기준 미충족")
+        else:
+            lines.append(f"{name}: 표본 외 거래 {n}/{required} — 거래 수 기준 충족")
+    return lines
+
+
 def evaluate_criteria(cmp: dict[str, Any]) -> dict[str, Any]:
-    """Automatic part of the spec 9.6 go-live gate (criterion 4, 4 weeks of paper, is manual).
+    """Automatic part of the spec 9.6 go-live gate on the holdout window (criterion 4, 4 weeks of
+    paper, is manual).
 
     A candidate (A or HYBRID) must beat C, BH and the random-control mean on BOTH Sharpe and
-    Calmar; among those, one must also have max_dd <= 15% and >= 50 trades."""
+    Calmar; among those, one must also have max_dd <= 15% and >= GO_LIVE_MIN_TRADES trades.
+    Criterion 3 counts all out-of-sample trades with frozen params (holdout + later paper);
+    `n_trades` / `trade_count` state the holdout's count per candidate."""
     comp = cmp["comparison"]
     rnd = cmp["random"].get("dist", {})
 
@@ -10040,12 +10100,14 @@ def evaluate_criteria(cmp: dict[str, Any]) -> dict[str, Any]:
             return a["sharpe"] > rnd["sharpe"]["mean"] and a["calmar"] > rnd["calmar"]["mean"]
         return True
 
-    winners = [n for n in ("A", "HYBRID") if n in comp and beats(n)]
-    passing = [n for n in winners if comp[n]["max_dd"] <= 0.15 and comp[n]["n_trades"] >= 50]
+    winners = [n for n in _CANDIDATES if n in comp and beats(n)]
+    passing = [n for n in winners if comp[n]["max_dd"] <= 0.15 and comp[n]["n_trades"] >= GO_LIVE_MIN_TRADES]
     return {
         "winners": winners,
         "max_dd_ok": any(comp[n]["max_dd"] <= 0.15 for n in winners),
-        "n_trades_ok": any(comp[n]["n_trades"] >= 50 for n in winners),
+        "n_trades_ok": any(comp[n]["n_trades"] >= GO_LIVE_MIN_TRADES for n in winners),
+        "n_trades": {n: int(comp[n]["n_trades"]) for n in _CANDIDATES if n in comp},
+        "trade_count": trade_count_lines(comp),
         "passing": passing,
         "paper_4_weeks": "manual check required",
         "automatic_criteria_met": bool(passing),
@@ -10111,12 +10173,12 @@ def run_holdout(
 - [ ] **Step 8: Run test to verify it passes**
 
 Run: `uv run pytest tests/backtest/test_walkforward.py tests/backtest/test_holdout.py -v`
-Expected: 12 passed.
+Expected: 15 passed (9 walk-forward, 6 holdout).
 
 - [ ] **Step 9: Commit**
 ```bash
 git add src/ewbot/backtest/walkforward.py src/ewbot/backtest/holdout.py tests/backtest/test_walkforward.py tests/backtest/test_holdout.py
-git commit -m "feat(backtest): 60-combo walk-forward with plateau selection and one-shot holdout lock"
+git commit -m "feat(backtest): 60-combo walk-forward (breakers off, >=12 train trades) with plateau selection, one-shot holdout lock and go-live trade count"
 ```
 
 ---
@@ -10129,7 +10191,7 @@ git commit -m "feat(backtest): 60-combo walk-forward with plateau selection and 
 - Test: `tests/backtest/test_report.py`, `tests/backtest/test_cli.py`
 
 **Interfaces:**
-- Consumes: T18–T21 (`compute_metrics`, `reliability_by_q`, `compare`, `run_backtest`, `breakdowns`, `walk_forward`, `run_holdout`, `GRID`), `ewbot.data.candles.load_1h, fill_gaps, check_integrity, aggregate_4h`, `ewbot.data.coinbase_history.update_cache`, `ewbot.config.load_config, with_overrides, AGGRESSIVE, CONSERVATIVE`. CLI end-to-end test only: `tests.synth.random_bars` (T10).
+- Consumes: T18–T21 (`compute_metrics`, `reliability_by_q`, `compare`, `run_backtest`, `breakdowns`, `walk_forward`, `run_holdout` (its `criteria["trade_count"]` lines), `GRID`, `MIN_TRAIN_TRADES`), `ewbot.data.candles.load_1h, fill_gaps, check_integrity, aggregate_4h`, `ewbot.data.coinbase_history.update_cache`, `ewbot.config.load_config, with_overrides, AGGRESSIVE, CONSERVATIVE`. CLI end-to-end test only: `tests.synth.random_bars` (T10).
 - Produces: `write_report(path, title, sections) -> Path` (+ `to_jsonable`), `ewbot.cli.main(argv) -> int` with subcommands `fetch | backtest | compare | walkforward | holdout`.
 
 Report (`write_report`): one self-contained HTML file, plotly via `<script src="https://cdn.plot.ly/plotly-2.35.2.min.js">`, light/dark via CSS variables. Recognised `sections` keys: `notes`, `equity` (equity chart, log axis when all values are positive, plus drawdown chart; series are down-sampled to about 4000 points, drawdown keeps each block's trough), `comparison` (+ `random` row with mean and [p5, p95], `ci` column), `per_setup`, `long_short`, `per_year`, `reliability`, `trades` (collapsible table per strategy; each trade with a snapshot has a collapsible chart that, on first open, draws the **top count's points as a labelled polyline** (S,1,2,... or X,A,B) over the **4h close series** from `entry - window` to `exit + window`, window = `snapshot_window_bars` (default 60) 4h bars, with entry marker and stop/TP lines), `candles4h`; any other key is rendered as a table (list of flat dicts) or JSON. Titles and all cell text are HTML-escaped, JSON embedded in the page escapes `</`.
@@ -10722,7 +10784,7 @@ from ewbot.backtest.holdout import HoldoutError, run_holdout
 from ewbot.backtest.metrics import compute_metrics, reliability_by_q
 from ewbot.backtest.report import to_jsonable, write_report
 from ewbot.backtest.runner import breakdowns, compare, equity_pairs, run_backtest, utc_ts
-from ewbot.backtest.walkforward import GRID, walk_forward
+from ewbot.backtest.walkforward import GRID, MIN_TRAIN_TRADES, walk_forward
 from ewbot.config import AGGRESSIVE, CONSERVATIVE, BotConfig, load_config, with_overrides
 from ewbot.data.candles import aggregate_4h, check_integrity, fill_gaps, load_1h
 from ewbot.data.coinbase_history import update_cache
@@ -10909,7 +10971,12 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
     print(f"walk-forward: {len(wf['folds'])} folds in {dt:.0f}s; chosen_final = {wf['chosen_final']}; json: {jpath}")
     _print_comparison({"WF-OOS": wf["stitched_metrics"]})
     sections = {
-        "notes": _notes(cfg, 0, 0)[1:] + [f"runtime {dt:.0f}s", f"grid {dict(GRID)}"],
+        "notes": _notes(cfg, 0, 0)[1:]
+        + [
+            f"runtime {dt:.0f}s",
+            f"grid {dict(GRID)}",
+            f"circuit breakers disabled in grid runs; a combo needs >= {MIN_TRAIN_TRADES} trades per training window",
+        ],
         "equity": {"WF-OOS (stitched)": wf["stitched_equity"]},
         "comparison": {"WF-OOS": wf["stitched_metrics"]},
         "trades": {"WF-OOS": wf["oos_trades"]},
@@ -10950,8 +11017,11 @@ def cmd_holdout(args: argparse.Namespace) -> int:
     cmp = out["compare"]
     _print_comparison(cmp["comparison"])
     print(json.dumps(to_jsonable(out["criteria"]), indent=1))
+    for line in out["criteria"]["trade_count"]:  # spec 9.6 criterion 3: out-of-sample trades N/50
+        print(line)
     start, end = out["window"]
-    sections = _compare_sections(cmp, df, _notes(with_overrides(cfg, **dict(zip(GRID, params))), start, end) + [f"lock {args.lock} sha256 {out['sha256'][:12]}"])
+    notes = _notes(with_overrides(cfg, **dict(zip(GRID, params))), start, end) + [f"lock {args.lock} sha256 {out['sha256'][:12]}"]
+    sections = _compare_sections(cmp, df, out["criteria"]["trade_count"] + notes)
     sections["criteria"] = out["criteria"]
     print(f"report: {write_report(_out(args), 'Holdout 2024-01-01..end (one-shot)', sections)}")
     return 0
