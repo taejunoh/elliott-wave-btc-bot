@@ -1,0 +1,49 @@
+# Mirrors the dataclass defaults in src/ewbot/config.py (a test enforces this).
+wave:
+  K4: 3.0
+  atr_len: 14
+  M: 12
+  sigma: 0.12
+  w0: 1.0
+  T: 0.05
+  h: 0.05
+  top_k: 5
+  wick_clip_atr1h: 6.0
+  warmup_4h: 200
+
+strategy:
+  mode: A                 # A | C | HYBRID
+  setups_enabled: [W3, W5, W5_REV, C_END]
+  Q_MIN: 0.6
+  S_MIN: 0.25
+  r_gate: 1.5
+  tp1_frac: 0.5
+  time_stop_mult: 1.5
+  time_stop_min_4h: 12
+  time_stop_max_4h: 60
+  setup3_risk_mult: 0.5
+  buf_struct_atr: 0.25    # setups W3, W5, FIB, trailing
+  buf_ext_atr: 0.5        # setups W5_REV, C_END
+  choch_bars: 3           # spec 5.2 trigger: high/low of the 3 1h bars before the E bar
+
+# Either a profile name ("conservative" | "aggressive") or a mapping
+# {name, risk_pct, max_leverage}.
+risk: conservative
+
+breakers:
+  daily_loss: 0.03
+  total_dd: 0.15
+  max_consec_losses: 5
+  consec_pause_hours: 24
+  enabled: true           # walk-forward grid runs switch this off in code (T21)
+
+costs:
+  fee_rate: 0.0005
+  fee_min_per_contract: 0.15
+  apply_min_fee: false    # per-contract minimum is NOT applied in backtests
+  slippage: 0.0005
+  funding_apr_long: 0.10
+  contract_size: 0.01
+
+initial_equity: 10000.0
+seed: 0
