@@ -3,10 +3,13 @@ from __future__ import annotations
 import dataclasses
 import math
 
+import numpy as np
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from ewbot.config import WaveParams
+from ewbot.indicators import atr_series
 from ewbot.types import H1, H4, Bar
 from ewbot.waves.engine import WaveState
 from tests.synth import T0, impulse_abc, make_path, random_bars, run_engine
@@ -60,6 +63,9 @@ def _poison(b: Bar, how: str) -> Bar:
 @settings(max_examples=40, deadline=None)
 @given(paths, st.data(), st.sampled_from(["x10", "nan"]))
 def test_poisoned_future_does_not_change_the_past(bars: list[Bar], data: st.DataObject, how: str) -> None:
+    """Guards hidden cross-run/global state only. In a sequential streaming harness the engine can never
+    see the poisoned future, so this cannot catch a pivot whose confirmed_at is backdated: that is the job
+    of the independent oracle test below."""
     t = data.draw(st.integers(1, len(bars) - 1))
     clean = run_engine(bars, P)
     poisoned = bars[:t] + [_poison(b, how) for b in bars[t:]]
@@ -77,3 +83,58 @@ def test_streaming_equals_batch_and_cache_equals_fresh(bars: list[Bar]) -> None:
 def test_synthetic_path_is_causal_too() -> None:
     bars, _ = make_path(impulse_abc(), 0.3, 7, WaveParams(warmup_4h=50))
     _assert_causal(run_engine(bars, WaveParams(warmup_4h=50)))
+
+
+def _four_hour(bars: list[Bar]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """High/low/close of the complete UTC 4h buckets, built straight from the raw 1h bars."""
+    buckets: dict[int, list[Bar]] = {}
+    for b in bars:
+        buckets.setdefault(b.ts // H4, []).append(b)
+    keys = sorted(k for k, v in buckets.items() if len(v) == H4 // H1)
+    assert keys == list(range(keys[0], keys[0] + len(keys)))
+    return (np.array([max(x.high for x in buckets[k]) for k in keys]),
+            np.array([min(x.low for x in buckets[k]) for k in keys]),
+            np.array([buckets[k][-1].close for k in keys]))
+
+
+def _assert_pivots_confirmed_by_the_book(bars: list[Bar], params: WaveParams) -> int:
+    """Independent oracle for spec 4.1: re-derive, from raw 4h bars and a separate ATR, that every pivot the
+    engine reports is confirmed on exactly the first 4h CLOSE that retraced K4*ATR from its extreme, and that
+    the state shows it at exactly that bar (the engine's own ``confirmed_at`` is not trusted)."""
+    states = run_engine(bars, params)
+    high, low, close = _four_hour(bars)
+    atr = atr_series(high, low, close, params.atr_len)
+    seen = 0
+    for s in states:
+        new = s.pivots4h[seen:]
+        assert len(new) <= 1
+        if new:
+            # (a) the pivot first appears on the 4h close at which it claims to be confirmed
+            assert s.closed_4h and s.new_pivot_4h == new[0] and s.i4h == new[0].confirmed_at
+        else:
+            assert s.new_pivot_4h is None
+        seen = len(s.pivots4h)
+    for p in states[-1].pivots4h:
+        c, k, thr = p.confirmed_at, p.kind, params.K4
+        ext = high if k > 0 else low
+        assert low[p.i] - 1e-9 <= p.price <= high[p.i] + 1e-9           # the extreme lies in its own bar
+        assert all(k * (ext[j] - p.price) <= 1e-9 for j in range(p.i, c + 1))   # nothing went further
+        assert not math.isnan(atr[c])
+        assert k * (p.price - close[c]) >= thr * atr[c] - 1e-9          # (b) retraced K4*ATR on that close
+        for j in range(p.i, c):                                         # ... and on no earlier close
+            assert math.isnan(atr[j]) or k * (p.price - close[j]) < thr * atr[j] + 1e-9, (p, j)
+    return len(states[-1].pivots4h)
+
+
+@settings(max_examples=40, deadline=None)
+@given(paths)
+def test_pivots_are_confirmed_exactly_when_the_close_retraces_k_atr(bars: list[Bar]) -> None:
+    _assert_pivots_confirmed_by_the_book(bars, P)
+
+
+@pytest.mark.parametrize("noise", [0.3, 1.0])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_synthetic_pivots_are_confirmed_by_the_book(noise: float, seed: int) -> None:
+    params = WaveParams(warmup_4h=50)
+    bars, _ = make_path(impulse_abc(), noise, seed, params)
+    assert _assert_pivots_confirmed_by_the_book(bars, params) >= 8

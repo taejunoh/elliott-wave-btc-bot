@@ -44,7 +44,14 @@ def test_mirror_of_synthetic_impulse() -> None:
     assert up_top.d == -dn_top.d and up_top.phase == dn_top.phase
 
 
-@settings(max_examples=25, deadline=None)
-@given(st.integers(0, 2**31 - 1), st.integers(120, 600))
-def test_mirror_property_on_random_paths(seed: int, n: int) -> None:
-    _assert_mirrored(random_bars(seed, n), WaveParams(K4=1.5, atr_len=5, warmup_4h=10))
+def test_mirror_property_on_random_paths() -> None:
+    params = WaveParams(K4=1.5, atr_len=5, warmup_4h=10)
+    total = []
+
+    @settings(max_examples=25, deadline=None)
+    @given(st.integers(0, 2**31 - 1), st.integers(120, 600))
+    def check(seed: int, n: int) -> None:
+        total.append(_assert_mirrored(random_bars(seed, n), params))
+
+    check()
+    assert sum(total) > 0, "vacuous: no random path produced a single count"
