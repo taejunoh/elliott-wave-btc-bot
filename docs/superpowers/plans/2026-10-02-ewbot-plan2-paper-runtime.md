@@ -4,16 +4,16 @@
 
 **Goal:** Run the frozen holdout strategy (A with K4 = 2.0, Q_MIN = 0.7, S_MIN = 0.5 from `holdout.lock`) as an hourly, deterministic paper-trading runtime on GitHub Actions that keeps accumulating out-of-sample trades toward the 50-trade go-live minimum, proves for at least 4 weeks that the decisions recorded in real time equal the decisions recomputed later, and reports through a ledger and HTML report on an orphan `paper` branch and through Telegram.
 
-**Architecture:** Every run recomputes the whole engine from the first cached bar with `run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)` (spec approach A), inside a read-only trace that records fills, stop moves and order sizes. Trades entering after the holdout's last bar are the paper trades. A JSON ledger stores epochs (strategy fingerprint), trades, decisions (with run id and the hash of the bars they depended on), discrepancies, runs and Telegram delivery state; every file write is temp file + `os.replace`. No strategy-fingerprinted module is edited: new code lives in `src/ewbot/paper/`, plus a `paper` sub-command in `cli.py`, `.github/workflows/paper.yml` and an ops guide.
+**Architecture:** Every run recomputes the whole engine from the first cached bar with `run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)` (spec approach A), inside a read-only trace that records fills, stop moves and order sizes. Trades entering after the holdout's last bar are the paper trades. A JSON ledger stores epochs (strategy fingerprint), trades, decisions (with run id and the hash of the bars they depended on), discrepancies, runs and Telegram delivery state; every file write is temp file + `os.replace`. No strategy-fingerprinted module is edited: new code lives in `src/ewbot/paper/`, plus a `paper` sub-command in `cli.py`, `.github/workflows/paper.yml` with its git helper `scripts/paper_sync.sh`, and an ops guide.
 
-**Tech Stack:** Python 3.12 (uv), numpy, pandas, pyarrow, requests, plotly (existing dependencies only); pytest; GitHub Actions (`actions/checkout@v7`, `astral-sh/setup-uv@v10`, `actions/cache@v6`); Telegram Bot API `sendMessage`.
+**Tech Stack:** Python 3.12 (uv), numpy, pandas, pyarrow, requests, plotly (existing dependencies only); pytest; GitHub Actions (`actions/checkout@v7`, `astral-sh/setup-uv` pinned to the v10.2.0 commit `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Telegram Bot API `sendMessage`.
 
 **Spec:** `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md` (parent: `docs/superpowers/specs/2026-10-01-elliott-wave-btc-bot-design.md`).
 
 ## Global Constraints
 
 - Work on branch `feat/plan2-paper`, from the repository root; Python 3.12 via uv; tests with `uv run pytest`. No new dependencies (`pyproject.toml` and `uv.lock` unchanged).
-- Never modify a strategy-fingerprinted file (spec §5.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Do not edit `backtest/**`, `data/coinbase_history.py` or `holdout.lock` either. Allowed: create `src/ewbot/paper/*`, `tests/paper/*`, `.github/workflows/paper.yml`, `docs/paper-trading.md`; modify `src/ewbot/cli.py`.
+- Never modify a strategy-fingerprinted file (spec §5.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Do not edit `backtest/**`, `data/coinbase_history.py` or `holdout.lock` either. Allowed: create `src/ewbot/paper/*`, `tests/paper/*`, `.github/workflows/paper.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`; modify `src/ewbot/cli.py`.
 - Fingerprint = `sha256( for path in sorted(paths): path + "\0" + bytes + "\0" )` over the repo-relative paths (`src/ewbot/<path>`) of that file set (25 files today). Baseline = the same set at holdout commit `64e628ad4865b3b04571a7cba2886881eae19176` (`64e628a`), read with `git cat-file blob` (the plain `git show 64e628a:<path>` bytes). Today both are `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
 - Frozen inputs: params only from `holdout.lock` (`[2.0, 0.7, 0.5]`); config = `holdout_config(BotConfig(), params)` (strategy A, conservative 1% / 3x, breakers on, fee 0.05%, slippage 0.05%, funding 10% APR long); recompute with `start_ts = HOLDOUT_START = 1704067200`; no CLI option changes any of it.
 - Holdout boundary: `last_bar_ts = 1790938800` (2026-10-02 11:00 UTC); paper trades have `entry_ts > last_bar_ts`; holdout `n_trades.A = 36`. A later epoch counts `entry_ts > epoch.started_ts`.
@@ -21,7 +21,7 @@
 - Decisions: `SIGNAL, ENTRY, TP1, TP2, STOP, EXIT, BREAKEVEN, TRAIL` as `(kind, ts, price, contracts, reason)` + `trade_key, levels, setup, direction, run_id, data_sha256, epoch_id`; id `kind:ts:trade_key`; prices and levels compared with relative tolerance `1e-9`; causes `DATA_REVISION` > `FINGERPRINT_CHANGE` > `UNEXPLAINED`.
 - Criterion 4: at least 28 days since the epoch's first successful run, 0 `UNEXPLAINED` discrepancies in the epoch, at least 95% of hours with a successful run.
 - Telegram: secrets `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`; without them nothing is sent and the run succeeds; each event id `kind:ts:trade_key` is sent at most once; 3 tries, then the event stays pending for the next run. Daily summary: first run at/after 09:00 America/New_York per New York date; criteria 1–2 (`compare`, RANDOM 100 runs, injectable) are recomputed only in that run. Gap warning: more than 3 h since the last successful run.
-- Workflow: `cron: "7 * * * *"` + `workflow_dispatch`; `concurrency: {group: paper, cancel-in-progress: false}`; `permissions: contents: write`; `paper` branch worktree created as an orphan on first use; every fetch shallow (master, the `64e628a` commit and `paper` at depth 1); push retried 3 times (refresh + recompute).
+- Workflow: `cron: "7 * * * *"` + `workflow_dispatch`; `concurrency: {group: paper, cancel-in-progress: false}`; `permissions: contents: write`; `paper` branch worktree created as an orphan on first use; every fetch shallow (master, the `64e628a` commit and `paper` at depth 1); orphan only when `ls-remote` exits 2, any other `ls-remote` failure fails the job; 3 pushes at most: the same commit again when `origin/paper` did not move (no recompute, no repeated Telegram message), refresh + recompute only when it moved, never after the last push (`scripts/paper_sync.sh`); 35-minute step timeouts on the `ewbot` steps; Telegram secrets only on the steps that send.
 - Tests never touch the network, the real `data/cache`, or `<repo>/holdout.lock`: synthetic candles (`tests/synth.random_bars`), temp git repos holding test locks, a fake sender and a fake fetcher. Never compute metrics on real data at/after 2024-01-01 except in the manual pre-deploy step (Task 11).
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -34,7 +34,7 @@
 5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). Each discrepancy is stored and alerted once.
 6. **Telegram without secrets** drops events instead of queueing them (a token added later must not flood the chat). A failed send keeps that event and every later one pending, in order.
 7. **Criteria 1–2** = `backtest.holdout.evaluate_criteria(compare(cfg, df, HOLDOUT_START, last_bar + 1h, random_runs, workers, allow_holdout=True))`, i.e. over `[HOLDOUT_START, last bar + 1h)`, only while the current epoch is eligible; the stored result is ignored once the epoch changes. The go-live candidate is A, the only strategy the runtime trades and counts (criteria 3–4 are about A's trades), so — like `evaluate_criteria`'s `passing` — one candidate must meet all four: criterion 1 = `"A" in winners`, criterion 2 = criterion 1 and A's max drawdown <= 15%. HYBRID is still compared and shown.
-8. **Failure alerts** are sent by `ewbot paper run` (stage + `EWBOT_RUN_URL`); it touches `EWBOT_FAILURE_MARKER`, and the workflow's `if: failure()` step only sends its own alert when that marker is missing (checkout / setup / sync / push failures).
+8. **Failure alerts** are sent by `ewbot paper run` (stage + `EWBOT_RUN_URL`); it touches `EWBOT_FAILURE_MARKER`, and the workflow's `if: failure() || cancelled()` step only sends its own alert when that marker is missing (checkout / setup / sync / push failures, step timeouts, cancellations).
 9. **Ledger fields beyond the spec list:** `pending_events`, `daily_summary_date`, `criteria`, and `through_ts` in each epoch.
 
 ## File Map
@@ -54,6 +54,7 @@
 | `tests/paper/helpers.py` | 3 | synthetic candles, test lock in a temp git repo, fakes |
 | `tests/paper/test_*.py` | 1–10 | unit, integration (time walk) and static tests |
 | `.github/workflows/paper.yml` | 10 | hourly Actions workflow |
+| `scripts/paper_sync.sh` | 10 | the workflow's git side: paper worktree, commit, push and retry |
 | `docs/paper-trading.md` | 10 | ops guide, Telegram setup for the user |
 
 ## Task Overview
@@ -69,10 +70,10 @@
 | 7 | Paper runner orchestration | 26 |
 | 8 | CLI `paper run` / `paper status` | 6 |
 | 9 | Time-walk integration test | 8 |
-| 10 | Static `allow_holdout` guard, workflow, ops guide | 4 |
+| 10 | Static `allow_holdout` guard, workflow, git sync script, ops guide | 38 |
 | 11 | Manual pre-deploy checklist (controller) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 117 more tests.
+Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 151 more tests.
 
 ---
 
@@ -4041,13 +4042,13 @@ EOF
 ### Task 10: Static `allow_holdout` guard, Actions workflow and ops guide
 
 **Files:**
-- Create: `.github/workflows/paper.yml`, `docs/paper-trading.md`
-- Test: `tests/paper/test_static.py`
+- Create: `.github/workflows/paper.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`
+- Test: `tests/paper/test_static.py`, `tests/paper/test_paper_sync.py`
 
 **Interfaces:**
-- Consumes: `pyyaml` (already a dependency), the AST of every `src/ewbot/**/*.py`.
-- Produces: the guard "`allow_holdout=True` appears only in `backtest/holdout.py` and `paper/runner.py`; non-literal values only in `backtest/runner.py`; no `"allow_holdout"` string or `check_before_holdout` call elsewhere"; the hourly workflow; the ops guide with the user's Telegram steps (spec §6.5).
-- Workflow env passed to `ewbot`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (secrets), `EWBOT_RUN_URL`, `EWBOT_FAILURE_MARKER`, `PAPER_DIR` (`$RUNNER_TEMP/paper`).
+- Consumes: `pyyaml` (already a dependency), the AST of every `src/ewbot/**/*.py`, `git` >= 2.42 (`worktree add --orphan`) and `bash` for the sync script and its tests (local bare repositories, no network).
+- Produces: the guard "`allow_holdout=True` appears only in `backtest/holdout.py` and `paper/runner.py`; non-literal values only in `backtest/runner.py`; every `allow_holdout` parameter defaults to `False` (only runner's private `_init_worker` / `_map_tasks` take it without a default); no `"allow_holdout"` string and no import, attribute, name or getattr string of runner's `check_before_holdout` / `_map_tasks` / `_init_worker` outside `backtest/runner.py` (a module may define its own helper of the same name: `walkforward._init_worker`)"; the hourly workflow; `scripts/paper_sync.sh` (`checkout`: paper worktree, orphan only on `ls-remote` exit 2; `push RECOMPUTE...`: commit, 3 pushes, the same commit again when `origin/paper` did not move, recompute only when it moved, never after the last push); the ops guide with the user's Telegram steps (spec §6.5).
+- Workflow env passed to `ewbot`: `EWBOT_RUN_URL` (job), `EWBOT_FAILURE_MARKER`, `PAPER_DIR` (`$RUNNER_TEMP/paper`, via `$GITHUB_ENV`); the secrets `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` only on the steps that can send (`paper`, `push`, `alert`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4061,6 +4062,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
 import yaml
 
 import ewbot
@@ -4070,19 +4072,32 @@ ROOT = SRC.parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "paper.yml"
 ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py"}  # Plan 2 spec 7.1
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
+# backtest/runner.py helpers that skip the holdout check or forward allow_holdout unchecked
+GUARDED = {"check_before_holdout", "_map_tasks", "_init_worker"}
+# the only allow_holdout parameters without a default: runner's private pool helpers, always passed explicitly
+REQUIRED_ALLOW = {("backtest/runner.py", "_init_worker"), ("backtest/runner.py", "_map_tasks")}
+SETUP_UV = "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7"  # v10.2.0
+SECRET_ENV = {
+    "TELEGRAM_BOT_TOKEN": "${{ secrets.TELEGRAM_BOT_TOKEN }}",
+    "TELEGRAM_CHAT_ID": "${{ secrets.TELEGRAM_CHAT_ID }}",
+}
+RUN = 'uv run ewbot paper run --ledger-dir "$PAPER_DIR"'
 
 
-def _calls():
+def _modules():
     for f in sorted(SRC.rglob("*.py")):
-        rel = f.relative_to(SRC).as_posix()
-        tree = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+        yield f.relative_to(SRC).as_posix(), ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+
+
+def _nodes():
+    for rel, tree in _modules():
         for node in ast.walk(tree):
             yield rel, node
 
 
 def test_only_the_holdout_and_the_paper_runner_pass_allow_holdout_true():
     literal_true, other = set(), set()
-    for rel, node in _calls():
+    for rel, node in _nodes():
         if isinstance(node, ast.Call):
             for kw in node.keywords:
                 if kw.arg == "allow_holdout":
@@ -4094,73 +4109,627 @@ def test_only_the_holdout_and_the_paper_runner_pass_allow_holdout_true():
     assert other <= PASS_THROUGH
 
 
+def _allow_holdout_params(tree: ast.AST) -> tuple[list[int], set[str]]:
+    """(lines of allow_holdout parameters whose default is not the literal False or that are *args /
+    **kwargs, names of the functions taking allow_holdout without a default)."""
+    bad, required = [], set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        a = fn.args
+        positional = a.posonlyargs + a.args
+        defaults = [None] * (len(positional) - len(a.defaults)) + list(a.defaults)
+        pairs = list(zip(positional, defaults)) + list(zip(a.kwonlyargs, a.kw_defaults))
+        bad += [s.lineno for s in (a.vararg, a.kwarg) if s is not None and s.arg == "allow_holdout"]
+        for param, default in pairs:
+            if param.arg != "allow_holdout":
+                continue
+            if default is None:
+                required.add(getattr(fn, "name", "<lambda>"))
+            elif not (isinstance(default, ast.Constant) and default.value is False):
+                bad.append(param.lineno)
+    return bad, required
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "def f(allow_holdout=True): ...",
+        "def f(*, allow_holdout=None): ...",
+        "def f(x, allow_holdout=1, /): ...",
+        "async def f(*, allow_holdout=bool(1)): ...",
+        "g = lambda allow_holdout=True: 0",
+        "def f(**allow_holdout): ...",
+    ],
+)
+def test_the_parameter_guard_catches_a_non_false_default(src):
+    assert _allow_holdout_params(ast.parse(src))[0]
+
+
+def test_allow_holdout_parameters_default_to_false():
+    required = set()
+    for rel, tree in _modules():
+        bad, names = _allow_holdout_params(tree)
+        assert not bad, (rel, bad)
+        required |= {(rel, name) for name in names}
+    assert required <= REQUIRED_ALLOW
+
+
+def _holdout_back_doors(tree: ast.AST) -> list[tuple[int, str]]:
+    """References outside backtest/runner.py that could reach the holdout without allow_holdout=True:
+    an "allow_holdout" string (`**{"allow_holdout": True}`), and any import, attribute, name or getattr
+    string of the GUARDED runner helpers. A module may define and call its own helper of the same name
+    (walkforward.py has its own _init_worker, which takes no allow_holdout)."""
+    own = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    found = []
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value == "allow_holdout" or node.value in GUARDED:
+                found.append((line, f"string {node.value!r}"))
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[-1] == "runner" and any(a.name == "*" for a in node.names):
+                found.append((line, "import * from a runner module"))
+            found += [(line, f"import {a.name}") for a in node.names if a.name in GUARDED]
+        elif isinstance(node, ast.Attribute) and node.attr in GUARDED:
+            found.append((line, f"attribute .{node.attr}"))
+        elif isinstance(node, ast.Name) and node.id in GUARDED and node.id not in own:
+            found.append((line, f"name {node.id}"))
+    return found
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        'run_backtest(cfg, df, **{"allow_holdout": True})',
+        "from ewbot.backtest.runner import check_before_holdout",
+        "from .runner import _init_worker as init",
+        "from ewbot.backtest.runner import *",
+        "from ewbot.backtest import runner\nrunner._map_tasks([], 1, cfg, df, 0, 0, True)",
+        "import ewbot.backtest.runner as r\ngetattr(r, '_init_worker')(cfg, df, 0, 0, True)",
+        "check_before_holdout(df, None, True)",
+    ],
+)
+def test_the_back_door_guard_catches(src):
+    assert _holdout_back_doors(ast.parse(src))
+
+
+def test_the_back_door_guard_allows_a_module_s_own_helper_of_the_same_name():
+    assert _holdout_back_doors(ast.parse("def _init_worker(cfg): ...\n_init_worker(cfg)")) == []
+
+
 def test_no_back_doors_into_the_holdout():
-    """No `**{"allow_holdout": True}` and no direct check_before_holdout call outside backtest/runner.py."""
-    for rel, node in _calls():
-        if isinstance(node, ast.Constant) and node.value == "allow_holdout":
-            assert rel in PASS_THROUGH, rel
-        if isinstance(node, ast.Call):
-            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
-            if name == "check_before_holdout":
-                assert rel in PASS_THROUGH, rel
+    for rel, tree in _modules():
+        if rel not in PASS_THROUGH:
+            assert _holdout_back_doors(tree) == [], rel
 
 
-def _steps():
+def _workflow():
     wf = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     return wf, wf["jobs"]["paper"]["steps"]
 
 
+def _step(steps, step_id):
+    return next(s for s in steps if s.get("id") == step_id)
+
+
 def test_workflow_triggers_concurrency_and_permissions():
-    wf, _ = _steps()
+    wf, _ = _workflow()
     on = wf[True]  # YAML 1.1 reads the bare key `on` as boolean True
     assert on["schedule"] == [{"cron": "7 * * * *"}] and "workflow_dispatch" in on
     assert wf["concurrency"] == {"group": "paper", "cancel-in-progress": False}
     assert wf["permissions"] == {"contents": "write"}
-    env = wf["jobs"]["paper"]["env"]
-    assert env["TELEGRAM_BOT_TOKEN"] == "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-    assert env["TELEGRAM_CHAT_ID"] == "${{ secrets.TELEGRAM_CHAT_ID }}"
+    assert "permissions" not in wf["jobs"]["paper"]
+
+
+def test_telegram_secrets_reach_only_the_steps_that_can_send():
+    wf, steps = _workflow()
+    assert "secrets." not in yaml.safe_dump(wf["jobs"]["paper"].get("env", {}))
+    with_secrets = [s.get("id") for s in steps if "secrets." in yaml.safe_dump(s)]
+    assert with_secrets == ["paper", "push", "alert"]  # the run, the push step's recompute, the alert
+    for i in with_secrets:
+        assert {k: v for k, v in _step(steps, i)["env"].items() if "secrets." in v} == SECRET_ENV, i
+    assert WORKFLOW.read_text(encoding="utf-8").count("secrets.") == 2 * len(with_secrets)
 
 
 def test_workflow_steps():
-    _, steps = _steps()
+    wf, steps = _workflow()
+    text = WORKFLOW.read_text(encoding="utf-8")
     uses = [s["uses"] for s in steps if "uses" in s]
-    assert uses == ["actions/checkout@v7", "astral-sh/setup-uv@v10", "actions/cache@v6"]
+    assert uses == ["actions/checkout@v7", SETUP_UV, "actions/cache@v6"]
+    assert f"uses: {SETUP_UV} # v10.2.0" in text  # third-party action pinned to a commit
     assert steps[0]["with"] == {"ref": "master"}  # shallow: the paper history is never fetched in full
     runs = [s.get("run", "") for s in steps]
-    joined = "\n".join(runs)
-    assert "git fetch --no-tags --depth=1 origin 64e628ad4865b3b04571a7cba2886881eae19176" in joined  # baseline
-    assert "git worktree add --orphan -b paper" in joined and "git ls-remote --exit-code --heads origin paper" in joined
+    checkout = _step(steps, "checkout-paper")["run"]
+    assert "git fetch --no-tags --depth=1 origin 64e628ad4865b3b04571a7cba2886881eae19176" in checkout  # baseline
+    assert 'PAPER_DIR="$RUNNER_TEMP/paper" bash scripts/paper_sync.sh checkout' in checkout
     assert "uv sync --frozen" in runs
-    paper = next(s for s in steps if s.get("id") == "paper")
-    assert paper["run"] == 'uv run ewbot paper run --ledger-dir "$PAPER_DIR"'
-    push = next(r for r in runs if "git -C \"$PAPER_DIR\" push" in r)
-    assert "for attempt in 1 2 3" in push and "reset -q --hard origin/paper" in push and "ewbot paper run" in push
+    paper, push = _step(steps, "paper"), _step(steps, "push")
+    assert paper["run"] == RUN
+    assert push["run"] == f"bash scripts/paper_sync.sh push {RUN}"  # recomputes only when origin/paper moved
+    # a hang becomes a step failure (and an alert) well before the job-level backstop
+    assert paper["timeout-minutes"] == 35 and push["timeout-minutes"] == 35
+    step_budget = sum(s.get("timeout-minutes", 0) for s in steps)
+    assert wf["jobs"]["paper"]["timeout-minutes"] >= step_budget + 10
     cache = next(s for s in steps if s.get("uses") == "actions/cache@v6")["with"]
     assert cache["path"] == "data/cache" and cache["restore-keys"].strip() == "btc-usd-1h-"
-    last = steps[-1]
-    assert last["if"] == "failure()" and "EWBOT_FAILURE_MARKER" in last["run"] and "sendMessage" in last["run"]
+
+
+def test_failure_alert_step():
+    _, steps = _workflow()
+    alert = steps[-1]
+    assert alert["id"] == "alert" and alert["if"] == "failure() || cancelled()"  # timeouts cancel
+    run = alert["run"]
+    assert "EWBOT_FAILURE_MARKER" in run and "sendMessage" in run
+    assert "curl" in run and "--fail-with-body" in run and "/dev/null" not in run  # keep Telegram's error
+    assert "set -x" not in run and "echo \"${TELEGRAM_BOT_TOKEN" not in run and "echo $TELEGRAM" not in run
+```
+
+**File: `tests/paper/test_paper_sync.py`**
+
+```python
+"""scripts/paper_sync.sh (the git side of .github/workflows/paper.yml) against local bare repositories.
+
+No network and no ewbot: the recompute is a fake command that rewrites the three ledger files and
+counts its calls (each real recompute may send Telegram messages, so the count is what matters),
+another writer is a second clone pushing to the bare origin, and push failures are simulated with a
+pre-push hook."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "paper_sync.sh"
+LEDGER_FILES = {"ledger.json", "report.html", "runs.log"}
+
+
+def _git_version() -> tuple[int, ...]:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+    return tuple(int(x) for x in re.findall(r"\d+", out)[:2])
+
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("bash") is None or _git_version() < (2, 42), reason="needs bash and git >= 2.42 (worktree --orphan)"
+)
+
+FAKE_RECOMPUTE = r"""#!/usr/bin/env bash
+# fake `ewbot paper run`: count the call, optionally let another writer push first, rewrite the ledger
+set -euo pipefail
+[ -z "${FAKE_FAIL:-}" ] || { echo "fake recompute failed" >&2; exit 7; }
+echo call >> "$FAKE_CALLS"
+n=$(wc -l < "$FAKE_CALLS" | tr -d ' ')
+if [ -n "${FAKE_OTHER_WRITER:-}" ]; then bash "$OTHER_WRITER"; fi
+printf '{"run": %s}\n' "$n" > "$PAPER_DIR/ledger.json"
+echo "report $n" > "$PAPER_DIR/report.html"
+echo "run $n" >> "$PAPER_DIR/runs.log"
+"""
+
+OTHER_WRITER = r"""#!/usr/bin/env bash
+# another writer: one commit on top of origin's paper branch (an orphan one if it has none), pushed
+# from a separate clone
+set -euo pipefail
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+d="$OTHER_CLONE"
+if git -C "$d" ls-remote --exit-code origin refs/heads/paper >/dev/null; then
+  git -C "$d" fetch -q origin +refs/heads/paper:refs/remotes/origin/paper
+  git -C "$d" checkout -q -B paper origin/paper
+elif [ "$(git -C "$d" branch --show-current)" != paper ]; then
+  git -C "$d" switch -q --orphan paper
+fi
+echo "other $(date +%s) $RANDOM" >> "$d/runs.log"
+echo '{"other": true}' > "$d/ledger.json"
+echo "other report" > "$d/report.html"
+git -C "$d" add ledger.json report.html runs.log
+git -C "$d" commit -q -m "other writer"
+git -C "$d" push -q origin HEAD:refs/heads/paper
+"""
+
+PRE_PUSH = r"""#!/usr/bin/env bash
+# HOOK_MODE=fail: the first HOOK_FAILS pushes fail before anything is sent (a transient error);
+# HOOK_MODE=land: push the commit with hooks off, then report a failure (the reply got lost)
+n=$(( $(cat "$HOOK_COUNT" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$HOOK_COUNT"
+case "${HOOK_MODE:-}" in
+  fail) [ "$n" -gt "$HOOK_FAILS" ] && exit 0; echo "simulated push failure $n" >&2; exit 1 ;;
+  land) git -c core.hooksPath=/dev/null push -q "$1" HEAD:refs/heads/paper; echo "simulated lost reply" >&2; exit 1 ;;
+esac
+"""
+
+
+class World:
+    """A bare origin with master, the workflow's master checkout (`work`), the paper worktree path
+    and another writer's clone."""
+
+    def __init__(self, tmp: Path):
+        self.tmp = tmp
+        self.origin, self.work, self.other = tmp / "origin.git", tmp / "work", tmp / "other"
+        self.paper = tmp / "runner-temp" / "paper"
+        self.hooks = tmp / "hooks"
+        self.hooks.mkdir()
+        gitconfig = tmp / "gitconfig"
+        gitconfig.write_text(
+            "[user]\n\tname = t\n\temail = t@t\n[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = master\n"
+            "[advice]\n\tdetachedHead = false\n",
+            encoding="utf-8",
+        )
+        self.fake = self._script("fake_recompute.sh", FAKE_RECOMPUTE)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        self.env.update(
+            GIT_CONFIG_GLOBAL=str(gitconfig),
+            GIT_CONFIG_NOSYSTEM="1",
+            PAPER_DIR=str(self.paper),
+            PAPER_PUSH_BACKOFF="0",
+            FAKE_CALLS=str(tmp / "calls"),
+            HOOK_COUNT=str(tmp / "hook-count"),
+            OTHER_CLONE=str(self.other),
+            OTHER_WRITER=str(self._script("other_writer.sh", OTHER_WRITER)),
+        )
+        self.git(tmp, "init", "-q", "--bare", str(self.origin))
+        self.git(tmp, "init", "-q", str(self.work))
+        (self.work / "README.md").write_text("code\n", encoding="utf-8")
+        self.git(self.work, "add", "README.md")
+        self.git(self.work, "commit", "-q", "-m", "code")
+        self.git(self.work, "remote", "add", "origin", str(self.origin))
+        self.git(self.work, "push", "-q", "origin", "master")
+        self.git(self.work, "config", "core.hooksPath", str(self.hooks))  # shared with the paper worktree
+        self.git(tmp, "clone", "-q", str(self.origin), str(self.other))
+
+    def _script(self, name: str, body: str) -> Path:
+        path = self.tmp / name
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def git(self, repo: Path, *args: str, check: bool = True) -> str:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=self.env)
+        if check:
+            assert r.returncode == 0, (args, r.stderr)
+        return r.stdout.strip()
+
+    def sync(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(SCRIPT), *args], cwd=self.work, capture_output=True, text=True, env={**self.env, **env}
+        )
+
+    def push(self, **env: str) -> subprocess.CompletedProcess:
+        return self.sync("push", "bash", str(self.fake), **env)
+
+    def recompute(self) -> None:
+        """The workflow's `Paper run` step."""
+        subprocess.run(["bash", str(self.fake)], check=True, env=self.env)
+
+    def other_writer(self) -> str:
+        subprocess.run(["bash", self.env["OTHER_WRITER"]], check=True, env=self.env, capture_output=True)
+        return self.origin_paper()
+
+    def first_run(self, seeded: bool) -> str:
+        """Checkout + paper run; returns origin's paper sha before the push step ("" on the first run)."""
+        seed = self.other_writer() if seeded else ""
+        r = self.sync("checkout")
+        assert r.returncode == 0, r.stderr
+        self.recompute()
+        return seed
+
+    def pre_push(self, mode: str, fails: int = 0) -> None:
+        (self.hooks / "pre-push").write_text(PRE_PUSH, encoding="utf-8")
+        (self.hooks / "pre-push").chmod(0o755)
+        self.env.update(HOOK_MODE=mode, HOOK_FAILS=str(fails))
+
+    def origin_paper(self) -> str:
+        return self.git(self.origin, "rev-parse", "-q", "--verify", "refs/heads/paper", check=False)
+
+    def head(self) -> str:
+        return self.git(self.paper, "rev-parse", "HEAD")
+
+    def calls(self) -> int:
+        path = Path(self.env["FAKE_CALLS"])
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def hook_count(self) -> int:
+        return int(Path(self.env["HOOK_COUNT"]).read_text())
+
+
+@pytest.fixture
+def w(tmp_path: Path) -> World:
+    return World(tmp_path)
+
+
+SEEDED = pytest.mark.parametrize("seeded", [False, True], ids=["first-run", "existing-branch"])
+
+
+# ----------------------------------------------------------------------------- checkout
+
+
+def test_checkout_starts_an_orphan_paper_branch_when_origin_has_none(w):
+    r = w.sync("checkout")
+    assert r.returncode == 0, r.stderr
+    assert w.git(w.paper, "symbolic-ref", "HEAD") == "refs/heads/paper"
+    assert w.git(w.paper, "rev-parse", "-q", "--verify", "HEAD", check=False) == ""  # unborn
+    assert [p.name for p in w.paper.iterdir()] == [".git"]  # none of master's files
+
+
+def test_checkout_uses_origins_paper_branch(w):
+    seed = w.other_writer()
+    r = w.sync("checkout")
+    assert r.returncode == 0, r.stderr
+    assert w.head() == seed and w.git(w.paper, "symbolic-ref", "HEAD") == "refs/heads/paper"
+    assert {p.name for p in w.paper.iterdir()} == LEDGER_FILES | {".git"}
+
+
+def test_checkout_fails_instead_of_starting_an_orphan_when_origin_is_unreadable(w):
+    w.other_writer()  # origin has a ledger, but this run cannot see it
+    w.git(w.work, "remote", "set-url", "origin", str(w.tmp / "unreachable.git"))
+    r = w.sync("checkout")
+    assert r.returncode != 0 and "ls-remote" in r.stderr
+    assert not w.paper.exists() and w.git(w.work, "branch", "--list", "paper") == ""
+
+
+# ----------------------------------------------------------------------------- commit and push
+
+
+@SEEDED
+def test_push_commits_the_ledger_files_and_pushes_them(w, seeded):
+    seed = w.first_run(seeded)
+    r = w.push()
+    assert r.returncode == 0, r.stderr
+    assert w.origin_paper() == w.head()
+    assert set(w.git(w.origin, "ls-tree", "--name-only", "paper").split()) == LEDGER_FILES
+    assert w.git(w.paper, "rev-parse", "-q", "--verify", "HEAD^", check=False) == seed
+    assert w.calls() == 1  # the push step did not recompute
+
+
+def test_push_without_a_ledger_change_pushes_nothing(w):
+    seed = w.other_writer()
+    assert w.sync("checkout").returncode == 0
+    r = w.push()
+    assert r.returncode == 0, r.stderr
+    assert "no ledger change" in r.stdout and w.origin_paper() == seed == w.head()
+
+
+@pytest.mark.parametrize("breakage", ["missing-ledger-file", "commit-fails"])
+def test_a_git_error_while_committing_fails_instead_of_reading_as_no_change(w, breakage):
+    w.first_run(seeded=False)
+    if breakage == "missing-ledger-file":
+        (w.paper / "report.html").unlink()
+    else:
+        (w.hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (w.hooks / "pre-commit").chmod(0o755)
+    r = w.push()
+    assert r.returncode != 0 and "commit" in r.stderr
+    assert "no ledger change" not in r.stdout and w.origin_paper() == ""
+
+
+@SEEDED
+def test_a_failed_push_to_an_unmoved_origin_is_retried_without_a_recompute(w, seeded):
+    seed = w.first_run(seeded)
+    w.pre_push("fail", fails=2)
+    r = w.push()
+    assert r.returncode == 0, r.stderr
+    assert w.hook_count() == 3 and "did not move" in r.stdout
+    assert w.calls() == 1  # no second recompute, so no Telegram message is sent twice
+    # the same single commit on top of the seed, pushed on the third try
+    assert w.origin_paper() == w.head() and w.git(w.paper, "rev-parse", "-q", "--verify", "HEAD^", check=False) == seed
+    assert (w.paper / "runs.log").read_text().splitlines()[-1] == "run 1"
+
+
+def test_a_push_that_landed_despite_an_error_is_done(w):
+    w.first_run(seeded=True)
+    w.pre_push("land")
+    r = w.push()
+    assert r.returncode == 0, r.stderr
+    assert "landed" in r.stdout and w.hook_count() == 1 and w.calls() == 1
+    assert w.origin_paper() == w.head()
+
+
+@SEEDED
+def test_a_moved_origin_is_recomputed_on_and_pushed_on_top(w, seeded):
+    w.first_run(seeded)
+    theirs = w.other_writer()  # someone else wrote to paper after this run started
+    r = w.push()
+    assert r.returncode == 0, r.stderr
+    assert w.calls() == 2  # one recompute on top of their ledger
+    assert w.origin_paper() == w.head() and w.git(w.paper, "rev-parse", "HEAD^") == theirs
+    log = (w.paper / "runs.log").read_text().splitlines()
+    assert log[-1] == "run 2" and log[-2].startswith("other ")  # their history kept, ours appended
+
+
+def test_gives_up_after_three_pushes_to_an_unmoved_origin(w):
+    seed = w.first_run(seeded=True)
+    w.pre_push("fail", fails=99)
+    r = w.push()
+    assert r.returncode != 0 and "push failed 3 times" in r.stderr
+    assert w.hook_count() == 3 and w.calls() == 1 and w.origin_paper() == seed
+
+
+def test_recomputes_at_most_twice_and_never_after_the_last_push(w):
+    w.first_run(seeded=True)
+    w.other_writer()
+    r = w.push(FAKE_OTHER_WRITER="1")  # origin moves again during every recompute
+    assert r.returncode != 0 and "push failed 3 times" in r.stderr
+    assert w.calls() == 3  # the Paper run step + 2 recomputes for 3 pushes
+    assert w.origin_paper() != w.head()
+
+
+def test_a_failing_recompute_fails_the_step(w):
+    w.first_run(seeded=True)
+    theirs = w.other_writer()
+    r = w.push(FAKE_FAIL="1")
+    assert r.returncode != 0 and w.origin_paper() == theirs
+
+
+def test_usage_errors(w):
+    assert w.sync().returncode != 0
+    assert w.sync("push").returncode != 0  # no recompute command
+    assert w.sync("checkout", PAPER_DIR="").returncode != 0
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-uv run pytest tests/paper/test_static.py -q
+uv run pytest tests/paper/test_static.py tests/paper/test_paper_sync.py -q
 ```
 
-Expected: `2 failed, 2 passed`: the two `allow_holdout` guards already pass (Task 7 respected them); the workflow tests fail with `FileNotFoundError` for `.github/workflows/paper.yml`.
+Expected: `20 failed, 18 passed`: the `allow_holdout` guards and their self-tests pass (Task 7 respected them), and so does `test_usage_errors` (a missing script exits non-zero too); the 4 workflow tests fail with `FileNotFoundError` for `.github/workflows/paper.yml` and 16 sync tests fail because `scripts/paper_sync.sh` does not exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```bash
-mkdir -p .github/workflows
+mkdir -p .github/workflows scripts
+```
+
+**File: `scripts/paper_sync.sh`** (executable: `chmod +x scripts/paper_sync.sh`; the workflow calls it with `bash`)
+
+```bash
+#!/usr/bin/env bash
+# Git side of .github/workflows/paper.yml (Plan 2 spec 6.1, 6.4); run from the master checkout.
+# Tested against local bare repositories in tests/paper/test_paper_sync.py.
+#
+#   paper_sync.sh checkout
+#       Worktree of origin's `paper` branch at $PAPER_DIR (shallow), or an orphan `paper` branch
+#       when origin has none (ls-remote exit 2). Any other ls-remote failure fails: a network or
+#       auth error must not start a fresh ledger.
+#   paper_sync.sh push RECOMPUTE...
+#       Commit ledger.json / report.html / runs.log in $PAPER_DIR and push the commit to origin's
+#       `paper` branch, 3 pushes at most. After a failed push:
+#         origin still at our commit's parent (or unreadable) -> push the same commit again after a
+#             short wait; no recompute, so no Telegram message is sent twice;
+#         origin already at our commit -> the push landed, done;
+#         origin moved (someone else wrote to `paper`) -> reset to it, run RECOMPUTE
+#             (`uv run ewbot paper run ...`), commit and push on top of it.
+#       Never recomputes after the last push; exits non-zero when every push failed.
+#
+# Environment: PAPER_DIR (required); PAPER_PUSH_BACKOFF = seconds, retry n waits n times this
+# (default 5).
+set -euo pipefail
+
+ATTEMPTS=3
+LEDGER_FILES=(ledger.json report.html runs.log)
+NOTHING_TO_COMMIT=3
+
+die() {
+  echo "paper_sync: $*" >&2
+  exit 1
+}
+
+# The sha of origin's paper branch, "" when origin has none; any other ls-remote failure is returned.
+origin_paper() {
+  local out rc=0
+  out=$(git -C "$1" ls-remote --exit-code origin refs/heads/paper) || rc=$?
+  case "$rc" in
+    0) echo "${out%%[[:space:]]*}" ;;
+    2) echo "" ;;
+    *) return "$rc" ;;
+  esac
+}
+
+checkout() {
+  local remote rc=0
+  remote=$(origin_paper .) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "git ls-remote origin failed (exit $rc): not starting a new paper branch"
+  fi
+  if [ -n "$remote" ]; then
+    git fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
+    git worktree add -B paper "$PAPER_DIR" origin/paper
+  else
+    echo "origin has no paper branch: starting an orphan one"
+    git worktree add --orphan -b paper "$PAPER_DIR"
+  fi
+}
+
+# 0 = committed, NOTHING_TO_COMMIT = no ledger change, 1 = git error. Every status is checked by hand:
+# the caller tests this function's status, which switches `set -e` off inside it.
+commit_ledger() {
+  local rc=0
+  git -C "$PAPER_DIR" add -- "${LEDGER_FILES[@]}" || return 1
+  git -C "$PAPER_DIR" diff --cached --quiet || rc=$?
+  case "$rc" in
+    0) return "$NOTHING_TO_COMMIT" ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  git -C "$PAPER_DIR" commit -q -m "paper: run $(date -u +%Y-%m-%dT%H:%MZ)" || return 1
+}
+
+# Commit the ledger; stop the script (successfully) when nothing changed, fail on a git error.
+commit_or_stop() {
+  local rc=0
+  commit_ledger || rc=$?
+  case "$rc" in
+    0) ;;
+    "$NOTHING_TO_COMMIT")
+      echo "no ledger change: nothing to push"
+      exit 0
+      ;;
+    *) die "git add / commit of the ledger failed in $PAPER_DIR" ;;
+  esac
+}
+
+push() {
+  [ "$#" -gt 0 ] || die "usage: paper_sync.sh push RECOMPUTE..."
+  local backoff="${PAPER_PUSH_BACKOFF:-5}" attempt head parent remote rc
+  commit_or_stop
+  for ((attempt = 1; ; attempt++)); do
+    if git -C "$PAPER_DIR" push origin HEAD:refs/heads/paper; then
+      echo "pushed $(git -C "$PAPER_DIR" rev-parse --short HEAD) to origin/paper (attempt $attempt)"
+      return 0
+    fi
+    head=$(git -C "$PAPER_DIR" rev-parse HEAD)
+    parent=$(git -C "$PAPER_DIR" rev-parse -q --verify 'HEAD^' || true) # "" for the first (orphan) commit
+    rc=0
+    remote=$(origin_paper "$PAPER_DIR") || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$remote" = "$head" ]; then
+      echo "origin/paper is at our commit: the push landed despite the error"
+      return 0
+    fi
+    if [ "$attempt" -ge "$ATTEMPTS" ]; then
+      die "push failed $ATTEMPTS times"
+    fi
+    if [ "$rc" -ne 0 ] || [ "$remote" = "$parent" ]; then
+      if [ "$rc" -ne 0 ]; then
+        echo "push failed (attempt $attempt) and origin is unreadable (ls-remote exit $rc): push the same commit again"
+      else
+        echo "push failed (attempt $attempt), origin/paper did not move: push the same commit again"
+      fi
+      sleep "$((backoff * attempt))"
+      continue
+    fi
+    [ -n "$remote" ] || die "origin's paper branch disappeared"
+    echo "push rejected (attempt $attempt): origin/paper moved to ${remote:0:12}, recompute on top of it"
+    git -C "$PAPER_DIR" fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
+    git -C "$PAPER_DIR" reset -q --hard origin/paper
+    "$@" || die "recompute failed (exit $?)"
+    commit_or_stop
+  done
+}
+
+: "${PAPER_DIR:?PAPER_DIR is not set}"
+case "${1:-}" in
+  checkout) checkout ;;
+  push)
+    shift
+    push "$@"
+    ;;
+  *) die "usage: paper_sync.sh checkout | push RECOMPUTE..." ;;
+esac
 ```
 
 **File: `.github/workflows/paper.yml`**
 
 ```yaml
 # ewbot paper-trading runtime (Plan 2 spec 6.1): one deterministic recompute per hour.
-# Code comes from master; ledger.json / report.html / runs.log live on the orphan `paper` branch.
+# Code comes from master; ledger.json / report.html / runs.log live on the orphan `paper` branch,
+# which only this workflow writes (docs/paper-trading.md: never push to it by hand).
 # Every fetch is shallow: the paper branch gets one commit per hour and its history is never needed here.
+# The git side (paper worktree, commit, push and retry) is scripts/paper_sync.sh.
+# The Telegram secrets reach only the steps that can send: the paper run, the push step (it reruns
+# ewbot when origin/paper moved) and the failure alert.
 name: paper
 
 on:
@@ -4178,10 +4747,9 @@ permissions:
 jobs:
   paper:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # backstop only: the steps below have their own timeouts, so a hang fails its step and alerts
+    timeout-minutes: 100
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       EWBOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Check out master
@@ -4190,6 +4758,8 @@ jobs:
           ref: master
 
       - name: Fetch the holdout commit and check out the paper branch (orphan on first use)
+        id: checkout-paper
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           echo "PAPER_DIR=$RUNNER_TEMP/paper" >> "$GITHUB_ENV"
@@ -4198,15 +4768,10 @@ jobs:
           git config --global user.email "ewbot-paper@users.noreply.github.com"
           # 64e628a: the fingerprint baseline, read once when ledger.json is created (spec 5.1)
           git fetch --no-tags --depth=1 origin 64e628ad4865b3b04571a7cba2886881eae19176
-          if git ls-remote --exit-code --heads origin paper >/dev/null; then
-            git fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
-            git worktree add -B paper "$RUNNER_TEMP/paper" origin/paper
-          else
-            git worktree add --orphan -b paper "$RUNNER_TEMP/paper"
-          fi
+          PAPER_DIR="$RUNNER_TEMP/paper" bash scripts/paper_sync.sh checkout
 
       - name: Install uv (with its cache)
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true
@@ -4221,44 +4786,37 @@ jobs:
             btc-usd-1h-
 
       - name: Sync dependencies
+        timeout-minutes: 10
         run: uv sync --frozen
 
+      # 1-2 min per hourly run, 10-20 min for the daily criteria 1-2 recompute
       - name: Paper run
         id: paper
+        timeout-minutes: 35
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: uv run ewbot paper run --ledger-dir "$PAPER_DIR"
 
-      - name: Commit and push the ledger (recompute and retry on conflict, 3 attempts)
-        run: |
-          set -euo pipefail
-          commit() {
-            git -C "$PAPER_DIR" add ledger.json report.html runs.log
-            if git -C "$PAPER_DIR" diff --cached --quiet; then
-              return 1
-            fi
-            git -C "$PAPER_DIR" commit -q -m "paper: run $(date -u +%Y-%m-%dT%H:%MZ)"
-          }
-          if ! commit; then
-            echo "no ledger change"
-            exit 0
-          fi
-          for attempt in 1 2 3; do
-            if git -C "$PAPER_DIR" push origin HEAD:refs/heads/paper; then
-              exit 0
-            fi
-            echo "push rejected (attempt $attempt): refresh the paper branch and recompute"
-            git -C "$PAPER_DIR" fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
-            git -C "$PAPER_DIR" reset -q --hard origin/paper
-            uv run ewbot paper run --ledger-dir "$PAPER_DIR"
-            if ! commit; then
-              exit 0
-            fi
-          done
-          echo "push failed 3 times" >&2
-          exit 1
+      # 3 pushes at most; the same commit again when origin/paper did not move, ewbot reruns only when it did
+      - name: Commit and push the ledger
+        id: push
+        timeout-minutes: 35
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: bash scripts/paper_sync.sh push uv run ewbot paper run --ledger-dir "$PAPER_DIR"
 
       - name: Telegram failure alert (fallback when ewbot did not send one)
-        if: failure()
+        id: alert
+        if: failure() || cancelled()
+        timeout-minutes: 2
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
         run: |
+          set -euo pipefail
           if [ -f "${EWBOT_FAILURE_MARKER:-/nonexistent}" ]; then
             echo "ewbot already sent the failure alert"
             exit 0
@@ -4267,10 +4825,13 @@ jobs:
             echo "no Telegram secrets: skipping the alert"
             exit 0
           fi
-          text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / push)"$'\n'"로그: ${EWBOT_RUN_URL}"
-          curl -sS --retry 3 -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / timeout / push) · ${JOB_STATUS}"$'\n'"로그: ${EWBOT_RUN_URL}"
+          # --fail-with-body: an HTTP error fails the step and prints Telegram's reply (never the token)
+          curl -sS --fail-with-body --retry 3 --max-time 30 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${text}"
+          echo
 ```
 
 **File: `docs/paper-trading.md`**
@@ -4282,10 +4843,10 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
 ## What runs
 
-- `.github/workflows/paper.yml` runs `uv run ewbot paper run --ledger-dir <paper worktree>` every hour at minute 7 (and on demand).
+- `.github/workflows/paper.yml` runs `uv run ewbot paper run --ledger-dir <paper worktree>` every hour at minute 7 (and on demand). `scripts/paper_sync.sh` does the git side: the `paper` worktree, the commit, the push and its retries.
 - Each run recomputes the whole engine deterministically from 2017 with the params in the committed `holdout.lock` (K4 = 2.0, Q_MIN = 0.7, S_MIN = 0.5), conservative risk, breakers on and Plan 1 costs. Trading starts at the holdout start (2024-01-01), so the run reproduces the holdout's A run and continues it.
 - Paper trades are the trades that **enter after the holdout's last bar** (`entry_ts > 1790938800`, 2026-10-02 11:00 UTC). A position already open at that bar belongs to the holdout and is never counted twice.
-- Results go to the orphan branch `paper` (never to `master`):
+- Results go to the orphan branch `paper` (never to `master`). Only the workflow writes to `paper`: never push to it by hand (see Failures).
   - `ledger.json`: baseline fingerprint and commit, holdout summary, epochs, closed trades, open position, decisions, discrepancies, runs, sent and pending Telegram events, the last criteria 1–2 result.
   - `report.html`: go-live status at the top, out-of-sample equity and drawdown, trade tables with snapshot charts, current top count, discrepancy list, epochs.
   - `runs.log`: one line per successful run (time, status, last bar, data hash, N/50, epoch).
@@ -4297,7 +4858,15 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
 2. Telegram bot:
    1. In Telegram, open **@BotFather**, send `/newbot`, choose a name and a username ending in `bot`. BotFather replies with the token (digits, a colon, then letters and digits). Keep it private.
    2. Open a chat with your new bot and send it any message (for example `hi`). A bot cannot write to you before you have written to it.
-   3. Find your chat ID: in a browser, open `https://api.telegram.org/bot<TOKEN>/getUpdates` (replace `<TOKEN>` with the token). In the JSON, the number right after `"chat":{"id":` is your chat ID (a group chat ID starts with `-`). If the result is empty, send the bot another message and reload.
+   3. Find your chat ID in a terminal. The token is typed at a hidden prompt, so it ends up neither in your shell history nor in a browser history:
+
+      ```bash
+      printf 'Bot token: '; read -rs TELEGRAM_BOT_TOKEN; echo
+      curl -sS --fail-with-body "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | grep -o '"chat":{"id":-*[0-9]*' | sort -u
+      unset TELEGRAM_BOT_TOKEN
+      ```
+
+      The number after `"chat":{"id":` is your chat ID (a group chat ID starts with `-`). If nothing is printed, send the bot another message and run the three lines again.
 3. Store both values as repository secrets. Run each command and paste the value at the prompt (so it does not end up in your shell history):
 
    ```bash
@@ -4332,7 +4901,7 @@ Locally, with a worktree of the `paper` branch (`git worktree add ../paper-ledge
 | 청산 | the fill that closed a trade (reason, PnL, R, out-of-sample N/50) |
 | 일일 요약 | first run at/after 09:00 New York time each day: position, equity, N/50, go-live status (criteria 1–2 are recomputed in this run: A/HYBRID vs C/BH/EMA/RANDOM x100; if that recompute fails the run still completes, a warning is sent once, and the summary comes from the next run that recomputes successfully) |
 | 경고 | strategy fingerprint change (new epoch), decision discrepancy, holdout data hash mismatch, run gap over 3 hours |
-| 실패 | the failed stage and the Actions log link (sent by `ewbot`; the workflow sends a fallback for checkout/setup/push failures) |
+| 실패 | the failed stage and the Actions log link (sent by `ewbot`; the workflow sends a fallback for checkout / setup / sync / push failures, step timeouts and cancellations) |
 
 Each message has an id `kind:ts:trade_key`; an id is sent at most once. A failed send is retried 3 times and then kept pending for the next run.
 
@@ -4346,30 +4915,43 @@ The strategy fingerprint covers `types.py`, `config.py`, `indicators.py`, `data/
 |---|---|
 | Coinbase fetch fails | 3 tries, then the run stops without a commit and alerts; the next run recomputes the missing bars |
 | Cache lost | full download; changed past bars show up as `DATA_REVISION` discrepancies |
-| Push conflict on `paper` | fetch the newest `paper`, recompute, push again (3 attempts) |
+| `paper` unreadable at checkout | `git ls-remote` failed (network, auth): the job fails and alerts. Only a definite "no such branch" (first run) starts an orphan `paper`, so an existing ledger is never replaced by a fresh one |
+| `ewbot` hangs | `Paper run` and the push step time out after 35 minutes (the daily recompute takes 10–20); the step fails and the workflow's fallback alert goes out. The alert also runs when the job is cancelled |
+| Push to `paper` fails | 3 pushes at most, then the job fails and alerts. If `origin/paper` did not move (network, a transient error), the same commit is pushed again after 5 s, then 10 s, without a recompute, so no Telegram message goes out twice. If `origin/paper` already holds the commit, the push landed. Only if `origin/paper` moved is the ledger reset to it, recomputed and pushed on top; that recompute may resend this run's Telegram messages |
+| Someone pushes to `paper` | runs never overlap (`concurrency: paper`), so a moved `origin/paper` means a push by hand: the next push recomputes on top of it (row above). Don't push to `paper`; read it with `git fetch` / `git show` (Reading the results) |
 | Actions itself stops | not detectable from inside a run: GitHub's failure e-mail and a missing daily summary are the alarm |
 
 ## Cost
 
-About 1–2 minutes per hourly run, plus the daily criteria 1–2 recompute (103 engine runs, roughly 10–20 minutes on a 2-vCPU runner): roughly 1,100–1,500 minutes a month, within the 2,000 free minutes of a private repository. If it gets close, lower the daily cost first (do not change the hourly schedule).
+Inputs: about 1–2 minutes per hourly run, plus the daily criteria 1–2 recompute (103 engine runs, roughly 10–20 minutes on a 2-vCPU runner) inside one run a day. GitHub rounds every job up to a whole minute (each run here is one job), so an hourly run of 1 min 10 s costs 2 minutes.
+
+| Estimate | Per day | 30-day month | 31-day month |
+|---|---|---|---|
+| low: 23 × 1 + 1 × (1 + 10) | 34 min | 1,020 min | 1,054 min |
+| high: 23 × 2 + 1 × (2 + 20) | 68 min | 2,040 min | 2,108 min |
+
+The high end is above the 2,000 free minutes a month of a private repository on GitHub Free, and it is the likely end once an hourly run takes just over a minute. Check the real usage in your GitHub billing settings after the first week.
+
+Do not lower the cost by changing what runs: the 100 RANDOM runs are part of criteria 1–2 (fewer runs change the criteria), and the hourly schedule is what criterion 4 counts. If a month would go over the free minutes, either allow paid Actions minutes (set a budget above $0: with the default $0, GitHub stops running the workflow once the free minutes are used up, and every missed hour counts against criterion 4), or move the job to a self-hosted runner (`runs-on: self-hosted`: no Actions minutes, but that machine has to be online every hour).
 ````
 
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-uv run pytest tests/paper/test_static.py -q
+uv run pytest tests/paper/test_static.py tests/paper/test_paper_sync.py -q
 uv run python -c "import yaml; yaml.safe_load(open('.github/workflows/paper.yml'))" && echo yaml-ok
 command -v actionlint >/dev/null && actionlint .github/workflows/paper.yml && echo actionlint-ok || echo 'actionlint not installed (optional)'
+command -v shellcheck >/dev/null && shellcheck scripts/paper_sync.sh && echo shellcheck-ok || echo 'shellcheck not installed (optional)'
 uv run pytest -q
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest holdout.lock pyproject.toml uv.lock
 ```
 
-Expected: `4 passed`; `yaml-ok`; `actionlint-ok` when actionlint is installed; the full suite `553 passed, 1 skipped` without a candle cache (`554 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
+Expected: `38 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `594 passed, 1 skipped` without a candle cache (`595 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .github/workflows/paper.yml docs/paper-trading.md tests/paper/test_static.py
+git add .github/workflows/paper.yml scripts/paper_sync.sh docs/paper-trading.md tests/paper/test_static.py tests/paper/test_paper_sync.py
 git commit -m "$(cat <<'EOF'
 ci(paper): hourly paper workflow, allow_holdout static guard and ops guide
 
@@ -4398,7 +4980,7 @@ uv run pytest -q
 uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 ```
 
-Expected: clean tree; `554 passed` (with the real cache present); the fingerprint tripwire passes, i.e. the working-tree fingerprint equals the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
+Expected: clean tree; `595 passed` (with the real cache present); the fingerprint tripwire passes, i.e. the working-tree fingerprint equals the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
 
 - [ ] **Step 2: One local run on real data (no Telegram, throw-away ledger)**
 
@@ -4434,7 +5016,7 @@ Expected: only trades with entry after 2026-10-02 11:00 UTC; 0 discrepancies; th
 
 - [ ] **Step 4: Merge and configure (user)**
 
-Open a PR from `feat/plan2-paper` to `master` and merge it (scheduled workflows run only from the default branch). Then follow `docs/paper-trading.md` → "One-time setup": create the bot with @BotFather, message it once, read the chat ID from `getUpdates`, and run `gh secret set TELEGRAM_BOT_TOKEN` / `gh secret set TELEGRAM_CHAT_ID` (values typed by the user at the prompt).
+Open a PR from `feat/plan2-paper` to `master` and merge it (scheduled workflows run only from the default branch). Then follow `docs/paper-trading.md` → "One-time setup": create the bot with @BotFather, message it once, read the chat ID with the guide's `curl … getUpdates` command (token typed at a hidden prompt), and run `gh secret set TELEGRAM_BOT_TOKEN` / `gh secret set TELEGRAM_CHAT_ID` (values typed by the user at the prompt).
 
 - [ ] **Step 5: First Actions run**
 
@@ -4461,4 +5043,4 @@ gh run list --workflow paper.yml --limit 30
 git fetch origin paper && git show origin/paper:runs.log | tail -n 30
 ```
 
-Expected: about 24 successful runs (one per hour at minute ~7, delays of a few minutes are normal), no `실행 공백` warning, exactly one `일일 요약` after 09:00 New York, `ewbot paper status` (on a worktree of `paper`) showing coverage near 100% and 0 unexplained discrepancies. Record the outcome in the PR or the project notes.
+Expected: about 24 successful runs (one per hour at minute ~7, delays of a few minutes are normal), no `실행 공백` warning, exactly one `일일 요약` after 09:00 New York, `ewbot paper status` (on a worktree of `paper`) showing coverage near 100% and 0 unexplained discrepancies. Note the billed minutes of an hourly run and of the daily-summary run against the guide's Cost table (its high end, 2,040–2,108 minutes a month, is above the 2,000 free minutes). Record the outcome in the PR or the project notes.
