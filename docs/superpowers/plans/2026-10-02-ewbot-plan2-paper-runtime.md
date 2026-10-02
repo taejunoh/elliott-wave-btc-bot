@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work on branch `feat/plan2-paper`, from the repository root; Python 3.12 via uv; tests with `uv run pytest`. No new dependencies (`pyproject.toml` and `uv.lock` unchanged).
+- Work on branch `feat/plan2-paper`, from the repository root; Python 3.12 via uv (the workflows pin the exact patch `3.12.13`); tests with `uv run pytest`. No new dependencies (`pyproject.toml` and `uv.lock` unchanged).
 - Never modify a strategy-fingerprinted file (spec §5.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Do not edit `backtest/**`, `data/coinbase_history.py` or `holdout.lock` either. Allowed: create `src/ewbot/paper/*`, `tests/paper/*`, `.github/workflows/paper.yml`, `.github/workflows/ci.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`; modify `src/ewbot/cli.py`.
 - Fingerprint = `sha256( for path in sorted(paths): path + "\0" + bytes + "\0" )` over the repo-relative paths (`src/ewbot/<path>`) of that file set (25 files today). Baseline = the same set at holdout commit `64e628ad4865b3b04571a7cba2886881eae19176` (`64e628a`), read with `git cat-file blob` (the plain `git show 64e628a:<path>` bytes). Today both are `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
 - Frozen inputs: params only from `holdout.lock` (`[2.0, 0.7, 0.5]`); config = `holdout_config(BotConfig(), params)` (strategy A, conservative 1% / 3x, breakers on, fee 0.05%, slippage 0.05%, funding 10% APR long); recompute with `start_ts = HOLDOUT_START = 1704067200`; no CLI option changes any of it. The precheck refuses a lock whose `sha256` is not `lock_digest(BotConfig(), params, random_runs, code_sha256)` (true for the committed lock: `d1be04baa06c…`).
@@ -31,7 +31,7 @@
 2. **Stop moves, TP1 partials and order sizes** are not in `EngineResult`. `paper/trace.py` swaps the names `PaperBroker` / `WaveEngine` that `ewbot.engine.loop` looks up at run time for pass-through subclasses that only log (no file is edited; a test proves the traced run is bit-identical to `run_backtest`).
 3. **When a decision is known.** A run whose last closed bar is T knows every fill and stop move with `ts <= T` and every signal with `ts <= T - 1h` (the engine never evaluates entries on the last bar); the END close of a still-open position is not a decision. Decisions are recorded by the first run that knows them (`known_at > epoch.through_ts`).
 4. **Epochs.** `started_ts` of epoch 1 is the holdout's last bar; a new epoch starts at the last bar of the run that saw the new fingerprint. Earlier epochs' trades are frozen; the current epoch's closed trades are recomputed every run. Reverting the code opens a new epoch with the baseline fingerprint: eligible again, but the holdout's 36 never count again (spec §8).
-5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). `ENVIRONMENT_CHANGE` (spec §5.3 as amended 2026-10-02) = the run that recorded the decision (for `APPEARED`: the first run that should have known it) has another runtime-environment digest than the current run; the environment (`paper/environment.py`) is the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and `ImageOS` / `ImageVersion` (None off Actions), and an unknown recording environment never counts as a change. Each discrepancy is stored and alerted once.
+5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). `ENVIRONMENT_CHANGE` (spec §5.3 as amended 2026-10-02) = the run that recorded the decision (for `APPEARED`: the first run that should have known it) has another runtime-environment digest than the current run; the environment (`paper/environment.py`) is the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and `ImageOS` (None off Actions) are compared; `ImageVersion` is recorded in every run but excluded from the digest (GitHub refreshes the image weekly, comparing it would mask real `UNEXPLAINED` discrepancies); and an unknown recording environment never counts as a change. Each discrepancy is stored and alerted once.
 6. **Telegram without secrets** drops events instead of queueing them (a token added later must not flood the chat). A failed send keeps that event and every later one pending, in order.
 7. **Criteria 1–2** = `backtest.holdout.evaluate_criteria(compare(cfg, df, HOLDOUT_START, last_bar + 1h, random_runs, workers, allow_holdout=True))`, i.e. over `[HOLDOUT_START, last bar + 1h)`, only while the current epoch is eligible; the stored result is ignored once the epoch changes. The go-live candidate is A, the only strategy the runtime trades and counts (criteria 3–4 are about A's trades), so — like `evaluate_criteria`'s `passing` — one candidate must meet all four: criterion 1 = `"A" in winners`, criterion 2 = criterion 1 and A's max drawdown <= 15%. HYBRID is still compared and shown. A failed recompute is tried at most `CRITERIA_ATTEMPTS = 2` times per New York date (the daily run and the next run, counted from `runs[].criteria_recompute`); after the second failure the daily summary is sent marked `기준 미갱신(stale)` with the previous result and `daily_summary_date` is set, so the next try is on the next New York date.
 8. **Failure alerts** are sent by `ewbot paper run` (stage + `EWBOT_RUN_URL`); it touches `EWBOT_FAILURE_MARKER`, and the workflow's `if: failure() || cancelled()` step only sends its own alert when that marker is missing (checkout / setup / sync / push failures, step timeouts, cancellations).
@@ -70,13 +70,13 @@
 | 4 | Out-of-sample extraction, decisions, replay check | 13 |
 | 5 | Telegram notifier, formats, timing, events | 27 |
 | 6 | Go-live criteria + paper HTML report | 7 |
-| 7 | Runtime environment + paper runner orchestration | 36 |
+| 7 | Runtime environment + paper runner orchestration | 37 |
 | 8 | CLI `paper run` / `paper status` | 6 |
 | 9 | Time-walk integration test | 8 |
-| 10 | Static `allow_holdout` guard, paper and CI workflows, git sync script, ops guide | 41 |
+| 10 | Static `allow_holdout` guard, paper and CI workflows, git sync script, ops guide | 42 |
 | 11 | Manual pre-deploy checklist (controller) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 172 more tests.
+Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 174 more tests.
 
 ---
 
@@ -2827,7 +2827,7 @@ EOF
 **Interfaces:**
 - Consumes: every `ewbot.paper` module above; `ewbot.backtest.holdout.DEFAULT_LOCK_PATH`, `data_fingerprint`, `holdout_config`, `lock_digest`; `ewbot.backtest.runner.run_backtest`, `compare(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False) -> dict`; `ewbot.backtest.walkforward.HOLDOUT_START`, `grid_combos()`; `ewbot.data.candles.fill_gaps`, `load_1h`; `ewbot.data.coinbase_history.update_cache(product, cache_dir)`.
 - Produces (`ewbot.paper.runner`): `PRODUCT = "BTC-USD"`, `FETCH_ATTEMPTS = 3`, `class PaperRunError(RuntimeError)` (`.stage`, `.message`), `default_fetch(cache_dir) -> Path`, `@dataclass PaperEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch, sender=None, clock=_wall_clock, fingerprint=current_fingerprint, baseline=baseline_fingerprint, random_runs=100, workers=max(1, os.cpu_count() or 1), sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)` (`_wall_clock() -> int` = `int(time.time())`), `@dataclass(frozen=True) RunOutcome(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, status)`, `precheck_lock(lock_path) -> dict` (also requires `lock["sha256"] == lock_digest(BotConfig(), params, random_runs, code_sha256)`), `run_paper(env) -> RunOutcome`.
-- Produces (`ewbot.paper.environment`): `PACKAGES = ("numpy", "pandas", "pyarrow")`, `runtime_environment(repo_root=None, environ=None) -> dict` (`python, numpy, pandas, pyarrow, uv_lock_sha256, image_os, image_version`), `environment_digest(env) -> str`.
+- Produces (`ewbot.paper.environment`): `PACKAGES = ("numpy", "pandas", "pyarrow")`, `DIGEST_EXCLUDED = ("image_version",)`, `runtime_environment(repo_root=None, environ=None) -> dict` (`python, numpy, pandas, pyarrow, uv_lock_sha256, image_os, image_version`), `environment_digest(env) -> str` (sha256 of the sorted JSON of `env` without the `DIGEST_EXCLUDED` keys).
 - Run record in `ledger.runs`: `id, ts, status, last_bar_ts, data_sha256, holdout_data_ok, holdout_trades_recomputed, epoch_id, paper_trades, count_total, new_decisions, new_discrepancies, env, env_sha256, warnings, notify`, plus `criteria_recompute: {ny_date, ok}` in a run that recomputed criteria 1–2. Each new decision is stamped `run_id, data_sha256, epoch_id, env_sha256`.
 - Failure stages: `precheck`, `ledger`, `fingerprint`, `data`, `recompute`, `events`, `write`, `notify`. Every step runs in a named `_stage`, so an unexpected exception surfaces as `PaperRunError(stage)`; the `notify` stage keeps only the exception type (the Telegram token is part of the API URL) and does not chain the cause. The daily criteria 1-2 recompute is the one step that never fails the run: an error there is a warning (`criteria_error_text`, once per New York date), the previous `ledger.criteria` stays and the next run retries it once (no daily summary yet); if that retry fails too, the daily summary goes out marked `기준 미갱신(stale)` (`daily_text(..., stale=error)`) with the previous result and the next try is on the next New York date.
 - Epoch boundary: the run that creates a new epoch records the decisions first known since the previous epoch's `through_ts` (`_recording_floor`), and passes that floor to `verify_decisions(..., appeared_after=floor)`. `ledger.json` is bound to the whole `holdout_summary(lock)`, not only its sha256 and last bar. A recomputed holdout A trade count different from the lock's `n_trades["A"]` warns once per distinct value (`holdout_trades_text`) and the run continues.
@@ -2869,12 +2869,20 @@ def test_runtime_environment_off_actions_and_without_a_lock_file(tmp_path):
     assert runtime_environment()["uv_lock_sha256"] is not None  # the repository's own uv.lock
 
 
-def test_environment_digest_is_order_independent_and_sensitive_to_every_value():
-    a = {"python": "3.12.7", "numpy": "2.1.0", "image_version": None}
+def test_environment_digest_is_order_independent_and_sensitive_to_every_compared_value():
+    a = {"python": "3.12.7", "numpy": "2.1.0", "image_os": None}
     assert environment_digest(a) == environment_digest(dict(reversed(list(a.items()))))
     assert len(environment_digest(a)) == 64
-    for key, value in (("python", "3.12.8"), ("numpy", "2.1.1"), ("image_version", "20261001.1.0")):
+    for key, value in (("python", "3.12.8"), ("numpy", "2.1.1"), ("image_os", "ubuntu24")):
         assert environment_digest({**a, key: value}) != environment_digest(a), key
+
+
+def test_environment_digest_ignores_the_runner_image_version_but_not_the_image_os():
+    a = {"python": "3.12.13", "numpy": "2.1.0", "image_os": "ubuntu24", "image_version": "20261001.1.0"}
+    assert environment_digest({**a, "image_version": "20261008.1.0"}) == environment_digest(a)
+    assert environment_digest({k: v for k, v in a.items() if k != "image_version"}) == environment_digest(a)
+    assert environment_digest({**a, "numpy": "2.1.1"}) != environment_digest(a)
+    assert environment_digest({**a, "image_os": "ubuntu22"}) != environment_digest(a)
 ```
 
 **File: `tests/paper/test_runner.py`**
@@ -3183,7 +3191,7 @@ def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, 
     data["decisions"].remove(lost)  # as if the recording run had not seen this exit
     path.write_text(json.dumps(data))
     if env_changed:
-        box["env"] = {**ENV_A, "image_version": "20261008.1.0"}  # GitHub rolled out a new runner image
+        box["env"] = {**ENV_A, "numpy": "2.1.1"}  # a dependency version moved under the frozen lock
     env.clock.now += H1
     out = run_paper(env)
     led = load_ledger(env.ledger_dir)
@@ -3331,7 +3339,11 @@ Expected: 2 collection errors, `ModuleNotFoundError: No module named 'ewbot.pape
 The environment is what can change a recompute without touching the strategy code: the Python
 version, the numpy / pandas / pyarrow versions, the sha256 of uv.lock and the GitHub Actions runner
 image (the ImageOS / ImageVersion variables the hosted runners set; None elsewhere). Every run
-records it; every decision carries the digest of the environment of the run that recorded it."""
+records all of it; every decision carries the digest of the environment of the run that recorded it.
+
+The digest compares the Python (full patch), numpy, pandas and pyarrow versions, the uv.lock sha256 and
+ImageOS. ImageVersion is recorded but left out of the digest: GitHub refreshes the ubuntu-24.04 image
+weekly, so comparing it would turn every later UNEXPLAINED discrepancy into ENVIRONMENT_CHANGE."""
 
 from __future__ import annotations
 
@@ -3346,6 +3358,7 @@ from typing import Any, Mapping
 from ewbot.paper.fingerprint import PROJECT_ROOT
 
 PACKAGES = ("numpy", "pandas", "pyarrow")
+DIGEST_EXCLUDED = ("image_version",)  # recorded in every run, not compared
 
 
 def _version(dist: str) -> str | None:
@@ -3376,8 +3389,9 @@ def runtime_environment(repo_root: Path | None = None, environ: Mapping[str, str
 
 
 def environment_digest(env: Mapping[str, Any]) -> str:
-    """sha256 of the sorted, compact JSON of an environment record."""
-    blob = json.dumps(dict(env), sort_keys=True, separators=(",", ":"))
+    """sha256 of the sorted, compact JSON of an environment record, without the DIGEST_EXCLUDED keys."""
+    compared = {key: value for key, value in env.items() if key not in DIGEST_EXCLUDED}
+    blob = json.dumps(compared, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 ```
 
@@ -3872,7 +3886,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
 uv run pytest tests/paper/test_environment.py tests/paper/test_runner.py -q
 ```
 
-Expected: `36 passed`.
+Expected: `37 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4464,6 +4478,7 @@ ROOT = SRC.parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "paper.yml"
 CI_WORKFLOW = WORKFLOWS / "ci.yml"
+PYTHON_PATCH = "3.12.13"  # the exact patch both workflows resolve; part of the compared environment
 RUNNER_IMAGE = "ubuntu-24.04"  # pinned while paper trading runs (spec 8): part of the recorded environment
 ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py"}  # Plan 2 spec 7.1
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
@@ -4689,6 +4704,15 @@ def test_ci_workflow_runs_the_fingerprint_and_static_guards_without_secrets():
     assert uses == ["actions/checkout@v7", SETUP_UV] and f"uses: {SETUP_UV} # v10.2.0" in text
     runs = [s["run"] for s in job["steps"] if "run" in s]
     assert runs == ["uv sync --frozen", "uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py"]
+
+
+def test_both_workflows_pin_the_exact_python_patch():
+    """Python is part of the compared environment, so setup-uv gets the full patch, not "3.12"."""
+    for path in (WORKFLOW, CI_WORKFLOW):
+        wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+        pins = [s["with"]["python-version"] for job in wf["jobs"].values() for s in job["steps"]
+                if str(s.get("uses", "")).startswith(SETUP_UV)]
+        assert pins == [PYTHON_PATCH], path.name
 ```
 
 **File: `tests/paper/test_paper_sync.py`**
@@ -5001,7 +5025,7 @@ def test_usage_errors(w):
 uv run pytest tests/paper/test_static.py tests/paper/test_paper_sync.py -q
 ```
 
-Expected: `23 failed, 18 passed`: the `allow_holdout` guards and their self-tests pass (Task 7 respected them), and so does `test_usage_errors` (a missing script exits non-zero too); the 7 workflow tests fail with `FileNotFoundError` (`.github/workflows/`, `paper.yml` and `ci.yml` do not exist yet) and 16 sync tests fail because `scripts/paper_sync.sh` does not exist.
+Expected: `24 failed, 18 passed`: the `allow_holdout` guards and their self-tests pass (Task 7 respected them), and so does `test_usage_errors` (a missing script exits non-zero too); the 8 workflow tests fail with `FileNotFoundError` (`.github/workflows/`, `paper.yml` and `ci.yml` do not exist yet) and 16 sync tests fail because `scripts/paper_sync.sh` does not exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -5200,7 +5224,7 @@ jobs:
       - name: Install uv (with its cache)
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -5290,7 +5314,7 @@ jobs:
       - name: Install uv (with its cache)
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -5387,7 +5411,7 @@ The precheck also binds the run to the lock's whole configuration: it refuses to
 
 ## Frozen runtime environment
 
-Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
+Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). `ImageVersion` is recorded but not compared: it is left out of the digest, because GitHub refreshes the image weekly and comparing it would hide real `UNEXPLAINED` discrepancies behind `ENVIRONMENT_CHANGE`. Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
 
 1. `DATA_REVISION`: a bar up to the decision changed.
 2. `FINGERPRINT_CHANGE`: it was recorded in another epoch.
@@ -5397,10 +5421,10 @@ Each run records its runtime environment in `ledger.json` (`runs[].env`): the Py
 While paper trading runs, keep the environment frozen:
 
 - Do not change `uv.lock`: no `uv lock --upgrade`, no dependency bumps, no merged dependency-update pull requests.
-- Do not change the Python version: `python-version: "3.12"` in `paper.yml` and `requires-python` in `pyproject.toml`.
+- Do not change the Python version: `python-version: "3.12.13"` in `paper.yml` and `ci.yml` and `requires-python` in `pyproject.toml`.
 - Do not change the runner image: `runs-on: ubuntu-24.04` in `paper.yml`, never `ubuntu-latest`.
 
-Some changes happen underneath anyway. GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly), and `python-version: "3.12"` takes whichever 3.12 patch release uv finds or downloads. Both show up as a new environment digest in `runs[].env`, and a discrepancy across one is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
+GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly). That is recorded in `runs[].env` but does not change the digest, so it never turns a discrepancy into `ENVIRONMENT_CHANGE`. The Python patch is pinned to `3.12.13`, so a different patch (or a new `ImageOS`, numpy, pandas, pyarrow or `uv.lock`) is what changes the digest, and a discrepancy across one is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
 
 ## Failures
 
@@ -5439,7 +5463,7 @@ uv run pytest -q
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest holdout.lock pyproject.toml uv.lock
 ```
 
-Expected: `41 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `615 passed, 1 skipped` without a candle cache (`616 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
+Expected: `42 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `617 passed, 1 skipped` without a candle cache (`618 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -5473,7 +5497,7 @@ uv run pytest -q
 uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 ```
 
-Expected: clean tree; `616 passed` (with the real cache present); both fingerprint tripwires pass, i.e. the working-tree fingerprint equals the pinned value and the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
+Expected: clean tree; `618 passed` (with the real cache present); both fingerprint tripwires pass, i.e. the working-tree fingerprint equals the pinned value and the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
 
 - [ ] **Step 2: One local run on real data (no Telegram, throw-away ledger)**
 
