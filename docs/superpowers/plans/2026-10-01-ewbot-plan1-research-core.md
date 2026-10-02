@@ -1713,7 +1713,7 @@ git commit -m "feat: Wilder ATR (streaming + series) and EMA"
 
 ## Part B1 — Wave Engine
 
-Tasks T5–T10 build `ewbot.waves`: 4h ZigZag → count enumeration with hard rules → Fib scoring → streaming `WaveEngine` → synthetic and no-lookahead verification. Spec section 4 is normative. Every code block below was run against stand-ins for the Part A modules (`Bar/H1/H4`, `WaveParams`, `ATR`, `aggregate_4h`, `to_bars`). The full B1 suite (114 tests) passed under both ATR first-bar conventions: with bar 0's `high-low` counted as a TR, and with it skipped.
+Tasks T5–T10 build `ewbot.waves`: 4h ZigZag → count enumeration with hard rules → Fib scoring → streaming `WaveEngine` → synthetic and no-lookahead verification. Spec section 4 is normative. Every code block below was run against stand-ins for the Part A modules (`Bar/H1/H4`, `WaveParams`, `ATR`, `aggregate_4h`, `to_bars`). The full B1 suite (116 tests) passed under both ATR first-bar conventions: with bar 0's `high-low` counted as a TR, and with it skipped.
 
 ### B1 conventions other parts rely on
 
@@ -1722,15 +1722,15 @@ Tasks T5–T10 build `ewbot.waves`: 4h ZigZag → count enumeration with hard ru
 - **Before the ZigZag initialises,** `WaveState.E_live == 0.0` and `E_live_ts == -1`. No NaN is used, so states compare with `==`. Counts are computed even while `ready` is False, so strategies must check `ws.ready`.
 - **Size of `WaveState.counts`.** It holds every deduped group, because S_rev is computed over all of them. Consumers slice `counts[:params.top_k]` for snapshots.
 - **`probs`.** They are `softmax(q'/T)` fixed at the 4h close and renormalised over the survivors. `probs == ()` and `s_rev == 0.0` when no counts are alive.
-- **Invalidation kill.** A count dies if a closed 1h bar goes strictly beyond its level (`low < lo` or `high > hi`). On the leg side the level is compared with `E_live`, on the opposite side with the bar's low or high. Dead keys are remembered, and any later count that extends a dead key's labeled points (same pattern and `d`) stays dead. Without this, a wick through P2 or P4 that never became a pivot would be forgotten at the next 4h re-enumeration.
+- **Invalidation kill.** A count dies if a closed 1h bar goes strictly beyond its level (`low < lo` or `high > hi`). On the leg side the level is compared with `E_live`, on the opposite side with the bar's low or high. Dead keys are remembered, and any later count that extends a dead key's labeled points (same pattern and `d`) stays dead. Without this, a wick through P2 or P4 that never became a pivot would be forgotten at the next 4h re-enumeration. A count that only becomes enumerable later is checked at that 4h close against every closed 1h bar after its last labeled point, so a wick that happened before it existed still kills it (and its key joins the dead list).
 - **`ws.lineages` covers lineage kills (C1).** It contains every alive raw count's lineage (before dedupe). It also contains completed patterns (IMP `S..P5`, ABC `X..C`, all confirmed, every hard rule held, end still the extreme). Finishing W5 or C is not a hard-rule violation, so a W5_REV or C_END trade must not be lineage-killed when its pattern completes. Known limit: a lineage also disappears when its S falls out of the 12-pivot window.
 - **Wick clipping (spec 4.1) is not done inside `WaveEngine`/`ZigZag`.** The caller (C1 `TradingEngine`) feeds bars already clipped with `clip_wicks(df, atr_series(...), wave.wick_clip_atr1h)` and aggregates 4h bars from the clipped 1h bars. The broker keeps the raw bars.
-- **Feeding contract.** On the 1h bar whose `(ts + H1) % H4 == 0` closes a complete UTC-aligned bucket, pass `bar4h` (the aggregate) and `sub_bars` (the four 1h bars, last one == `bar1h`). Otherwise pass `None, None`. `tests/synth.feed` is the reference streaming implementation and is tested equal to the `aggregate_4h` batch path.
+- **Feeding contract.** On the 1h bar whose `(ts + H1) % H4 == 0` closes a complete UTC-aligned bucket, pass `bar4h` (the aggregate) and `sub_bars` (the four 1h bars, last one == `bar1h`). Otherwise pass `None, None`; any other `bar4h` raises `ValueError`. `tests/synth.feed` is the reference streaming implementation and is tested equal to the `aggregate_4h` batch path.
 - **Tie-break.** The spec's four keys (q, #points, S.i, pivot indices) leave exact ties: IMP W2/W3 and ABC B/C on the same points score the same whenever both `g_start` values are 1 and the ratio lies in both zones. Those ties go to IMP. This decides between setup ① (W3 entry) and setup ④ (C_END) when the evidence is identical; ABC wins only on strictly better evidence (flats, shallow B, context).
 
 ### Performance strategy
 
-- Enumeration runs only on 4h closes. The 1h path updates `E_live`, kills by level (O(1) fast path through `max(lo)` and `min(hi)`), renormalises, and recomputes S_rev.
+- Enumeration runs only on 4h closes. The 1h path updates `E_live`, kills by level (O(1) fast path through `max(lo)` and `min(hi)`), renormalises, and recomputes S_rev. The 4h-close 1h-history check costs one `bisect` per distinct last labeled point (monotonic stacks of closed 1h bars).
 - The confirmed-point part of each count is a cached "skeleton": point choice, extreme constraints, static hard rules, `g_start` and completed-wave scores, keyed on the pivot window. A 4h close without a new pivot only re-checks E and recomputes the in-progress term. A new pivot rebuilds the skeletons, which costs under 500 DFS nodes in practice (bounded below 10k and property-tested).
 - Measured in pure Python on 80,000 hourly GBM bars: about 1.2–1.4 s with the cache and about 5 s without it, against a 3-minute budget. `tests/waves/test_engine_perf.py` asserts this.
 
@@ -3310,12 +3310,14 @@ git commit -m "feat(waves): backward DFS count enumeration with skeleton cache, 
   - B2 strategies read `ready`, `top`, `q_top`, `s_rev`, `E_live`, `E_live_ts`, `leg_start`, `atr4h`, `counts` and `probs`.
   - C1 uses `lineages` (lineage kill), `new_pivot_4h` (trailing stop) and `top` (cooldown clear).
 - Per-step order (spec 3, step 2–3):
-  1. On a 4h close: ZigZag update, then `E_live := E`, then enumerate, drop dead keys, dedupe, hysteresis `q' = q + h` for the previous step's top lineage when the points are a prefix extension, sort by `q'`, and compute `p = softmax(q'/T)`.
+  1. On a 4h close: ZigZag update, then `E_live := E`, then enumerate, drop dead keys, drop every count or completed pattern that a closed 1h bar after its last labeled point already went beyond (`low < lo` or `high > hi`; its key joins the dead list), dedupe, hysteresis `q' = q + h` for the previous step's top lineage when the points are a prefix extension, sort by `q'`, and compute `p = softmax(q'/T)`.
   2. Otherwise: update E_live from the closed 1h bar (strictly beyond).
   3. Kill by invalidation.
   4. Renormalise the probabilities.
   5. Recompute S_rev with E_live.
 - `ready = (i4h + 1 >= warmup_4h) and zigzag initialised`. An `assert` guards that no pivot is confirmed after the current `i4h`.
+- 1h history check (step 1): a count can first become enumerable after a wick that would have killed it (E crosses a skipped pivot, or a new pivot opens new combinations), so the dead list alone is not enough. The engine keeps two monotonic stacks of closed 1h bars (lows strictly increasing, highs strictly decreasing) from which the min low / max high after any `ts` is one `bisect` away; bars before the window's first pivot are dropped on every new pivot.
+- Input checks: `bar4h` must be the UTC 4h bucket that `bar1h` closes (`(bar1h.ts + H1) % H4 == 0` and `bar4h.ts == bar1h.ts + H1 - H4`), and `sub_bars` must end with `bar1h`; otherwise `ValueError`, before any state changes.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3486,7 +3488,8 @@ def test_upper_wick_through_w5_cap_kills_count() -> None:
     ok = _run(bars)
     w5 = next(c for c in ok[h5].counts if c.prices == pts)
     assert (w5.phase, w5.inval) == ("W5", Invalidation(1110.0, 1200.0))
-    assert ok[h5 - 1].ts < ok[h5].ts and any(c.prices == pts for c in ok[h5 + 1].counts)
+    # without the spike the count lives until P5 (every high stays below the cap)
+    assert bars[h5].high < 1200.0 and all(any(c.prices == pts for c in s.counts) for s in ok[h5 - 1:hours[12] + 1])
     bars[h5] = dataclasses.replace(bars[h5], high=1200.5)      # one 1h spike above the H3 cap
     hit = _run(bars)
     assert any(c.prices == pts for c in hit[h5 - 1].counts)
@@ -3494,11 +3497,71 @@ def test_upper_wick_through_w5_cap_kills_count() -> None:
     assert hit[h5].E_live == 1200.5 and hit[h5].E_live_ts == bars[h5].ts
 
 
-def test_sub_bars_must_end_with_the_closing_1h_bar() -> None:
-    eng = WaveEngine(P)
+def test_wick_before_a_count_is_enumerable_still_kills_it() -> None:
+    # S=1000 P1=1100 P2=1045, a small 1080/1050 swing, then up to 1200 and back to 1150. (S, P1, P2) as W3
+    # skips 1080/1050, so it is only enumerable once E >= 1080. A 1h wick to 1040 (< P2) before that must
+    # kill it when it first shows up, and every W4/W5 built on it.
+    way = WAY[:7] + [1000.0, 1100.0, 1045.0, 1080.0, 1050.0, 1200.0, 1150.0]
+    bars, hours = _linear(way)
+    w3 = (1000.0, 1100.0, 1045.0)
+    has = lambda s: any(c.pattern == "IMP" and c.d == 1 and c.prices[:3] == w3 for c in s.counts)  # noqa: E731
+    ok = _run(bars)
+    up = next(k for k in range(hours[11], len(ok)) if ok[k].pivots4h[-1].price == 1050.0)
+    hw = _first_non_4h_hour(up + 1)                       # leg up from 1050, E still below 1080
+    assert ok[hw].E_live < 1080.0 and not has(ok[hw])
+    appear = next(k for k in range(hw, len(ok)) if has(ok[k]))
+    assert ok[appear].closed_4h and ok[appear].top.prices == w3
+    assert ok[-1].top.prices == w3 + (1200.0,) and ok[-1].top.phase == "W4"
+    bars[hw] = dataclasses.replace(bars[hw], low=1040.0)  # wick 5 below P2, close unchanged
+    states = _run(bars)
+    assert [p.price for p in states[-1].pivots4h] == [p.price for p in ok[-1].pivots4h]
+    assert not any(has(s) for s in states[hw:])
+    assert _check_probs_and_s_rev(states, P) > 0
+
+
+REF = 2000.0                                              # mirror p' = 2*REF - p
+
+
+def _mirror(bars: list[Bar]) -> list[Bar]:
+    return [Bar(b.ts, 2 * REF - b.open, 2 * REF - b.low, 2 * REF - b.high, 2 * REF - b.close, b.volume)
+            for b in bars]
+
+
+def test_mirrored_leg_down_tracks_lows_and_dies_on_an_upper_wick() -> None:
+    m = lambda *xs: tuple(2 * REF - x for x in xs)  # noqa: E731
+    bars = _mirror(BARS)
+    states = _run(bars)
+    assert [p.price for p in states[-1].pivots4h] == list(m(*WAY[:-1]))
+    h = H["S"] + 40                                       # mid W1, now a leg down
+    while not states[h].closed_4h:
+        h += 1
+    for k in range(h + 1, h + 4):
+        s = states[k]
+        assert not s.closed_4h and s.leg_dir == -1
+        assert s.E_live == bars[k].low and s.E_live_ts == bars[k].ts
+    t3 = states[H["3"]].top
+    assert (t3.pattern, t3.d, t3.phase, t3.prices) == ("IMP", -1, "W3", m(1000.0, 1100.0, 1045.0))
+    hw = _first_non_4h_hour(H["2"] + 29)
+    w3 = m(1000.0, 1100.0, 1045.0)
+    assert t3.inval == Invalidation(None, w3[2])
+    bars[hw] = dataclasses.replace(bars[hw], high=w3[2] + 2.0)       # wick 2 above P2
+    hit = _run(bars)
+    has = lambda s: any(c.pattern == "IMP" and c.d == -1 and c.prices[:3] == w3 for c in s.counts)  # noqa: E731
+    assert has(hit[hw - 1]) and not any(has(s) for s in hit[hw:H["5"] + 1])
+    assert _check_probs_and_s_rev(hit, P) > 0
+
+
+def test_4h_close_inputs_are_validated() -> None:
     b = BARS[:4]
-    with pytest.raises(ValueError):
-        eng.on_1h_close(b[3], Bar(b[0].ts, b[0].open, 1300.0, 1200.0, b[3].close, 4.0), b[:3])
+    agg = Bar(b[0].ts, b[0].open, max(x.high for x in b), min(x.low for x in b), b[3].close, 4.0)
+    eng = WaveEngine(P)
+    with pytest.raises(ValueError):                       # sub_bars must end with the closing 1h bar
+        eng.on_1h_close(b[3], agg, b[:3])
+    with pytest.raises(ValueError):                       # bar1h does not close a 4h bucket
+        eng.on_1h_close(b[2], agg, b[:3])
+    with pytest.raises(ValueError):                       # bar4h is not the bucket bar1h closes
+        eng.on_1h_close(b[3], dataclasses.replace(agg, ts=b[0].ts + H4), b)
+    assert eng.on_1h_close(b[3], agg, b).i4h == 0          # rejected calls left no trace
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -3513,7 +3576,8 @@ Expected: FAIL with "ModuleNotFoundError: No module named 'ewbot.waves.engine'"
 
 Per closed 1h bar:
  1. if it closes a 4h bucket: ZigZag(4h) update; E_live := E; enumerate (skeleton cache, see
-    enumerate.py) -> drop counts on the dead list -> dedupe -> hysteresis q' -> sort -> p = softmax(q'/T);
+    enumerate.py) -> drop counts on the dead list -> drop counts the 1h history already invalidated
+    (below) -> dedupe -> hysteresis q' -> sort -> p = softmax(q'/T);
  2. otherwise: E_live/E_live_ts := the 1h bar's high (leg up) / low (leg down) if strictly beyond;
  3. invalidation: a count (or a completed pattern kept for lineage bookkeeping) dies if the bar went
     strictly beyond its level. On the E side the level is compared with E_live, on the opposite side
@@ -3522,14 +3586,23 @@ Per closed 1h bar:
     never became a pivot cannot be "forgotten" at the next 4h re-enumeration;
  4. probabilities fixed at the 4h close are renormalised over the survivors; done-ness and S_rev are
     recomputed with E_live.
+
+1h history (step 1): a count can become enumerable only later (E crosses a skipped pivot, a new pivot
+opens new combinations), after a wick that would have killed it. So at every 4h close each enumerated
+count / completed pattern is also checked against EVERY closed 1h bar strictly after its last labeled
+point (that point's sub_ts) up to and including the current bar: min LOW < lo or max HIGH > hi kills
+it and its key joins the dead list. The suffix extremes come from two monotonic stacks of closed 1h
+bars, so a query costs O(log n) and only bars that are already closed are ever seen.
 """
 from __future__ import annotations
 
+import math
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Sequence
 
 from ewbot.config import WaveParams
-from ewbot.types import Bar
+from ewbot.types import H1, H4, Bar
 from ewbot.waves.enumerate import Count, _Completed, _dedupe_sorted, _Enumerator, _sort_key
 from ewbot.waves.scoring import is_done, softmax
 from ewbot.waves.zigzag import Pivot, ZigZag
@@ -3564,15 +3637,56 @@ class _Item:
     lo: float | None
     hi: float | None
     lineage: tuple[str, int, int]
+    since: int                      # sub_ts of the last labeled point (1h history starts after it)
 
 
 def _count_item(c: Count) -> _Item:
     inv = c.inval
-    return _Item((c.pattern, c.d, tuple(p.i for p in c.points)), inv.lo, inv.hi, c.lineage)
+    return _Item((c.pattern, c.d, tuple(p.i for p in c.points)), inv.lo, inv.hi, c.lineage, c.points[-1].sub_ts)
 
 
-def _completed_item(c: _Completed) -> _Item:
-    return _Item((c.lineage[0], c.lineage[1], c.key), c.inval.lo, c.inval.hi, c.lineage)
+def _completed_item(c: _Completed, end_ts: int) -> _Item:
+    return _Item((c.lineage[0], c.lineage[1], c.key), c.inval.lo, c.inval.hi, c.lineage, end_ts)
+
+
+class _SuffixExtremes:
+    """min LOW / max HIGH over the closed 1h bars with ts > t, for any t: lows are kept on a stack that
+    strictly increases (a new bar pops every low >= its own), highs on one that strictly decreases. The
+    first entry after t is then the extreme of everything after t."""
+
+    def __init__(self) -> None:
+        self._lo_ts: list[int] = []
+        self._lo: list[float] = []
+        self._hi_ts: list[int] = []
+        self._hi: list[float] = []
+
+    def push(self, bar: Bar) -> None:
+        lo_ts, lo, hi_ts, hi = self._lo_ts, self._lo, self._hi_ts, self._hi
+        while lo and lo[-1] >= bar.low:
+            lo.pop()
+            lo_ts.pop()
+        lo.append(bar.low)
+        lo_ts.append(bar.ts)
+        while hi and hi[-1] <= bar.high:
+            hi.pop()
+            hi_ts.pop()
+        hi.append(bar.high)
+        hi_ts.append(bar.ts)
+
+    def after(self, t: int) -> tuple[float, float]:
+        """(min LOW, max HIGH) over the bars with ts > t; (inf, -inf) if there are none."""
+        k = bisect_right(self._lo_ts, t)
+        lo = self._lo[k] if k < len(self._lo) else math.inf
+        k = bisect_right(self._hi_ts, t)
+        hi = self._hi[k] if k < len(self._hi) else -math.inf
+        return lo, hi
+
+    def forget_until(self, t: int) -> None:
+        """Drop bars with ts <= t (no later query starts before t)."""
+        k = bisect_right(self._lo_ts, t)
+        del self._lo[:k], self._lo_ts[:k]
+        k = bisect_right(self._hi_ts, t)
+        del self._hi[:k], self._hi_ts[:k]
 
 
 class WaveEngine:
@@ -3595,19 +3709,25 @@ class WaveEngine:
         self._prev_top: Count | None = None
         self._pivots_t: tuple[Pivot, ...] = ()
         self._lineages: frozenset[tuple[str, int, int]] = frozenset()
+        self._hist = _SuffixExtremes()         # closed 1h bars after the oldest pivot in the window
+        self._sub_ts: dict[tuple[int, int], int] = {}   # (i, kind) -> sub_ts of the window's pivots
 
     # ------------------------------------------------------------------ public
     def on_1h_close(self, bar1h: Bar, bar4h: Bar | None, sub_bars: Sequence[Bar] | None) -> WaveState:
         zz = self._zz
         new_piv: Pivot | None = None
         if bar4h is not None:
+            if (bar1h.ts + H1) % H4 != 0 or bar4h.ts != bar1h.ts + H1 - H4:
+                raise ValueError("bar4h must be the UTC 4h bucket that bar1h closes")
             if sub_bars is not None and (len(sub_bars) == 0 or sub_bars[-1].ts != bar1h.ts):
                 raise ValueError("sub_bars must end with the 1h bar that closes the 4h bucket")
+        self._hist.push(bar1h)
+        if bar4h is not None:
             self._i4h += 1
             new_piv = zz.update(self._i4h, bar4h, sub_bars)
             if new_piv is not None:
                 self._pivots_t = tuple(zz.pivots)
-                self._prune_dead()
+                self._on_new_pivot()
             if zz.leg_dir != 0:
                 self._E_live, self._E_live_ts = zz.E, zz.E_sub_ts
                 self._rescore()
@@ -3622,18 +3742,33 @@ class WaveEngine:
         return state
 
     # ----------------------------------------------------------------- private
-    def _prune_dead(self) -> None:
-        """Forget dead keys whose first point left the M-pivot window (they can never recur)."""
-        piv = self._zz.pivots
-        if self._dead and len(piv) > self.params.M:
-            lo_i = piv[len(piv) - self.params.M].i
+    def _on_new_pivot(self) -> None:
+        """Slide the M-pivot window: forget dead keys whose first point left it (they can never recur)
+        and 1h bars before its first pivot (no count's history starts there any more)."""
+        win = self._zz.pivots[-self.params.M:]
+        lo_i = win[0].i
+        if self._dead and len(self._zz.pivots) > self.params.M:
             self._dead = {k for k in self._dead if k[2][0] >= lo_i}
+        self._hist.forget_until(win[0].sub_ts)
+        self._sub_ts = {(p.i, p.kind): p.sub_ts for p in win}
 
     def _is_dead(self, pattern: str, d: int, idx: tuple[int, ...]) -> bool:
         dead = self._dead
         if not dead:
             return False
         return any((pattern, d, idx[:k]) in dead for k in range(2, len(idx) + 1))
+
+    def _history_kills(self, items: list[_Item]) -> set[_DeadKey]:
+        """Keys of the items that some closed 1h bar after their last labeled point went beyond."""
+        ext: dict[int, tuple[float, float]] = {}
+        killed: set[_DeadKey] = set()
+        for it in items:
+            e = ext.get(it.since)
+            if e is None:
+                e = ext[it.since] = self._hist.after(it.since)
+            if (it.lo is not None and e[0] < it.lo) or (it.hi is not None and e[1] > it.hi):
+                killed.add(it.key)
+        return killed
 
     def _rescore(self) -> None:
         zz, p = self._zz, self.params
@@ -3642,6 +3777,15 @@ class WaveEngine:
         raw, done = enum.run(zz.pivots, zz.leg_dir, zz.E)
         raw = [c for c in raw if not self._is_dead(c.pattern, c.d, tuple(x.i for x in c.points))]
         done = [c for c in done if not self._is_dead(c.lineage[0], c.lineage[1], c.key)]
+        raw_items = [_count_item(c) for c in raw]
+        # the end point of a completed pattern is the window pivot with .i == key[-1] and kind == d
+        done_items = [_completed_item(c, self._sub_ts[(c.key[-1], c.lineage[1])]) for c in done]
+        killed = self._history_kills(raw_items + done_items)
+        if killed:
+            self._dead |= killed
+            raw = [c for c, it in zip(raw, raw_items) if it.key not in killed]
+            raw_items = [it for it in raw_items if it.key not in killed]
+            done_items = [it for it in done_items if it.key not in killed]
         counts = _dedupe_sorted(raw)
         prev = self._prev_top
         qp = [
@@ -3655,7 +3799,7 @@ class WaveEngine:
         self._keys = [(c.pattern, c.d, tuple(x.i for x in c.points)) for c in self._counts]
         self._prices = [c.prices for c in self._counts]
         self._p0 = softmax([qp[k] for k in order], p.T)
-        self._items = [_count_item(c) for c in raw] + [_completed_item(c) for c in done]
+        self._items = raw_items + done_items
         self._refresh_items()
 
     def _refresh_items(self) -> None:
@@ -3708,7 +3852,7 @@ class WaveEngine:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/waves/test_engine.py -v`
-Expected: PASS (8 passed)
+Expected: PASS (10 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -4240,7 +4384,7 @@ def random_bars(seed: int, n: int, vol: float = 6.0, start: float = 5000.0) -> l
 Run: `uv run pytest tests/waves/test_synthetic.py tests/waves/test_no_lookahead.py tests/waves/test_mirror.py tests/waves/test_engine_perf.py -v -s`
 Expected: PASS (29 passed). The run prints the recovery curve, e.g. `{0.0: 1.0, 0.3: 1.0, 1.0: 1.0, 2.0: 0.83, 3.0: 0.0}`, and the 80k-bar timings (about 1–2 s each).
 
-Then run the whole wave suite: `uv run pytest tests/waves -q` → `114 passed`.
+Then run the whole wave suite: `uv run pytest tests/waves -q` → `116 passed`.
 
 - [ ] **Step 5: Commit**
 
