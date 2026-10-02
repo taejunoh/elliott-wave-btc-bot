@@ -20,7 +20,7 @@ import pandas as pd
 
 from ewbot.backtest.holdout import HoldoutError, run_holdout
 from ewbot.backtest.metrics import compute_metrics, reliability_by_q
-from ewbot.backtest.report import to_jsonable, write_report
+from ewbot.backtest.report import BENCHMARKS, to_jsonable, write_report
 from ewbot.backtest.runner import breakdowns, compare, equity_pairs, run_backtest, utc_ts
 from ewbot.backtest.walkforward import GRID, HOLDOUT_START, MIN_TRAIN_TRADES, WF_END, walk_forward
 from ewbot.config import AGGRESSIVE, CONSERVATIVE, BotConfig, load_config, with_overrides
@@ -137,10 +137,19 @@ def _candles4h(df: pd.DataFrame) -> dict[str, list]:
 
 
 def _print_comparison(comp: dict[str, dict[str, Any]]) -> None:
+    """Console table; BH / EMA show "-" for win_rate and avg_r (benchmark R is not comparable)."""
     cols = ("total_return", "cagr", "max_dd", "sharpe", "calmar", "win_rate", "avg_r", "n_trades")
     print(f"{'':8}" + "".join(f"{c:>13}" for c in cols))
     for name, m in comp.items():
-        print(f"{name:8}" + "".join(f"{m[c]:>13.3f}" if c != "n_trades" else f"{m[c]:>13d}" for c in cols))
+        cells = []
+        for c in cols:
+            if c == "n_trades":
+                cells.append(f"{m[c]:>13d}")
+            elif name in BENCHMARKS and c in ("win_rate", "avg_r"):
+                cells.append(f"{'-':>13}")
+            else:
+                cells.append(f"{m[c]:>13.3f}")
+        print(f"{name:8}" + "".join(cells))
 
 
 def _compare_sections(cmp: dict[str, Any], df: pd.DataFrame, notes: list[str]) -> dict[str, Any]:

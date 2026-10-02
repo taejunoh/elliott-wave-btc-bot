@@ -140,6 +140,10 @@ def test_compare_end_to_end_on_synthetic_cache_writes_report(tmp_path, capsys):
     assert "1 missing" in captured.err and f"report: {out}" in captured.out
     for name in ("A", "C", "HYBRID", "BH", "EMA"):
         assert any(line.startswith(name) for line in captured.out.splitlines()), name
+    for line in captured.out.splitlines():  # benchmarks: win_rate and avg_r are not comparable -> "-"
+        cols = line.split()
+        if cols and cols[0] in ("BH", "EMA"):
+            assert cols[6:8] == ["-", "-"] and cols[8].isdigit(), line
     html = out.read_text(encoding="utf-8")
     for heading in ("<h2>Equity", "<h2>Drawdown", "<h2>Comparison", "<h2>Trades - A"):
         assert heading in html

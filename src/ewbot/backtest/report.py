@@ -34,6 +34,11 @@ _STAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("avg_r", "Avg R", "num"),
     ("pnl", "PnL", "money"),
 )
+# Always-in-the-market benchmarks: their single mark-to-market / flip "trades" have no stop, so their R
+# multiples, win rate and R confidence interval are not comparable with the strategies' and show "-".
+BENCHMARKS = frozenset({"BH", "EMA"})
+_TRADE_R_KEYS = frozenset({"win_rate", "avg_r"})
+_TRADE_HEADERS = ("Entry (UTC)", "Exit (UTC)", "Setup", "Dir", "Ctr", "Entry px", "Exit px", "PnL", "R", "Exit", "Snapshot")
 _KNOWN_KEYS = {
     "notes", "equity", "comparison", "random", "ci", "per_setup", "long_short", "per_year",
     "reliability", "trades", "candles4h", "snapshot_window_bars",
@@ -81,13 +86,33 @@ def _fmt(value: Any, kind: str) -> str:
     return f"{float(value):.2f}"
 
 
+def _row(cells: Sequence[Any]) -> str:
+    return "<tr>" + "".join(f"<td>{c if isinstance(c, _Raw) else escape(str(c))}</td>" for c in cells) + "</tr>"
+
+
 def _table(headers: Sequence[str], rows: Sequence[Sequence[Any]], cls: str = "") -> str:
     head = "".join(f"<th>{escape(str(h))}</th>" for h in headers)
-    body = []
-    for row in rows:
-        cells = "".join(f"<td>{c if isinstance(c, _Raw) else escape(str(c))}</td>" for c in row)
-        body.append(f"<tr>{cells}</tr>")
-    return f'<div class="tw"><table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+    body = "".join(_row(r) for r in rows)
+    return f'<div class="tw"><table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def _trades_table(rows: Sequence[tuple[Sequence[Any], int | None]]) -> str:
+    """Trades table; a trade with a snapshot (gid not None) is followed by a hidden full-width row
+    (<td colspan=all columns>) holding its chart, shown by the row's `chart` button (toggleSnap)."""
+    n = len(_TRADE_HEADERS)
+    head = "".join(f"<th>{escape(h)}</th>" for h in _TRADE_HEADERS)
+    body: list[str] = []
+    for cells, gid in rows:
+        body.append(_row(cells))
+        if gid is not None:
+            body.append(
+                f'<tr class="snaprow" id="snaprow-{gid}" hidden><td colspan="{n}">'
+                f'<div class="snap" id="snap-{gid}"></div></td></tr>'
+            )
+    return (
+        f'<div class="tw"><table class="trades"><thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>'
+    )
 
 
 # ----------------------------------------------------------------------------- equity data
@@ -164,9 +189,11 @@ def _comparison_html(comp: Mapping[str, Mapping[str, Any]], rnd: Mapping[str, An
     headers = ["Strategy"] + [h for _, h, _ in _METRIC_COLUMNS] + ["Avg R 95% CI"]
     rows: list[list[Any]] = []
     for name, m in comp.items():
-        interval = (ci or {}).get(name, {}).get("avg_r")
+        bench = name in BENCHMARKS
+        interval = None if bench else (ci or {}).get(name, {}).get("avg_r")
         ci_txt = f"[{interval[0]:.2f}, {interval[1]:.2f}]" if interval else "-"
-        rows.append([name] + [_fmt(m.get(k), kind) for k, _, kind in _METRIC_COLUMNS] + [ci_txt])
+        cells = ["-" if bench and k in _TRADE_R_KEYS else _fmt(m.get(k), kind) for k, _, kind in _METRIC_COLUMNS]
+        rows.append([name] + cells + [ci_txt])
     dist = (rnd or {}).get("dist") or {}
     if dist:
         cells: list[Any] = [f"RANDOM x{rnd.get('runs', '?')} (mean [p5, p95])"]
@@ -176,6 +203,8 @@ def _comparison_html(comp: Mapping[str, Mapping[str, Any]], rnd: Mapping[str, An
         cells.append("-")
         rows.append(cells)
     out = _table(headers, rows, "cmp")
+    if BENCHMARKS & set(comp):
+        out += '<p class="muted">BH / EMA: win rate, avg R and its CI are not shown - benchmark R multiples are not comparable.</p>'
     beaten = (rnd or {}).get("beaten_by") or {}
     if beaten:
         items = "; ".join(
@@ -230,7 +259,9 @@ h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:28px 0 8px;border-b
 .tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{border-bottom:1px solid var(--line);padding:4px 8px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
 thead th{background:var(--card);position:sticky;top:0}
-.chart{width:100%;height:380px}.snap{width:100%;height:340px}
+.chart{width:100%;height:380px}.snap{width:100%;min-width:480px;height:400px}
+tr.snaprow td{padding:6px 0 14px;text-align:left;white-space:normal}
+button.snapbtn{font:inherit;color:var(--accent);background:none;border:1px solid var(--line);border-radius:4px;padding:0 8px;cursor:pointer}
 details{margin:6px 0}summary{cursor:pointer;color:var(--accent)}
 pre{background:var(--card);padding:10px;overflow:auto;border-radius:6px}
 ul.notes{margin:0 0 8px;padding-left:18px;color:var(--muted)}
@@ -275,6 +306,21 @@ function renderSnap(i){
   const shapes = [];
   [t.stop,t.tp1,t.tp2].forEach(v=>{if(v!=null){shapes.push({type:'line',x0:ex,x1:xe,y0:v,y1:v,line:{dash:'dash',width:1,color:'#888'}});}});
   Plotly.newPlot(div, traces, baseLayout({shapes:shapes,title:{text:t.setup+' '+(t.dir>0?'long':'short')+' - '+JSON.stringify(t.meta),font:{size:11}}}), {responsive:true});
+}
+function resizeSnap(div){
+  if(div && div.dataset.done && typeof Plotly !== 'undefined' && div.offsetParent !== null){Plotly.Plots.resize(div);}
+}
+function toggleSnap(i){
+  const row = document.getElementById('snaprow-'+i);
+  if(!row){return;}
+  row.hidden = !row.hidden;
+  if(row.hidden){return;}
+  renderSnap(i);  // first show: drawn now that the full-width row is visible
+  const div = document.getElementById('snap-'+i);
+  requestAnimationFrame(()=>resizeSnap(div));  // later shows: fit the current row width
+}
+function resizeSnapsIn(el){
+  if(el.open){el.querySelectorAll('.snap').forEach(d=>requestAnimationFrame(()=>resizeSnap(d)));}
 }
 window.addEventListener('load', drawMain);
 </script></body></html>
@@ -329,20 +375,20 @@ def write_report(path: Path, title: str, sections: dict[str, Any]) -> Path:
             gid = len(views)
             view = _snapshot_view(t)
             views.append(view)
+            has_chart = bool(view["counts"])
             chart = _Raw(
-                f'<details ontoggle="renderSnap({gid})"><summary>chart</summary><div class="snap" id="snap-{gid}"></div></details>'
-                if view["counts"]
-                else ""
+                f'<button type="button" class="snapbtn" onclick="toggleSnap({gid})">chart</button>' if has_chart else ""
             )
-            rows.append(
-                [
-                    _iso(t.entry_ts), _iso(t.exit_ts), t.setup, "L" if t.direction > 0 else "S", t.contracts,
-                    f"{t.entry_price:,.2f}", f"{t.exit_price_avg:,.2f}", f"{t.pnl:,.2f}", f"{t.r_multiple:.2f}",
-                    t.exit_reason, chart,
-                ]
-            )
-        headers = ["Entry (UTC)", "Exit (UTC)", "Setup", "Dir", "Ctr", "Entry px", "Exit px", "PnL", "R", "Exit", "Snapshot"]
-        body.append(f"<h2>Trades - {escape(name)} ({len(trades)})</h2><details><summary>show table</summary>{_table(headers, rows)}</details>")
+            cells = [
+                _iso(t.entry_ts), _iso(t.exit_ts), t.setup, "L" if t.direction > 0 else "S", t.contracts,
+                f"{t.entry_price:,.2f}", f"{t.exit_price_avg:,.2f}", f"{t.pnl:,.2f}", f"{t.r_multiple:.2f}",
+                t.exit_reason, chart,
+            ]
+            rows.append((cells, gid if has_chart else None))
+        body.append(
+            f"<h2>Trades - {escape(name)} ({len(trades)})</h2>"
+            f'<details ontoggle="resizeSnapsIn(this)"><summary>show table</summary>{_trades_table(rows)}</details>'
+        )
 
     for key, value in sections.items():
         if key not in _KNOWN_KEYS:
