@@ -128,8 +128,9 @@ __pycache__/
 .hypothesis/
 data/cache/
 reports/
-holdout.lock
 ```
+
+`holdout.lock` is deliberately **not** ignored: after the single holdout run it is committed as the permanent record that the holdout has been used (T21/T22).
 
 `src/ewbot/__init__.py`:
 ```python
@@ -1723,7 +1724,7 @@ Tasks T5–T10 build `ewbot.waves`: 4h ZigZag → count enumeration with hard ru
 - **Size of `WaveState.counts`.** It holds every deduped group, because S_rev is computed over all of them. Consumers slice `counts[:params.top_k]` for snapshots.
 - **`probs`.** They are `softmax(q'/T)` fixed at the 4h close and renormalised over the survivors. `probs == ()` and `s_rev == 0.0` when no counts are alive.
 - **Invalidation kill.** A count dies if a closed 1h bar goes strictly beyond its level (`low < lo` or `high > hi`). On the leg side the level is compared with `E_live`, on the opposite side with the bar's low or high. Dead keys are remembered, and any later count that extends a dead key's labeled points (same pattern and `d`) stays dead. Without this, a wick through P2 or P4 that never became a pivot would be forgotten at the next 4h re-enumeration. A count that only becomes enumerable later is checked at that 4h close against every closed 1h bar after its last labeled point, so a wick that happened before it existed still kills it (and its key joins the dead list).
-- **`ws.lineages` covers lineage kills (C1).** It contains every alive raw count's lineage (before dedupe). It also contains completed patterns (IMP `S..P5`, ABC `X..C`, all confirmed, every hard rule held, end still the extreme). Finishing W5 or C is not a hard-rule violation, so a W5_REV or C_END trade must not be lineage-killed when its pattern completes. Known limit: a lineage also disappears when its S falls out of the 12-pivot window.
+- **`ws.lineages` covers lineage kills (C1).** It contains every alive raw count's lineage (before dedupe). It also contains completed patterns (IMP `S..P5`, ABC `X..C`, all confirmed, every hard rule held, end still the extreme). Finishing W5 or C is not a hard-rule violation, so a W5_REV or C_END trade must not be lineage-killed when its pattern completes. A lineage also disappears when its S falls out of the 12-pivot window; that is not a hard-rule break, so C1's lineage-kill exit fires only while S is still inside the window (T17).
 - **Wick clipping (spec 4.1) is not done inside `WaveEngine`/`ZigZag`.** The caller (C1 `TradingEngine`) feeds bars already clipped with `clip_wicks(df, atr_series(...), wave.wick_clip_atr1h)` and aggregates 4h bars from the clipped 1h bars. The broker keeps the raw bars.
 - **Feeding contract.** On the 1h bar whose `(ts + H1) % H4 == 0` closes a complete UTC-aligned bucket, pass `bar4h` (the aggregate) and `sub_bars` (the four 1h bars, last one == `bar1h`). Otherwise pass `None, None`; any other `bar4h` raises `ValueError`. `tests/synth.feed` is the reference streaming implementation and is tested equal to the `aggregate_4h` batch path.
 - **Tie-break.** The spec's four keys (q, #points, S.i, pivot indices) leave exact ties: IMP W2/W3 and ABC B/C on the same points score the same whenever both `g_start` values are 1 and the ratio lies in both zones. Those ties go to IMP. This decides between setup ① (W3 entry) and setup ④ (C_END) when the evidence is identical; ABC wins only on strictly better evidence (flats, shallow B, context).
@@ -7285,6 +7286,8 @@ git commit -m "feat: risk sizing (slippage-aware, leverage cap, liquidation chec
     `ewbot.waves.zigzag.Pivot`, `ewbot.waves.patterns.N_POINTS` (tests only).
   - `ewbot.strategy.choch.ChochDetector`, `ewbot.strategy.base.{Signal, Strategy}`.
   - T15 `PaperBroker`, `Fill`, `PaperPosition`; T16 `size_contracts`, `CircuitBreakers`.
+  - Tests only: `tests.synth.{T0, Waypoint, make_path, q64}` (T10) for the lineage-window tests, which
+    run the real `WaveEngine` on synthetic paths.
 - Produces: `Trade`, `EquityPoint`, `EngineResult`, `TradingEngine`, exactly as in the contract, plus
   extensions 3 and 4. Management rules fixed here (spec 5.3, 5.4, 6.3):
   - **Entry.** A signal at bar t fills at the open of bar t+1. Its size comes from
@@ -7302,8 +7305,12 @@ git commit -m "feat: risk sizing (slippage-aware, leverage cap, liquidation chec
   - **Time stop.** Every 4h close observed while the position is open and TP1 has not filled adds 1,
     including the close of the entry bar's own bucket. At `>= sig.time_stop_4h` the engine queues an
     exit (reason `TIME`).
-  - **Lineage kill.** If `sig.lineage` is set, `ws.ready`, and `sig.lineage not in ws.lineages`, the
-    engine queues an exit (reason `LINEAGE`).
+  - **Lineage kill.** If `sig.lineage` is set, `ws.ready`, `sig.lineage not in ws.lineages`, and the
+    lineage's S pivot is still inside the M-pivot enumeration window (`len(ws.pivots4h) < M` or
+    `lineage[2] >= ws.pivots4h[-M].i`, M = `cfg.wave.M`), the engine queues an exit (reason `LINEAGE`).
+    - Reason: a lineage whose S has aged out of the last M pivots is invisible to the enumerator, so
+      its absence is not a hard-rule break (spec 5.4). That position is left to its stop, targets and
+      time stop. (On 2017–2023, mode A: LINEAGE exits 19 → 16 at K4 3.0 and 21 → 15 at K4 2.0.)
   - **Exit precedence.** Only the first queued exit reason counts, in the order TIME, LINEAGE,
     BREAKER, then FLIP.
   - **Flip.** An opposite-direction signal that passes cooldown and sizing queues an exit (reason
@@ -7625,7 +7632,11 @@ Expected: PASS — 11 passed (the `_tp1_split` parametrization counts 6).
 The engine tests use the real `PaperBroker`, sizing, breakers and the Part A candle helpers. They use
 a scripted `StubWave`, a no-op choch and a `FakeStrategy` that returns planned signals by timestamp.
 With zero costs, a 1% risk, `entry_ref` 50_000 and stop 49_000, every trade is exactly 10 contracts,
-so 1 USD of price movement is 0.1 USD of P&L.
+so 1 USD of price movement is 0.1 USD of P&L. Four tests pin the lineage-kill window: a stubbed one at
+the window boundary (S at the oldest window pivot exits, one pivot older does not), and two that run the
+real `WaveEngine` on `tests.synth` paths — a bull impulse whose S ages out of the 12-pivot window while
+P5 is never exceeded (no LINEAGE exit, the trade runs to END) and a W2 that falls below S while S is in
+the window (LINEAGE exit at the next open).
 
 `tests/engine/test_engine_loop.py`:
 
@@ -7637,14 +7648,16 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from ewbot.config import BotConfig, BreakerParams, CostParams
+from ewbot.config import BotConfig, BreakerParams, CostParams, WaveParams
 from ewbot.engine.loop import EngineResult, TradingEngine
 from ewbot.strategy.base import Signal
 from ewbot.types import H1, Bar
-from ewbot.waves.engine import WaveState
+from ewbot.waves.engine import WaveEngine, WaveState
 from ewbot.waves.enumerate import Count
 from ewbot.waves.patterns import N_POINTS
 from ewbot.waves.zigzag import Pivot
+from tests.synth import T0 as SYNTH_T0
+from tests.synth import Waypoint, make_path, q64
 
 T0 = 1_704_067_200    # Mon 2024-01-01 00:00 UTC (4h aligned)
 FRI = 1_704_412_800   # Fri 2024-01-05 00:00 UTC; bar 20 = 15:00 EST, 21 = 16:00, 22 = 17:00 (closed)
@@ -7905,6 +7918,20 @@ def test_lineage_kill_exits_at_next_open() -> None:
     assert t.pnl == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize("s_i, reason", [(9, "END"), (10, "LINEAGE")], ids=["S-aged-out", "S-oldest-in-window"])
+def test_lineage_absence_exits_only_while_s_is_in_the_m_pivot_window(s_i: int, reason: str) -> None:
+    # 12 pivots with .i = 10..21: the enumeration window (M = 12) starts at .i 10
+    piv = tuple(Pivot(i=10 + k, sub_ts=ts(0), price=50_000.0, kind=1 if k % 2 else -1, confirmed_at=11 + k)
+                for k in range(12))
+    lin = ("IMP", 1, s_i)
+    wave = StubWave(default=dict(lineages=frozenset({lin}), pivots4h=piv),
+                    at={ts(5): dict(lineages=frozenset(), pivots4h=piv)})
+    res, _, _ = run(frame(10), {ts(1): sig(ts(1), lineage=lin)}, wave)
+    [t] = res.trades
+    assert t.exit_reason == reason
+    assert t.exit_ts == (ts(6) if reason == "LINEAGE" else ts(9))
+
+
 def test_flip_on_opposite_signal_and_ignore_same_direction() -> None:
     long1, long2, short = sig(ts(1)), sig(ts(3)), sig(ts(5), d=-1, setup="W5_REV")
     rows = {6: (50_200.0, 50_300.0, 50_100.0, 50_200.0), 9: (50_100.0, 50_200.0, 50_000.0, 50_100.0)}
@@ -7966,6 +7993,110 @@ def test_total_halt_flattens_and_blocks_entries() -> None:
     assert (t.exit_ts, t.exit_reason, t.exit_price_avg) == (ts(4), "BREAKER", 49_450.0)
     assert t.pnl == pytest.approx(-55.0)
     assert ts(6) not in strat.calls
+
+
+# ----------------------------------------------------------------------------- lineage window (real WaveEngine)
+
+_LEAD = (1400, 1300, 1360, 1250, 1310, 1200, 1260, 1150, 1210, 1080, 1130, 1040, 1090)  # 13 falling pivots
+
+
+class _RecordingWave:
+    """The real WaveEngine, recording every WaveState it returns."""
+
+    def __init__(self, params: WaveParams) -> None:
+        self.inner = WaveEngine(params)
+        self.states: list[WaveState] = []
+
+    def on_1h_close(self, bar1h: Bar, bar4h: Bar | None, sub_bars: Any) -> WaveState:
+        st = self.inner.on_1h_close(bar1h, bar4h, sub_bars)
+        self.states.append(st)
+        return st
+
+
+class _LineageProbe:
+    """Emits ONE signal tied to lineage ("IMP", +1, S.i) as soon as the 4h pivot `after` is the last
+    confirmed pivot and the lineage is alive. Stop and targets are far outside the path."""
+
+    name = "PROBE"
+
+    def __init__(self, s_ts: int, after: float, d: int, stop: float, tp1: float, tp2: float) -> None:
+        self.s_ts, self.after, self.d = s_ts, after, d
+        self.levels = (stop, tp1, tp2)
+        self.lineage: tuple[str, int, int] | None = None
+        self.done = False
+
+    def on_bar(self, bar: Bar, ws: WaveState, choch: Any) -> Signal | None:
+        if self.done or not ws.pivots4h or ws.pivots4h[-1].price != self.after:
+            return None
+        s = [p for p in ws.pivots4h if p.sub_ts == self.s_ts]
+        if not s or ("IMP", 1, s[0].i) not in ws.lineages:
+            return None
+        self.done, self.lineage = True, ("IMP", 1, s[0].i)
+        stop, tp1, tp2 = self.levels
+        return Signal(ts=bar.ts, setup="W3", direction=self.d, entry_ref=bar.close, stop=stop, tp1=tp1, tp2=tp2,
+                      risk_mult=1.0, time_stop_4h=None, instance=None, lineage=self.lineage, reason="probe")
+
+
+def _path_frame(way: list[Waypoint], params: WaveParams) -> tuple[pd.DataFrame, list[int]]:
+    bars, hours = make_path(way, 0.0, 0, params)
+    df = pd.DataFrame({"ts": [b.ts for b in bars], "open": [b.open for b in bars], "high": [b.high for b in bars],
+                       "low": [b.low for b in bars], "close": [b.close for b in bars], "volume": [1.0] * len(bars)})
+    return df, hours
+
+
+def _in_window(lineage: tuple[str, int, int], ws: WaveState, m: int) -> bool:
+    return len(ws.pivots4h) < m or lineage[2] >= ws.pivots4h[-m].i
+
+
+def test_lineage_that_ages_out_of_the_pivot_window_does_not_exit() -> None:
+    """Bull impulse S..P5, then six lower-high / lower-low swings that never exceed P5: the completed
+    impulse stays valid (no hard rule broken), but once S is older than the last M=12 pivots the
+    enumerator no longer sees it and the lineage vanishes from ws.lineages. That is not a lineage
+    kill (spec 5.4: a hard-rule break caused by a new pivot), so the short must not exit LINEAGE."""
+    params = WaveParams(warmup_4h=20)
+    p5 = 1100.0 - 55.0 + 161.8 - 0.3 * 161.8 + 100.0
+    swings = (60, 25, 90, 50, 120, 80, 150, 110, 180, 140, 210, 170)  # P5 - x: lower highs, lower lows
+    way = [Waypoint(float(x), "") for x in _LEAD]
+    way += [Waypoint(q64(x), lab) for x, lab in ((1000.0, "S"), (1100.0, "1"), (1045.0, "2"),
+                                                (1045.0 + 161.8, "3"), (1045.0 + 0.7 * 161.8, "4"), (p5, "5"))]
+    way += [Waypoint(q64(p5 - x), "") for x in swings]
+    df, hours = _path_frame(way, params)
+    s_ts, p5 = SYNTH_T0 + hours[len(_LEAD)] * H1, q64(p5)
+    probe = _LineageProbe(s_ts, after=p5, d=-1, stop=p5 + 300.0, tp1=500.0, tp2=400.0)
+    wave = _RecordingWave(params)
+    cfg = BotConfig(costs=ZERO, wave=params)
+    res = TradingEngine(cfg, probe, wave_engine=wave, choch=NullChoch()).run(df)  # type: ignore[arg-type]
+
+    [t] = res.trades
+    lin = probe.lineage
+    assert lin is not None and t.direction == -1
+    during = [st for st in wave.states if t.entry_ts <= st.ts < t.exit_ts]
+    assert float(df.loc[df["ts"] >= t.entry_ts, "high"].max()) <= p5  # P5 never exceeded: no rule broken
+    aged_out = [st for st in during if lin not in st.lineages and not _in_window(lin, st, params.M)]
+    assert aged_out, "scenario must reproduce a lineage that left the 12-pivot window"
+    assert not [st for st in during if lin not in st.lineages and _in_window(lin, st, params.M)]
+    assert t.exit_reason == "END"
+
+
+def test_lineage_killed_by_a_rule_break_inside_the_window_still_exits() -> None:
+    """Same lead-in (15 pivots, so the window check is not trivially true), S, P1, then W2 falls
+    below S: H1 (P2 > S) is broken while S is in the window -> LINEAGE exit at the next open."""
+    params = WaveParams(warmup_4h=20)
+    way = [Waypoint(float(x), "") for x in _LEAD]
+    way += [Waypoint(1000.0, "S"), Waypoint(1100.0, "1"), Waypoint(960.0, ""), Waypoint(1050.0, "")]
+    df, hours = _path_frame(way, params)
+    s_ts = SYNTH_T0 + hours[len(_LEAD)] * H1
+    probe = _LineageProbe(s_ts, after=1100.0, d=1, stop=700.0, tp1=2000.0, tp2=2100.0)
+    wave = _RecordingWave(params)
+    res = TradingEngine(BotConfig(costs=ZERO, wave=params), probe, wave_engine=wave, choch=NullChoch()).run(df)  # type: ignore[arg-type]
+
+    [t] = res.trades
+    lin = probe.lineage
+    assert lin is not None and t.exit_reason == "LINEAGE"
+    kill = next(st for st in wave.states if st.ts >= t.entry_ts and lin not in st.lineages)
+    assert len(kill.pivots4h) >= params.M and _in_window(lin, kill, params.M)
+    assert float(df.loc[df["ts"] == kill.ts, "low"].iloc[0]) < 1000.0  # the bar that went below S
+    assert t.exit_ts == kill.ts + H1  # exit at the next 1h open
 ```
 
 - [ ] **Step 6: Run test to verify it fails**
@@ -7992,6 +8123,7 @@ Per closed 1h bar:
   3. wave.on_1h_close(cbar, bar4h, sub_bars)      bar4h built here from UTC 4h buckets of clipped bars
   4. choch.update(cbar)
   5. position management                          trailing on new 4h pivot, time stop, lineage kill
+                                                  (only while the lineage's S is in the last-M pivots)
   6. breakers.on_equity(close instant, equity)    TOTAL_HALT -> flatten at next open, no more entries
   7. cooldown release; entry / flip evaluation    (bar.ts >= start_ts, no pending entry, can_enter,
                                                    no blackout on this bar or the fill bar, not the last bar)
@@ -8025,10 +8157,18 @@ from ewbot.strategy.base import Signal, Strategy
 from ewbot.strategy.choch import ChochDetector
 from ewbot.types import H1, H4, Bar
 from ewbot.waves.engine import WaveEngine, WaveState
+from ewbot.waves.zigzag import Pivot
 
 __all__ = ["EngineResult", "EquityPoint", "Trade", "TradingEngine"]
 
 _CLOSING_KIND_REASON = {"STOP": "STOP", "TP1": "TP1", "TP2": "TP2"}
+
+
+def _in_window(lineage: Sequence, pivots4h: Sequence[Pivot], m: int) -> bool:
+    """True while the lineage's S pivot (lineage[2] = S.i) is inside the last-M-pivot enumeration
+    window. Outside it the enumerator cannot see the lineage at all, so its absence from
+    ws.lineages is not a hard-rule break (spec 5.4) and must not trigger a LINEAGE exit."""
+    return len(pivots4h) < m or lineage[2] >= pivots4h[-m].i
 
 
 def _agg_4h(sub: Sequence[Bar]) -> Bar:
@@ -8203,7 +8343,12 @@ class _Run:
             if ot.sig.time_stop_4h is not None and ot.n4h >= ot.sig.time_stop_4h:
                 self._request_exit("TIME")
         lineage = ot.sig.lineage
-        if lineage is not None and ws.ready and tuple(lineage) not in ws.lineages:
+        if (
+            lineage is not None
+            and ws.ready
+            and tuple(lineage) not in ws.lineages
+            and _in_window(lineage, ws.pivots4h, self.cfg.wave.M)
+        ):
             self._request_exit("LINEAGE")
 
     def _request_exit(self, reason: str) -> None:
@@ -8274,10 +8419,10 @@ class _Run:
 - [ ] **Step 8: Run tests to verify they pass**
 
 Run: `uv run pytest tests/engine -v`
-Expected: PASS — 27 passed (11 in `test_position_mgr.py`, 16 in `test_engine_loop.py`).
+Expected: PASS — 31 passed (11 in `test_position_mgr.py`, 20 in `test_engine_loop.py`).
 
 Then run the whole suite to check that nothing upstream broke: `uv run pytest -q`. Expected: all
-tests pass. Part C1 alone contributes 70 tests.
+tests pass. Part C1 alone contributes 74 tests.
 
 Accounting sanity check (optional, about 1 s). Over a random run, the sum of trade P&L must equal
 the final equity minus the initial equity, to float precision:
@@ -8330,14 +8475,15 @@ Tasks **T18–T23**. Everything here lives in `src/ewbot/backtest/`, `src/ewbot/
 - `execution.costs.slip(price, side, c)` returns the **adjusted fill price** (buy pays up, sell receives less); `fee(price, contracts, c)` returns USD for `contracts` contracts of `c.contract_size` BTC with `apply_min_fee=False`. Benchmark tests hand-compute with `price*(1±slippage)` and `fee_rate * price * contracts * contract_size`.
 - Equity points are one per 1h bar, `ts` = bar open. Benchmarks follow the same convention and fill at the **next bar open**.
 - `compute_metrics` windows are `[start_ts, end_ts)`: equity points inside the window **plus the last point before it as base** (so the first in-window return is measured against the true previous value and consecutive walk-forward folds join without a gap). Trade stats use trades whose `entry_ts` is in the window. `calmar = cagr / max_dd`, and `0.0` when `max_dd == 0` (nothing to divide by).
-- `buy_hold_equity` / `ema_cross_equity` are the contract names; `buy_hold()` is an extra public helper that also returns the single trade (used for exposure and fee reporting). Buy&hold is a **spot** hold (fractional BTC, no leverage, no funding): one entry fee + slippage at the next open, one exit fee + slippage at the last close. EMA is a 1x futures position and pays/receives funding like the strategies. EMA/BH trades have no stop, so their `r_multiple` is defined as `pnl / (1% of equity at entry)`; `avg_r` of BH/EMA is therefore **not comparable** with Elliott `avg_r`.
+- `buy_hold_equity` / `ema_cross_equity` are the contract names; `buy_hold()` is an extra public helper that also returns the single trade (used for exposure and fee reporting). Buy&hold is a **spot** hold (fractional BTC, no leverage, no funding): one entry fee + slippage at the next open, one exit fee + slippage at the last close. EMA is a 1x futures position and pays/receives funding like the strategies. EMA/BH trades have no stop, so their `r_multiple` is defined as `pnl / (1% of equity at entry)`; `avg_r` of BH/EMA is therefore **not comparable** with Elliott `avg_r`, and the comparison tables (HTML and console) show `-` for their win rate, avg R and avg R CI.
 - `RandomEntryStrategy` pre-draws its whole plan at construction (times, directions, reference trade) from `seed`; the stop distance is stored as a **fraction of price** (so a 2017 stop of 5% stays 5% in 2021), TP multiples in R, and the time stop comes from `time_stop_bars(reference holding time in 4h bars)`. Times in the blackout (`entry_blackout(t)` or `entry_blackout(t+H1)`) are never eligible, matching the engine's own gate. The engine still decides whether a planned signal is usable (flat / breakers / cooldown), so realised random trades can be slightly fewer than `n_signals`.
 - `compare()` gains an optional trailing `workers: int = 1` (parallel A/C/HYBRID and RANDOM runs). `n_signals` for RANDOM = number of **A trades** in the window (A's actual entries), geometry sampled from those trades, seeds `cfg.seed + k`.
 - `Trade.snapshot` is only specified as "top-5 counts (pattern,d,phase,points[(ts,price)],q), q_top, s_rev, E_live, reason". The report looks for the counts list under `"counts"` (also accepts `"top5"` / `"top_counts"`), items as dicts with `pattern, d, phase, q, points`; `q_top` is read by `reliability_by_q`. If Part C1 names the key differently, change the single tuple in `report._snapshot_view`.
 - Walk-forward runs each of the 60 combos **once** over `[2017-01-01, 2024-01-01)` and slices that continuous run into train/test windows (compounding therefore carries across folds; this is the approximation the contract asks for). The first ~33 days of 2017 are engine warm-up (200 4h bars), so the first training window is slightly shorter than 24 months of trading. Bars at/after `WF_END` (2024-01-01) are dropped before anything runs, and `HOLDOUT_START` is derived from `WF_END`, so the boundary has a single source.
 - Circuit breakers are **disabled** in those grid runs: `run_grid` applies `breakers.enabled = False` itself. Breakers are a risk overlay validated in the holdout and in paper mode. In one continuous 2017–2023 run a TOTAL_HALT latched in an early year would zero the trades of every later fold and disqualify the combo there for reasons unrelated to that fold. The holdout, `compare` and plain backtests keep breakers on.
 - A combo is eligible in a fold only with `>= MIN_TRAIN_TRADES = 12` trades in the 24-month training window (spec 9.3). This floor only keeps a handful of trades from producing a degenerate Calmar; it is not a statistical-power criterion. On 2017–2023 the strategy makes about 8–13 trades a year (K4 4.0 → 2.0), so a floor of 30 left most folds with no eligible combo.
-- The holdout is run through `compare()` so that A / HYBRID can be judged against C, buy&hold and the random control on the same window (spec 9.6); only `[2024-01-01, last bar]` is reported. The lock file is written **before** the run, lives at `<project root>/holdout.lock` (never the CWD) and is bound to the full resolved config (every `BotConfig` field + grid + holdout start + `random_runs`). Off-grid params, disabled breakers, a non-conservative risk profile and `random_runs < 1` are refused before anything is written, and without a random-control distribution the automatic go-live criteria are not met.
+- **Holdout isolation.** Every CLI command except `holdout` cuts the candle frame to `ts < HOLDOUT_START` right after loading it, so no engine run, benchmark or report candle sees 2024+, and an explicit `--start` at/after 2024-01-01 or `--end` after it is refused with exit code 2 (T22). Independently, `runner.run_backtest` / `compare` raise `ValueError` when `end_ts > HOLDOUT_START` (or `end_ts` is `None` and the frame reaches it) unless `allow_holdout=True`, which only `holdout.run_holdout` passes (T21 Step 4a).
+- The holdout is run through `compare()` so that A / HYBRID can be judged against C, buy&hold and the random control on the same window (spec 9.6); only `[2024-01-01, last bar]` is reported. The lock file is written **before** the run, lives at `<project root>/holdout.lock` (never the CWD; the CLI cannot choose another path) and is bound to the full resolved config (every `BotConfig` field + grid + holdout start + `random_runs`) and to a sha256 over `src/ewbot/**/*.py`. It also stores a sha256 of the holdout bars up to the first attempt's last bar: a rerun with revised, missing or fewer holdout bars is refused, appended newer bars are allowed. Every run records its params provenance and headline metrics. The lock is not git-ignored and is committed after the run. Off-grid params, disabled breakers, a non-conservative risk profile and `random_runs < 1` are refused before anything is written, and without a random-control distribution the automatic go-live criteria are not met.
 - Go-live trade count (spec 9.6 criterion 3): **50 out-of-sample trades with the frozen parameters**, counted over the holdout plus later paper trading (Plan 2). At the measured frequency the holdout alone yields roughly 21–35 trades, so the holdout report states each candidate's `n_trades` and, below 50, prints `<name>: 표본 외 거래 N/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족`. These lines are counts only, never performance claims. Plan 1 does not implement the paper accumulation.
 - `pyproject.toml` must expose the console script `ewbot = "ewbot.cli:main"` (T22 checks/adds it).
 
@@ -9253,6 +9399,8 @@ git commit -m "feat(backtest): buy&hold, EMA 50/200 and random-entry benchmarks"
 `compare()` return shape (consumed by the report and the holdout):
 `{"period": {"start","end"}, "comparison": {A,C,HYBRID,BH,EMA -> Metrics as dict}, "random": {"runs","n_signals","dist": {metric -> mean/p05/p50/p95}, "beaten_by": {A|C|HYBRID -> {sharpe, calmar, total_return -> share of random runs beaten}}}, "equity": {name -> [(ts, equity)]}, "ci": {name -> {"avg_r": (lo, hi), "win_rate": (lo, hi)}}, "breakdown": {A|C|HYBRID -> {"per_setup","long_short","per_year"}}, "trades": {name -> [Trade]}}`.
 
+**Later change (T21 Step 4a, final review):** once `walkforward.HOLDOUT_START` exists, `run_backtest` and `compare` gain a keyword-only `allow_holdout=False` and refuse to run past 2024-01-01, and the integration test's synthetic data moves back 156 weeks so that it ends before 2024. The code blocks of this task are the T20 versions; the final `runner.py`, `test_runner.py` and `test_integration_synth.py` are listed in T21 Step 4a.
+
 A, C and HYBRID use the **same cfg** except `strategy.mode`. Parallelism uses a `multiprocessing.Pool` whose initializer stores `(cfg, df, start, end)` once per worker (spawn-safe on macOS); `workers <= 1` runs in-process. The unit test swaps `TradingEngine` / `make_strategy` for fakes, so it needs no wave engine. The second test file, `test_integration_synth.py`, is the cross-part integration check: two years of synthetic 1h bars from `tests/synth.random_bars` (T10) go through the real candles → wave engine → CHoCH → strategies → sizing/breakers → PaperBroker → metrics/benchmarks stack for A, C, HYBRID and `compare(random_runs=3)`, plus an end-to-end price-mirror check (about 7 s).
 
 - [ ] **Step 1: Write the failing test**
@@ -9763,20 +9911,22 @@ git commit -m "feat(backtest): runner, A/C/HYBRID/BH/EMA/random comparison with 
 
 **Files:**
 - Create: `src/ewbot/backtest/walkforward.py`, `src/ewbot/backtest/holdout.py`
+- Modify (Step 4a, holdout guard): `src/ewbot/backtest/runner.py`, `tests/backtest/test_runner.py`, `tests/backtest/test_integration_synth.py`
 - Test: `tests/backtest/test_walkforward.py`, `tests/backtest/test_holdout.py`
 
 **Interfaces:**
 - Consumes: T18 `compute_metrics`; T20 `run_backtest, compare, utc_ts`; `ewbot.config.with_overrides, CONSERVATIVE` and T1 `BreakerParams.enabled`; T16 `CircuitBreakers` (a no-op when disabled); `ewbot.engine.loop.EngineResult, EquityPoint`.
-- Produces (walkforward): `GRID` (60 combos, key order `wave.K4, strategy.Q_MIN, strategy.S_MIN`), `WF_START = "2017-01-01"`, `WF_END = "2024-01-01"` (the single source of the walk-forward / holdout boundary), `MIN_TRAIN_TRADES = 12`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5`, `grid_combos()`, `config_for(cfg, combo)`, `run_grid(cfg, df1h, start_ts, end_ts, workers) -> {combo: EngineResult}` (drops bars at/after `end_ts`, always runs with `breakers.enabled = False`), `folds(...)`, `pick_plateau(calmar, n_trades, min_trades=MIN_TRAIN_TRADES)`, `select_plateau(results, train_start, train_end, min_trades=MIN_TRAIN_TRADES)`, `oos_returns`, `evaluate_folds(results, fold_list, equity0, min_trades=MIN_TRAIN_TRADES)` (returns `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`), `walk_forward(cfg, df1h, workers) -> dict` (drops bars at/after `WF_END` first).
-- Produces (holdout): `HOLDOUT_START = utc_ts(WF_END)`, `GO_LIVE_MIN_TRADES = 50`, `PROJECT_ROOT`, `DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout.lock"`, `LOCK_VERSION = 2`, `HoldoutError`, `params_digest` (informational), `holdout_config(cfg, params)`, `lock_digest(cfg, params, random_runs=100)`, `trade_count_lines(comp, required=GO_LIVE_MIN_TRADES) -> list[str]`, `evaluate_criteria` (also returns `n_trades` per candidate, the `trade_count` lines and `random_control_evaluated`), `run_holdout(cfg, df1h, params, lock_path=None, confirm=False, *, random_runs=100, workers=1) -> {params, sha256, lock_path, window, compare, criteria}`.
+- Produces (walkforward): `GRID` (60 combos, key order `wave.K4, strategy.Q_MIN, strategy.S_MIN`), `WF_START = "2017-01-01"`, `WF_END = "2024-01-01"` (the single source of the walk-forward / holdout boundary), `HOLDOUT_START = utc_ts(WF_END)` (imported by the runner guard, the holdout and the CLI), `MIN_TRAIN_TRADES = 12`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5`, `grid_combos()`, `config_for(cfg, combo)`, `run_grid(cfg, df1h, start_ts, end_ts, workers) -> {combo: EngineResult}` (drops bars at/after `end_ts`, always runs with `breakers.enabled = False`), `folds(...)`, `pick_plateau(calmar, n_trades, min_trades=MIN_TRAIN_TRADES)`, `select_plateau(results, train_start, train_end, min_trades=MIN_TRAIN_TRADES)`, `oos_returns`, `evaluate_folds(results, fold_list, equity0, min_trades=MIN_TRAIN_TRADES)` (returns `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`), `walk_forward(cfg, df1h, workers) -> dict` (drops bars at/after `WF_END` first).
+- Produces (runner, Step 4a): `check_before_holdout(df1h, end_ts, allow_holdout=False)`; `run_backtest(cfg, df1h, start_ts=None, end_ts=None, *, allow_holdout=False)` and `compare(..., workers=1, *, allow_holdout=False)` raise `ValueError` before running anything when `end_ts > HOLDOUT_START`, or `end_ts is None` and `df1h` has bars at/after it, unless `allow_holdout=True` (only `run_holdout` passes it).
+- Produces (holdout): `HOLDOUT_START` (imported from walkforward), `GO_LIVE_MIN_TRADES = 50`, `PROJECT_ROOT`, `DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout.lock"`, `PACKAGE_DIR` (= `src/ewbot`), `LOCK_VERSION = 3`, `HoldoutError`, `params_digest` (informational), `holdout_config(cfg, params)`, `code_fingerprint(pkg_dir=None)`, `git_state()` (informational), `data_fingerprint(df1h, start_ts, last_ts)`, `lock_digest(cfg, params, random_runs=100, code_sha256=None)`, `trade_count_lines(comp, required=GO_LIVE_MIN_TRADES) -> list[str]`, `evaluate_criteria` (also returns `n_trades` per candidate, the `trade_count` lines and `random_control_evaluated`), `run_holdout(cfg, df1h, params, lock_path=None, confirm=False, *, random_runs=100, workers=1, params_source="explicit") -> {params, sha256, lock_path, window, compare, criteria}` (`lock_path` exists for tests only; the CLI never passes it).
 
 Rules implemented:
 - **Folds** (24-month train, 6-month test, rolling 6 months, first test 2019-01-01, last test end `WF_END` = 2024-01-01) give exactly 10 folds; boundaries are listed literally in `test_folds_exact_boundaries` (fold 0: train `2017-01-01 .. 2019-01-01`, test `2019-01-01 .. 2019-07-01`; fold 9: train `2021-07-01 .. 2023-07-01`, test `2023-07-01 .. 2024-01-01`).
 - **Plateau**: score of a combo = mean Calmar over every combo whose grid index differs by at most 1 on each axis (itself included), counting only eligible combos (`>= min_trades` trades in the training window, finite Calmar). A combo is **selectable** only if it is eligible and at least half (`MIN_ELIGIBLE_NEIGHBOUR_FRAC`) of its in-grid neighbours, itself excluded, are eligible too (a corner of the 4x5x3 grid has 7 neighbours and needs 4; an interior cell has 26 and needs 13), so an eligible cell surrounded by ineligible ones cannot win a "plateau" made of itself. Highest score wins; ties (compared at 12 significant digits) go to the higher own Calmar, then the smallest grid index; no selectable combo raises `ValueError`. The test grid is 4x5x3 with a plateau block of Calmar 2.0, an isolated corner spike of 5.0 (neighbourhood mean `14/8 = 1.75`) and everything else 1.0: naive argmax picks the spike, the plateau rule picks `(3.0, 0.6, 0.0)`; with the spike's 7 neighbours ineligible the pick is still `(3.0, 0.6, 0.0)`.
 - **Stitching**: for each fold the chosen combo's single-run equity is sliced to the test window, hourly returns are compounded onto a running equity that starts at `initial_equity`; a fold with no selectable combo stays flat (`chosen = None`). `chosen_final` is the pick of the last fold that picked anything; `chosen_final_from_fold` names that fold and `chosen_final_fallback` is `True` when it is not the last fold (the most recent training window had no selectable combo), so the CLI can refuse to pass it on silently (T22).
-- **2024 cut (defence in depth)**: `HOLDOUT_START` is derived from `WF_END`. `walk_forward` drops every bar at/after `WF_END` before anything runs and `run_grid` drops bars at/after its `end_ts` (= `WF_END` when called from `walk_forward`); the engine also cuts at `end_ts` itself. `test_walk_forward_never_sees_bars_at_or_after_wf_end` feeds a frame whose post-2024 bars are poisoned (x10 and NaN) to a deliberately leaky fake engine and requires the result to equal the walk-forward of the clean truncated frame.
+- **2024 cut (defence in depth)**: `HOLDOUT_START` is derived from `WF_END`. `walk_forward` drops every bar at/after `WF_END` before anything runs and `run_grid` drops bars at/after its `end_ts` (= `WF_END` when called from `walk_forward`); the engine also cuts at `end_ts` itself. `test_walk_forward_never_sees_bars_at_or_after_wf_end` feeds a frame whose post-2024 bars are poisoned (x10 and NaN) to a deliberately leaky fake engine and requires the result to equal the walk-forward of the clean truncated frame. The runner guard (Step 4a) and the CLI cut (T22) extend the same boundary to every research run.
 - **Holdout validation** (before anything is written, `HoldoutError`): `confirm=True`; params must be a `GRID` combo; `breakers.enabled` must be `True`; the risk profile must equal `CONSERVATIVE` (name and values); `random_runs >= 1`; `df1h` must contain bars at/after `HOLDOUT_START`.
-- **Holdout lock**: default path `DEFAULT_LOCK_PATH` = `<project root>/holdout.lock`, resolved from the package location (`Path(__file__).resolve().parents[3]`, src layout, editable install), never the CWD; if no `pyproject.toml` is found there, `lock_path` must be passed. The lock is bound to `lock_digest(cfg, params, random_runs)` = sha256 of the sorted JSON of every field of `holdout_config(cfg, params)` (the fully resolved `BotConfig` of the run; `strategy.mode` is pinned to `"A"` because `compare()` runs A, C and HYBRID itself), the grid values, `HOLDOUT_START` and `random_runs`. It is JSON `{version, keys, params, sha256, params_sha256, config, grid, holdout_start, random_runs, first_run, runs}`, written atomically **before** the run (a crash cannot be used to retune) and again after it. `first_run` records the first completed run (`start_ts`, `end_ts` = last bar + 1h, `last_bar_ts`, headline metrics of A / HYBRID / C / BH / EMA, the RANDOM summary, criteria and `n_trades`) and is never overwritten; `runs` lists every attempt. Re-running the identical configuration is allowed (e.g. later, with more data); any other difference (params, any config field, `random_runs`) raises `HoldoutError` naming the changed keys, without touching the lock. An unreadable lock is refused.
+- **Holdout lock**: the path is `DEFAULT_LOCK_PATH` = `<project root>/holdout.lock`, resolved from the package location (`Path(__file__).resolve().parents[3]`, src layout, editable install), never the CWD; if no `pyproject.toml` is found there, the run is refused. `run_holdout(lock_path=...)` exists for tests only — the CLI has no `--lock` option (T22). The lock is bound to `lock_digest(cfg, params, random_runs)` = sha256 of the sorted JSON of every field of `holdout_config(cfg, params)` (the fully resolved `BotConfig` of the run; `strategy.mode` is pinned to `"A"` because `compare()` runs A, C and HYBRID itself), the grid values, `HOLDOUT_START`, `random_runs` and `code_fingerprint()` = sha256 over every `src/ewbot/**/*.py` file (sorted relative path + bytes), so a rerun after any source change is refused. The git HEAD and dirty flag are recorded per run, informationally. The lock also stores `data` = `{start_ts, last_bar_ts, n_bars, sha256}`, the `data_fingerprint` of the holdout bars (ts and OHLCV) from `HOLDOUT_START` to the first attempt's last bar; a rerun recomputes it over the same prefix and is refused if it differs (revised, missing or fewer bars); newer bars after it are allowed. It is JSON `{version: 3, keys, params, sha256, params_sha256, code_sha256, config, grid, holdout_start, random_runs, data, first_run, runs}`, written atomically **before** the run (a crash cannot be used to retune) and again after it. `first_run` records the first completed run (`start_ts`, `end_ts` = last bar + 1h, `last_bar_ts`, headline metrics of A / HYBRID / C / BH / EMA, the RANDOM summary, criteria and `n_trades`) and is never overwritten; every entry of `runs` records `started`, `completed`, `end_ts`, `last_bar_ts`, `params_source` (`"explicit"` or `"walkforward:<path>#chosen_final"`), `git_head`, `git_dirty` and, once completed, its own `headline` and `criteria`. Re-running the identical configuration and code on the same holdout bars is allowed (e.g. later, with more data); any other difference (params, any config field, `random_runs`, `code_sha256`) raises `HoldoutError` naming the changed keys, without touching the lock. An unreadable lock is refused. `holdout.lock` is not git-ignored: after the run the CLI prints the `git add` / `git commit` commands (it never commits by itself).
 - **Random control mandatory**: if the random distribution is empty (`random_runs` produced nothing, or A made no trades to replay) no candidate wins, `random_control_evaluated` is `False` and `automatic_criteria_met` is `False`.
 - **Training floor**: `MIN_TRAIN_TRADES = 12` trades per 24-month training window is the default of `pick_plateau`, `select_plateau` and `evaluate_folds` (spec 9.3). It is a degeneracy guard for the Calmar objective, not a power criterion. On 2017–2023 the strategy makes about 8–13 trades a year (K4 4.0 → 2.0); at 12, between 24 and 60 of the 60 combos are eligible in every fold, while a floor of 30 leaves most folds with none. (The neighbour rule can only shrink the selectable set; it has not been re-measured on real data.)
 - **Breakers off in grid runs**: `run_grid` applies `with_overrides(cfg, **{"breakers.enabled": False})` before running anything, so the pool workers and the in-process path both get it and the caller's config is unchanged. The reason: a TOTAL_HALT latched early in the single 2017–2023 run would zero every later fold. The holdout (`compare`) and plain backtests keep breakers on.
@@ -10079,9 +10229,11 @@ GRID: dict[str, tuple[float, ...]] = {
     "strategy.S_MIN": (0.0, 0.25, 0.5),
 }
 WF_START = "2017-01-01"
-# Single source of the walk-forward / holdout boundary: the holdout (holdout.HOLDOUT_START) starts
-# here, and walk_forward() drops every bar at/after it before anything runs.
+# Single source of the walk-forward / holdout boundary: the holdout starts here, walk_forward() drops
+# every bar at/after it before anything runs, runner.run_backtest / compare refuse to cross it unless
+# holdout.run_holdout asks them to, and every CLI command except `holdout` cuts its data here.
 WF_END = "2024-01-01"
+HOLDOUT_START = utc_ts(WF_END)
 # spec 9.3: a combo needs this many trades in a 24-month training window. A degeneracy floor for
 # the Calmar objective, not a power criterion (2017-2023: about 8-13 trades/year).
 MIN_TRAIN_TRADES = 12
@@ -10336,6 +10488,574 @@ def walk_forward(cfg: BotConfig, df1h: pd.DataFrame, workers: int) -> dict[str, 
 Run: `uv run pytest tests/backtest/test_walkforward.py -v`
 Expected: 13 passed.
 
+- [ ] **Step 4a: Guard the runner against the holdout (defence in depth)**
+
+`HOLDOUT_START` now exists, so `run_backtest` and `compare` refuse to cross it unless `allow_holdout=True` (only `run_holdout`, Step 7, passes it); the CLI also cuts the data (T22). The runner imports `HOLDOUT_START` lazily inside `_holdout_start()` because `walkforward` imports `runner`. The T20 integration test used synthetic data from 2023-11-15 to 2025-11; it moves back 156 whole weeks (2020-11-18 .. 2022-11-18), which keeps the weekday / hour-of-week layout of `tests/synth`.
+
+Final `tests/backtest/test_runner.py` (adds `test_run_backtest_refuses_the_holdout_unless_allowed` and `test_compare_refuses_the_holdout_unless_allowed`; `FakeEngine` records its runs):
+
+`tests/backtest/test_runner.py`:
+
+```python
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from ewbot.backtest import runner
+from ewbot.backtest.benchmarks import RandomEntryStrategy
+from ewbot.backtest.runner import breakdowns, compare, utc_ts
+from ewbot.backtest.walkforward import HOLDOUT_START
+from ewbot.config import BotConfig
+from ewbot.engine.loop import EngineResult, EquityPoint
+
+T0 = utc_ts("2020-01-01")
+H = 3600
+N = 1000
+
+
+def _df(t0: int = T0) -> pd.DataFrame:
+    px = [100.0 + 10.0 * ((i // 50) % 4) - 0.01 * i for i in range(N)]  # saw-tooth, positive
+    return pd.DataFrame(
+        {
+            "ts": [t0 + i * H for i in range(N)],
+            "open": px,
+            "high": [p + 1 for p in px],
+            "low": [p - 1 for p in px],
+            "close": px,
+            "volume": [1.0] * N,
+            "synthetic": [False] * N,
+        }
+    )
+
+
+class FakeEngine:
+    """Replaces TradingEngine: returns canned results per strategy name, records RANDOM plans."""
+
+    random_strategies: list = []
+    trade_factory = None
+    runs: list = []
+
+    def __init__(self, cfg, strategy):
+        self.strategy = strategy
+
+    def run(self, df1h, start_ts=None, end_ts=None):
+        name = self.strategy.name
+        FakeEngine.runs.append((name, start_ts, end_ts))
+        mk = FakeEngine.trade_factory
+        if name == "A":
+            trades = (
+                mk(entry_ts=T0 + 100 * H, exit_ts=T0 + 110 * H, pnl=300.0, r=2.0, setup="W3"),
+                mk(entry_ts=T0 + 200 * H, exit_ts=T0 + 210 * H, pnl=-100.0, r=-1.0, setup="W5", direction=-1),
+                mk(entry_ts=T0 + 300 * H, exit_ts=T0 + 310 * H, pnl=200.0, r=1.5, setup="W3"),
+            )
+            vals = [10_000 + 2 * i for i in range(N)]
+        elif name == "RANDOM":
+            FakeEngine.random_strategies.append(self.strategy)
+            trades = ()
+            k = self.strategy.seed + 1
+            vals = [10_000 + k * (-1) ** (i // 24) * (i % 24) for i in range(N)]
+        else:
+            trades = ()
+            vals = [10_000 + i for i in range(N)]
+        eq = tuple(EquityPoint(ts=T0 + i * H, equity=float(v)) for i, v in enumerate(vals))
+        return EngineResult(trades=trades, equity=eq, signals=(), events=())
+
+
+@pytest.fixture
+def patched(monkeypatch, mk_trade):
+    from types import SimpleNamespace
+
+    FakeEngine.random_strategies = []
+    FakeEngine.runs = []
+    FakeEngine.trade_factory = staticmethod(mk_trade)
+    monkeypatch.setattr(runner, "TradingEngine", FakeEngine)
+    monkeypatch.setattr(runner, "make_strategy", lambda sp: SimpleNamespace(name=sp.mode))
+    return FakeEngine
+
+
+def test_utc_ts():
+    assert utc_ts("2017-01-01") == 1_483_228_800
+    assert utc_ts("2024-01-01") == 1_704_067_200
+
+
+def test_run_backtest_uses_mode_strategy(patched):
+    from ewbot.config import with_overrides
+
+    cfg = with_overrides(BotConfig(), **{"strategy.mode": "C"})
+    res = runner.run_backtest(cfg, _df(), T0, T0 + N * H)
+    assert len(res.equity) == N and res.trades == ()
+
+
+def test_compare_structure_and_random(patched):
+    df = _df()
+    cmp = compare(BotConfig(), df, T0, T0 + N * H, random_runs=3, workers=1)
+    assert set(cmp["comparison"]) == {"A", "C", "HYBRID", "BH", "EMA"}
+    assert set(cmp["equity"]) == set(cmp["comparison"])
+    a = cmp["comparison"]["A"]
+    assert a["n_trades"] == 3 and a["win_rate"] == pytest.approx(2 / 3)
+    assert cmp["comparison"]["BH"]["exposure"] == 1.0
+    assert cmp["comparison"]["BH"]["n_trades"] == 1
+    assert cmp["ci"]["A"]["avg_r"][0] <= (2.0 - 1.0 + 1.5) / 3 <= cmp["ci"]["A"]["avg_r"][1]
+    assert len(cmp["equity"]["BH"]) == N
+
+    rnd = cmp["random"]
+    assert rnd["runs"] == 3 and rnd["n_signals"] == 3
+    d = rnd["dist"]["sharpe"]
+    assert d["p05"] <= d["p50"] <= d["p95"]
+    assert set(rnd["beaten_by"]) == {"A", "C", "HYBRID"}
+    assert all(0.0 <= v <= 1.0 for v in rnd["beaten_by"]["A"].values())
+    # RANDOM strategies: seeds cfg.seed + k, same count as A's trades, 3 planned entries each
+    seeds = sorted(s.seed for s in patched.random_strategies)
+    assert seeds == [0, 1, 2]
+    assert all(isinstance(s, RandomEntryStrategy) and len(s.planned_times) == 3 for s in patched.random_strategies)
+
+    bd = cmp["breakdown"]["A"]
+    assert set(bd["per_setup"]) == {"W3", "W5"} and bd["per_setup"]["W3"]["n"] == 2
+    assert bd["long_short"]["long"]["n"] == 2 and bd["long_short"]["short"]["n"] == 1
+    assert list(bd["per_year"]) == ["2020"]
+
+
+def test_compare_without_random_runs(patched):
+    cmp = compare(BotConfig(), _df(), T0, T0 + N * H, random_runs=0)
+    assert cmp["random"]["runs"] == 0 and cmp["random"]["dist"] == {}
+
+
+def test_breakdowns_per_year_boundaries(mk_trade):
+    t1 = mk_trade(entry_ts=utc_ts("2020-12-31"), exit_ts=utc_ts("2020-12-31") + H, pnl=1.0)
+    t2 = mk_trade(entry_ts=utc_ts("2021-01-02"), exit_ts=utc_ts("2021-01-02") + H, pnl=-1.0)
+    eq = tuple(
+        EquityPoint(ts=utc_ts("2020-12-30") + i * 86400, equity=10_000.0 + i) for i in range(6)
+    )
+    res = EngineResult(trades=(t1, t2), equity=eq, signals=(), events=())
+    bd = breakdowns(res, utc_ts("2020-12-30"), utc_ts("2021-01-05"))
+    assert list(bd["per_year"]) == ["2020", "2021"]
+    assert bd["per_year"]["2020"]["n_trades"] == 1 and bd["per_year"]["2021"]["n_trades"] == 1
+    assert bd["per_year"]["2021"]["total_return"] > 0
+
+
+def test_run_backtest_refuses_the_holdout_unless_allowed(patched):
+    cfg = BotConfig()
+    with pytest.raises(ValueError, match="holdout"):
+        runner.run_backtest(cfg, _df(), T0, HOLDOUT_START + H)  # end after the walk-forward boundary
+    spanning = _df(t0=HOLDOUT_START - 500 * H)  # 500 bars before 2024-01-01, 500 at/after it
+    with pytest.raises(ValueError, match="holdout"):
+        runner.run_backtest(cfg, spanning)  # no end_ts: the engine would run into the holdout bars
+    assert patched.runs == []  # refused before the engine ran
+    runner.run_backtest(cfg, spanning, None, HOLDOUT_START)  # ends exactly at the boundary: fine
+    runner.run_backtest(cfg, spanning, None, None, allow_holdout=True)  # holdout.run_holdout only
+    assert [r[2] for r in patched.runs] == [HOLDOUT_START, None]
+
+
+def test_compare_refuses_the_holdout_unless_allowed(patched):
+    end = utc_ts("2025-01-01")
+    with pytest.raises(ValueError, match="holdout"):
+        compare(BotConfig(), _df(), T0, end, random_runs=1)
+    assert patched.runs == []  # nothing ran: not A/C/HYBRID, not the random control
+    cmp = compare(BotConfig(), _df(), T0, end, random_runs=1, allow_holdout=True)
+    assert cmp["period"] == {"start": T0, "end": end}
+    assert {r[0] for r in patched.runs} == {"A", "C", "HYBRID", "RANDOM"}
+    compare(BotConfig(), _df(), T0, HOLDOUT_START, random_runs=0)  # up to the boundary: fine
+```
+
+Final `tests/backtest/test_integration_synth.py` (data moved before 2024):
+
+`tests/backtest/test_integration_synth.py`:
+
+```python
+"""End-to-end integration on synthetic data: the REAL stack, no stubs.
+
+candles (fill_gaps, wick clip) -> WaveEngine -> ChochDetector -> strategies A / C / HYBRID ->
+sizing + breakers -> PaperBroker -> Trade / EquityPoint -> metrics, benchmarks, random control.
+Two years of 1h bars from tests/synth.py (seed 0 stays between ~7.4k and ~24.8k), moved back by
+156 whole weeks (2020-11-18 .. 2022-11-18) so that nothing reaches the 2024-01-01 holdout boundary
+that run_backtest / compare refuse to cross.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ewbot.backtest.runner import compare, run_backtest
+from ewbot.backtest.walkforward import HOLDOUT_START
+from ewbot.config import SETUPS, BotConfig, BreakerParams, CostParams, with_overrides
+from ewbot.data.candles import fill_gaps
+from ewbot.types import H1
+from tests.synth import random_bars
+
+N_BARS = 2 * 8760  # two years of 1h bars
+SHIFT = 156 * 7 * 24 * H1  # whole weeks keep the weekday / hour-of-week layout of tests/synth
+WARMUP_H = 40 * 24  # > 200 4h bars of wave-engine warm-up before entries are allowed
+MODES = ("A", "C", "HYBRID")
+SETUPS_OF = {"A": set(SETUPS), "C": {"FIB"}, "HYBRID": set(SETUPS) | {"FIB"}}
+EXIT_REASONS = {"STOP", "TP1", "TP2", "TIME", "LINEAGE", "FLIP", "BREAKER", "END"}
+
+
+def synth_frame() -> pd.DataFrame:
+    bars = random_bars(seed=0, n=N_BARS, vol=30.0, start=20_000.0)
+    df = pd.DataFrame(
+        {
+            "ts": np.array([b.ts - SHIFT for b in bars], dtype=np.int64),
+            "open": [b.open for b in bars],
+            "high": [b.high for b in bars],
+            "low": [b.low for b in bars],
+            "close": [b.close for b in bars],
+            "volume": [b.volume for b in bars],
+        }
+    )
+    return df.drop(index=[3_000, 3_001, 9_000]).reset_index(drop=True)  # 3 missing hours
+
+
+@pytest.fixture(scope="module")
+def synth():
+    df = fill_gaps(synth_frame())  # what the CLI does before every run
+    start = int(df["ts"].iloc[0]) + WARMUP_H * H1
+    end = int(df["ts"].iloc[-1]) + H1
+    cfg = BotConfig()
+    runs = {m: run_backtest(with_overrides(cfg, **{"strategy.mode": m}), df, start, end) for m in MODES}
+    return df, start, end, cfg, runs
+
+
+@pytest.fixture(scope="module")
+def cmp(synth):
+    df, start, end, cfg, _ = synth
+    return compare(cfg, df, start, end, random_runs=3, workers=1)
+
+
+def test_synthetic_frame_is_a_valid_positive_price_path(synth):
+    df = synth[0]
+    assert len(df) == N_BARS and int(df["synthetic"].sum()) == 3
+    assert int(df["ts"].max()) < HOLDOUT_START
+    assert float(df["low"].min()) > 1_000.0
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_mode_runs_end_to_end_and_books_every_dollar(synth, mode):
+    df, start, end, cfg, runs = synth
+    res = runs[mode]
+    assert [p.ts for p in res.equity] == list(range(start, end, H1))
+    eq = np.array([p.equity for p in res.equity])
+    assert np.isfinite(eq).all() and (eq > 0).all()
+    # trades sum to the equity change (fees and funding are inside Trade.pnl)
+    assert sum(t.pnl for t in res.trades) == pytest.approx(eq[-1] - cfg.initial_equity, abs=1e-6)
+    assert res.events[0][0] == int(df["ts"].iloc[0]) and res.events[0][1].startswith("WICKS_CLIPPED:")
+    assert len(res.signals) >= len(res.trades)
+    assert all(s.ts >= start for s in res.signals)
+    prev_exit = start
+    for t in res.trades:
+        assert start < t.entry_ts <= t.exit_ts < end
+        assert t.entry_ts >= prev_exit  # one position at a time (a flip exits and enters on the same open)
+        prev_exit = t.exit_ts
+        assert t.setup in SETUPS_OF[mode] and t.exit_reason in EXIT_REASONS
+        assert t.contracts >= 1 and math.isfinite(t.r_multiple)
+        assert t.snapshot["setup"] == t.setup
+        if t.setup in SETUPS:  # Elliott gates (spec 5.3) as recorded at signal time
+            assert t.snapshot["counts"]
+            assert t.snapshot["q_top"] >= cfg.strategy.Q_MIN and t.snapshot["s_rev"] >= cfg.strategy.S_MIN
+
+
+def test_elliott_strategy_actually_trades(synth):
+    runs = synth[4]
+    assert len(runs["A"].trades) >= 3  # seed 0: about ten; 0 would mean a wiring/gate problem
+
+
+def test_compare_on_the_real_stack(synth, cmp):
+    df, start, end, cfg, runs = synth
+    assert set(cmp["comparison"]) == {"A", "C", "HYBRID", "BH", "EMA"}
+    for name, m in cmp["comparison"].items():
+        assert all(math.isfinite(float(v)) for v in m.values()), name
+        assert 0.0 <= m["max_dd"] <= 1.0
+    for mode in MODES:  # compare() drives the same engine: identical trades and equity
+        assert cmp["trades"][mode] == list(runs[mode].trades)
+        assert cmp["equity"][mode] == [(p.ts, p.equity) for p in runs[mode].equity]
+    assert cmp["random"]["runs"] == 3 and cmp["random"]["n_signals"] == len(runs["A"].trades)
+    assert set(cmp["random"]["beaten_by"]) == set(MODES)
+    # spot buy&hold: raw price multiple minus two fees and two slippages, no funding
+    c = cfg.costs
+    w = df[(df["ts"] >= start) & (df["ts"] < end)]
+    multiple = float(w["close"].iloc[-1]) / float(w["open"].iloc[1])
+    expect = multiple * ((1 - c.slippage) / (1 + c.slippage)) * ((1 - c.fee_rate) / (1 + c.fee_rate)) - 1
+    assert cmp["comparison"]["BH"]["total_return"] == pytest.approx(expect, rel=1e-9)
+    [bh] = cmp["trades"]["BH"]
+    assert bh.funding == 0.0 and bh.exit_reason == "END"
+    assert cmp["comparison"]["EMA"]["n_trades"] >= 1
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_price_mirror_flips_every_trade_through_the_whole_stack(synth, mode):
+    """Spec 10 symmetry end to end: p' = 2 * p_ref - p gives the same trades at the same times with
+    the opposite direction. Costs are zeroed (funding is the one asymmetric cost) and breakers are off
+    (they act on % equity, which differs once the leverage cap binds at different price levels)."""
+    df, start, end, _, _ = synth
+    p_ref = 20_000.0  # on the 1/64 price grid of tests/synth, so mirrored prices are exact
+    mirrored = df.assign(
+        open=2 * p_ref - df["open"],
+        high=2 * p_ref - df["low"],
+        low=2 * p_ref - df["high"],
+        close=2 * p_ref - df["close"],
+    )
+    cfg = with_overrides(
+        BotConfig(
+            costs=CostParams(fee_rate=0.0, slippage=0.0, funding_apr_long=0.0),
+            breakers=BreakerParams(daily_loss=1.0, total_dd=1.0, max_consec_losses=10**6),
+        ),
+        **{"strategy.mode": mode},
+    )
+    a = run_backtest(cfg, df, start, end)
+    b = run_backtest(cfg, mirrored, start, end)
+
+    def key(t, sign):
+        return (t.entry_ts, t.exit_ts, t.setup, sign * t.direction, t.exit_reason)
+
+    assert [key(t, 1) for t in a.trades] == [key(t, -1) for t in b.trades]
+    assert [(s.ts, s.setup, s.direction) for s in a.signals] == [(s.ts, s.setup, -s.direction) for s in b.signals]
+    if mode == "A":
+        assert a.trades
+```
+
+Run: `uv run pytest tests/backtest/test_runner.py -v`
+Expected: FAIL — the two new tests fail with `Failed: DID NOT RAISE <class 'ValueError'>`.
+
+Final `src/ewbot/backtest/runner.py`:
+
+`src/ewbot/backtest/runner.py`:
+
+```python
+"""Backtest runner and the A / C / HYBRID / BH / EMA / RANDOM comparison."""
+
+from __future__ import annotations
+
+import dataclasses
+import multiprocessing as mp
+from datetime import UTC, datetime
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
+
+from ewbot.backtest.benchmarks import RandomEntryStrategy, buy_hold, ema_cross_equity
+from ewbot.backtest.metrics import Metrics, bootstrap_ci, compute_metrics, trade_stats
+from ewbot.config import BotConfig, with_overrides
+from ewbot.engine.loop import EngineResult, EquityPoint, TradingEngine, Trade
+from ewbot.strategy.hybrid import make_strategy
+
+MODES = ("A", "C", "HYBRID")
+_RANDOM_METRICS = ("total_return", "max_dd", "sharpe", "calmar", "avg_r", "n_trades")
+
+
+def utc_ts(date: str) -> int:
+    """'YYYY-MM-DD' (UTC midnight) -> epoch seconds."""
+    return int(datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC).timestamp())
+
+
+def equity_pairs(equity: Sequence[EquityPoint]) -> list[tuple[int, float]]:
+    return [(p.ts, p.equity) for p in equity]
+
+
+def _holdout_start() -> int:
+    from ewbot.backtest.walkforward import HOLDOUT_START  # deferred: walkforward imports this module
+
+    return HOLDOUT_START
+
+
+def check_before_holdout(df1h: pd.DataFrame, end_ts: int | None, allow_holdout: bool = False) -> None:
+    """Raise ValueError if a run over df1h up to end_ts (exclusive; None = every bar) would see a bar
+    at/after HOLDOUT_START. Only holdout.run_holdout passes allow_holdout=True."""
+    if allow_holdout:
+        return
+    hs = _holdout_start()
+    if end_ts is None:
+        if len(df1h) and int(df1h["ts"].max()) >= hs:
+            raise ValueError(
+                "df1h has bars in the holdout (2024-01-01 onwards) and no end_ts: pass end_ts <= "
+                "HOLDOUT_START (only holdout.run_holdout may pass allow_holdout=True)"
+            )
+    elif end_ts > hs:
+        raise ValueError(
+            f"end_ts {end_ts} reaches into the holdout (HOLDOUT_START = {hs}); research runs must end by "
+            "it (only holdout.run_holdout may pass allow_holdout=True)"
+        )
+
+
+def run_backtest(
+    cfg: BotConfig,
+    df1h: pd.DataFrame,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    *,
+    allow_holdout: bool = False,
+) -> EngineResult:
+    """One TradingEngine run with the strategy selected by cfg.strategy.mode. Refuses (ValueError)
+    to run into the holdout unless allow_holdout=True (see check_before_holdout)."""
+    check_before_holdout(df1h, end_ts, allow_holdout)
+    engine = TradingEngine(cfg, make_strategy(cfg.strategy))
+    return engine.run(df1h, start_ts, end_ts)
+
+
+# ----------------------------------------------------------------------------- breakdowns
+
+
+def breakdowns(res: EngineResult, start_ts: int, end_ts: int) -> dict[str, Any]:
+    """Per-setup, long/short and per-calendar-year breakdowns of one engine result."""
+    trades = [t for t in res.trades if start_ts <= t.entry_ts < end_ts]
+    per_setup = {
+        s: trade_stats([t for t in trades if t.setup == s]) for s in sorted({t.setup for t in trades})
+    }
+    long_short = {
+        "long": trade_stats([t for t in trades if t.direction > 0]),
+        "short": trade_stats([t for t in trades if t.direction < 0]),
+    }
+    per_year: dict[str, dict[str, float | int]] = {}
+    y0 = datetime.fromtimestamp(start_ts, UTC).year
+    y1 = datetime.fromtimestamp(end_ts - 1, UTC).year
+    for y in range(y0, y1 + 1):
+        lo = max(start_ts, utc_ts(f"{y}-01-01"))
+        hi = min(end_ts, utc_ts(f"{y + 1}-01-01"))
+        per_year[str(y)] = dataclasses.asdict(compute_metrics(res.equity, res.trades, lo, hi))
+    return {"per_setup": per_setup, "long_short": long_short, "per_year": per_year}
+
+
+# ----------------------------------------------------------------------------- task execution
+
+# Per-process state set by the pool initializer (spawn-safe; each worker gets its own copy).
+_STATE: dict[str, Any] = {}
+
+
+def _init_worker(cfg: BotConfig, df1h: pd.DataFrame, start_ts: int, end_ts: int, allow_holdout: bool) -> None:
+    _STATE.update(cfg=cfg, df=df1h, start=start_ts, end=end_ts, allow_holdout=allow_holdout)
+
+
+def _task(spec: tuple) -> EngineResult:
+    cfg: BotConfig = _STATE["cfg"]
+    df, start, end, allow = _STATE["df"], _STATE["start"], _STATE["end"], _STATE["allow_holdout"]
+    if spec[0] == "mode":
+        return run_backtest(with_overrides(cfg, **{"strategy.mode": spec[1]}), df, start, end, allow_holdout=allow)
+    _, seed, refs, n_signals = spec
+    check_before_holdout(df, end, allow)
+    strat = RandomEntryStrategy(cfg.strategy, refs, n_signals, (start, end), seed)
+    res = TradingEngine(cfg, strat).run(df, start, end)
+    return dataclasses.replace(res, signals=())  # keep the pickle back to the parent small
+
+
+def _map_tasks(
+    specs: list[tuple],
+    workers: int,
+    cfg: BotConfig,
+    df1h: pd.DataFrame,
+    start_ts: int,
+    end_ts: int,
+    allow_holdout: bool,
+) -> list[EngineResult]:
+    initargs = (cfg, df1h, start_ts, end_ts, allow_holdout)
+    if workers <= 1 or len(specs) <= 1:
+        _init_worker(*initargs)
+        return [_task(s) for s in specs]
+    with mp.Pool(min(workers, len(specs)), initializer=_init_worker, initargs=initargs) as pool:
+        return pool.map(_task, specs, chunksize=1)
+
+
+# ----------------------------------------------------------------------------- compare
+
+
+def _dist(values: Sequence[float]) -> dict[str, float]:
+    a = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(a.mean()),
+        "p05": float(np.percentile(a, 5)),
+        "p50": float(np.percentile(a, 50)),
+        "p95": float(np.percentile(a, 95)),
+    }
+
+
+def compare(
+    cfg: BotConfig,
+    df1h: pd.DataFrame,
+    start_ts: int,
+    end_ts: int,
+    random_runs: int = 100,
+    workers: int = 1,
+    *,
+    allow_holdout: bool = False,
+) -> dict[str, Any]:
+    """Run A, C, HYBRID (same cfg, only strategy.mode differs), buy&hold, EMA 50/200 and
+    `random_runs` RandomEntryStrategy runs over [start_ts, end_ts) with identical costs.
+    Refuses (ValueError, before anything runs) an end_ts after HOLDOUT_START unless
+    allow_holdout=True, which only holdout.run_holdout passes.
+
+    Returns {"period", "comparison": {name: Metrics dict}, "random": {...}, "equity": {name:
+    [(ts, equity)]}, "ci": {name: {...}}, "breakdown": {name: {...}}, "trades": {name: [Trade]}}.
+    """
+    check_before_holdout(df1h, end_ts, allow_holdout)
+    mode_specs = [("mode", m) for m in MODES]
+    results = dict(zip(MODES, _map_tasks(mode_specs, workers, cfg, df1h, start_ts, end_ts, allow_holdout)))
+
+    equity: dict[str, list[tuple[int, float]]] = {}
+    trades: dict[str, list[Trade]] = {}
+    comparison: dict[str, dict[str, float | int]] = {}
+    ci: dict[str, dict[str, tuple[float, float]]] = {}
+    breakdown: dict[str, dict[str, Any]] = {}
+    metrics: dict[str, Metrics] = {}
+
+    def add(name: str, eq: Sequence[EquityPoint], trs: Sequence[Trade], res: EngineResult | None) -> None:
+        m = compute_metrics(eq, trs, start_ts, end_ts)
+        metrics[name] = m
+        comparison[name] = dataclasses.asdict(m)
+        equity[name] = equity_pairs(eq)
+        trades[name] = list(trs)
+        win = [t for t in trs if start_ts <= t.entry_ts < end_ts]
+        ci[name] = {
+            "avg_r": bootstrap_ci(win, "avg_r", seed=cfg.seed),
+            "win_rate": bootstrap_ci(win, "win_rate", seed=cfg.seed),
+        }
+        if res is not None:
+            breakdown[name] = breakdowns(res, start_ts, end_ts)
+
+    for mode in MODES:
+        add(mode, results[mode].equity, results[mode].trades, results[mode])
+
+    bh_eq, bh_trades = buy_hold(df1h, start_ts, end_ts, cfg.costs, cfg.initial_equity)
+    add("BH", bh_eq, bh_trades, None)
+    comparison["BH"]["exposure"] = 1.0  # always invested; mark-to-market trade is one END exit
+    ema_eq, ema_trades = ema_cross_equity(df1h, start_ts, end_ts, cfg.costs, cfg.initial_equity)
+    add("EMA", ema_eq, ema_trades, None)
+
+    # Random control: same number of entries as A actually made, geometry from A's trades.
+    a_trades = [t for t in results["A"].trades if start_ts <= t.entry_ts < end_ts]
+    n_signals = len(a_trades)
+    rand_metrics: list[Metrics] = []
+    if random_runs > 0 and n_signals > 0:
+        specs = [("random", cfg.seed + k, a_trades, n_signals) for k in range(random_runs)]
+        for r in _map_tasks(specs, workers, cfg, df1h, start_ts, end_ts, allow_holdout):
+            rand_metrics.append(compute_metrics(r.equity, r.trades, start_ts, end_ts))
+    random: dict[str, Any] = {"runs": len(rand_metrics), "n_signals": n_signals, "dist": {}, "beaten_by": {}}
+    if rand_metrics:
+        for key in _RANDOM_METRICS:
+            random["dist"][key] = _dist([getattr(m, key) for m in rand_metrics])
+        for name in MODES:
+            random["beaten_by"][name] = {
+                key: float(np.mean([getattr(m, key) < getattr(metrics[name], key) for m in rand_metrics]))
+                for key in ("sharpe", "calmar", "total_return")
+            }
+
+    return {
+        "period": {"start": start_ts, "end": end_ts},
+        "comparison": comparison,
+        "random": random,
+        "equity": equity,
+        "ci": ci,
+        "breakdown": breakdown,
+        "trades": trades,
+    }
+```
+
+Run: `uv run pytest tests/backtest/test_runner.py tests/backtest/test_integration_synth.py tests/backtest/test_walkforward.py -v`
+Expected: 29 passed (7 runner, 9 integration, 13 walk-forward).
+
+
 - [ ] **Step 5: Write the failing test (holdout)**
 
 `tests/backtest/test_holdout.py`:
@@ -10372,9 +11092,11 @@ def _m(sharpe, calmar, dd=0.1, n=60):
     return {"sharpe": sharpe, "calmar": calmar, "max_dd": dd, "n_trades": n}
 
 
-def _fake_compare_factory(calls):
-    def fake(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1):
+def _fake_compare_factory(calls, allowed=None):
+    def fake(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False):
         calls.append((cfg, start_ts, end_ts, random_runs))
+        if allowed is not None:
+            allowed.append(allow_holdout)
         return {
             "comparison": {
                 "A": _m(1.0, 2.0),
@@ -10420,8 +11142,8 @@ def test_requires_confirm_and_writes_nothing(tmp_path, df, monkeypatch):
 
 
 def test_lock_created_rerun_same_ok_different_refused(tmp_path, df, monkeypatch):
-    calls = []
-    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls))
+    calls, allowed = [], []
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls, allowed))
     lock = tmp_path / "sub" / "holdout.lock"
     out = run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=7)
     data = json.loads(lock.read_text())
@@ -10434,6 +11156,7 @@ def test_lock_created_rerun_same_ok_different_refused(tmp_path, df, monkeypatch)
     assert (cfg_used.wave.K4, cfg_used.strategy.Q_MIN, cfg_used.strategy.S_MIN) == PARAMS
     assert out["window"] == (start, end) and out["sha256"] == data["sha256"]
     assert out["lock_path"] == str(lock)
+    assert allowed == [True]  # the only caller that may let compare() into the holdout
 
     run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=7)  # identical: allowed
     assert len(json.loads(lock.read_text())["runs"]) == 2
@@ -10662,6 +11385,106 @@ def test_trade_count_lines_state_out_of_sample_progress():
     assert crit["n_trades"] == {"A": 27, "HYBRID": 60}
     assert crit["trade_count"][0] == "A: 표본 외 거래 27/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족"
     assert crit["n_trades_ok"] is False and crit["automatic_criteria_met"] is False
+
+
+# ----------------------------------------------------------------------------- code / data fingerprints
+
+
+def test_code_fingerprint_covers_every_package_source_file(tmp_path):
+    pkg = tmp_path / "pkg"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "a.py").write_text("x = 1\n")
+    (pkg / "sub" / "b.py").write_text("y = 2\n")
+    base = holdout.code_fingerprint(pkg)
+    assert len(base) == 64 and base == holdout.code_fingerprint(pkg)
+    (pkg / "sub" / "__pycache__").mkdir()
+    (pkg / "sub" / "__pycache__" / "b.cpython-312.pyc").write_bytes(b"\0junk")
+    (pkg / "notes.txt").write_text("not code")
+    assert holdout.code_fingerprint(pkg) == base  # only *.py sources count
+    (pkg / "sub" / "b.py").write_text("y = 3\n")
+    changed = holdout.code_fingerprint(pkg)
+    assert changed != base
+    (pkg / "c.py").write_text("")
+    assert holdout.code_fingerprint(pkg) != changed  # a new module counts too
+    assert holdout.PACKAGE_DIR == Path(holdout.__file__).resolve().parents[1]  # src/ewbot
+
+
+def test_lock_digest_binds_the_code_fingerprint(monkeypatch):
+    base = holdout.lock_digest(BotConfig(), PARAMS)
+    assert base == holdout.lock_digest(BotConfig(), PARAMS, code_sha256=holdout.code_fingerprint())
+    assert base != holdout.lock_digest(BotConfig(), PARAMS, code_sha256="0" * 64)
+
+
+def test_rerun_after_a_code_change_is_refused(tmp_path, df, monkeypatch):
+    calls = []
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls))
+    lock = tmp_path / "holdout.lock"
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    data = json.loads(lock.read_text())
+    assert data["code_sha256"] == holdout.code_fingerprint() and data["version"] == holdout.LOCK_VERSION
+    run0 = data["runs"][0]
+    assert "git_head" in run0 and "git_dirty" in run0  # informational only
+    before = lock.read_text()
+    monkeypatch.setattr(holdout, "code_fingerprint", lambda pkg=None: "f" * 64)  # e.g. a retuned strategy file
+    with pytest.raises(HoldoutError, match="code_sha256"):
+        run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    assert lock.read_text() == before and len(calls) == 1
+
+
+def test_data_fingerprint_is_the_holdout_window_prefix(df):
+    last = int(df["ts"].iloc[-1])
+    fp = holdout.data_fingerprint(df, HOLDOUT_START, last)
+    assert len(fp) == 64
+    warm = df.copy()
+    warm.loc[warm["ts"] < HOLDOUT_START, "close"] = 2.0  # warm-up bars are not part of it
+    assert holdout.data_fingerprint(warm, HOLDOUT_START, last) == fp
+    longer = pd.concat([df, df.tail(1).assign(ts=last + H)], ignore_index=True)
+    assert holdout.data_fingerprint(longer, HOLDOUT_START, last) == fp  # appended bars: same prefix
+    for col in ("open", "high", "low", "close", "volume"):
+        moved = df.copy()
+        moved.loc[moved["ts"] == HOLDOUT_START + H, col] = 1.5
+        assert holdout.data_fingerprint(moved, HOLDOUT_START, last) != fp, col
+    assert holdout.data_fingerprint(df.iloc[:-1], HOLDOUT_START, last) != fp  # a missing bar
+
+
+def test_rerun_with_changed_holdout_bars_is_refused(tmp_path, df, monkeypatch):
+    calls = []
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls))
+    lock = tmp_path / "holdout.lock"
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    data = json.loads(lock.read_text())
+    last_bar = int(df["ts"].iloc[-1])
+    assert data["data"] == {
+        "start_ts": HOLDOUT_START,
+        "last_bar_ts": last_bar,
+        "n_bars": int((df["ts"] >= HOLDOUT_START).sum()),
+        "sha256": holdout.data_fingerprint(df, HOLDOUT_START, last_bar),
+    }
+    before = lock.read_text()
+    edited = df.copy()
+    edited.loc[edited["ts"] == HOLDOUT_START + 2 * H, "close"] = 0.9  # a revised holdout candle
+    with pytest.raises(HoldoutError, match="data"):
+        run_holdout(BotConfig(), edited, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    with pytest.raises(HoldoutError, match="data"):
+        run_holdout(BotConfig(), df.iloc[:-2], PARAMS, lock_path=lock, confirm=True, random_runs=5)  # shorter
+    assert lock.read_text() == before and len(calls) == 1
+    longer = pd.concat([df, df.tail(3).assign(ts=[last_bar + k * H for k in (1, 2, 3)])], ignore_index=True)
+    run_holdout(BotConfig(), longer, PARAMS, lock_path=lock, confirm=True, random_runs=5)  # newer bars: fine
+    assert len(calls) == 2 and json.loads(lock.read_text())["data"]["last_bar_ts"] == last_bar
+
+
+def test_runs_record_params_provenance_and_their_own_headline(tmp_path, df, monkeypatch):
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory([]))
+    lock = tmp_path / "holdout.lock"
+    src = "walkforward:reports/walkforward.json#chosen_final"
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5, params_source=src)
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    runs = json.loads(lock.read_text())["runs"]
+    assert [r["params_source"] for r in runs] == [src, "explicit"]
+    for r in runs:
+        assert r["completed"] is not None
+        assert r["headline"]["A"] == {"sharpe": 1.0, "calmar": 2.0, "max_dd": 0.1, "n_trades": 60}
+        assert r["criteria"]["automatic_criteria_met"] is True
 ```
 
 - [ ] **Step 6: Run test to verify it fails**
@@ -10674,7 +11497,8 @@ Expected: FAIL at collection with `ModuleNotFoundError: No module named 'ewbot.b
 `src/ewbot/backtest/holdout.py`:
 
 ```python
-"""One-shot holdout [WF_END, end) behind a lock file bound to the full run configuration."""
+"""One-shot holdout [WF_END, end) behind a lock file bound to the full run configuration, the code
+and the holdout candles."""
 
 from __future__ import annotations
 
@@ -10682,24 +11506,28 @@ import dataclasses
 import hashlib
 import json
 import os
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 
-from ewbot.backtest.runner import compare, utc_ts
-from ewbot.backtest.walkforward import GRID, WF_END, config_for, grid_combos
+from ewbot.backtest.runner import compare
+from ewbot.backtest.walkforward import GRID, HOLDOUT_START, WF_END, config_for, grid_combos
 from ewbot.config import CONSERVATIVE, BotConfig, with_overrides
 from ewbot.types import H1
 
-HOLDOUT_START = utc_ts(WF_END)  # single source: the holdout starts exactly where the walk-forward ends
+# HOLDOUT_START (imported above) is defined once, in walkforward, as utc_ts(WF_END).
 GO_LIVE_MIN_TRADES = 50  # spec 9.6 criterion 3: out-of-sample trades with frozen params (holdout + paper)
 # src/ewbot/backtest/holdout.py -> parents[3] is the repository root (src layout, editable install).
 # The default lock lives there, never in the current working directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout.lock"
-LOCK_VERSION = 2
+PACKAGE_DIR = Path(__file__).resolve().parents[1]  # src/ewbot: every *.py below it is fingerprinted
+LOCK_VERSION = 3
+_BAR_COLUMNS = ("open", "high", "low", "close", "volume")
 _CANDIDATES = ("A", "HYBRID")
 _HEADLINE_STRATEGIES = ("A", "HYBRID", "C", "BH", "EMA")
 _HEADLINE_KEYS = ("total_return", "cagr", "max_dd", "sharpe", "calmar", "n_trades")
@@ -10722,14 +11550,56 @@ def holdout_config(cfg: BotConfig, params: Sequence[float]) -> BotConfig:
     return with_overrides(config_for(cfg, tuple(float(p) for p in params)), **{"strategy.mode": "A"})
 
 
-def lock_digest(cfg: BotConfig, params: Sequence[float], random_runs: int = 100) -> str:
+def code_fingerprint(pkg_dir: Path | None = None) -> str:
+    """sha256 over every *.py file below pkg_dir (default PACKAGE_DIR = src/ewbot), in sorted
+    relative-path order, each as <relative path> NUL <bytes> NUL. Any edit, addition, removal or
+    rename of a source file changes it; caches and non-Python files do not."""
+    root = PACKAGE_DIR if pkg_dir is None else Path(pkg_dir)
+    h = hashlib.sha256()
+    for rel in sorted(f.relative_to(root).as_posix() for f in root.rglob("*.py") if f.is_file()):
+        h.update(rel.encode("utf-8") + b"\0" + (root / rel).read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def _git(*args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(PROJECT_ROOT), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def git_state() -> dict[str, Any]:
+    """Informational only (the binding is code_fingerprint): HEAD commit and whether tracked files
+    have uncommitted changes; None when git is unavailable."""
+    head = _git("rev-parse", "HEAD")
+    status = _git("status", "--porcelain", "--untracked-files=no")
+    return {"git_head": head.strip() if head else None, "git_dirty": None if status is None else bool(status.strip())}
+
+
+def data_fingerprint(df1h: pd.DataFrame, start_ts: int, last_ts: int) -> str:
+    """sha256 of the bars with start_ts <= ts <= last_ts: their ts (int64) and open/high/low/close/
+    volume (float64), in ts order. Bars after last_ts (newer data) do not change it."""
+    w = df1h[(df1h["ts"] >= start_ts) & (df1h["ts"] <= last_ts)].sort_values("ts")
+    h = hashlib.sha256()
+    h.update(w["ts"].to_numpy(dtype=np.int64).tobytes())
+    for col in _BAR_COLUMNS:
+        h.update(w[col].to_numpy(dtype=np.float64).tobytes())
+    return h.hexdigest()
+
+
+def lock_digest(
+    cfg: BotConfig, params: Sequence[float], random_runs: int = 100, code_sha256: str | None = None
+) -> str:
     """sha256 of the sorted JSON of everything that determines the holdout result: every field of
-    holdout_config(cfg, params), the grid values, the holdout start and the random-control size."""
+    holdout_config(cfg, params), the grid values, the holdout start, the random-control size and
+    the code fingerprint (default: code_fingerprint() of the running package)."""
     payload = {
         "config": dataclasses.asdict(holdout_config(cfg, params)),
         "grid": {k: list(v) for k, v in GRID.items()},
         "holdout_start": HOLDOUT_START,
         "random_runs": int(random_runs),
+        "code_sha256": code_fingerprint() if code_sha256 is None else code_sha256,
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -10862,6 +11732,25 @@ def _headline(cmp: dict[str, Any], criteria: dict[str, Any]) -> dict[str, Any]:
 # ----------------------------------------------------------------------------- run
 
 
+def _check_data(lock: dict[str, Any], df1h: pd.DataFrame, lock_path: Path) -> None:
+    """Refuse a rerun whose holdout bars up to the first run's last bar differ from the first run's
+    (revised, missing or shorter data). Newer bars after it are allowed."""
+    rec = lock.get("data")
+    if not isinstance(rec, dict) or "last_bar_ts" not in rec or "sha256" not in rec:
+        raise HoldoutError(f"{lock_path} has no data fingerprint; refusing to run - inspect it by hand")
+    last = int(rec["last_bar_ts"])
+    if int(df1h["ts"].iloc[-1]) < last:
+        raise HoldoutError(
+            f"{lock_path}: the data ends before the first run's last bar ({last}); refusing to run on "
+            "fewer holdout bars than the locked run"
+        )
+    if data_fingerprint(df1h, HOLDOUT_START, last) != rec["sha256"]:
+        raise HoldoutError(
+            f"{lock_path}: the holdout bars {HOLDOUT_START}..{last} differ from the locked run's data "
+            "(revised or missing candles); refusing to run"
+        )
+
+
 def run_holdout(
     cfg: BotConfig,
     df1h: pd.DataFrame,
@@ -10871,18 +11760,23 @@ def run_holdout(
     *,
     random_runs: int = 100,
     workers: int = 1,
+    params_source: str = "explicit",
 ) -> dict[str, Any]:
     """Run A / C / HYBRID / BH / EMA / RANDOM on [HOLDOUT_START, last bar] with `params`
     (K4, Q_MIN, S_MIN), once per configuration.
 
     Checked before anything is written: confirm=True; params are a GRID combo; circuit breakers on;
     the conservative risk profile; random_runs >= 1; data at/after HOLDOUT_START.
-    The lock (default DEFAULT_LOCK_PATH = <project root>/holdout.lock, independent of the CWD) is
-    bound to lock_digest(cfg, params, random_runs) - every config field, the grid, the holdout start
-    and the random-control size - and is written BEFORE the run, so a crash cannot be used to retune.
-    Re-running the identical configuration is allowed (e.g. later, with more data); anything else is
-    refused. The first completed run's window and headline metrics are recorded in the lock and
-    never overwritten."""
+    The lock (DEFAULT_LOCK_PATH = <project root>/holdout.lock, independent of the CWD; `lock_path`
+    exists for tests only - the CLI cannot change it) is bound to lock_digest(cfg, params,
+    random_runs) - every config field, the grid, the holdout start, the random-control size and the
+    code fingerprint of src/ewbot - and to data_fingerprint of the holdout bars the first attempt saw.
+    It is written BEFORE the run, so a crash cannot be used to retune. Re-running is allowed only
+    with the identical configuration and code and the identical holdout bars up to the first
+    attempt's last bar (newer bars may be appended); anything else is refused.
+    Every run records params_source ("explicit" or "walkforward:<path>#chosen_final"), the git HEAD
+    and dirty flag (informational) and, once completed, its headline metrics. The first completed
+    run's window and headline are also kept in `first_run` and never overwritten."""
     if not confirm:
         raise HoldoutError("the holdout is single-use: pass confirm=True (CLI: --confirm) to run it")
     combo = _validate(cfg, params, random_runs)
@@ -10893,21 +11787,36 @@ def run_holdout(
     end_ts = last_bar + H1
     lock_path = _default_lock_path() if lock_path is None else Path(lock_path)
     run_cfg = holdout_config(cfg, combo)
-    digest = lock_digest(cfg, combo, random_runs)
+    code_sha = code_fingerprint()
+    digest = lock_digest(cfg, combo, random_runs, code_sha256=code_sha)
     config_json = json.loads(json.dumps(dataclasses.asdict(run_cfg)))
 
-    run: dict[str, Any] = {"started": _now(), "end_ts": end_ts, "last_bar_ts": last_bar, "completed": None}
+    run: dict[str, Any] = {
+        "started": _now(),
+        "end_ts": end_ts,
+        "last_bar_ts": last_bar,
+        "params_source": params_source,
+        **git_state(),
+        "completed": None,
+    }
     if lock_path.exists():
         lock = _read_lock(lock_path)
         if lock.get("sha256") != digest:
             changed = _changed_keys(
-                {"params": lock.get("params"), "config": lock.get("config"), "random_runs": lock.get("random_runs")},
-                {"params": list(combo), "config": config_json, "random_runs": int(random_runs)},
+                {
+                    "params": lock.get("params"),
+                    "config": lock.get("config"),
+                    "random_runs": lock.get("random_runs"),
+                    "code_sha256": lock.get("code_sha256"),
+                },
+                {"params": list(combo), "config": config_json, "random_runs": int(random_runs), "code_sha256": code_sha},
             )
             raise HoldoutError(
                 f"{lock_path} is locked to params {lock.get('params')} (sha256 {str(lock.get('sha256'))[:12]}); "
-                f"refusing to run a different configuration (params {list(combo)}; changed: {changed or 'unknown'})"
+                f"refusing to run a different configuration or code (params {list(combo)}; changed: "
+                f"{changed or 'unknown'})"
             )
+        _check_data(lock, df1h, lock_path)
         lock.setdefault("runs", []).append(run)
     else:
         lock = {
@@ -10916,19 +11825,27 @@ def run_holdout(
             "params": list(combo),
             "sha256": digest,
             "params_sha256": params_digest(combo),
+            "code_sha256": code_sha,
             "config": config_json,
             "grid": {k: list(v) for k, v in GRID.items()},
             "holdout_start": HOLDOUT_START,
             "random_runs": int(random_runs),
+            "data": {
+                "start_ts": HOLDOUT_START,
+                "last_bar_ts": last_bar,
+                "n_bars": int((ts >= HOLDOUT_START).sum()),
+                "sha256": data_fingerprint(df1h, HOLDOUT_START, last_bar),
+            },
             "first_run": None,
             "runs": [run],
         }
     _write_lock(lock_path, lock)
 
-    cmp = compare(run_cfg, df1h, HOLDOUT_START, end_ts, random_runs=random_runs, workers=workers)
+    cmp = compare(run_cfg, df1h, HOLDOUT_START, end_ts, random_runs=random_runs, workers=workers, allow_holdout=True)
     criteria = evaluate_criteria(cmp)
 
     run["completed"] = _now()
+    run.update(_headline(cmp, criteria))
     if lock.get("first_run") is None:
         lock["first_run"] = {
             "started": run["started"],
@@ -10952,12 +11869,12 @@ def run_holdout(
 - [ ] **Step 8: Run test to verify it passes**
 
 Run: `uv run pytest tests/backtest/test_walkforward.py tests/backtest/test_holdout.py -v`
-Expected: 49 passed (13 walk-forward, 36 holdout incl. parametrized cases). No `holdout.lock` is created in the repository (the holdout tests point `DEFAULT_LOCK_PATH` and the CWD at `tmp_path`).
+Expected: 55 passed (13 walk-forward, 42 holdout incl. parametrized cases). No `holdout.lock` is created in the repository (the holdout tests point `DEFAULT_LOCK_PATH` and the CWD at `tmp_path`).
 
 - [ ] **Step 9: Commit**
 ```bash
-git add src/ewbot/backtest/walkforward.py src/ewbot/backtest/holdout.py tests/backtest/test_walkforward.py tests/backtest/test_holdout.py
-git commit -m "feat(backtest): 60-combo walk-forward (breakers off, >=12 train trades, 2024 cut) with plateau selection, one-shot holdout locked to the full config, mandatory random control and go-live trade count"
+git add src/ewbot/backtest/walkforward.py src/ewbot/backtest/holdout.py src/ewbot/backtest/runner.py tests/backtest/test_walkforward.py tests/backtest/test_holdout.py tests/backtest/test_runner.py tests/backtest/test_integration_synth.py
+git commit -m "feat(backtest): 60-combo walk-forward (breakers off, >=12 train trades, 2024 cut) with plateau selection, runner holdout guard, one-shot holdout locked to config, code and data, mandatory random control and go-live trade count"
 ```
 
 ---
@@ -10970,12 +11887,12 @@ git commit -m "feat(backtest): 60-combo walk-forward (breakers off, >=12 train t
 - Test: `tests/backtest/test_report.py`, `tests/backtest/test_cli.py`
 
 **Interfaces:**
-- Consumes: T18–T21 (`compute_metrics`, `reliability_by_q`, `compare`, `run_backtest`, `breakdowns`, `walk_forward` (its `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`), `run_holdout` (its `criteria["trade_count"]` lines, `lock_path`, `sha256`; `lock_path=None` means `holdout.DEFAULT_LOCK_PATH` = `<project root>/holdout.lock`), `GRID`, `MIN_TRAIN_TRADES`), `ewbot.data.candles.load_1h, fill_gaps, check_integrity, aggregate_4h`, `ewbot.data.coinbase_history.update_cache`, `ewbot.config.load_config, with_overrides, AGGRESSIVE, CONSERVATIVE`. CLI end-to-end test only: `tests.synth.random_bars` (T10).
+- Consumes: T18–T21 (`compute_metrics`, `reliability_by_q`, `compare`, `run_backtest`, `breakdowns`, `walk_forward` (its `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`), `run_holdout` (its `criteria["trade_count"]` lines, `lock_path`, `sha256`; the CLI never passes `lock_path`, so the lock is always `holdout.DEFAULT_LOCK_PATH` = `<project root>/holdout.lock`; it passes `params_source`), `GRID`, `MIN_TRAIN_TRADES`, `HOLDOUT_START`, `WF_END`), `ewbot.data.candles.load_1h, fill_gaps, check_integrity, aggregate_4h`, `ewbot.data.coinbase_history.update_cache`, `ewbot.config.load_config, with_overrides, AGGRESSIVE, CONSERVATIVE`. CLI end-to-end test only: `tests.synth.random_bars` (T10).
 - Produces: `write_report(path, title, sections) -> Path` (+ `to_jsonable`), `ewbot.cli.main(argv) -> int` with subcommands `fetch | backtest | compare | walkforward | holdout`.
 
-Report (`write_report`): one self-contained HTML file, plotly via `<script src="https://cdn.plot.ly/plotly-2.35.2.min.js">`, light/dark via CSS variables. Recognised `sections` keys: `notes`, `equity` (equity chart, log axis when all values are positive, plus drawdown chart; series are down-sampled to about 4000 points, drawdown keeps each block's trough), `comparison` (+ `random` row with mean and [p5, p95], `ci` column), `per_setup`, `long_short`, `per_year`, `reliability`, `trades` (collapsible table per strategy; each trade with a snapshot has a collapsible chart that, on first open, draws the **top count's points as a labelled polyline** (S,1,2,... or X,A,B) over the **4h close series** from `entry - window` to `exit + window`, window = `snapshot_window_bars` (default 60) 4h bars, with entry marker and stop/TP lines), `candles4h`; any other key is rendered as a table (list of flat dicts) or JSON. Titles and all cell text are HTML-escaped, JSON embedded in the page escapes `</`.
+Report (`write_report`): one self-contained HTML file, plotly via `<script src="https://cdn.plot.ly/plotly-2.35.2.min.js">`, light/dark via CSS variables. Recognised `sections` keys: `notes`, `equity` (equity chart, log axis when all values are positive, plus drawdown chart; series are down-sampled to about 4000 points, drawdown keeps each block's trough), `comparison` (+ `random` row with mean and [p5, p95], `ci` column; BH and EMA show `-` for win rate, avg R and the avg R CI because benchmark R multiples are not comparable), `per_setup`, `long_short`, `per_year`, `reliability`, `trades` (collapsible table per strategy; each trade with a snapshot has a `chart` button that shows a hidden full-width row right below the trade (`<tr class="snaprow"><td colspan="11">`), draws the chart there on first open and calls `Plotly.Plots.resize` once the row is visible; the chart shows the **top count's points as a labelled polyline** (S,1,2,... or X,A,B) over the **4h close series** from `entry - window` to `exit + window`, window = `snapshot_window_bars` (default 60) 4h bars, with entry marker and stop/TP lines), `candles4h`; any other key is rendered as a table (list of flat dicts) or JSON. Titles and all cell text are HTML-escaped, JSON embedded in the page escapes `</`.
 
-CLI options: `--config`, `--profile {conservative,aggressive}`, `--mode {A,C,HYBRID}`, `--start/--end YYYY-MM-DD` (UTC, end exclusive), `--workers`, `--out`, `--confirm`, plus `--product`, `--cache-dir`, `--random-runs` (compare, holdout), `--params` / `--params-from` / `--lock` (holdout). `--lock` defaults to `None`, so `run_holdout` uses `<project root>/holdout.lock` whatever the CWD. `holdout` without `--confirm` returns exit code 2 **before loading any data**; a `HoldoutError` (lock bound to a different config, off-grid params, aggressive profile, breakers off, `--random-runs 0`) is printed as `refusing: ...` with exit code 2. `walkforward` writes `<out>.json` containing `chosen_final`, `chosen_final_from_fold` and `chosen_final_fallback` and warns on stderr when `chosen_final` is a fallback from an earlier fold; `holdout --params-from` reads `chosen_final` and refuses a fallback one (pass `--params` explicitly to accept it).
+CLI options: `--config`, `--profile {conservative,aggressive}`, `--mode {A,C,HYBRID}`, `--start/--end YYYY-MM-DD` (UTC, end exclusive), `--workers`, `--out`, `--confirm`, plus `--product`, `--cache-dir`, `--random-runs` (compare, holdout), `--params` / `--params-from` (holdout). There is no `--lock`: the holdout lock is always `<project root>/holdout.lock`. **Holdout isolation:** every command except `holdout` drops the bars at/after `HOLDOUT_START` right after loading the cache (the `[data]` line on stderr says how many), so engine runs, benchmarks and report candles never see 2024+ and the default window ends at 2024-01-01; an explicit `--start` at/after 2024-01-01 or `--end` after it is refused with `refusing: ...` and exit code 2 before any data is read. The console comparison table prints `-` for the `win_rate` and `avg_r` of BH and EMA. `holdout` without `--confirm` returns exit code 2 **before loading any data**; a `HoldoutError` (lock bound to a different config or code, changed holdout bars, off-grid params, aggressive profile, breakers off, `--random-runs 0`) is printed as `refusing: ...` with exit code 2. A holdout run records its params provenance (`explicit` or `walkforward:<path>#chosen_final`) and, after it succeeds, prints the `git add` / `git commit` commands for `holdout.lock` (nothing is committed automatically). `walkforward` writes `<out>.json` containing `chosen_final`, `chosen_final_from_fold` and `chosen_final_fallback` and warns on stderr when `chosen_final` is a fallback from an earlier fold; `holdout --params-from` reads `chosen_final` and refuses a fallback one (pass `--params` explicitly to accept it).
 
 - [ ] **Step 1: Write the failing test (report)**
 
@@ -11032,11 +11949,11 @@ def test_write_report_contains_sections(tmp_path, mk_trade, mk_equity):
     assert "cdn.plot.ly" in html and "Plotly.newPlot" in html
     for needle in ("Equity", "Drawdown", "Comparison", "Per setup", "Long / short", "Per year",
                    "Reliability by q", "Trades - A (2)", "RANDOM x3", "C_END", "W3", "2020-01-01 01:00".replace(" ", "T") + ":00Z",
-                   "<details", "renderSnap(0)", "show table", "costs: 0.05% fee", "<h2>folds</h2>", "2019H1"):
+                   "<details", "toggleSnap(0)", "show table", "costs: 0.05% fee", "<h2>folds</h2>", "2019H1"):
         assert needle in html, needle
     assert "Test &lt;report&gt;" in html and "<report>" not in html
     # only the trade with a snapshot gets a chart; payload is valid JSON with labelled polyline points
-    assert "renderSnap(1)" not in html
+    assert "toggleSnap(1)" not in html and "snaprow-1" not in html
     payload = re.search(r"const TRADES = (\[.*?\]);\n", html, re.S).group(1)
     trades = json.loads(payload)
     assert len(trades) == 2 and trades[0]["counts"][0]["labels"] == ["S", "1"]
@@ -11059,6 +11976,54 @@ def test_to_jsonable_handles_dataclasses_numpy_nan(mk_trade):
     d = to_jsonable({"t": mk_trade(), "n": np.int64(3), "x": float("inf"), "tup": (1, 2)})
     assert d["n"] == 3 and d["x"] is None and d["tup"] == [1, 2] and d["t"]["setup"] == "W3"
     json.dumps(d, allow_nan=False)
+
+
+def _cells(html: str, first: str) -> list[str]:
+    row = re.search(rf"<tr><td>{re.escape(first)}</td>(.*?)</tr>", html, re.S).group(1)
+    return [first] + re.findall(r"<td>(.*?)</td>", row, re.S)
+
+
+def test_snapshot_chart_gets_its_own_full_width_row(tmp_path, mk_trade):
+    """The chart is not squeezed into the last cell: a hidden row right below the trade row spans
+    every column, and the chart is resized once it becomes visible."""
+    t0 = mk_trade(entry_ts=T0 + H, exit_ts=T0 + 3 * H, snapshot=_snapshot())
+    t1 = mk_trade(entry_ts=T0 + 4 * H, exit_ts=T0 + 5 * H)  # no snapshot: no chart row
+    t2 = mk_trade(entry_ts=T0 + 6 * H, exit_ts=T0 + 7 * H, snapshot=_snapshot())
+    html = write_report(tmp_path / "t.html", "T", {"trades": {"A": [t0, t1, t2]}}).read_text(encoding="utf-8")
+    table = re.search(r'<table class="trades">(.*?)</table>', html, re.S).group(1)
+    n_cols = len(re.findall(r"<th>", table))
+    assert n_cols == 11
+    rows = re.findall(r"<tr[^>]*>.*?</tr>", table.split("<tbody>")[1], re.S)
+    assert len(rows) == 5  # trade 0, its chart row, trade 1, trade 2, its chart row
+    for k, gid in ((1, 0), (4, 2)):
+        assert rows[k] == (
+            f'<tr class="snaprow" id="snaprow-{gid}" hidden><td colspan="{n_cols}">'
+            f'<div class="snap" id="snap-{gid}"></div></td></tr>'
+        )
+        assert f"toggleSnap({gid})" in rows[k - 1]  # the button sits in the trade row just above
+    assert "toggleSnap(1)" not in html and "snaprow-1" not in html
+    script = html.split("<script>")[-1]
+    assert "function toggleSnap" in script and "Plotly.Plots.resize" in script
+
+
+def test_benchmarks_show_no_trade_r_statistics(tmp_path, mk_trade, mk_equity):
+    """BH and EMA are always-in-the-market benchmarks: their R multiples are not comparable with the
+    strategies', so win rate, avg R and its CI are shown as '-' (trades and exposure still are)."""
+    eq = mk_equity([100, 110, 120, 130], t0=T0)
+    tr = [mk_trade(entry_ts=T0, exit_ts=T0 + 3 * H, pnl=30.0, r=4.0)]
+    m = compute_metrics(eq, tr)
+    ci = {n: {"avg_r": (1.0, 2.0)} for n in ("A", "BH", "EMA")}
+    html = write_report(
+        tmp_path / "c.html", "C", {"comparison": {"A": m, "BH": m, "EMA": m}, "ci": ci}
+    ).read_text(encoding="utf-8")
+    head = re.findall(r"<th>(.*?)</th>", re.search(r'<table class="cmp">(.*?)</thead>', html, re.S).group(1))
+    win, avg, trades, ci_col = (head.index(h) for h in ("Win rate", "Avg R", "Trades", "Avg R 95% CI"))
+    a = _cells(html, "A")
+    assert a[win] == "100.0%" and a[avg] == "4.00" and a[ci_col] == "[1.00, 2.00]"
+    for name in ("BH", "EMA"):
+        c = _cells(html, name)
+        assert (c[win], c[avg], c[ci_col]) == ("-", "-", "-"), name
+        assert c[trades] == "1" and c[1] == a[1]  # trade count and return are still shown
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -11107,6 +12072,11 @@ _STAT_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("avg_r", "Avg R", "num"),
     ("pnl", "PnL", "money"),
 )
+# Always-in-the-market benchmarks: their single mark-to-market / flip "trades" have no stop, so their R
+# multiples, win rate and R confidence interval are not comparable with the strategies' and show "-".
+BENCHMARKS = frozenset({"BH", "EMA"})
+_TRADE_R_KEYS = frozenset({"win_rate", "avg_r"})
+_TRADE_HEADERS = ("Entry (UTC)", "Exit (UTC)", "Setup", "Dir", "Ctr", "Entry px", "Exit px", "PnL", "R", "Exit", "Snapshot")
 _KNOWN_KEYS = {
     "notes", "equity", "comparison", "random", "ci", "per_setup", "long_short", "per_year",
     "reliability", "trades", "candles4h", "snapshot_window_bars",
@@ -11154,13 +12124,33 @@ def _fmt(value: Any, kind: str) -> str:
     return f"{float(value):.2f}"
 
 
+def _row(cells: Sequence[Any]) -> str:
+    return "<tr>" + "".join(f"<td>{c if isinstance(c, _Raw) else escape(str(c))}</td>" for c in cells) + "</tr>"
+
+
 def _table(headers: Sequence[str], rows: Sequence[Sequence[Any]], cls: str = "") -> str:
     head = "".join(f"<th>{escape(str(h))}</th>" for h in headers)
-    body = []
-    for row in rows:
-        cells = "".join(f"<td>{c if isinstance(c, _Raw) else escape(str(c))}</td>" for c in row)
-        body.append(f"<tr>{cells}</tr>")
-    return f'<div class="tw"><table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+    body = "".join(_row(r) for r in rows)
+    return f'<div class="tw"><table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def _trades_table(rows: Sequence[tuple[Sequence[Any], int | None]]) -> str:
+    """Trades table; a trade with a snapshot (gid not None) is followed by a hidden full-width row
+    (<td colspan=all columns>) holding its chart, shown by the row's `chart` button (toggleSnap)."""
+    n = len(_TRADE_HEADERS)
+    head = "".join(f"<th>{escape(h)}</th>" for h in _TRADE_HEADERS)
+    body: list[str] = []
+    for cells, gid in rows:
+        body.append(_row(cells))
+        if gid is not None:
+            body.append(
+                f'<tr class="snaprow" id="snaprow-{gid}" hidden><td colspan="{n}">'
+                f'<div class="snap" id="snap-{gid}"></div></td></tr>'
+            )
+    return (
+        f'<div class="tw"><table class="trades"><thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>'
+    )
 
 
 # ----------------------------------------------------------------------------- equity data
@@ -11237,9 +12227,11 @@ def _comparison_html(comp: Mapping[str, Mapping[str, Any]], rnd: Mapping[str, An
     headers = ["Strategy"] + [h for _, h, _ in _METRIC_COLUMNS] + ["Avg R 95% CI"]
     rows: list[list[Any]] = []
     for name, m in comp.items():
-        interval = (ci or {}).get(name, {}).get("avg_r")
+        bench = name in BENCHMARKS
+        interval = None if bench else (ci or {}).get(name, {}).get("avg_r")
         ci_txt = f"[{interval[0]:.2f}, {interval[1]:.2f}]" if interval else "-"
-        rows.append([name] + [_fmt(m.get(k), kind) for k, _, kind in _METRIC_COLUMNS] + [ci_txt])
+        cells = ["-" if bench and k in _TRADE_R_KEYS else _fmt(m.get(k), kind) for k, _, kind in _METRIC_COLUMNS]
+        rows.append([name] + cells + [ci_txt])
     dist = (rnd or {}).get("dist") or {}
     if dist:
         cells: list[Any] = [f"RANDOM x{rnd.get('runs', '?')} (mean [p5, p95])"]
@@ -11249,6 +12241,8 @@ def _comparison_html(comp: Mapping[str, Mapping[str, Any]], rnd: Mapping[str, An
         cells.append("-")
         rows.append(cells)
     out = _table(headers, rows, "cmp")
+    if BENCHMARKS & set(comp):
+        out += '<p class="muted">BH / EMA: win rate, avg R and its CI are not shown - benchmark R multiples are not comparable.</p>'
     beaten = (rnd or {}).get("beaten_by") or {}
     if beaten:
         items = "; ".join(
@@ -11303,7 +12297,9 @@ h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:28px 0 8px;border-b
 .tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{border-bottom:1px solid var(--line);padding:4px 8px;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}
 thead th{background:var(--card);position:sticky;top:0}
-.chart{width:100%;height:380px}.snap{width:100%;height:340px}
+.chart{width:100%;height:380px}.snap{width:100%;min-width:480px;height:400px}
+tr.snaprow td{padding:6px 0 14px;text-align:left;white-space:normal}
+button.snapbtn{font:inherit;color:var(--accent);background:none;border:1px solid var(--line);border-radius:4px;padding:0 8px;cursor:pointer}
 details{margin:6px 0}summary{cursor:pointer;color:var(--accent)}
 pre{background:var(--card);padding:10px;overflow:auto;border-radius:6px}
 ul.notes{margin:0 0 8px;padding-left:18px;color:var(--muted)}
@@ -11348,6 +12344,21 @@ function renderSnap(i){
   const shapes = [];
   [t.stop,t.tp1,t.tp2].forEach(v=>{if(v!=null){shapes.push({type:'line',x0:ex,x1:xe,y0:v,y1:v,line:{dash:'dash',width:1,color:'#888'}});}});
   Plotly.newPlot(div, traces, baseLayout({shapes:shapes,title:{text:t.setup+' '+(t.dir>0?'long':'short')+' - '+JSON.stringify(t.meta),font:{size:11}}}), {responsive:true});
+}
+function resizeSnap(div){
+  if(div && div.dataset.done && typeof Plotly !== 'undefined' && div.offsetParent !== null){Plotly.Plots.resize(div);}
+}
+function toggleSnap(i){
+  const row = document.getElementById('snaprow-'+i);
+  if(!row){return;}
+  row.hidden = !row.hidden;
+  if(row.hidden){return;}
+  renderSnap(i);  // first show: drawn now that the full-width row is visible
+  const div = document.getElementById('snap-'+i);
+  requestAnimationFrame(()=>resizeSnap(div));  // later shows: fit the current row width
+}
+function resizeSnapsIn(el){
+  if(el.open){el.querySelectorAll('.snap').forEach(d=>requestAnimationFrame(()=>resizeSnap(d)));}
 }
 window.addEventListener('load', drawMain);
 </script></body></html>
@@ -11402,20 +12413,20 @@ def write_report(path: Path, title: str, sections: dict[str, Any]) -> Path:
             gid = len(views)
             view = _snapshot_view(t)
             views.append(view)
+            has_chart = bool(view["counts"])
             chart = _Raw(
-                f'<details ontoggle="renderSnap({gid})"><summary>chart</summary><div class="snap" id="snap-{gid}"></div></details>'
-                if view["counts"]
-                else ""
+                f'<button type="button" class="snapbtn" onclick="toggleSnap({gid})">chart</button>' if has_chart else ""
             )
-            rows.append(
-                [
-                    _iso(t.entry_ts), _iso(t.exit_ts), t.setup, "L" if t.direction > 0 else "S", t.contracts,
-                    f"{t.entry_price:,.2f}", f"{t.exit_price_avg:,.2f}", f"{t.pnl:,.2f}", f"{t.r_multiple:.2f}",
-                    t.exit_reason, chart,
-                ]
-            )
-        headers = ["Entry (UTC)", "Exit (UTC)", "Setup", "Dir", "Ctr", "Entry px", "Exit px", "PnL", "R", "Exit", "Snapshot"]
-        body.append(f"<h2>Trades - {escape(name)} ({len(trades)})</h2><details><summary>show table</summary>{_table(headers, rows)}</details>")
+            cells = [
+                _iso(t.entry_ts), _iso(t.exit_ts), t.setup, "L" if t.direction > 0 else "S", t.contracts,
+                f"{t.entry_price:,.2f}", f"{t.exit_price_avg:,.2f}", f"{t.pnl:,.2f}", f"{t.r_multiple:.2f}",
+                t.exit_reason, chart,
+            ]
+            rows.append((cells, gid if has_chart else None))
+        body.append(
+            f"<h2>Trades - {escape(name)} ({len(trades)})</h2>"
+            f'<details ontoggle="resizeSnapsIn(this)"><summary>show table</summary>{_trades_table(rows)}</details>'
+        )
 
     for key, value in sections.items():
         if key not in _KNOWN_KEYS:
@@ -11441,7 +12452,7 @@ def write_report(path: Path, title: str, sections: dict[str, Any]) -> Path:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/backtest/test_report.py -v`
-Expected: 3 passed.
+Expected: 5 passed.
 
 - [ ] **Step 5: Write the failing test (CLI)**
 
@@ -11452,6 +12463,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11460,10 +12472,31 @@ import pandas as pd
 import pytest
 
 import ewbot
+from ewbot import cli
+from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.cli import build_parser, main
 from tests.synth import random_bars
 
 SRC = str(Path(ewbot.__file__).resolve().parents[1])  # works with or without an editable install
+WEEK = 7 * 24 * 3600
+
+
+def _write_cache(cache: Path, shift_weeks: int = 0, n_days: int = 120, drop: tuple[int, ...] = ()) -> pd.DataFrame:
+    """tests/synth random bars from 2023-11-15 (120 days reach 2024-03-14), moved by whole weeks."""
+    bars = random_bars(seed=0, n=n_days * 24, vol=30.0, start=20_000.0)
+    df = pd.DataFrame(
+        {
+            "ts": [b.ts + shift_weeks * WEEK for b in bars],
+            "open": [b.open for b in bars],
+            "high": [b.high for b in bars],
+            "low": [b.low for b in bars],
+            "close": [b.close for b in bars],
+            "volume": [b.volume for b in bars],
+        }
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+    df.drop(index=list(drop)).to_parquet(cache / "BTC-USD_1h.parquet", index=False)
+    return df
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:
@@ -11486,14 +12519,18 @@ def test_subcommand_help_flags():
     for flag in ("--config", "--profile", "--mode", "--start", "--end", "--workers", "--out", "--random-runs"):
         assert flag in r.stdout
     r = _run("holdout", "--help")
-    assert r.returncode == 0 and "--confirm" in r.stdout and "--params" in r.stdout and "--lock" in r.stdout
+    assert r.returncode == 0 and "--confirm" in r.stdout and "--params" in r.stdout
+    assert "--lock" not in r.stdout  # the lock location is not a CLI choice
 
 
 def test_parser_defaults_and_types():
     ns = build_parser().parse_args(["compare", "--start", "2019-01-01", "--end", "2024-01-01", "--workers", "3"])
     assert (ns.cmd, ns.start, ns.end, ns.workers, ns.random_runs) == ("compare", "2019-01-01", "2024-01-01", 3, 100)
     ho = build_parser().parse_args(["holdout", "--params", "3.0,0.6,0.25"])
-    assert ho.confirm is False and ho.lock is None  # run_holdout then uses <project root>/holdout.lock
+    assert ho.confirm is False and not hasattr(ho, "lock")  # always <project root>/holdout.lock
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(["holdout", "--params", "3.0,0.6,0.25", "--lock", "/tmp/other.lock"])
+    assert exc.value.code == 2
 
 
 def test_holdout_without_confirm_is_refused_before_touching_data(capsys, tmp_path):
@@ -11508,45 +12545,131 @@ def test_missing_cache_gives_clear_error(tmp_path):
     assert r.returncode != 0 and "ewbot fetch" in r.stderr
 
 
-def test_params_from_refuses_a_fallback_chosen_final(tmp_path):
+@pytest.fixture
+def tmp_lock(tmp_path, monkeypatch):
+    """Point the (only) holdout lock location at a temp file: no test may write <repo>/holdout.lock."""
+    from ewbot.backtest import holdout
+
+    lock = tmp_path / "root" / "holdout.lock"
+    monkeypatch.setattr(holdout, "DEFAULT_LOCK_PATH", lock)
+    return lock
+
+
+def test_params_from_refuses_a_fallback_chosen_final(tmp_path, tmp_lock):
     wf = tmp_path / "walkforward.json"
     wf.write_text(
         json.dumps({"chosen_final": [3.0, 0.6, 0.25], "chosen_final_from_fold": 7, "chosen_final_fallback": True}),
         encoding="utf-8",
     )
-    lock = tmp_path / "holdout.lock"
-    argv = ["holdout", "--params-from", str(wf), "--confirm", "--cache-dir", str(tmp_path), "--lock", str(lock)]
+    argv = ["holdout", "--params-from", str(wf), "--confirm", "--cache-dir", str(tmp_path)]
     with pytest.raises(SystemExit, match="fold 7"):
         main(argv)
-    assert not lock.exists()  # refused before any data or lock is touched
+    assert not tmp_lock.exists()  # refused before any data or lock is touched
+
+
+def test_holdout_cli_records_provenance_and_asks_to_commit_the_lock(tmp_path, tmp_lock, capsys):
+    """Synthetic cache only (tests never run the holdout on real data)."""
+    cache = tmp_path / "cache"
+    _write_cache(cache)  # 2023-11-15 .. 2024-03-14
+    wf = tmp_path / "walkforward.json"
+    wf.write_text(json.dumps({"chosen_final": [3.0, 0.6, 0.25], "chosen_final_fallback": False}), encoding="utf-8")
+    common = ["--confirm", "--cache-dir", str(cache), "--random-runs", "1", "--workers", "1"]
+    assert main(["holdout", "--params-from", str(wf), *common, "--out", str(tmp_path / "h1.html")]) == 0
+    out = capsys.readouterr().out
+    assert "git add" in out and "git commit" in out and str(tmp_lock) in out
+    assert main(["holdout", "--params", "3.0,0.6,0.25", *common, "--out", str(tmp_path / "h2.html")]) == 0
+    runs = json.loads(tmp_lock.read_text(encoding="utf-8"))["runs"]
+    assert [r["params_source"] for r in runs] == [f"walkforward:{wf}#chosen_final", "explicit"]
+    assert all(r["headline"]["A"]["n_trades"] >= 0 for r in runs)
+
+
+def test_gitignore_keeps_the_holdout_lock_and_runtime_log_tracked():
+    root = Path(__file__).resolve().parents[2]
+    lines = {ln.strip() for ln in (root / ".gitignore").read_text(encoding="utf-8").splitlines()}
+    assert "holdout.lock" not in lines  # the lock must be committed after the one holdout run
+    assert not {ln for ln in lines if ln.startswith("docs")}  # docs/backtest-runtime.md is tracked
 
 
 def test_compare_end_to_end_on_synthetic_cache_writes_report(tmp_path, capsys):
     """Real stack through the CLI: parquet cache -> load_1h/fill_gaps -> compare -> HTML report."""
-    bars = random_bars(seed=0, n=120 * 24, vol=30.0, start=20_000.0)  # 2023-11-15 .. 2024-03-14
-    df = pd.DataFrame(
-        {
-            "ts": [b.ts for b in bars],
-            "open": [b.open for b in bars],
-            "high": [b.high for b in bars],
-            "low": [b.low for b in bars],
-            "close": [b.close for b in bars],
-            "volume": [b.volume for b in bars],
-        }
-    )
     cache = tmp_path / "cache"
-    cache.mkdir()
-    df.drop(index=[1_500]).to_parquet(cache / "BTC-USD_1h.parquet", index=False)  # one missing hour
+    _write_cache(cache, shift_weeks=-26, drop=(1_500,))  # 2023-05-17 .. 2023-09-14, one missing hour
     out = tmp_path / "compare.html"
-    argv = ["compare", "--cache-dir", str(cache), "--start", "2023-12-26", "--random-runs", "2", "--workers", "1"]
+    argv = ["compare", "--cache-dir", str(cache), "--start", "2023-06-27", "--random-runs", "2", "--workers", "1"]
     assert main([*argv, "--out", str(out)]) == 0
     captured = capsys.readouterr()
     assert "1 missing" in captured.err and f"report: {out}" in captured.out
     for name in ("A", "C", "HYBRID", "BH", "EMA"):
         assert any(line.startswith(name) for line in captured.out.splitlines()), name
+    for line in captured.out.splitlines():  # benchmarks: win_rate and avg_r are not comparable -> "-"
+        cols = line.split()
+        if cols and cols[0] in ("BH", "EMA"):
+            assert cols[6:8] == ["-", "-"] and cols[8].isdigit(), line
     html = out.read_text(encoding="utf-8")
     for heading in ("<h2>Equity", "<h2>Drawdown", "<h2>Comparison", "<h2>Trades - A"):
         assert heading in html
+
+
+def _spy_compare(monkeypatch) -> list[tuple[int, int, int]]:
+    seen: list[tuple[int, int, int]] = []
+    real = cli.compare
+
+    def spy(cfg, df1h, start_ts, end_ts, **kw):
+        seen.append((int(df1h["ts"].max()), start_ts, end_ts))
+        return real(cfg, df1h, start_ts, end_ts, **kw)
+
+    monkeypatch.setattr(cli, "compare", spy)
+    return seen
+
+
+def test_default_compare_on_a_cache_spanning_2024_only_sees_bars_before_it(tmp_path, capsys, monkeypatch):
+    cache = tmp_path / "cache"
+    _write_cache(cache)  # 2023-11-15 .. 2024-03-14: about 2.5 months inside the holdout
+    seen = _spy_compare(monkeypatch)
+    out = tmp_path / "c.html"
+    assert main(["compare", "--cache-dir", str(cache), "--random-runs", "2", "--workers", "1", "--out", str(out)]) == 0
+    [(last_bar, start, end)] = seen
+    assert last_bar == HOLDOUT_START - 3600 and end == HOLDOUT_START  # the frame itself was cut
+    assert "excluded" in capsys.readouterr().err  # the [data] line says the holdout bars were dropped
+    html = out.read_text(encoding="utf-8")
+    assert not re.search(r"20(2[4-9]|[3-9]\d)-\d\d-\d\dT", html)  # no ISO timestamp from 2024 on
+    c4 = json.loads(re.search(r"const C4 = (\{.*?\});\n", html, re.S).group(1))
+    assert c4["ts"] and max(c4["ts"]) < HOLDOUT_START  # report candles stop before the holdout
+    trades = json.loads(re.search(r"const TRADES = (\[.*?\]);\n", html, re.S).group(1))
+    assert all(t["exit_ts"] < HOLDOUT_START for t in trades)
+
+
+def test_default_backtest_window_ends_at_the_holdout(tmp_path, capsys):
+    cache = tmp_path / "cache"
+    _write_cache(cache)
+    out = tmp_path / "b.html"
+    assert main(["backtest", "--cache-dir", str(cache), "--out", str(out)]) == 0
+    html = out.read_text(encoding="utf-8")
+    assert "2023-11-15 .. 2024-01-01 (UTC, end exclusive)" in html
+    assert not re.search(r"20(2[4-9]|[3-9]\d)-\d\d-\d\dT", html)
+
+
+@pytest.mark.parametrize(
+    "dates",
+    [("--end", "2025-01-01"), ("--end", "2024-01-02"), ("--start", "2024-01-01"), ("--start", "2024-02-01")],
+    ids=["end-2025", "end-one-day-in", "start-at-boundary", "start-inside"],
+)
+@pytest.mark.parametrize("cmd", ["backtest", "compare"])
+def test_explicit_dates_inside_the_holdout_are_refused(tmp_path, capsys, cmd, dates):
+    cache = tmp_path / "cache"
+    _write_cache(cache)
+    with pytest.raises(SystemExit) as exc:
+        main([cmd, "--cache-dir", str(cache), *dates, "--out", str(tmp_path / "x.html")])
+    assert exc.value.code == 2
+    assert "holdout" in capsys.readouterr().err
+    assert not (tmp_path / "x.html").exists()
+
+
+def test_end_exactly_at_the_holdout_start_is_allowed(tmp_path):
+    cache = tmp_path / "cache"
+    _write_cache(cache)
+    out = tmp_path / "b.html"
+    assert main(["backtest", "--cache-dir", str(cache), "--start", "2023-12-20", "--end", "2024-01-01", "--out", str(out)]) == 0
 ```
 
 - [ ] **Step 6: Run test to verify it fails**
@@ -11559,7 +12682,12 @@ Expected: FAIL at collection with `ModuleNotFoundError: No module named 'ewbot.c
 `src/ewbot/cli.py`:
 
 ```python
-"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout."""
+"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout.
+
+Holdout isolation: every command except `holdout` cuts the candle frame to ts < HOLDOUT_START
+(2024-01-01) right after loading it, before any engine run, benchmark or report candle sees it, and
+an explicit --start at/after HOLDOUT_START or --end after it is refused (exit 2). runner.run_backtest
+and runner.compare refuse the holdout on their own as well (defence in depth)."""
 
 from __future__ import annotations
 
@@ -11570,15 +12698,15 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 import pandas as pd
 
 from ewbot.backtest.holdout import HoldoutError, run_holdout
 from ewbot.backtest.metrics import compute_metrics, reliability_by_q
-from ewbot.backtest.report import to_jsonable, write_report
+from ewbot.backtest.report import BENCHMARKS, to_jsonable, write_report
 from ewbot.backtest.runner import breakdowns, compare, equity_pairs, run_backtest, utc_ts
-from ewbot.backtest.walkforward import GRID, MIN_TRAIN_TRADES, walk_forward
+from ewbot.backtest.walkforward import GRID, HOLDOUT_START, MIN_TRAIN_TRADES, WF_END, walk_forward
 from ewbot.config import AGGRESSIVE, CONSERVATIVE, BotConfig, load_config, with_overrides
 from ewbot.data.candles import aggregate_4h, check_integrity, fill_gaps, load_1h
 from ewbot.data.coinbase_history import update_cache
@@ -11596,7 +12724,9 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--profile", choices=("conservative", "aggressive"), default=None, help="risk profile override")
     common.add_argument("--mode", choices=("A", "C", "HYBRID"), default=None, help="strategy for `backtest` (compare runs all three)")
     common.add_argument("--start", default=None, help="UTC date YYYY-MM-DD (default: first bar)")
-    common.add_argument("--end", default=None, help="UTC date YYYY-MM-DD, exclusive (default: after the last bar)")
+    common.add_argument(
+        "--end", default=None, help=f"UTC date YYYY-MM-DD, exclusive, at most {WF_END} (default: after the last bar before it)"
+    )
     common.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1), help="parallel processes")
     common.add_argument("--out", type=Path, default=None, help="output HTML path (default: reports/<command>.html)")
     common.add_argument("--product", default="BTC-USD")
@@ -11607,11 +12737,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp = sub.add_parser("compare", parents=[common], help="A, C, HYBRID vs buy&hold, EMA 50/200 and random entries")
     p_cmp.add_argument("--random-runs", type=int, default=100)
     sub.add_parser("walkforward", parents=[common], help="60-combo walk-forward on 2017-01..2023-12")
-    p_ho = sub.add_parser("holdout", parents=[common], help="ONE-SHOT evaluation on 2024-01-01..end")
+    p_ho = sub.add_parser(
+        "holdout", parents=[common], help="ONE-SHOT evaluation on 2024-01-01..end (lock: <project root>/holdout.lock)"
+    )
     p_ho.add_argument("--random-runs", type=int, default=100)
     p_ho.add_argument("--params", default=None, help="K4,Q_MIN,S_MIN e.g. 3.0,0.6,0.25")
     p_ho.add_argument("--params-from", type=Path, default=None, help="reports/walkforward.json (uses chosen_final)")
-    p_ho.add_argument("--lock", type=Path, default=None, help="lock file (default: <project root>/holdout.lock)")
     p_ho.add_argument("--confirm", action="store_true", help="required: acknowledge the holdout is single-use")
     return parser
 
@@ -11629,19 +12760,52 @@ def _load_cfg(args: argparse.Namespace) -> BotConfig:
     return cfg
 
 
-def _load_df(args: argparse.Namespace) -> pd.DataFrame:
+def _refuse(msg: str) -> NoReturn:
+    print(f"refusing: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _load_df(args: argparse.Namespace, *, holdout: bool = False) -> pd.DataFrame:
+    """The gap-filled 1h frame. Unless holdout=True (only `ewbot holdout`), every bar at/after
+    HOLDOUT_START is dropped HERE, before anything else can see it."""
     path = Path(args.cache_dir) / f"{args.product}_1h.parquet"
     if not path.exists():
         raise SystemExit(f"candle cache not found: {path} - run `ewbot fetch` first")
     raw = load_1h(path)
+    note = ""
+    if not holdout:
+        n_all = len(raw)
+        raw = raw[raw["ts"] < HOLDOUT_START].reset_index(drop=True)
+        if raw.empty:
+            raise SystemExit(f"no bars before {WF_END} in {path}")
+        note = f", {n_all - len(raw)} bars at/after {WF_END} excluded (holdout)"
     rep = check_integrity(raw)
-    print(f"[data] {rep.n} bars, {len(rep.missing_ts)} missing, {len(rep.duplicate_ts)} duplicate", file=sys.stderr)
+    print(
+        f"[data] {rep.n} bars, {len(rep.missing_ts)} missing, {len(rep.duplicate_ts)} duplicate{note}",
+        file=sys.stderr,
+    )
     return fill_gaps(raw)
 
 
+def _requested_window(args: argparse.Namespace) -> tuple[int | None, int | None]:
+    """Explicit --start/--end as epoch seconds (None when not given). Research commands never reach
+    into the holdout: --start at/after HOLDOUT_START or --end after it is refused with exit code 2."""
+    start = utc_ts(args.start) if args.start else None
+    end = utc_ts(args.end) if args.end else None
+    if (start is not None and start >= HOLDOUT_START) or (end is not None and end > HOLDOUT_START):
+        _refuse(
+            f"--start {args.start} / --end {args.end} reach into the holdout ({WF_END} onwards). Research "
+            f"windows must end by {WF_END}; the holdout is evaluated once, with `ewbot holdout`."
+        )
+    return start, end
+
+
 def _range(args: argparse.Namespace, df: pd.DataFrame) -> tuple[int, int]:
-    start = utc_ts(args.start) if args.start else int(df["ts"].iloc[0])
-    end = utc_ts(args.end) if args.end else int(df["ts"].iloc[-1]) + H1
+    """[start, end): explicit --start/--end (checked by _requested_window), else the first bar and
+    one hour after the last bar of the (already cut) frame."""
+    req_start, req_end = _requested_window(args)
+    start = req_start if req_start is not None else int(df["ts"].iloc[0])
+    end = req_end if req_end is not None else int(df["ts"].iloc[-1]) + H1
     if end <= start:
         raise SystemExit("--end must be after --start")
     return start, end
@@ -11657,10 +12821,19 @@ def _candles4h(df: pd.DataFrame) -> dict[str, list]:
 
 
 def _print_comparison(comp: dict[str, dict[str, Any]]) -> None:
+    """Console table; BH / EMA show "-" for win_rate and avg_r (benchmark R is not comparable)."""
     cols = ("total_return", "cagr", "max_dd", "sharpe", "calmar", "win_rate", "avg_r", "n_trades")
     print(f"{'':8}" + "".join(f"{c:>13}" for c in cols))
     for name, m in comp.items():
-        print(f"{name:8}" + "".join(f"{m[c]:>13.3f}" if c != "n_trades" else f"{m[c]:>13d}" for c in cols))
+        cells = []
+        for c in cols:
+            if c == "n_trades":
+                cells.append(f"{m[c]:>13d}")
+            elif name in BENCHMARKS and c in ("win_rate", "avg_r"):
+                cells.append(f"{'-':>13}")
+            else:
+                cells.append(f"{m[c]:>13.3f}")
+        print(f"{name:8}" + "".join(cells))
 
 
 def _compare_sections(cmp: dict[str, Any], df: pd.DataFrame, notes: list[str]) -> dict[str, Any]:
@@ -11703,6 +12876,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
+    _requested_window(args)  # refuse holdout dates before touching any data
     cfg, df = _load_cfg(args), _load_df(args)
     start, end = _range(args, df)
     t0 = time.perf_counter()
@@ -11729,6 +12903,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
+    _requested_window(args)  # refuse holdout dates before touching any data
     cfg, df = _load_cfg(args), _load_df(args)
     start, end = _range(args, df)
     t0 = time.perf_counter()
@@ -11790,9 +12965,11 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
     return 0
 
 
-def _parse_params(args: argparse.Namespace) -> tuple[float, ...]:
+def _parse_params(args: argparse.Namespace) -> tuple[tuple[float, ...], str]:
+    """(K4, Q_MIN, S_MIN) and their provenance: "explicit" or "walkforward:<path>#chosen_final"."""
     if args.params:
         vals = tuple(float(x) for x in args.params.split(","))
+        source = "explicit"
     elif args.params_from:
         wf = json.loads(Path(args.params_from).read_text(encoding="utf-8"))
         chosen = wf.get("chosen_final")
@@ -11804,21 +12981,24 @@ def _parse_params(args: argparse.Namespace) -> tuple[float, ...]:
                 "last fold (no selectable combo there); pass --params explicitly if you accept it"
             )
         vals = tuple(float(x) for x in chosen)
+        source = f"walkforward:{args.params_from}#chosen_final"
     else:
         raise SystemExit("holdout needs --params K4,Q_MIN,S_MIN or --params-from reports/walkforward.json")
     if len(vals) != len(GRID):
         raise SystemExit(f"expected {len(GRID)} params for {list(GRID)}, got {len(vals)}")
-    return vals
+    return vals, source
 
 
 def cmd_holdout(args: argparse.Namespace) -> int:
     if not args.confirm:
         print("refusing: the holdout is single-use. Re-run with --confirm once you are done tuning.", file=sys.stderr)
         return 2
-    params = _parse_params(args)
-    cfg, df = _load_cfg(args), _load_df(args)
-    try:
-        out = run_holdout(cfg, df, params, lock_path=args.lock, confirm=True, random_runs=args.random_runs, workers=args.workers)
+    params, source = _parse_params(args)
+    cfg, df = _load_cfg(args), _load_df(args, holdout=True)
+    try:  # the lock is always DEFAULT_LOCK_PATH (<project root>/holdout.lock): not a CLI choice
+        out = run_holdout(
+            cfg, df, params, confirm=True, random_runs=args.random_runs, workers=args.workers, params_source=source
+        )
     except HoldoutError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 2
@@ -11832,6 +13012,13 @@ def cmd_holdout(args: argparse.Namespace) -> int:
     sections = _compare_sections(cmp, df, out["criteria"]["trade_count"] + notes)
     sections["criteria"] = out["criteria"]
     print(f"report: {write_report(_out(args), 'Holdout 2024-01-01..end (one-shot)', sections)}")
+    lock = out["lock_path"]
+    print(
+        f"\nholdout lock written: {lock} (sha256 {out['sha256'][:12]}).\n"
+        "Commit it NOW - it is the permanent record that the holdout has been used (not done automatically):\n"
+        f'  git add "{lock}"\n'
+        f'  git commit -m "chore(holdout): record holdout run {out["sha256"][:12]}"'
+    )
     return 0
 
 
@@ -11873,7 +13060,7 @@ uv sync
 - [ ] **Step 8: Run test to verify it passes**
 
 Run: `uv run pytest tests/backtest/test_report.py tests/backtest/test_cli.py -v && uv run ewbot --help`
-Expected: 10 passed (the last CLI test runs `ewbot compare` end to end on a synthetic parquet cache and checks the HTML report, about 2 s); the help text lists `fetch, backtest, compare, walkforward, holdout`.
+Expected: 25 passed (5 report, 20 CLI; the CLI tests run `compare`, `backtest` and `holdout` end to end on synthetic parquet caches in `tmp_path` with the lock pointed at `tmp_path` — never the real data, never the repository lock — about 15 s); the help text lists `fetch, backtest, compare, walkforward, holdout`.
 
 - [ ] **Step 9: Commit**
 ```bash
@@ -12065,7 +13252,7 @@ uv run python scripts/time_commands.py "compare 2019-2023 random=100" -- \
   uv run ewbot compare --start 2019-01-01 --end 2024-01-01 --workers 6 --random-runs 100 --out reports/compare.html
 ```
 
-Expected stdout for both: a six-line table with rows `A, C, HYBRID, BH, EMA` (columns `total_return cagr max_dd sharpe calmar win_rate avg_r n_trades`), then `random control: <runs> runs, <n> entries each; compare took <S>s` (`<n>` equals the number of A trades in 2019-2023), then `report: reports/compare.html`. Runtime model: the compare performs `3 + random_runs` engine runs, each feeding all bars from 2017 to 2024, so wall time is about `T_single * (1 + random_runs / workers)` where `T_single` is the Step 5 time; with `T_single = 120 s`, 6 workers and 100 runs expect about 35 minutes. If that is too slow for a first look, use `--random-runs 30` and note it in the log, but run the full 100 before drawing conclusions about A versus the random control.
+Expected stderr first: `[data] <n> bars, <m> missing, 0 duplicate, <k> bars at/after 2024-01-01 excluded (holdout)`. Expected stdout for both: a six-line table with rows `A, C, HYBRID, BH, EMA` (columns `total_return cagr max_dd sharpe calmar win_rate avg_r n_trades`; BH and EMA print `-` for `win_rate` and `avg_r`), then `random control: <runs> runs, <n> entries each; compare took <S>s` (`<n>` equals the number of A trades in 2019-2023), then `report: reports/compare.html`. Runtime model: the compare performs `3 + random_runs` engine runs, each feeding all bars from 2017 to 2024, so wall time is about `T_single * (1 + random_runs / workers)` where `T_single` is the Step 5 time; with `T_single = 120 s`, 6 workers and 100 runs expect about 35 minutes. If that is too slow for a first look, use `--random-runs 30` and note it in the log, but run the full 100 before drawing conclusions about A versus the random control.
 
 - [ ] **Step 7: Open and inspect the report**
 
@@ -12075,11 +13262,11 @@ open reports/compare.html
 
 Checklist (all must hold; the page needs internet access for the plotly CDN):
 1. **Equity** chart shows five lines (A, C, HYBRID, BH, EMA) starting at 10,000 on 2019-01-01 on a log axis; **Drawdown** chart below shows the same five names, all at or below 0%.
-2. **Comparison** table has rows `A, C, HYBRID, BH, EMA` plus a sixth row `RANDOM x100 (mean [p5, p95])`, with an `Avg R 95% CI` column for the five strategies, and a muted line `Share of random runs beaten by each strategy` underneath.
+2. **Comparison** table has rows `A, C, HYBRID, BH, EMA` plus a sixth row `RANDOM x100 (mean [p5, p95])`, with an `Avg R 95% CI` column filled for A, C and HYBRID (BH and EMA show `-` for win rate, avg R and the CI: benchmark R is not comparable), and muted lines saying so and `Share of random runs beaten by each strategy` underneath.
 3. **Buy&hold sanity band** (not a target): BH is a **spot** hold (fractional BTC, no leverage, no funding; T19). It buys at the open of the window's second bar (2019-01-01 01:00 UTC, about 3,692) and sells at the last close (2023-12-31 23:00 UTC, about 42,288), a raw multiple of about 11.45x, and pays only two fees and two slippages: `BH total_return = multiple · ((1−s)/(1+s)) · ((1−f)/(1+f)) − 1 ≈ 11.45 · 0.998 − 1` ≈ **+1,040%** (measured on the Coinbase cache: +1,043.1%), and `max_dd` ≈ **77%** (69,000 in 2021-11 down to about 15,500 in 2022-11). A BH return more than a few tenths of a percent below the raw multiple means funding or extra fees are being charged; a return above the raw multiple means the entry is not filled at the next open. `BH n_trades = 1`, `exposure = 100%`.
 4. **EMA** row: `n_trades` in the tens (a 4h 50/200 cross flips a few times per year); `exposure` is high (always in the market once warmed up).
 5. **Per setup** table lists only setups that actually traded (some of `W3, W5, W5_REV, C_END`; `FIB` appears under `C`, mixed setups under `HYBRID`), each with trades, win rate, avg R and an `Avg R 95% CI`. **Long / short** and **Per year** (2019 .. 2023) tables exist for A, C and HYBRID.
-6. **Trades - A** is collapsed under `show table`; open it, open one row's `chart`: a line of 4h closes with a dotted labelled polyline (S,1,2,...) for the top count, a triangle at the entry and dashed horizontal lines for stop/TP1/TP2. No console errors in the browser.
+6. **Trades - A** is collapsed under `show table`; open it and click one row's `chart` button: a full-width row opens right below that trade (as wide as the table, well over 500 px in a desktop window) with a line of 4h closes with a dotted labelled polyline (S,1,2,...) for the top count, a triangle at the entry and dashed horizontal lines for stop/TP1/TP2. No console errors in the browser.
 7. Nothing in the page says `NaN`, `Infinity` or `undefined`.
 
 If an item fails, fix the cause (report code in T22, metric definitions in T18, simulator in T19) before recording numbers.
