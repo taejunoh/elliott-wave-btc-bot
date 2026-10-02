@@ -4,7 +4,7 @@
 
 **Goal:** Run the frozen holdout strategy (A with K4 = 2.0, Q_MIN = 0.7, S_MIN = 0.5 from `holdout.lock`) as an hourly, deterministic paper-trading runtime on GitHub Actions that keeps accumulating out-of-sample trades toward the 50-trade go-live minimum, proves for at least 4 weeks that the decisions recorded in real time equal the decisions recomputed later, and reports through a ledger and HTML report on an orphan `paper` branch and through Telegram.
 
-**Architecture:** Every run recomputes the whole engine from the first cached bar with `run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)` (spec approach A), inside a read-only trace that records fills, stop moves and order sizes. Trades entering after the holdout's last bar are the paper trades. A JSON ledger stores epochs (strategy fingerprint), trades, decisions (with run id and the hash of the bars they depended on), discrepancies, runs and Telegram delivery state; every file write is temp file + `os.replace`. No strategy-fingerprinted module is edited: new code lives in `src/ewbot/paper/`, plus a `paper` sub-command in `cli.py`, `.github/workflows/paper.yml` with its git helper `scripts/paper_sync.sh`, and an ops guide.
+**Architecture:** Every run recomputes the whole engine from the first cached bar with `run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)` (spec approach A), inside a read-only trace that records fills, stop moves and order sizes. Trades entering after the holdout's last bar are the paper trades. A JSON ledger stores epochs (strategy fingerprint), trades, decisions (with run id, the hash of the bars they depended on and the recording run's runtime-environment digest), discrepancies, runs (each with its runtime environment) and Telegram delivery state; every file write is temp file + `os.replace`. No strategy-fingerprinted module is edited: new code lives in `src/ewbot/paper/`, plus a `paper` sub-command in `cli.py`, `.github/workflows/paper.yml` with its git helper `scripts/paper_sync.sh`, the read-only `.github/workflows/ci.yml` fingerprint guard on pull requests and `master` pushes, and an ops guide.
 
 **Tech Stack:** Python 3.12 (uv), numpy, pandas, pyarrow, requests, plotly (existing dependencies only); pytest; GitHub Actions (`actions/checkout@v7`, `astral-sh/setup-uv` pinned to the v10.2.0 commit `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Telegram Bot API `sendMessage`.
 
@@ -13,15 +13,15 @@
 ## Global Constraints
 
 - Work on branch `feat/plan2-paper`, from the repository root; Python 3.12 via uv; tests with `uv run pytest`. No new dependencies (`pyproject.toml` and `uv.lock` unchanged).
-- Never modify a strategy-fingerprinted file (spec §5.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Do not edit `backtest/**`, `data/coinbase_history.py` or `holdout.lock` either. Allowed: create `src/ewbot/paper/*`, `tests/paper/*`, `.github/workflows/paper.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`; modify `src/ewbot/cli.py`.
+- Never modify a strategy-fingerprinted file (spec §5.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Do not edit `backtest/**`, `data/coinbase_history.py` or `holdout.lock` either. Allowed: create `src/ewbot/paper/*`, `tests/paper/*`, `.github/workflows/paper.yml`, `.github/workflows/ci.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`; modify `src/ewbot/cli.py`.
 - Fingerprint = `sha256( for path in sorted(paths): path + "\0" + bytes + "\0" )` over the repo-relative paths (`src/ewbot/<path>`) of that file set (25 files today). Baseline = the same set at holdout commit `64e628ad4865b3b04571a7cba2886881eae19176` (`64e628a`), read with `git cat-file blob` (the plain `git show 64e628a:<path>` bytes). Today both are `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
-- Frozen inputs: params only from `holdout.lock` (`[2.0, 0.7, 0.5]`); config = `holdout_config(BotConfig(), params)` (strategy A, conservative 1% / 3x, breakers on, fee 0.05%, slippage 0.05%, funding 10% APR long); recompute with `start_ts = HOLDOUT_START = 1704067200`; no CLI option changes any of it.
+- Frozen inputs: params only from `holdout.lock` (`[2.0, 0.7, 0.5]`); config = `holdout_config(BotConfig(), params)` (strategy A, conservative 1% / 3x, breakers on, fee 0.05%, slippage 0.05%, funding 10% APR long); recompute with `start_ts = HOLDOUT_START = 1704067200`; no CLI option changes any of it. The precheck refuses a lock whose `sha256` is not `lock_digest(BotConfig(), params, random_runs, code_sha256)` (true for the committed lock: `d1be04baa06c…`).
 - Holdout boundary: `last_bar_ts = 1790938800` (2026-10-02 11:00 UTC); paper trades have `entry_ts > last_bar_ts`; holdout `n_trades.A = 36`. A later epoch counts `entry_ts > epoch.started_ts`.
 - Go-live count (criterion 3) = holdout 36 (only while the ledger never left epoch 1) + closed paper trades of the current epoch; required 50; eligible only while the current epoch's fingerprint equals the baseline.
-- Decisions: `SIGNAL, ENTRY, TP1, TP2, STOP, EXIT, BREAKEVEN, TRAIL` as `(kind, ts, price, contracts, reason)` + `trade_key, levels, setup, direction, run_id, data_sha256, epoch_id`; id `kind:ts:trade_key`; prices and levels compared with relative tolerance `1e-9`; causes `DATA_REVISION` > `FINGERPRINT_CHANGE` > `UNEXPLAINED`.
-- Criterion 4: at least 28 days since the epoch's first successful run, 0 `UNEXPLAINED` discrepancies in the epoch, at least 95% of hours with a successful run.
-- Telegram: secrets `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`; without them nothing is sent and the run succeeds; each event id `kind:ts:trade_key` is sent at most once; 3 tries, then the event stays pending for the next run. Daily summary: first run at/after 09:00 America/New_York per New York date; criteria 1–2 (`compare`, RANDOM 100 runs, injectable) are recomputed only in that run. Gap warning: more than 3 h since the last successful run.
-- Workflow: `cron: "7 * * * *"` + `workflow_dispatch`; `concurrency: {group: paper, cancel-in-progress: false}`; `permissions: contents: write`; `paper` branch worktree created as an orphan on first use; every fetch shallow (master, the `64e628a` commit and `paper` at depth 1); orphan only when `ls-remote` exits 2, any other `ls-remote` failure fails the job; 3 pushes at most: the same commit again when `origin/paper` did not move (no recompute, no repeated Telegram message), refresh + recompute only when it moved, never after the last push (`scripts/paper_sync.sh`); 35-minute step timeouts on the `ewbot` steps; Telegram secrets only on the steps that send.
+- Decisions: `SIGNAL, ENTRY, TP1, TP2, STOP, EXIT, BREAKEVEN, TRAIL` as `(kind, ts, price, contracts, reason)` + `trade_key, levels, setup, direction, run_id, data_sha256, epoch_id, env_sha256`; id `kind:ts:trade_key`; prices and levels compared with relative tolerance `1e-9`; causes `DATA_REVISION` > `FINGERPRINT_CHANGE` > `ENVIRONMENT_CHANGE` > `UNEXPLAINED`.
+- Criterion 4: at least 28 days since the epoch's first successful run, 0 `UNEXPLAINED` discrepancies in the epoch (`ENVIRONMENT_CHANGE` ones are warned and shown, not counted), at least 95% of hours with a successful run.
+- Telegram: secrets `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`; without them nothing is sent and the run succeeds; each event id `kind:ts:trade_key` is sent at most once per pushed ledger (a run killed after sending, or whose pushes all fail, may send it again in the next run; never lost); 3 tries, then the event stays pending for the next run; an error note keeps a `SendError`'s message and only the type name of any other exception. Daily summary: first run at/after 09:00 America/New_York per New York date; criteria 1–2 (`compare`, RANDOM 100 runs, injectable) are recomputed only in that run; a failure is retried by the next run once (`CRITERIA_ATTEMPTS = 2` per New York date), then the summary goes out marked `기준 미갱신(stale)` with the previous result. Gap warning: more than 3 h since the last successful run.
+- Workflow: `cron: "7 * * * *"` + `workflow_dispatch`; `runs-on: ubuntu-24.04` (pinned, part of the recorded environment); `concurrency: {group: paper, cancel-in-progress: false}`; `permissions: contents: write`; `paper` branch worktree created as an orphan on first use; every fetch shallow (master, the `64e628a` commit and `paper` at depth 1); orphan only when `ls-remote` exits 2, any other `ls-remote` failure fails the job; 3 pushes at most: the same commit again when `origin/paper` did not move (no recompute, no repeated Telegram message), refresh + recompute only when it moved, never after the last push (`scripts/paper_sync.sh`); 35-minute step timeouts on the `ewbot` steps; the fallback alert's `curl --retry 3 --max-time 20` fits its 2-minute step timeout; Telegram secrets only on the steps that send. `.github/workflows/ci.yml`: on `pull_request` and `push` to `master`, `permissions: contents: read`, no secrets, `ubuntu-24.04`, `uv sync --frozen`, then `uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py` (the fingerprint test pins the baseline value, so it never skips without git history).
 - Tests never touch the network, the real `data/cache`, or `<repo>/holdout.lock`: synthetic candles (`tests/synth.random_bars`), temp git repos holding test locks, a fake sender and a fake fetcher. Never compute metrics on real data at/after 2024-01-01 except in the manual pre-deploy step (Task 11).
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -31,11 +31,12 @@
 2. **Stop moves, TP1 partials and order sizes** are not in `EngineResult`. `paper/trace.py` swaps the names `PaperBroker` / `WaveEngine` that `ewbot.engine.loop` looks up at run time for pass-through subclasses that only log (no file is edited; a test proves the traced run is bit-identical to `run_backtest`).
 3. **When a decision is known.** A run whose last closed bar is T knows every fill and stop move with `ts <= T` and every signal with `ts <= T - 1h` (the engine never evaluates entries on the last bar); the END close of a still-open position is not a decision. Decisions are recorded by the first run that knows them (`known_at > epoch.through_ts`).
 4. **Epochs.** `started_ts` of epoch 1 is the holdout's last bar; a new epoch starts at the last bar of the run that saw the new fingerprint. Earlier epochs' trades are frozen; the current epoch's closed trades are recomputed every run. Reverting the code opens a new epoch with the baseline fingerprint: eligible again, but the holdout's 36 never count again (spec §8).
-5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). Each discrepancy is stored and alerted once.
+5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). `ENVIRONMENT_CHANGE` (spec §5.3 as amended 2026-10-02) = the run that recorded the decision (for `APPEARED`: the first run that should have known it) has another runtime-environment digest than the current run; the environment (`paper/environment.py`) is the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and `ImageOS` / `ImageVersion` (None off Actions), and an unknown recording environment never counts as a change. Each discrepancy is stored and alerted once.
 6. **Telegram without secrets** drops events instead of queueing them (a token added later must not flood the chat). A failed send keeps that event and every later one pending, in order.
-7. **Criteria 1–2** = `backtest.holdout.evaluate_criteria(compare(cfg, df, HOLDOUT_START, last_bar + 1h, random_runs, workers, allow_holdout=True))`, i.e. over `[HOLDOUT_START, last bar + 1h)`, only while the current epoch is eligible; the stored result is ignored once the epoch changes. The go-live candidate is A, the only strategy the runtime trades and counts (criteria 3–4 are about A's trades), so — like `evaluate_criteria`'s `passing` — one candidate must meet all four: criterion 1 = `"A" in winners`, criterion 2 = criterion 1 and A's max drawdown <= 15%. HYBRID is still compared and shown.
+7. **Criteria 1–2** = `backtest.holdout.evaluate_criteria(compare(cfg, df, HOLDOUT_START, last_bar + 1h, random_runs, workers, allow_holdout=True))`, i.e. over `[HOLDOUT_START, last bar + 1h)`, only while the current epoch is eligible; the stored result is ignored once the epoch changes. The go-live candidate is A, the only strategy the runtime trades and counts (criteria 3–4 are about A's trades), so — like `evaluate_criteria`'s `passing` — one candidate must meet all four: criterion 1 = `"A" in winners`, criterion 2 = criterion 1 and A's max drawdown <= 15%. HYBRID is still compared and shown. A failed recompute is tried at most `CRITERIA_ATTEMPTS = 2` times per New York date (the daily run and the next run, counted from `runs[].criteria_recompute`); after the second failure the daily summary is sent marked `기준 미갱신(stale)` with the previous result and `daily_summary_date` is set, so the next try is on the next New York date.
 8. **Failure alerts** are sent by `ewbot paper run` (stage + `EWBOT_RUN_URL`); it touches `EWBOT_FAILURE_MARKER`, and the workflow's `if: failure() || cancelled()` step only sends its own alert when that marker is missing (checkout / setup / sync / push failures, step timeouts, cancellations).
-9. **Ledger fields beyond the spec list:** `pending_events`, `daily_summary_date`, `criteria`, and `through_ts` in each epoch.
+9. **Ledger fields beyond the spec list:** `pending_events`, `daily_summary_date`, `criteria`, `through_ts` in each epoch, `env` / `env_sha256` / `criteria_recompute` in each run and `env_sha256` in each decision (no schema-version change: no `paper` ledger existed yet).
+10. **Lock binding.** Besides the git checks, the grid combo and the holdout start, the precheck requires `lock["sha256"] == lock_digest(BotConfig(), params, int(lock["random_runs"]), lock["code_sha256"])`: the whole configuration the run uses (BotConfig defaults with the lock's params), the grid and the holdout start must be the ones the holdout ran with. A changed `BotConfig` default or grid therefore stops the runs at `precheck` instead of opening a new epoch.
 
 ## File Map
 
@@ -49,11 +50,13 @@
 | `src/ewbot/paper/notify.py` | 5 | Telegram sender, delivery with retry, message formats, timing, events |
 | `src/ewbot/paper/criteria.py` | 6 | criteria 1–4 status block |
 | `src/ewbot/paper/report.py` | 6 | `report.html` on top of `backtest.report.write_report` |
+| `src/ewbot/paper/environment.py` | 7 | runtime environment record and digest (`ENVIRONMENT_CHANGE`) |
 | `src/ewbot/paper/runner.py` | 7 | one `paper run`: precheck, data, epoch, recompute, ledger, notify |
 | `src/ewbot/cli.py` (modify) | 8 | `ewbot paper run` and `ewbot paper status` |
 | `tests/paper/helpers.py` | 3 | synthetic candles, test lock in a temp git repo, fakes |
 | `tests/paper/test_*.py` | 1–10 | unit, integration (time walk) and static tests |
 | `.github/workflows/paper.yml` | 10 | hourly Actions workflow |
+| `.github/workflows/ci.yml` | 10 | fingerprint and static guards on pull requests and `master` pushes |
 | `scripts/paper_sync.sh` | 10 | the workflow's git side: paper worktree, commit, push and retry |
 | `docs/paper-trading.md` | 10 | ops guide, Telegram setup for the user |
 
@@ -61,19 +64,19 @@
 
 | Task | Component | New tests |
 |---|---|---|
-| 1 | Strategy fingerprint | 18 |
+| 1 | Strategy fingerprint | 19 |
 | 2 | Ledger model, atomic IO, epochs | 9 |
 | 3 | Engine trace + shared test helpers | 6 |
-| 4 | Out-of-sample extraction, decisions, replay check | 12 |
-| 5 | Telegram notifier, formats, timing, events | 21 |
+| 4 | Out-of-sample extraction, decisions, replay check | 13 |
+| 5 | Telegram notifier, formats, timing, events | 27 |
 | 6 | Go-live criteria + paper HTML report | 7 |
-| 7 | Paper runner orchestration | 26 |
+| 7 | Runtime environment + paper runner orchestration | 36 |
 | 8 | CLI `paper run` / `paper status` | 6 |
 | 9 | Time-walk integration test | 8 |
-| 10 | Static `allow_holdout` guard, workflow, git sync script, ops guide | 38 |
+| 10 | Static `allow_holdout` guard, paper and CI workflows, git sync script, ops guide | 41 |
 | 11 | Manual pre-deploy checklist (controller) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 151 more tests.
+Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 172 more tests.
 
 ---
 
@@ -90,7 +93,7 @@ Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a
 
 - [ ] **Step 1: Write the failing test**
 
-Create the test package and the fingerprint tests. `test_baseline_recomputes_from_git_and_equals_the_working_tree` is a tripwire: it recomputes the `64e628a` baseline from git and requires it to equal the working tree (true today: Plan 1 merged without later edits to these files; it is skipped only in a clone without that commit).
+Create the test package and the fingerprint tests. Two tripwires: `test_the_working_tree_fingerprint_is_the_frozen_baseline` compares the working tree with the pinned baseline value `FROZEN` (no git needed, never skipped: `.github/workflows/ci.yml` runs it, Task 10), and `test_baseline_recomputes_from_git_and_equals_the_working_tree` recomputes the `64e628a` baseline from git and requires it to equal both (true today: Plan 1 merged without later edits to these files; it is skipped only in a clone without that commit).
 
 ```bash
 mkdir -p src/ewbot/paper tests/paper
@@ -123,6 +126,10 @@ from ewbot.paper.fingerprint import (
     is_fingerprinted,
     tree_files,
 )
+
+# The baseline value at the holdout commit 64e628a (spec 5.1). Pinned here so the guard below needs no
+# git history: .github/workflows/ci.yml runs it on every pull request to master and every push to master.
+FROZEN = "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1"
 
 EXPECTED = {
     "src/ewbot/types.py",
@@ -161,6 +168,13 @@ def _has_commit(commit: str) -> bool:
     except OSError:
         return False
     return r.returncode == 0
+
+
+def test_the_working_tree_fingerprint_is_the_frozen_baseline():
+    """Tripwire that never skips: if this fails, a fingerprinted file changed after the holdout. Merged
+    and run, that change opens a new epoch and resets the go-live counter; reverting it later does not
+    bring the holdout's 36 trades back (spec 8)."""
+    assert current_fingerprint() == FROZEN
 
 
 def test_the_file_set_is_exactly_the_spec_list():
@@ -212,7 +226,7 @@ def test_baseline_recomputes_from_git_and_equals_the_working_tree():
     """Tripwire: if this fails, a fingerprinted file changed after the holdout and the paper go-live
     counter will reset (new epoch) on the next `ewbot paper run`."""
     fp, sha = baseline_fingerprint()
-    assert sha == HOLDOUT_COMMIT and len(fp) == 64
+    assert sha == HOLDOUT_COMMIT and fp == FROZEN
     assert fp == current_fingerprint()
 
 
@@ -356,7 +370,7 @@ uv run pytest tests/paper/test_fingerprint.py -q
 uv run python -c "from ewbot.paper.fingerprint import *; print(current_fingerprint()); print(baseline_fingerprint())"
 ```
 
-Expected: `18 passed`; both lines print `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1` (the second with `'64e628ad4865b3b04571a7cba2886881eae19176'`).
+Expected: `19 passed`; both lines print `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1` (the second with `'64e628ad4865b3b04571a7cba2886881eae19176'`).
 
 - [ ] **Step 5: Commit**
 
@@ -783,9 +797,9 @@ EOF
 - Test: `tests/paper/test_trace.py`
 
 **Interfaces:**
-- Consumes: module globals `ewbot.engine.loop.PaperBroker` / `ewbot.engine.loop.WaveEngine` (looked up by `_Run.__init__` and `TradingEngine.run`); `PaperBroker.process_bar(bar) -> list[Fill]`, `queue_entry(direction, contracts, stop, tp1, tp2, tp1_contracts)`, `set_stop(price)`, `close_now(ts, price) -> Fill | None`; `WaveEngine.on_1h_close(bar1h, bar4h, sub_bars) -> WaveState`; `run_backtest(cfg, df1h, start_ts=None, end_ts=None, *, allow_holdout=False) -> EngineResult`; `holdout_config(cfg, params) -> BotConfig`; `data_fingerprint(df1h, start_ts, last_ts) -> str`; `tests.synth.random_bars(seed, n, vol, start)`.
+- Consumes: module globals `ewbot.engine.loop.PaperBroker` / `ewbot.engine.loop.WaveEngine` (looked up by `_Run.__init__` and `TradingEngine.run`); `PaperBroker.process_bar(bar) -> list[Fill]`, `queue_entry(direction, contracts, stop, tp1, tp2, tp1_contracts)`, `set_stop(price)`, `close_now(ts, price) -> Fill | None`; `WaveEngine.on_1h_close(bar1h, bar4h, sub_bars) -> WaveState`; `run_backtest(cfg, df1h, start_ts=None, end_ts=None, *, allow_holdout=False) -> EngineResult`; `holdout_config(cfg, params) -> BotConfig`; `data_fingerprint(df1h, start_ts, last_ts) -> str`; `lock_digest(cfg, params, random_runs=100, code_sha256=None) -> str`; `tests.synth.random_bars(seed, n, vol, start)`.
 - Produces (`ewbot.paper.trace`): `OrderRec(ts, direction, contracts, stop, tp1, tp2)`, `FillRec(ts, kind, contracts, price, trade_key)`, `StopRec(ts, trade_key, old, new, kind)` (`kind` `"BREAKEVEN"` / `"TRAIL"`), `EngineTrace(orders, fills, stops, end_fill, last_state, last_ts, brokers)`, `traced_engine() -> ContextManager[EngineTrace]`.
-- Produces (`tests.paper.helpers`): `PARAMS = (2.0, 0.5, 0.0)`, `SEED = 2`, `N_BARS = 3000`, `BOUNDARY = 1704844800` (2024-01-10 00:00 UTC), `HOLDOUT_A_TRADES = 2`, `ts(text) -> int`, `synth_frame(n=N_BARS, seed=SEED) -> DataFrame`, `make_lock(df, boundary=BOUNDARY, params=PARAMS, n_a=2, **overrides) -> dict`, `git(repo, *args)`, `commit_lock(repo, lock) -> Path`, `FakeSender(fail=0)` (`.texts`, `.calls`, `.fail`), `FakeFetch(source, clock, fail=0)` (`.calls`, `.fail`), `Clock(now)` (`.now`).
+- Produces (`tests.paper.helpers`): `PARAMS = (2.0, 0.5, 0.0)`, `SEED = 2`, `N_BARS = 3000`, `BOUNDARY = 1704844800` (2024-01-10 00:00 UTC), `HOLDOUT_A_TRADES = 2`, `ts(text) -> int`, `synth_frame(n=N_BARS, seed=SEED) -> DataFrame`, `CODE_SHA` (stand-in holdout code fingerprint), `make_lock(df, boundary=BOUNDARY, params=PARAMS, n_a=2, **overrides) -> dict` (its `sha256` is the real `lock_digest(BotConfig(), params, random_runs, code_sha256)` of the final lock unless `sha256` itself is overridden), `git(repo, *args)`, `commit_lock(repo, lock) -> Path`, `FakeSender(fail=0)` (`.texts`, `.calls`, `.fail`), `FakeFetch(source, clock, fail=0)` (`.calls`, `.fail`), `Clock(now)` (`.now`).
 - Synthetic path facts used by Tasks 4–9 (seed 2, 3000 bars from 2023-11-15 00:00 UTC, `PARAMS`): A trades enter 2024-01-01 20:00 and 01-06 20:00 (holdout side of `BOUNDARY`), 01-12 15:00 (TIME exit 01-22 12:00), 02-07 21:00 (STOP 02-08 22:00), 02-16 02:00 short (STOP 02-18 17:00) and 03-13 23:00 C_END long (TRAIL 03-14 07:00, TP1 + BREAKEVEN 03-14 23:00, TP2 03-16 18:00).
 
 - [ ] **Step 1: Write the failing test**
@@ -810,7 +824,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.holdout import data_fingerprint, holdout_config
+from ewbot.backtest.holdout import data_fingerprint, holdout_config, lock_digest
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.config import BotConfig
 from ewbot.types import H1
@@ -821,6 +835,7 @@ SEED = 2
 N_BARS = 3000  # 2023-11-15 00:00 .. 2024-03-18 23:00 UTC
 BOUNDARY = 1_704_844_800  # 2024-01-10 00:00 UTC: the synthetic holdout's last bar
 HOLDOUT_A_TRADES = 2  # synthetic A trades entering in [HOLDOUT_START, BOUNDARY]
+CODE_SHA = "c0de" * 16  # stands in for the holdout's code_fingerprint (bound through lock_digest)
 
 
 def ts(text: str) -> int:
@@ -844,13 +859,16 @@ def synth_frame(n: int = N_BARS, seed: int = SEED) -> pd.DataFrame:
 
 def make_lock(df: pd.DataFrame, boundary: int = BOUNDARY, params: tuple[float, ...] = PARAMS,
               n_a: int = HOLDOUT_A_TRADES, **overrides: Any) -> dict[str, Any]:
-    """A completed-holdout lock with the real schema (v3) for synthetic data."""
+    """A completed-holdout lock with the real schema (v3) for synthetic data. Its sha256 is the real
+    lock_digest(BotConfig(), params, random_runs, code_sha256) of the final lock (after `overrides`),
+    unless `sha256` itself is overridden."""
     cfg = holdout_config(BotConfig(), params)
     lock = {
         "version": 3,
         "keys": ["wave.K4", "strategy.Q_MIN", "strategy.S_MIN"],
         "params": list(params),
-        "sha256": "d" * 64,
+        "sha256": None,
+        "code_sha256": CODE_SHA,
         "config": json.loads(json.dumps(dataclasses.asdict(cfg))),
         "holdout_start": HOLDOUT_START,
         "random_runs": 100,
@@ -864,6 +882,8 @@ def make_lock(df: pd.DataFrame, boundary: int = BOUNDARY, params: tuple[float, .
         "runs": [],
     }
     lock.update(overrides)
+    if lock["sha256"] is None:
+        lock["sha256"] = lock_digest(BotConfig(), lock["params"], lock["random_runs"], lock["code_sha256"])
     return lock
 
 
@@ -1189,7 +1209,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `EngineResult(trades, equity, signals, events)`, `Trade`, `Signal(ts, setup, direction, entry_ref, stop, tp1, tp2, risk_mult, time_stop_4h, instance, lineage, reason)`, `EngineTrace` / `traced_engine` (Task 3), `H1`, `WaveState`, `tests.paper.helpers` (Task 3).
-- Produces (`ewbot.paper.decisions`): `REL_TOL = 1e-9`, `DECISION_KINDS`, `CAUSES`, `split_result(res, trace) -> tuple[list[Trade], Trade | None]`, `paper_trades(closed, boundary_ts) -> list[Trade]`, `decision_id(kind, ts, trade_key) -> str`, `known_at(d) -> int`, `build_decisions(res, trace, trades) -> list[dict]` (keys `id, kind, ts, price, contracts, reason, trade_key, levels, setup, direction`), `same_decision(a, b) -> bool`, `classify(recorded, data_revised, current_epoch_id) -> str`, `verify_decisions(recorded, recomputed, epoch, revised_at, appeared_revised, *, appeared_after=None) -> list[dict]` (keys `id, type, decision_id, cause, recorded, recomputed`; the APPEARED window is known_at in `(appeared_after or epoch started_ts, epoch through_ts]`), `decisions_to_record(recomputed, epoch, recorded_ids) -> list[dict]`, `open_position_record(open_trade, trace, epoch_start) -> dict`, `top_count_summary(ws) -> dict | None`.
+- Produces (`ewbot.paper.decisions`): `REL_TOL = 1e-9`, `DECISION_KINDS`, `CAUSES`, `split_result(res, trace) -> tuple[list[Trade], Trade | None]`, `paper_trades(closed, boundary_ts) -> list[Trade]`, `decision_id(kind, ts, trade_key) -> str`, `known_at(d) -> int`, `build_decisions(res, trace, trades) -> list[dict]` (keys `id, kind, ts, price, contracts, reason, trade_key, levels, setup, direction`), `same_decision(a, b) -> bool`, `classify(recorded, data_revised, current_epoch_id, env_changed=False) -> str` (`CAUSES` order: `DATA_REVISION`, `FINGERPRINT_CHANGE`, `ENVIRONMENT_CHANGE`, `UNEXPLAINED`), `verify_decisions(recorded, recomputed, epoch, revised_at, appeared_revised, *, appeared_after=None, env_sha256=None, appeared_env=None) -> list[dict]` (keys `id, type, decision_id, cause, recorded, recomputed`; the APPEARED window is known_at in `(appeared_after or epoch started_ts, epoch through_ts]`; a recorded decision's `env_sha256`, or `appeared_env(recomputed)` for APPEARED, is compared with the current `env_sha256`, None never counting as a change), `decisions_to_record(recomputed, epoch, recorded_ids) -> list[dict]`, `open_position_record(open_trade, trace, epoch_start) -> dict`, `top_count_summary(ws) -> dict | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1315,13 +1335,18 @@ def test_same_decision_tolerance():
 def test_classify_order():
     rec = {"epoch_id": 1}
     assert classify(rec, True, 2) == "DATA_REVISION"
+    assert classify(rec, True, 2, env_changed=True) == "DATA_REVISION"
     assert classify(rec, False, 2) == "FINGERPRINT_CHANGE"
+    assert classify(rec, False, 2, env_changed=True) == "FINGERPRINT_CHANGE"
+    assert classify(rec, False, 1, env_changed=True) == "ENVIRONMENT_CHANGE"
+    assert classify(None, False, 2, env_changed=True) == "ENVIRONMENT_CHANGE"
     assert classify(rec, False, 1) == "UNEXPLAINED"
     assert classify(None, False, 2) == "UNEXPLAINED"
 
 
-def _record(decs, df, epoch_id=1):
-    return [{**d, "run_id": "r1", "epoch_id": epoch_id, "data_sha256": data_fingerprint(df, 0, d["ts"])} for d in decs]
+def _record(decs, df, epoch_id=1, env_sha256="env-a"):
+    return [{**d, "run_id": "r1", "epoch_id": epoch_id, "data_sha256": data_fingerprint(df, 0, d["ts"]),
+             "env_sha256": env_sha256} for d in decs]
 
 
 def test_replay_check_classifies_a_revised_bar_as_data_revision(full):
@@ -1362,6 +1387,27 @@ def test_replay_check_fingerprint_change_and_unexplained(full):
     gone = _record(decs, df) + [{**_record(decs[:1], df)[0], "id": "ENTRY:1:1", "ts": 1, "trade_key": 1}]
     found = verify_decisions(gone, full[4], epoch1, lambda d: False, lambda r: False)
     assert [(f["type"], f["decision_id"], f["cause"]) for f in found] == [("VANISHED", "ENTRY:1:1", "UNEXPLAINED")]
+
+
+def test_replay_check_environment_change_against_the_recording_run(full):
+    df = synth_frame()
+    decs = [d for d in full[4] if known_at(d) > BOUNDARY]
+    epoch1 = {"id": 1, "started_ts": BOUNDARY, "through_ts": int(df["ts"].iloc[-1])}
+    tampered = _record(decs[1:], df)  # recorded under environment "env-a"; decs[0] was never recorded
+    tampered[0] = {**tampered[0], "price": tampered[0]["price"] + 1.0}
+
+    def check(current, appeared_env):
+        found = verify_decisions(tampered, full[4], epoch1, lambda d: False, lambda r: False,
+                                 env_sha256=current, appeared_env=appeared_env)
+        return [(f["type"], f["cause"]) for f in found]
+
+    assert check("env-b", lambda r: "env-a") == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "ENVIRONMENT_CHANGE")]
+    assert check("env-a", lambda r: "env-a") == [("CHANGED", "UNEXPLAINED"), ("APPEARED", "UNEXPLAINED")]
+    # unknown recording environment (no run should have known it yet / not recorded): not an environment change
+    assert check("env-b", lambda r: None) == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "UNEXPLAINED")]
+    unstamped = [{k: v for k, v in d.items() if k != "env_sha256"} for d in tampered]
+    found = verify_decisions(unstamped, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b")
+    assert [(f["type"], f["cause"]) for f in found] == [("CHANGED", "UNEXPLAINED"), ("APPEARED", "UNEXPLAINED")]
 
 
 def test_appeared_only_inside_the_epochs_recorded_window(full):
@@ -1433,7 +1479,7 @@ from ewbot.waves.engine import WaveState
 
 REL_TOL = 1e-9
 DECISION_KINDS = ("SIGNAL", "ENTRY", "TP1", "TP2", "STOP", "EXIT", "BREAKEVEN", "TRAIL")
-CAUSES = ("DATA_REVISION", "FINGERPRINT_CHANGE", "UNEXPLAINED")
+CAUSES = ("DATA_REVISION", "FINGERPRINT_CHANGE", "ENVIRONMENT_CHANGE", "UNEXPLAINED")  # in priority order
 _ORDER = {k: i for i, k in enumerate(("EXIT", "ENTRY", "STOP", "TP1", "TP2", "BREAKEVEN", "TRAIL", "SIGNAL"))}
 _COMPARED = ("kind", "ts", "trade_key", "contracts", "reason", "setup", "direction")
 
@@ -1526,14 +1572,24 @@ def same_decision(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return all(_close(x, y) for x, y in zip(a["levels"], b["levels"], strict=True))
 
 
-def classify(recorded: dict[str, Any] | None, data_revised: bool, current_epoch_id: int) -> str:
+def classify(
+    recorded: dict[str, Any] | None, data_revised: bool, current_epoch_id: int, env_changed: bool = False
+) -> str:
     """DATA_REVISION if a bar up to the decision changed; else FINGERPRINT_CHANGE if the decision
-    was recorded under another epoch; else UNEXPLAINED."""
+    was recorded under another epoch; else ENVIRONMENT_CHANGE if the run that recorded it (or should
+    have) ran in another runtime environment (paper.environment); else UNEXPLAINED."""
     if data_revised:
         return "DATA_REVISION"
     if recorded is not None and int(recorded["epoch_id"]) != int(current_epoch_id):
         return "FINGERPRINT_CHANGE"
+    if env_changed:
+        return "ENVIRONMENT_CHANGE"
     return "UNEXPLAINED"
+
+
+def _env_changed(recording: str | None, current: str | None) -> bool:
+    """Only a known recording environment that differs from the current one counts."""
+    return recording is not None and current is not None and recording != current
 
 
 def verify_decisions(
@@ -1544,13 +1600,18 @@ def verify_decisions(
     appeared_revised: Callable[[dict[str, Any]], bool],
     *,
     appeared_after: int | None = None,
+    env_sha256: str | None = None,
+    appeared_env: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Replay check. Every recorded decision must reappear unchanged (else CHANGED / VANISHED); a
     recomputed decision of the current epoch that a previous run should already have known but did
     not record is APPEARED. revised_at(recorded) / appeared_revised(recomputed) say whether the bars
     up to that decision changed since it was (or should have been) recorded. The APPEARED window is
     known_at in (appeared_after, epoch through_ts]; appeared_after defaults to the epoch's started_ts
-    (the runner passes where the epoch began recording, see runner._recording_floor)."""
+    (the runner passes where the epoch began recording, see runner._recording_floor).
+    env_sha256 is the current run's environment digest; it is compared with a recorded decision's
+    env_sha256 and, for APPEARED, with appeared_env(recomputed) - the environment digest of the run
+    that should have recorded it (None: unknown, never an environment change)."""
     by_id = {d["id"]: d for d in recomputed}
     rec_ids = {d["id"] for d in recorded}
     found: list[dict[str, Any]] = []
@@ -1559,7 +1620,7 @@ def verify_decisions(
         if r is not None and same_decision(d, r):
             continue
         kind = "VANISHED" if r is None else "CHANGED"
-        cause = classify(d, revised_at(d), epoch["id"])
+        cause = classify(d, revised_at(d), epoch["id"], _env_changed(d.get("env_sha256"), env_sha256))
         found.append({"id": f"{kind}:{d['id']}", "type": kind, "decision_id": d["id"], "cause": cause,
                       "recorded": d, "recomputed": r})
     lo = int(epoch["started_ts"]) if appeared_after is None else int(appeared_after)
@@ -1567,7 +1628,8 @@ def verify_decisions(
     for r in recomputed:
         if r["id"] in rec_ids or not lo < known_at(r) <= hi:
             continue
-        cause = classify(None, appeared_revised(r), epoch["id"])
+        recording_env = None if appeared_env is None else appeared_env(r)
+        cause = classify(None, appeared_revised(r), epoch["id"], _env_changed(recording_env, env_sha256))
         found.append({"id": f"APPEARED:{r['id']}", "type": "APPEARED", "decision_id": r["id"], "cause": cause,
                       "recorded": None, "recomputed": r})
     return found
@@ -1635,7 +1697,7 @@ def top_count_summary(ws: WaveState | None) -> dict[str, Any] | None:
 uv run pytest tests/paper/test_decisions.py -q
 ```
 
-Expected: `12 passed`.
+Expected: `13 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1659,7 +1721,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `Ledger`, `new_ledger` (Task 2), `Trade`, `ewbot.strategy.base.blended_r(direction, entry, stop, tp1, tp2, tp1_frac) -> float`, `H1`, `requests`, `tests.paper.helpers.FakeSender`, `ts` (Task 3).
-- Produces (`ewbot.paper.notify`): `NY = ZoneInfo("America/New_York")`, `DAILY_HOUR_NY = 9`, `GAP_WARN_S = 10800`, `SEND_ATTEMPTS = 3`, `TELEGRAM_API`, `HEAD = "[ewbot paper]"`, `class SendError`, `Sender` protocol `(text) -> None`, `TelegramSender(token, chat_id, session=None, timeout=15.0)`, `sender_from_env(env=None) -> TelegramSender | None`, `make_event(kind, ts, trade_key, text) -> dict` (`id, kind, text, attempts`), `deliver(pending, sent_ids, sender, attempts=3, sleep=time.sleep) -> tuple[list[dict], list[str], list[str]]` (still pending, newly sent ids, notes), `daily_summary_due(now_ts, last_date) -> str | None`, `last_ok_run_ts(runs) -> int | None`, `gap_seconds(now_ts, runs) -> int | None`, formats `entry_text(t, tp1_frac)`, `stop_move_text(dec, t)`, `close_text(t, count, counted)`, `daily_text(ny_date, position, equity, count, status)`, `epoch_text(epoch)`, `discrepancy_text(items)`, `data_hash_text(expected, got)`, `holdout_trades_text(expected, got)`, `criteria_error_text(ny_date, error)`, `gap_text(seconds, last_ts)`, `failure_text(stage, message, run_url)`, `position_line(pos)`, `decision_events(fresh, trades, open_key, epoch_start, count, cur_closed, tp1_frac) -> list[dict]`, `queue_events(ledger, events) -> list[str]`.
+- Produces (`ewbot.paper.notify`): `NY = ZoneInfo("America/New_York")`, `DAILY_HOUR_NY = 9`, `CRITERIA_ATTEMPTS = 2`, `GAP_WARN_S = 10800`, `SEND_ATTEMPTS = 3`, `TELEGRAM_API`, `HEAD = "[ewbot paper]"`, `class SendError`, `Sender` protocol `(text) -> None`, `TelegramSender(token, chat_id, session=None, timeout=15.0)` (any failure is a `SendError`: `telegram HTTP <status>: <reply>` for a status other than 200 or a reply that is not a JSON object with `ok: true`, `telegram request failed: <type name>` for any exception while posting or reading the reply), `sender_from_env(env=None) -> TelegramSender | None`, `make_event(kind, ts, trade_key, text) -> dict` (`id, kind, text, attempts`), `deliver(pending, sent_ids, sender, attempts=3, sleep=time.sleep) -> tuple[list[dict], list[str], list[str]]` (still pending, newly sent ids, notes; a note keeps a `SendError`'s message, only the type name of other exceptions), `daily_summary_due(now_ts, last_date) -> str | None`, `last_ok_run_ts(runs) -> int | None`, `gap_seconds(now_ts, runs) -> int | None`, formats `entry_text(t, tp1_frac)`, `stop_move_text(dec, t)`, `close_text(t, count, counted)`, `daily_text(ny_date, position, equity, count, status, stale=None)` (with `stale`: header marked `기준 미갱신(stale)` and a line with the error), `epoch_text(epoch)`, `discrepancy_text(items)`, `data_hash_text(expected, got)`, `holdout_trades_text(expected, got)`, `criteria_error_text(ny_date, error)`, `gap_text(seconds, last_ts)`, `failure_text(stage, message, run_url)`, `position_line(pos)`, `decision_events(fresh, trades, open_key, epoch_start, count, cur_closed, tp1_frac) -> list[dict]`, `queue_events(ledger, events) -> list[str]`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1678,6 +1740,7 @@ from ewbot.paper.notify import (
     SendError,
     TelegramSender,
     close_text,
+    criteria_error_text,
     daily_summary_due,
     daily_text,
     decision_events,
@@ -1698,12 +1761,16 @@ TOKEN = "123456:SECRET"
 
 
 class _Resp:
-    def __init__(self, status: int, body: dict) -> None:
+    """`body` is the parsed JSON reply, or an exception that json() raises (a non-JSON reply)."""
+
+    def __init__(self, status: int, body: object) -> None:
         self.status_code = status
         self._body = body
         self.text = str(body)
 
-    def json(self) -> dict:
+    def json(self) -> object:
+        if isinstance(self._body, Exception):
+            raise self._body
         return self._body
 
 
@@ -1743,6 +1810,36 @@ def test_telegram_sender_raises_without_leaking_the_token(resp):
     with pytest.raises(SendError) as exc:
         TelegramSender(TOKEN, "42", session=_Session(resp))("hello")
     assert TOKEN not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "resp, expected",
+    [
+        (_Resp(502, ValueError("<html>bad gateway</html>")), "telegram HTTP 502"),  # non-JSON reply
+        (_Resp(200, ValueError("not json")), "telegram HTTP 200"),
+        (_Resp(200, ["ok"]), "telegram HTTP 200"),  # JSON, but not an object
+        (_Resp(200, None), "telegram HTTP 200"),
+        (_Resp(200, RuntimeError(f"decoder broke on {TOKEN}")), "RuntimeError"),  # any other failure: type only
+    ],
+)
+def test_telegram_sender_turns_odd_replies_into_send_errors(resp, expected):
+    with pytest.raises(SendError) as exc:
+        TelegramSender(TOKEN, "42", session=_Session(resp))("hello")
+    assert expected in str(exc.value) and TOKEN not in str(exc.value) and exc.value.__cause__ is None
+
+
+def test_deliver_notes_only_the_error_type_unless_it_is_a_send_error():
+    def leaky(text: str) -> None:
+        raise ConnectionError(f"POST https://api.telegram.org/bot{TOKEN}/sendMessage failed")
+
+    _, _, notes = deliver(_events(1), [], leaky, sleep=lambda s: None)
+    assert notes == ["send failed for ENTRY:1000:0: ConnectionError"]
+
+    def rejected(text: str) -> None:
+        raise SendError("telegram HTTP 429: too many requests")
+
+    _, _, notes = deliver(_events(1), [], rejected, sleep=lambda s: None)
+    assert notes == ["send failed for ENTRY:1000:0: telegram HTTP 429: too many requests"]
 
 
 def test_sender_from_env():
@@ -1825,6 +1922,11 @@ def test_entry_close_stop_and_failure_formats():
     assert "단계 data" in text and "coinbase down" in text and "actions/runs/1" in text
     assert "로그" not in failure_text("data", "x", None)
     assert daily_text("2024-02-08", "p", "e", "c", ["s1", "s2"]).splitlines()[1:] == ["p", "e", "c", "s1", "s2"]
+    stale = daily_text("2024-02-08", "p", "e", "c", ["s1"], stale="RuntimeError: boom").splitlines()
+    assert stale[0].endswith("일일 요약 2024-02-08 (뉴욕) · 기준 미갱신(stale)") and stale[1:4] == ["p", "e", "c"]
+    assert "재계산 2회 실패" in stale[4] and "RuntimeError: boom" in stale[4] and stale[5] == "s1"
+    text = criteria_error_text("2024-02-08", "RuntimeError: boom")
+    assert "2024-02-08" in text and "다음 실행에서 1회 다시 계산" in text and "기준 미갱신(stale)" in text
     assert position_line(None) == "포지션: 없음"
 
 
@@ -1903,6 +2005,7 @@ from ewbot.types import H1
 
 NY = ZoneInfo("America/New_York")
 DAILY_HOUR_NY = 9
+CRITERIA_ATTEMPTS = 2  # criteria 1-2 recomputes per New York date: the daily-summary run and one retry
 GAP_WARN_S = 3 * H1
 SEND_ATTEMPTS = 3
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
@@ -1919,7 +2022,10 @@ class Sender(Protocol):
 
 
 class TelegramSender:
-    """POST sendMessage (plain text, no parse mode). Raises SendError on any failure."""
+    """POST sendMessage (plain text, no parse mode). Raises SendError on any failure: an HTTP status
+    other than 200 or a reply that is not a JSON object with "ok": true (message: the status and the
+    start of Telegram's reply), or any exception while posting or reading the reply (message: its
+    type name only - the API URL holds the token)."""
 
     def __init__(self, token: str, chat_id: str, session: Any | None = None, timeout: float = 15.0) -> None:
         self._url = TELEGRAM_API.format(token=token)
@@ -1931,11 +2037,17 @@ class TelegramSender:
         payload = {"chat_id": self._chat_id, "text": text, "disable_web_page_preview": True}
         try:
             resp = self._session.post(self._url, json=payload, timeout=self._timeout)
-        except requests.RequestException as exc:
-            raise SendError(f"telegram request failed: {type(exc).__name__}") from None  # no token in messages
-        ok = resp.status_code == 200 and bool(resp.json().get("ok"))
+            status = int(resp.status_code)
+            try:
+                body = resp.json()
+            except ValueError:  # not JSON (requests' JSONDecodeError is a ValueError)
+                body = None
+            ok = status == 200 and isinstance(body, dict) and bool(body.get("ok"))
+            reply = "" if ok else str(resp.text)[:200]
+        except Exception as exc:  # noqa: BLE001 - transport or reply errors: type name only, no token
+            raise SendError(f"telegram request failed: {type(exc).__name__}") from None
         if not ok:
-            raise SendError(f"telegram HTTP {resp.status_code}: {resp.text[:200]}")
+            raise SendError(f"telegram HTTP {status}: {reply}")
 
 
 def sender_from_env(env: Mapping[str, str] | None = None) -> TelegramSender | None:
@@ -1958,7 +2070,8 @@ def deliver(
     """Send pending events in order. Returns (still pending, newly sent ids, error notes).
     No sender: the events are dropped unsent (not kept, so a later token does not flood the chat).
     Ids already sent are dropped silently. The first event that fails `attempts` times stops the
-    batch: it and every later event stay pending, in order."""
+    batch: it and every later event stay pending, in order. The error note keeps a SendError's
+    message (token-free by construction) and only the type name of any other exception."""
     if sender is None:
         return [], [], [f"telegram not configured: {len(pending)} event(s) not sent"] if pending else []
     done = set(sent_ids)
@@ -1979,7 +2092,8 @@ def deliver(
         if err is not None:
             rest = [dict(e) for e in pending[i:] if e["id"] not in done]
             rest[0]["attempts"] = int(rest[0].get("attempts", 0)) + 1
-            return rest, newly, [f"send failed for {ev['id']}: {err}"]
+            why = str(err) if isinstance(err, SendError) else type(err).__name__
+            return rest, newly, [f"send failed for {ev['id']}: {why}"]
         newly.append(ev["id"])
         done.add(ev["id"])
     return [], newly, []
@@ -2081,8 +2195,16 @@ def close_text(t: Trade, count: Mapping[str, Any], counted: bool) -> str:
     )
 
 
-def daily_text(ny_date: str, position: str, equity: str, count: str, status: Sequence[str]) -> str:
-    return "\n".join([f"{HEAD} 일일 요약 {ny_date} (뉴욕)", position, equity, count, *status])
+def daily_text(
+    ny_date: str, position: str, equity: str, count: str, status: Sequence[str], stale: str | None = None
+) -> str:
+    """stale: why criteria 1-2 could not be recomputed on this date (the status block then shows the
+    previous result and the summary is marked 기준 미갱신(stale))."""
+    head = f"{HEAD} 일일 요약 {ny_date} (뉴욕)"
+    if stale is None:
+        return "\n".join([head, position, equity, count, *status])
+    note = f"실거래 전환 판정 1·2번 재계산 {CRITERIA_ATTEMPTS}회 실패: 이전 결과 표시 ({stale[:200]})"
+    return "\n".join([f"{head} · 기준 미갱신(stale)", position, equity, count, note, *status])
 
 
 def epoch_text(epoch: Mapping[str, Any]) -> str:
@@ -2101,6 +2223,11 @@ def discrepancy_text(items: Sequence[Mapping[str, Any]]) -> str:
         lines.append(f"{d['type']} {d['decision_id']} · {d['cause']}")
     if len(items) > 10:
         lines.append(f"외 {len(items) - 10}건 더 (report.html 참고)")
+    if any(d["cause"] == "ENVIRONMENT_CHANGE" for d in items):
+        lines.append(
+            "ENVIRONMENT_CHANGE: 결정을 기록한 실행과 실행 환경(Python·numpy·pandas·pyarrow·uv.lock·실행기 이미지)이 "
+            "다름 - 4번 기준 원인 불명 집계에서 제외"
+        )
     return "\n".join(lines)
 
 
@@ -2129,7 +2256,7 @@ def criteria_error_text(ny_date: str, error: str) -> str:
         [
             f"{HEAD} 경고: 실거래 전환 판정 1·2번 재계산 실패 ({ny_date} 뉴욕)",
             error[:300],
-            "이전 결과를 유지하고 다음 실행에서 다시 계산함 (일일 요약은 계산에 성공한 실행에서 보냄)",
+            "이전 결과를 유지하고 다음 실행에서 1회 다시 계산함 (다시 실패하면 일일 요약을 '기준 미갱신(stale)'으로 보냄)",
         ]
     )
 
@@ -2199,7 +2326,7 @@ def queue_events(ledger: Ledger, events: Sequence[dict[str, Any]]) -> list[str]:
 uv run pytest tests/paper/test_notify.py -q
 ```
 
-Expected: `21 passed`.
+Expected: `27 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2223,8 +2350,8 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.backtest.holdout.evaluate_criteria(cmp) -> dict` (`winners`, `max_dd_ok`, `n_trades_ok`, `n_trades`, `trade_count`, `random_control_evaluated`, `passing`, `paper_4_weeks`, `automatic_criteria_met`), `Ledger`, `current_epoch`, `golive_count`, `trade_from_record`, `ensure_epoch`, `new_ledger`, `replace_epoch_trades` (Task 2), `position_line` (Task 5), `compute_metrics(equity, trades, start_ts=None, end_ts=None) -> Metrics`, `write_report(path, title, sections) -> Path`, `aggregate_4h(df1h)`, `EquityPoint`, `Trade`.
-- Produces (`ewbot.paper.criteria`): `PAPER_MIN_DAYS = 28`, `COVERAGE_MIN = 0.95`, `MAX_DD = 0.15`, `summarize_compare(cmp, start_ts, end_ts, epoch_id, computed_ts) -> dict` (`computed_ts, epoch_id, window, winners, max_dd_ok, random_control_evaluated, headline, random`), `run_coverage(runs, epoch_id, now_ts) -> dict`, `criterion4(ledger, now_ts) -> dict` (`first_ts`, `days`, `hours`, `covered`, `coverage`, `unexplained`, `met`), `golive_status(ledger, now_ts) -> dict` (`epoch_id, eligible, count, criteria_1_2, c1, c2, c3, c4, all_met`), `status_lines(st) -> list[str]`.
-- Produces (`ewbot.paper.report`): `write_paper_report(path, ledger, status, equity, paper_closed, df1h, top_count, now_ts) -> Path` (atomic).
+- Produces (`ewbot.paper.criteria`): `PAPER_MIN_DAYS = 28`, `COVERAGE_MIN = 0.95`, `MAX_DD = 0.15`, `summarize_compare(cmp, start_ts, end_ts, epoch_id, computed_ts) -> dict` (`computed_ts, epoch_id, window, winners, max_dd_ok, random_control_evaluated, headline, random`), `run_coverage(runs, epoch_id, now_ts) -> dict`, `criterion4(ledger, now_ts) -> dict` (`first_ts`, `days`, `hours`, `covered`, `coverage`, `unexplained`, `environment` (ENVIRONMENT_CHANGE count, shown only), `met`), `golive_status(ledger, now_ts) -> dict` (`epoch_id, eligible, count, criteria_1_2, c1, c2, c3, c4, all_met`), `status_lines(st) -> list[str]`.
+- Produces (`ewbot.paper.report`): `write_paper_report(path, ledger, status, equity, paper_closed, df1h, top_count, now_ts) -> Path` (atomic; the notes show the last run's runtime environment).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2304,6 +2431,11 @@ def test_criterion4_needs_28_days_95_percent_and_no_unexplained():
     assert not criterion4(led, now)["met"]
     led.discrepancies[0]["cause"] = "DATA_REVISION"
     assert criterion4(led, now)["met"]
+    led.discrepancies[0]["cause"] = "ENVIRONMENT_CHANGE"  # warned and shown, not counted (spec 5.3)
+    c4 = criterion4(led, now)
+    assert c4["met"] and c4["unexplained"] == 0 and c4["environment"] == 1
+    line = status_lines(golive_status(led, now))[4]
+    assert "원인 불명 불일치 0건" in line and "실행 환경 변경 불일치 1건(4번 집계 제외)" in line
     led.runs = _hourly_runs(T0, hours, skip=set(range(10, 60)))  # 50 missing hours: < 95%
     assert not criterion4(led, now)["met"]
 
@@ -2314,6 +2446,7 @@ def test_summarize_compare_and_status_lines():
     assert st["c1"] is None and st["c2"] is None and st["c3"] is False and not st["all_met"]
     lines = status_lines(st)
     assert "미계산" in lines[1] and "3. 표본 외 거래 36/50 (홀드아웃 36 + 모의 0): 미충족" in lines[3]
+    assert "실행 환경 변경" not in lines[4]  # shown only when there is one
     assert lines[-1] == "=> 실거래 전환 검토 불가"
 
     led.criteria = summarize_compare(_cmp(), 1_704_067_200, T0, 1, T0)
@@ -2355,9 +2488,15 @@ def _ledger_for_report():
     led = new_ledger("fp" * 32, "c" * 40, LOCK)
     replace_epoch_trades(led, 1, [_trade(T0, T0 + 5 * H1)])
     led.runs = [{"id": "r1", "ts": T0 + 30 * H1, "status": "ok", "epoch_id": 1, "last_bar_ts": T0 + 29 * H1,
-                 "holdout_data_ok": False}]
+                 "holdout_data_ok": False,
+                 "env": {"python": "3.12.7", "numpy": "2.1.0", "pandas": "2.2.3", "pyarrow": "18.0.0",
+                         "uv_lock_sha256": "f" * 64, "image_os": "ubuntu24", "image_version": "20261001.1.0"},
+                 "env_sha256": "e" * 64}]
     led.discrepancies = [{"id": "CHANGED:ENTRY:1:1", "type": "CHANGED", "decision_id": "ENTRY:1:1",
                           "cause": "DATA_REVISION", "epoch_id": 1, "detected_ts": T0, "detected_run": "r1",
+                          "recorded": None, "recomputed": None},
+                         {"id": "CHANGED:EXIT:2:1", "type": "CHANGED", "decision_id": "EXIT:2:1",
+                          "cause": "ENVIRONMENT_CHANGE", "epoch_id": 1, "detected_ts": T0, "detected_run": "r1",
                           "recorded": None, "recomputed": None}]
     led.open_position = {"entry_ts": T0 + 20 * H1, "setup": "C_END", "direction": -1, "contracts": 4, "remaining": 2,
                          "entry_price": 100.0, "stop": 101.0, "pnl_if_closed": -3.0, "counted": True}
@@ -2374,7 +2513,9 @@ def test_paper_report_sections(tmp_path):
     html = path.read_text(encoding="utf-8")
     for part in ("실거래 전환 판정", "1. 위험 대비 수익", "4. 모의매매 재현", "현재 1등 카운트", "IMP d=1 W3",
                  "포지션: C_END 숏 2/4계약", "불일치 (재현성 손상 기록)", "Trades - epoch 1 (current) (1)",
-                 "CHANGED:ENTRY:1:1", "DATA_REVISION", "eq-chart", "dd-chart", "A paper", "criteria 1-2 window"):
+                 "CHANGED:ENTRY:1:1", "DATA_REVISION", "ENVIRONMENT_CHANGE", "eq-chart", "dd-chart", "A paper",
+                 "criteria 1-2 window", "실행 환경 eeeeeeeeeeee: Python 3.12.7 · numpy 2.1.0 · pandas 2.2.3 · "
+                 "pyarrow 18.0.0 · uv.lock ffffffffffff · 이미지 ubuntu24 20261001.1.0"):
         assert part in html, part
     assert html.index("실거래 전환 판정") < html.index("eq-chart")  # the go-live block is at the top
     assert sorted(os.listdir(tmp_path)) == ["report.html"]
@@ -2473,14 +2614,14 @@ def run_coverage(runs: list[dict[str, Any]], epoch_id: int, now_ts: int) -> dict
 
 
 def criterion4(ledger: Ledger, now_ts: int) -> dict[str, Any]:
-    """>= 28 days of paper runs, 0 UNEXPLAINED discrepancies in the epoch, >= 95% hourly coverage."""
+    """>= 28 days of paper runs, 0 UNEXPLAINED discrepancies in the epoch, >= 95% hourly coverage.
+    ENVIRONMENT_CHANGE discrepancies are counted for display only (spec 5.3: not UNEXPLAINED)."""
     cur = current_epoch(ledger)
     cov = run_coverage(ledger.runs, cur["id"], now_ts)
-    unexplained = sum(
-        1 for d in ledger.discrepancies if d["cause"] == "UNEXPLAINED" and int(d["epoch_id"]) == int(cur["id"])
-    )
+    causes = [d["cause"] for d in ledger.discrepancies if int(d["epoch_id"]) == int(cur["id"])]
+    unexplained = causes.count("UNEXPLAINED")
     met = cov["days"] >= PAPER_MIN_DAYS and unexplained == 0 and cov["coverage"] >= COVERAGE_MIN
-    return {**cov, "unexplained": unexplained, "met": met}
+    return {**cov, "unexplained": unexplained, "environment": causes.count("ENVIRONMENT_CHANGE"), "met": met}
 
 
 def golive_status(ledger: Ledger, now_ts: int) -> dict[str, Any]:
@@ -2523,9 +2664,10 @@ def status_lines(st: dict[str, Any]) -> list[str]:
         f"3. 표본 외 거래 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}): "
         f"{_mark(st['c3'])}"
     )
+    env = f", 실행 환경 변경 불일치 {c4['environment']}건(4번 집계 제외)" if c4.get("environment") else ""
     lines.append(
         f"4. 모의매매 재현: {_mark(c4['met'])} (운영 {c4['days']:.1f}/{PAPER_MIN_DAYS}일, 커버리지 "
-        f"{c4['coverage'] * 100:.1f}%, 원인 불명 불일치 {c4['unexplained']}건)"
+        f"{c4['coverage'] * 100:.1f}%, 원인 불명 불일치 {c4['unexplained']}건{env})"
     )
     lines.append("=> 실거래 전환 검토 가능 (자동 전환하지 않음)" if st["all_met"] else "=> 실거래 전환 검토 불가")
     return lines
@@ -2574,6 +2716,18 @@ def _top_note(top: dict[str, Any] | None) -> str:
     )
 
 
+def _env_note(run: dict[str, Any] | None) -> str:
+    env = (run or {}).get("env")
+    if not env:
+        return "실행 환경: -"
+    lock = (env.get("uv_lock_sha256") or "-")[:12]
+    image = f"{env.get('image_os') or '-'} {env.get('image_version') or '-'}"
+    return (
+        f"실행 환경 {str(run.get('env_sha256', ''))[:12]}: Python {env.get('python')} · numpy {env.get('numpy')} · "
+        f"pandas {env.get('pandas')} · pyarrow {env.get('pyarrow')} · uv.lock {lock} · 이미지 {image}"
+    )
+
+
 def write_paper_report(
     path: Path,
     ledger: Ledger,
@@ -2597,6 +2751,7 @@ def write_paper_report(
         f"{ledger.baseline['fingerprint'][:12]} @ {ledger.baseline['commit'][:7]}",
         "홀드아웃 데이터 해시: "
         + ("일치" if last_run is None or last_run.get("holdout_data_ok", True) else "불일치 (재현성 손상 기록)"),
+        _env_note(last_run),
         position_line(ledger.open_position),
         _top_note(top_count),
         f"표본 외 구간: {_utc(start)} 이후 (홀드아웃 마지막 봉 {_utc(boundary)})",
@@ -2666,17 +2821,61 @@ EOF
 ### Task 7: Paper runner orchestration
 
 **Files:**
-- Create: `src/ewbot/paper/runner.py`
-- Test: `tests/paper/test_runner.py`
+- Create: `src/ewbot/paper/environment.py`, `src/ewbot/paper/runner.py`
+- Test: `tests/paper/test_environment.py`, `tests/paper/test_runner.py`
 
 **Interfaces:**
-- Consumes: every `ewbot.paper` module above; `ewbot.backtest.holdout.DEFAULT_LOCK_PATH`, `data_fingerprint`, `holdout_config`; `ewbot.backtest.runner.run_backtest`, `compare(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False) -> dict`; `ewbot.backtest.walkforward.HOLDOUT_START`, `grid_combos()`; `ewbot.data.candles.fill_gaps`, `load_1h`; `ewbot.data.coinbase_history.update_cache(product, cache_dir)`.
-- Produces (`ewbot.paper.runner`): `PRODUCT = "BTC-USD"`, `FETCH_ATTEMPTS = 3`, `class PaperRunError(RuntimeError)` (`.stage`, `.message`), `default_fetch(cache_dir) -> Path`, `@dataclass PaperEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch, sender=None, clock=_wall_clock, fingerprint=current_fingerprint, baseline=baseline_fingerprint, random_runs=100, workers=max(1, os.cpu_count() or 1), sleep=time.sleep, fetch_backoff_s=10.0)` (`_wall_clock() -> int` = `int(time.time())`), `@dataclass(frozen=True) RunOutcome(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, status)`, `precheck_lock(lock_path) -> dict`, `run_paper(env) -> RunOutcome`.
-- Run record in `ledger.runs`: `id, ts, status, last_bar_ts, data_sha256, holdout_data_ok, holdout_trades_recomputed, epoch_id, paper_trades, count_total, new_decisions, new_discrepancies, warnings, notify`.
-- Failure stages: `precheck`, `ledger`, `fingerprint`, `data`, `recompute`, `events`, `write`, `notify`. Every step runs in a named `_stage`, so an unexpected exception surfaces as `PaperRunError(stage)`; the `notify` stage keeps only the exception type (the Telegram token is part of the API URL) and does not chain the cause. The daily criteria 1-2 recompute is the one step that never fails the run: an error there is a warning (`criteria_error_text`, once per New York date), the previous `ledger.criteria` stays and the next hourly run retries it (no daily summary until it succeeds).
+- Consumes: every `ewbot.paper` module above; `ewbot.backtest.holdout.DEFAULT_LOCK_PATH`, `data_fingerprint`, `holdout_config`, `lock_digest`; `ewbot.backtest.runner.run_backtest`, `compare(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False) -> dict`; `ewbot.backtest.walkforward.HOLDOUT_START`, `grid_combos()`; `ewbot.data.candles.fill_gaps`, `load_1h`; `ewbot.data.coinbase_history.update_cache(product, cache_dir)`.
+- Produces (`ewbot.paper.runner`): `PRODUCT = "BTC-USD"`, `FETCH_ATTEMPTS = 3`, `class PaperRunError(RuntimeError)` (`.stage`, `.message`), `default_fetch(cache_dir) -> Path`, `@dataclass PaperEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch, sender=None, clock=_wall_clock, fingerprint=current_fingerprint, baseline=baseline_fingerprint, random_runs=100, workers=max(1, os.cpu_count() or 1), sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)` (`_wall_clock() -> int` = `int(time.time())`), `@dataclass(frozen=True) RunOutcome(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, status)`, `precheck_lock(lock_path) -> dict` (also requires `lock["sha256"] == lock_digest(BotConfig(), params, random_runs, code_sha256)`), `run_paper(env) -> RunOutcome`.
+- Produces (`ewbot.paper.environment`): `PACKAGES = ("numpy", "pandas", "pyarrow")`, `runtime_environment(repo_root=None, environ=None) -> dict` (`python, numpy, pandas, pyarrow, uv_lock_sha256, image_os, image_version`), `environment_digest(env) -> str`.
+- Run record in `ledger.runs`: `id, ts, status, last_bar_ts, data_sha256, holdout_data_ok, holdout_trades_recomputed, epoch_id, paper_trades, count_total, new_decisions, new_discrepancies, env, env_sha256, warnings, notify`, plus `criteria_recompute: {ny_date, ok}` in a run that recomputed criteria 1–2. Each new decision is stamped `run_id, data_sha256, epoch_id, env_sha256`.
+- Failure stages: `precheck`, `ledger`, `fingerprint`, `data`, `recompute`, `events`, `write`, `notify`. Every step runs in a named `_stage`, so an unexpected exception surfaces as `PaperRunError(stage)`; the `notify` stage keeps only the exception type (the Telegram token is part of the API URL) and does not chain the cause. The daily criteria 1-2 recompute is the one step that never fails the run: an error there is a warning (`criteria_error_text`, once per New York date), the previous `ledger.criteria` stays and the next run retries it once (no daily summary yet); if that retry fails too, the daily summary goes out marked `기준 미갱신(stale)` (`daily_text(..., stale=error)`) with the previous result and the next try is on the next New York date.
 - Epoch boundary: the run that creates a new epoch records the decisions first known since the previous epoch's `through_ts` (`_recording_floor`), and passes that floor to `verify_decisions(..., appeared_after=floor)`. `ledger.json` is bound to the whole `holdout_summary(lock)`, not only its sha256 and last bar. A recomputed holdout A trade count different from the lock's `n_trades["A"]` warns once per distinct value (`holdout_trades_text`) and the run continues.
 
 - [ ] **Step 1: Write the failing test**
+
+**File: `tests/paper/test_environment.py`**
+
+```python
+from __future__ import annotations
+
+import hashlib
+import platform
+
+import numpy as np
+import pandas as pd
+import pyarrow
+
+from ewbot.paper.environment import environment_digest, runtime_environment
+
+
+def test_runtime_environment_records_versions_lock_hash_and_runner_image(tmp_path):
+    (tmp_path / "uv.lock").write_bytes(b"version = 1\n")
+    env = runtime_environment(tmp_path, {"ImageOS": "ubuntu24", "ImageVersion": "20261001.1.0", "OTHER": "x"})
+    assert env == {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "pyarrow": pyarrow.__version__,
+        "uv_lock_sha256": hashlib.sha256(b"version = 1\n").hexdigest(),
+        "image_os": "ubuntu24",
+        "image_version": "20261001.1.0",
+    }
+
+
+def test_runtime_environment_off_actions_and_without_a_lock_file(tmp_path):
+    env = runtime_environment(tmp_path, {})
+    assert env["image_os"] is None and env["image_version"] is None and env["uv_lock_sha256"] is None
+    assert runtime_environment()["uv_lock_sha256"] is not None  # the repository's own uv.lock
+
+
+def test_environment_digest_is_order_independent_and_sensitive_to_every_value():
+    a = {"python": "3.12.7", "numpy": "2.1.0", "image_version": None}
+    assert environment_digest(a) == environment_digest(dict(reversed(list(a.items()))))
+    assert len(environment_digest(a)) == 64
+    for key, value in (("python", "3.12.8"), ("numpy", "2.1.1"), ("image_version", "20261001.1.0")):
+        assert environment_digest({**a, key: value}) != environment_digest(a), key
+```
 
 **File: `tests/paper/test_runner.py`**
 
@@ -2689,6 +2888,8 @@ import os
 import pytest
 
 from ewbot.paper import runner
+from ewbot.paper.criteria import criterion4
+from ewbot.paper.environment import environment_digest
 from ewbot.paper.ledger import LEDGER_FILE, REPORT_FILE, RUNS_LOG, load_ledger
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
 from ewbot.types import H1
@@ -2705,6 +2906,8 @@ from tests.paper.helpers import (
 )
 
 FIRST = ts("2024-02-10 12:07")  # 07:07 New York: no daily summary
+ENV_A = {"python": "3.12.7", "numpy": "2.1.0", "pandas": "2.2.3", "pyarrow": "18.0.0", "uv_lock_sha256": "a" * 64,
+         "image_os": "ubuntu24", "image_version": "20261001.1.0"}
 
 
 @pytest.fixture(scope="module")
@@ -2721,7 +2924,7 @@ def make_env(tmp_path, df):
             ledger_dir=tmp_path / "paper", lock_path=lock_path, cache_dir=tmp_path / "cache",
             fetch=FakeFetch(df, clock), sender=FakeSender() if sender is None else sender, clock=clock,
             fingerprint=lambda: "fp-base", baseline=lambda: ("fp-base", "c" * 40), random_runs=2, workers=1,
-            sleep=lambda s: None,
+            sleep=lambda s: None, environment=lambda: dict(ENV_A),
         )
         defaults.update(kw)
         return PaperEnv(**defaults)
@@ -2743,6 +2946,8 @@ def test_first_run_writes_ledger_report_log_and_notifies(make_env):
     assert min(d["ts"] for d in led.decisions) == ts("2024-01-12 14:00")  # SIGNAL bar of the first paper trade
     run = led.runs[0]
     assert run["status"] == "ok" and run["holdout_data_ok"] is True and run["last_bar_ts"] == ts("2024-02-10 11:00")
+    assert run["env"] == ENV_A and run["env_sha256"] == environment_digest(ENV_A)
+    assert all(d["env_sha256"] == run["env_sha256"] for d in led.decisions)  # stamped by the recording run
     assert run["holdout_trades_recomputed"] == 2 and run["count_total"] == 4  # 2 holdout + 2 paper
     texts = env.sender.texts
     assert sum("신규 진입" in t for t in texts) == 2 and sum("청산" in t for t in texts) == 2
@@ -2786,7 +2991,9 @@ def _modify(path):
     path.write_text(json.dumps(data))
 
 
-@pytest.mark.parametrize("case", ["missing", "untracked", "modified", "staged", "grid", "start", "incomplete"])
+@pytest.mark.parametrize(
+    "case", ["missing", "untracked", "modified", "staged", "grid", "start", "incomplete", "digest", "random_runs", "code"]
+)
 def test_precheck_refuses_and_writes_nothing(make_env, df, tmp_path, case):
     lock = make_lock(df)
     if case == "grid":
@@ -2795,6 +3002,12 @@ def test_precheck_refuses_and_writes_nothing(make_env, df, tmp_path, case):
         lock["holdout_start"] = lock["holdout_start"] + H1
     if case == "incomplete":
         del lock["first_run"]
+    if case == "digest":  # sha256 is not lock_digest(BotConfig(), params, random_runs, code_sha256)
+        lock["sha256"] = "d" * 64
+    if case == "random_runs":  # the holdout ran another random-control size than the digest says
+        lock["random_runs"] = 99
+    if case == "code":
+        del lock["code_sha256"]
     env = make_env(lock=lock)
     path = env.lock_path
     if case == "missing":
@@ -2832,9 +3045,16 @@ def test_fetch_is_retried_three_times(make_env, df):
 def test_ledger_of_another_holdout_is_refused(make_env, df):
     env = make_env()
     run_paper(env)
-    other = make_env(lock=make_lock(df, sha256="e" * 64))
+    other = make_env(lock=make_lock(df, code_sha256="e" * 64))  # a valid lock with another digest
     with pytest.raises(PaperRunError, match="different holdout lock"):
         run_paper(other)
+
+
+def test_precheck_names_the_lock_digest_mismatch(make_env, df):
+    env = make_env(lock=make_lock(df, sha256="d" * 64))
+    with pytest.raises(PaperRunError, match="lock_digest") as exc:
+        run_paper(env)
+    assert exc.value.stage == "precheck"
 
 
 def test_corrupt_ledger_stops_at_the_ledger_stage(make_env):
@@ -2950,34 +3170,96 @@ def test_new_epoch_records_the_decisions_known_since_the_previous_run(make_env):
     assert [(d["type"], d["decision_id"], d["cause"]) for d in found] == [("APPEARED", sig, "UNEXPLAINED")]
 
 
-def test_criteria_failure_warns_once_and_is_retried_next_hour(make_env, monkeypatch):
-    env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
+@pytest.mark.parametrize("env_changed", [True, False])
+def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, env_changed):
+    box = {"env": dict(ENV_A)}
+    env = make_env(environment=lambda: dict(box["env"]))
     run_paper(env)
-    before = load_ledger(env.ledger_dir).criteria
-    real = runner.compare
+    path = env.ledger_dir / LEDGER_FILE
+    data = json.loads(path.read_text())
+    changed = next(d for d in data["decisions"] if d["kind"] == "ENTRY")
+    changed["price"] += 1.0  # as if the recording run had computed another fill price
+    lost = next(d for d in data["decisions"] if d["kind"] == "EXIT")
+    data["decisions"].remove(lost)  # as if the recording run had not seen this exit
+    path.write_text(json.dumps(data))
+    if env_changed:
+        box["env"] = {**ENV_A, "image_version": "20261008.1.0"}  # GitHub rolled out a new runner image
+    env.clock.now += H1
+    out = run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    cause = "ENVIRONMENT_CHANGE" if env_changed else "UNEXPLAINED"
+    assert [(d["type"], d["decision_id"], d["cause"]) for d in led.discrepancies] == [
+        ("CHANGED", changed["id"], cause), ("APPEARED", lost["id"], cause)]
+    assert out.new_discrepancies == 2 and led.runs[-1]["env_sha256"] == environment_digest(box["env"])
+    warning = env.sender.texts[-1]
+    assert "결정 불일치 2건" in warning and cause in warning
+    assert ("4번 기준 원인 불명 집계에서 제외" in warning) is env_changed
+    c4 = criterion4(led, env.clock.now)
+    assert (c4["unexplained"], c4["environment"]) == ((0, 2) if env_changed else (2, 0))
 
+
+RETRY_NOTE = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
+
+
+def _broken_compare(calls: list[int]):
     def broken(*args, **kwargs):
+        calls.append(1)
         raise RuntimeError("compare blew up")
 
-    monkeypatch.setattr(runner, "compare", broken)
-    for t in ("2024-02-13 14:07", "2024-02-13 15:07"):
-        env.clock.now = ts(t)
-        out = run_paper(env)
-        led = load_ledger(env.ledger_dir)
-        note = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
-        assert led.runs[-1]["status"] == "ok" and led.runs[-1]["warnings"] == [note] and note in out.notes
-    assert led.criteria == before and led.daily_summary_date == "2024-02-12"
+    return broken
+
+
+def test_criteria_failure_warns_once_and_is_retried_by_the_next_run(make_env, monkeypatch):
+    env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
+    run_paper(env)
+    real, calls = runner.compare, []
+    monkeypatch.setattr(runner, "compare", _broken_compare(calls))
+    env.clock.now = ts("2024-02-13 14:07")
+    out = run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    run = led.runs[-1]
+    assert run["status"] == "ok" and run["warnings"] == [RETRY_NOTE] and RETRY_NOTE in out.notes
+    assert run["criteria_recompute"] == {"ny_date": "2024-02-13", "ok": False}
+    assert led.daily_summary_date == "2024-02-12" and not any("일일 요약 2024-02-13" in t for t in env.sender.texts)
     warned = [t for t in env.sender.texts if "1·2번 재계산 실패" in t]
     assert len(warned) == 1 and "2024-02-13" in warned[0] and "compare blew up" in warned[0]
-    assert not any("일일 요약 2024-02-13" in t for t in env.sender.texts)
-    assert (env.ledger_dir / RUNS_LOG).read_text().count("\n") == 3
 
     monkeypatch.setattr(runner, "compare", real)
-    env.clock.now = ts("2024-02-13 16:07")
+    env.clock.now = ts("2024-02-13 15:07")  # the one retry succeeds: a normal daily summary
     run_paper(env)
     led = load_ledger(env.ledger_dir)
-    assert led.daily_summary_date == "2024-02-13" and led.criteria["computed_ts"] == ts("2024-02-13 16:07")
-    assert sum("일일 요약 2024-02-13" in t for t in env.sender.texts) == 1 and led.runs[-1]["warnings"] == []
+    assert led.daily_summary_date == "2024-02-13" and led.criteria["computed_ts"] == ts("2024-02-13 15:07")
+    daily = [t for t in env.sender.texts if "일일 요약 2024-02-13" in t]
+    assert len(daily) == 1 and "stale" not in daily[0] and led.runs[-1]["warnings"] == []
+    assert led.runs[-1]["criteria_recompute"] == {"ny_date": "2024-02-13", "ok": True} and len(calls) == 1
+
+
+def test_second_criteria_failure_sends_a_stale_daily_summary_and_stops_retrying_that_date(make_env, monkeypatch):
+    env = make_env(now=ts("2024-02-12 14:07"))
+    run_paper(env)
+    before = load_ledger(env.ledger_dir).criteria
+    calls: list[int] = []
+    monkeypatch.setattr(runner, "compare", _broken_compare(calls))
+    for t in ("2024-02-13 14:07", "2024-02-13 15:07", "2024-02-13 16:07"):
+        env.clock.now = ts(t)
+        run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    assert len(calls) == 2  # the daily run and one retry; 16:07 does not try again
+    assert led.criteria == before and led.daily_summary_date == "2024-02-13"
+    assert [r["warnings"] for r in led.runs[1:]] == [
+        [RETRY_NOTE],
+        ["criteria 1-2 not recomputed (attempt 2/2 on 2024-02-13 failed: daily summary sent stale, next try on "
+         "the next New York date): RuntimeError: compare blew up"],
+        [],
+    ]
+    assert sum("1·2번 재계산 실패" in t for t in env.sender.texts) == 1  # one warning per New York date
+    daily = [t for t in env.sender.texts if "일일 요약 2024-02-13" in t]
+    assert len(daily) == 1 and "기준 미갱신(stale)" in daily[0] and "compare blew up" in daily[0]
+    assert "2024-02-12 계산" in daily[0]  # the previous criteria 1-2 result is what the summary shows
+    assert (env.ledger_dir / RUNS_LOG).read_text().count("\n") == 4
+    env.clock.now = ts("2024-02-14 14:07")  # the next New York date tries again
+    run_paper(env)
+    assert len(calls) == 3 and load_ledger(env.ledger_dir).runs[-1]["warnings"] == [RETRY_NOTE]
 
 
 def test_holdout_trade_count_mismatch_warns_once(make_env, df):
@@ -2999,7 +3281,7 @@ def test_ledger_is_bound_to_the_whole_holdout_summary(make_env, df, key):
     lock = make_lock(df, params=(2.0, 0.7, 0.5)) if key == "params" else make_lock(df, n_a=3 if key == "n_trades" else 2)
     if key == "data_sha256":
         lock["data"]["sha256"] = "0" * 64
-    other = make_env(lock=lock)  # same lock sha256 and last bar as the ledger's
+    other = make_env(lock=lock)  # same last bar (data_sha256 / n_trades: same lock sha256 too) as the ledger's
     with pytest.raises(PaperRunError, match=f"different holdout lock .*{key}") as exc:
         run_paper(other)
     assert exc.value.stage == "precheck" and other.fetch.calls == 0 and other.sender.texts == []
@@ -3032,14 +3314,72 @@ def test_unexpected_errors_name_their_stage_and_withhold_secret_details(make_env
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-uv run pytest tests/paper/test_runner.py -q
+uv run pytest tests/paper/test_environment.py tests/paper/test_runner.py -q
 ```
 
-Expected: collection error `ModuleNotFoundError: No module named 'ewbot.paper.runner'`.
+Expected: 2 collection errors, `ModuleNotFoundError: No module named 'ewbot.paper.environment'` and `No module named 'ewbot.paper.runner'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-This module is the only non-holdout caller of `allow_holdout=True` (`run_backtest` for the recompute, `compare` for the daily criteria); Task 10 adds the static guard.
+`runner.py` is the only non-holdout caller of `allow_holdout=True` (`run_backtest` for the recompute, `compare` for the daily criteria); Task 10 adds the static guard.
+
+**File: `src/ewbot/paper/environment.py`**
+
+```python
+"""Runtime environment of a paper run (Plan 2 spec 5.3, ENVIRONMENT_CHANGE; spec 8 freezes it).
+
+The environment is what can change a recompute without touching the strategy code: the Python
+version, the numpy / pandas / pyarrow versions, the sha256 of uv.lock and the GitHub Actions runner
+image (the ImageOS / ImageVersion variables the hosted runners set; None elsewhere). Every run
+records it; every decision carries the digest of the environment of the run that recorded it."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+from importlib import metadata
+from pathlib import Path
+from typing import Any, Mapping
+
+from ewbot.paper.fingerprint import PROJECT_ROOT
+
+PACKAGES = ("numpy", "pandas", "pyarrow")
+
+
+def _version(dist: str) -> str | None:
+    try:
+        return metadata.version(dist)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _sha256_of(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def runtime_environment(repo_root: Path | None = None, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """{"python", "numpy", "pandas", "pyarrow", "uv_lock_sha256", "image_os", "image_version"}."""
+    root = PROJECT_ROOT if repo_root is None else Path(repo_root)
+    environ = os.environ if environ is None else environ
+    return {
+        "python": platform.python_version(),
+        **{name: _version(name) for name in PACKAGES},
+        "uv_lock_sha256": _sha256_of(root / "uv.lock"),
+        "image_os": environ.get("ImageOS"),
+        "image_version": environ.get("ImageVersion"),
+    }
+
+
+def environment_digest(env: Mapping[str, Any]) -> str:
+    """sha256 of the sorted, compact JSON of an environment record."""
+    blob = json.dumps(dict(env), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+```
 
 **File: `src/ewbot/paper/runner.py`**
 
@@ -3049,12 +3389,17 @@ out-of-sample extraction -> replay check -> ledger / report / runs.log -> Telegr
 
 Inputs are frozen: the params come from holdout.lock only, the rest of the configuration is the
 BotConfig defaults (conservative risk, breakers on, Plan 1 costs) - holdout_config(BotConfig(), params),
-exactly how the holdout ran. The recompute starts trading at the holdout start, so it reproduces the
-holdout's A run and continues it; trades entering after the holdout's last bar are paper trades.
+exactly how the holdout ran; the precheck refuses a lock whose sha256 is not
+lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. whose configuration is not the one this
+run would use. The recompute starts trading at the holdout start, so it reproduces the holdout's A run
+and continues it; trades entering after the holdout's last bar are paper trades. Every run records its
+runtime environment (paper.environment); decisions carry the digest of the environment that recorded
+them, for the ENVIRONMENT_CHANGE cause of the replay check.
 
 Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
-the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it) and is
-retried by the next run.
+the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it): the next run
+retries it once; if that fails too, the daily summary goes out marked stale with the previous result
+and the next try is on the next New York date (CRITERIA_ATTEMPTS per date).
 
 This module is the only non-holdout caller of allow_holdout=True (a static test enforces it)."""
 
@@ -3073,7 +3418,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.holdout import DEFAULT_LOCK_PATH, data_fingerprint, holdout_config
+from ewbot.backtest.holdout import DEFAULT_LOCK_PATH, data_fingerprint, holdout_config, lock_digest
 from ewbot.backtest.runner import compare, run_backtest
 from ewbot.backtest.walkforward import HOLDOUT_START, grid_combos
 from ewbot.config import BotConfig
@@ -3090,6 +3435,7 @@ from ewbot.paper.decisions import (
     top_count_summary,
     verify_decisions,
 )
+from ewbot.paper.environment import environment_digest, runtime_environment
 from ewbot.paper.fingerprint import FingerprintError, baseline_fingerprint, current_fingerprint
 from ewbot.paper.ledger import (
     GO_LIVE_STRATEGY,
@@ -3107,6 +3453,7 @@ from ewbot.paper.ledger import (
     save_ledger,
 )
 from ewbot.paper.notify import (
+    CRITERIA_ATTEMPTS,
     GAP_WARN_S,
     NY,
     Sender,
@@ -3168,6 +3515,7 @@ class PaperEnv:
     workers: int = field(default_factory=lambda: max(1, os.cpu_count() or 1))
     sleep: Callable[[float], None] = time.sleep
     fetch_backoff_s: float = 10.0
+    environment: Callable[[], dict[str, Any]] = runtime_environment
 
 
 @dataclass(frozen=True)
@@ -3211,8 +3559,11 @@ def _git_ok(cwd: Path, *args: str) -> bool:
 
 
 def precheck_lock(lock_path: Path) -> dict[str, Any]:
-    """holdout.lock exists, is committed (in HEAD), has no staged or unstaged change, and its params
-    are a walk-forward grid combo. Returns the parsed lock."""
+    """holdout.lock exists, is committed (in HEAD), has no staged or unstaged change, its params are
+    a walk-forward grid combo, its holdout start is HOLDOUT_START and its sha256 equals
+    lock_digest(BotConfig(), params, random_runs, code_sha256): the full configuration this run uses
+    (BotConfig defaults with the lock's params), the grid and the holdout start are the ones the
+    holdout ran with. Returns the parsed lock."""
     p = Path(lock_path)
     if not p.is_file():
         raise PaperRunError("precheck", f"{p} not found: the paper runtime needs the committed holdout lock")
@@ -3228,12 +3579,21 @@ def precheck_lock(lock_path: Path) -> dict[str, Any]:
         str(lock["sha256"])
         int(lock["first_run"]["criteria"]["n_trades"]["A"])
         holdout_start = int(lock["holdout_start"])
+        random_runs = int(lock["random_runs"])
+        code_sha = str(lock["code_sha256"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise PaperRunError("precheck", f"{p} is not a completed holdout lock: {exc!r}") from exc
     if params not in grid_combos():
         raise PaperRunError("precheck", f"lock params {list(params)} are not a walk-forward grid combo")
     if holdout_start != HOLDOUT_START:
         raise PaperRunError("precheck", f"lock holdout_start {holdout_start} != {HOLDOUT_START}")
+    digest = lock_digest(BotConfig(), params, random_runs, code_sha)
+    if digest != lock["sha256"]:
+        raise PaperRunError(
+            "precheck",
+            f"lock sha256 {str(lock['sha256'])[:12]} != lock_digest(BotConfig(), params, random_runs, code_sha256) "
+            f"{digest[:12]}: this run's configuration is not the one the holdout ran with",
+        )
     return lock
 
 
@@ -3310,6 +3670,11 @@ def _ny9_ts(ny_date: str) -> int:
     return int(datetime(y, m, d, 9, tzinfo=NY).timestamp())
 
 
+def _criteria_failures(runs: list[dict[str, Any]], ny_date: str) -> int:
+    """Failed criteria 1-2 recomputes recorded for this New York date."""
+    return sum(1 for r in runs if r.get("criteria_recompute") == {"ny_date": ny_date, "ok": False})
+
+
 def _run_id(now: int) -> str:
     return datetime.fromtimestamp(now, UTC).strftime("%Y%m%dT%H%M%SZ")
 
@@ -3324,6 +3689,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         lock = precheck_lock(env.lock_path)
         cfg = holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
         ledger_dir = Path(env.ledger_dir)
+        run_env = dict(env.environment())
+        env_sha = environment_digest(run_env)
 
     ledger = _open_ledger(env, ledger_dir, lock)
     with _stage("ledger"):
@@ -3366,13 +3733,21 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         def revised_at(d: dict[str, Any]) -> bool:
             return prefix(d["ts"]) != d["data_sha256"]
 
+        def first_knowing_run(r: dict[str, Any]) -> dict[str, Any] | None:
+            """The first successful run that should have recorded r."""
+            return next((x for x in ok_runs if x["last_bar_ts"] >= known_at(r)), None)
+
         def appeared_revised(r: dict[str, Any]) -> bool:
-            run = next((x for x in ok_runs if x["last_bar_ts"] >= known_at(r)), None)
+            run = first_knowing_run(r)
             return run is not None and prefix(run["last_bar_ts"]) != run["data_sha256"]
+
+        def appeared_env(r: dict[str, Any]) -> str | None:
+            run = first_knowing_run(r)
+            return None if run is None else run.get("env_sha256")
 
         recomputed = build_decisions(res, trace, all_trades)
         found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised,
-                                 appeared_after=floor)
+                                 appeared_after=floor, env_sha256=env_sha, appeared_env=appeared_env)
         known = {d["id"] for d in ledger.discrepancies}
         new_disc = [
             {**d, "epoch_id": epoch["id"], "detected_ts": last_bar, "detected_run": run_id}
@@ -3382,7 +3757,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         ledger.discrepancies.extend(new_disc)
         fresh = decisions_to_record(recomputed, epoch, {d["id"] for d in ledger.decisions})
         for d in fresh:
-            d.update(run_id=run_id, data_sha256=prefix(d["ts"]), epoch_id=epoch["id"])
+            d.update(run_id=run_id, data_sha256=prefix(d["ts"]), epoch_id=epoch["id"], env_sha256=env_sha)
         ledger.decisions.extend(fresh)
         epoch["through_ts"] = max(int(epoch["through_ts"]), last_bar)
 
@@ -3420,23 +3795,36 @@ def run_paper(env: PaperEnv) -> RunOutcome:
             "count_total": count["total"],
             "new_decisions": len(fresh),
             "new_discrepancies": len(new_disc),
+            "env": run_env,
+            "env_sha256": env_sha,
             "warnings": warnings,
         }
         ledger.runs.append(run)
         due = daily_summary_due(now, ledger.daily_summary_date)
 
+    stale: str | None = None  # why today's daily summary shows the previous criteria 1-2 result
     if due is not None and count["eligible"]:
+        failed = _criteria_failures(ledger.runs, due)
         try:
             end = last_bar + H1
             cmp = compare(cfg, df, hs["holdout_start"], end, random_runs=env.random_runs, workers=env.workers,
                           allow_holdout=True)
             ledger.criteria = summarize_compare(cmp, hs["holdout_start"], end, epoch["id"], now)
+            run["criteria_recompute"] = {"ny_date": due, "ok": True}
         except Exception as exc:  # noqa: BLE001 - criteria 1-2 are a daily extra: never block the hourly run
             err = f"{type(exc).__name__}: {exc}"
-            warnings.append(f"criteria 1-2 not recomputed (retried next run): {err}")
-            with _stage("events"):  # one warning per New York date; the previous ledger.criteria stays
-                events.append(make_event("CRITERIA", _ny9_ts(due), 0, criteria_error_text(due, err)))
-            due = None  # no daily summary and no daily_summary_date until the criteria are recomputed
+            run["criteria_recompute"] = {"ny_date": due, "ok": False}
+            if failed + 1 < CRITERIA_ATTEMPTS:
+                warnings.append(f"criteria 1-2 not recomputed (retried next run): {err}")
+                with _stage("events"):  # one warning per New York date; the previous ledger.criteria stays
+                    events.append(make_event("CRITERIA", _ny9_ts(due), 0, criteria_error_text(due, err)))
+                due = None  # no daily summary and no daily_summary_date: the next run retries
+            else:
+                warnings.append(
+                    f"criteria 1-2 not recomputed (attempt {failed + 1}/{CRITERIA_ATTEMPTS} on {due} failed: daily "
+                    f"summary sent stale, next try on the next New York date): {err}"
+                )
+                stale = err
 
     with _stage("events"):
         if due is not None:
@@ -3449,7 +3837,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
                 f"구간 {epoch['id']}"
             )
             st = golive_status(ledger, now)
-            text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st))
+            text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st),
+                              stale=stale)
             events.append(make_event("DAILY", _ny9_ts(due), 0, text))
             ledger.daily_summary_date = due
         queued = queue_events(ledger, events)
@@ -3480,15 +3869,15 @@ def run_paper(env: PaperEnv) -> RunOutcome:
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
-uv run pytest tests/paper/test_runner.py -q
+uv run pytest tests/paper/test_environment.py tests/paper/test_runner.py -q
 ```
 
-Expected: `26 passed`.
+Expected: `36 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/ewbot/paper/runner.py tests/paper/test_runner.py
+git add src/ewbot/paper/environment.py src/ewbot/paper/runner.py tests/paper/test_environment.py tests/paper/test_runner.py
 git commit -m "$(cat <<'EOF'
 feat(paper): hourly paper run orchestration
 
@@ -3575,6 +3964,7 @@ def test_paper_run_then_status(fake_env, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "실거래 전환 판정" in out and "3. 표본 외 거래 4/50" in out and "포지션: 없음" in out
     assert "holdout trades recomputed 2 (lock: 2)" in out and "holdout data ok" in out
+    assert "discrepancies 0 (unexplained 0, environment change 0)" in out
 
 
 def test_status_without_a_ledger_fails(tmp_path, capsys):
@@ -3796,9 +4186,10 @@ def _paper_status(args: argparse.Namespace) -> int:
             f"holdout trades recomputed {r['holdout_trades_recomputed']} (lock: {led.holdout['n_trades']['A']})"
         )
     unexplained = sum(1 for d in led.discrepancies if d["cause"] == "UNEXPLAINED")
+    environment = sum(1 for d in led.discrepancies if d["cause"] == "ENVIRONMENT_CHANGE")
     print(
-        f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)} (unexplained {unexplained}), "
-        f"pending events {len(led.pending_events)}"
+        f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)} (unexplained {unexplained}, "
+        f"environment change {environment}), pending events {len(led.pending_events)}"
     )
     return 0
 
@@ -4023,7 +4414,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run pytest tests/paper -q
 ```
 
-Expected: `106 passed` (all paper tests so far, about 50 s; the walk fixture alone takes about 25 s).
+Expected: `131 passed` (all paper tests so far, about 50 s; the walk fixture alone takes about 25 s).
 
 - [ ] **Step 5: Commit**
 
@@ -4042,12 +4433,12 @@ EOF
 ### Task 10: Static `allow_holdout` guard, Actions workflow and ops guide
 
 **Files:**
-- Create: `.github/workflows/paper.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`
+- Create: `.github/workflows/paper.yml`, `.github/workflows/ci.yml`, `scripts/paper_sync.sh`, `docs/paper-trading.md`
 - Test: `tests/paper/test_static.py`, `tests/paper/test_paper_sync.py`
 
 **Interfaces:**
 - Consumes: `pyyaml` (already a dependency), the AST of every `src/ewbot/**/*.py`, `git` >= 2.42 (`worktree add --orphan`) and `bash` for the sync script and its tests (local bare repositories, no network).
-- Produces: the guard "`allow_holdout=True` appears only in `backtest/holdout.py` and `paper/runner.py`; non-literal values only in `backtest/runner.py`; every `allow_holdout` parameter defaults to `False` (only runner's private `_init_worker` / `_map_tasks` take it without a default); no `"allow_holdout"` string and no import, attribute, name or getattr string of runner's `check_before_holdout` / `_map_tasks` / `_init_worker` outside `backtest/runner.py` (a module may define its own helper of the same name: `walkforward._init_worker`)"; the hourly workflow; `scripts/paper_sync.sh` (`checkout`: paper worktree, orphan only on `ls-remote` exit 2; `push RECOMPUTE...`: commit, 3 pushes, the same commit again when `origin/paper` did not move, recompute only when it moved, never after the last push); the ops guide with the user's Telegram steps (spec §6.5).
+- Produces: the guard "`allow_holdout=True` appears only in `backtest/holdout.py` and `paper/runner.py`; non-literal values only in `backtest/runner.py`; every `allow_holdout` parameter defaults to `False` (only runner's private `_init_worker` / `_map_tasks` take it without a default); no `"allow_holdout"` string and no import, attribute, name or getattr string of runner's `check_before_holdout` / `_map_tasks` / `_init_worker` outside `backtest/runner.py` (a module may define its own helper of the same name: `walkforward._init_worker`)"; the hourly workflow (`runs-on: ubuntu-24.04`); the CI guard workflow `ci.yml` (pull requests and pushes to `master`: `tests/paper/test_fingerprint.py` with the pinned baseline and `tests/paper/test_static.py`, read-only, no secrets); `scripts/paper_sync.sh` (`checkout`: paper worktree, orphan only on `ls-remote` exit 2; `push RECOMPUTE...`: commit, 3 pushes, the same commit again when `origin/paper` did not move, recompute only when it moved, never after the last push); the ops guide with the user's Telegram steps (spec §6.5), the Actions budget step, what the CI guard does and does not do, the no-revert rule, the lock binding and the frozen runtime environment (spec §8).
 - Workflow env passed to `ewbot`: `EWBOT_RUN_URL` (job), `EWBOT_FAILURE_MARKER`, `PAPER_DIR` (`$RUNNER_TEMP/paper`, via `$GITHUB_ENV`); the secrets `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` only on the steps that can send (`paper`, `push`, `alert`).
 
 - [ ] **Step 1: Write the failing test**
@@ -4060,6 +4451,7 @@ EOF
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -4069,7 +4461,10 @@ import ewbot
 
 SRC = Path(ewbot.__file__).resolve().parent  # src/ewbot
 ROOT = SRC.parents[1]
-WORKFLOW = ROOT / ".github" / "workflows" / "paper.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
+WORKFLOW = WORKFLOWS / "paper.yml"
+CI_WORKFLOW = WORKFLOWS / "ci.yml"
+RUNNER_IMAGE = "ubuntu-24.04"  # pinned while paper trading runs (spec 8): part of the recorded environment
 ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py"}  # Plan 2 spec 7.1
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
 # backtest/runner.py helpers that skip the holdout check or forward allow_holdout unchecked
@@ -4213,6 +4608,10 @@ def _step(steps, step_id):
     return next(s for s in steps if s.get("id") == step_id)
 
 
+def test_the_repository_has_exactly_the_paper_and_ci_workflows():
+    assert sorted(p.name for p in WORKFLOWS.iterdir()) == ["ci.yml", "paper.yml"]
+
+
 def test_workflow_triggers_concurrency_and_permissions():
     wf, _ = _workflow()
     on = wf[True]  # YAML 1.1 reads the bare key `on` as boolean True
@@ -4220,6 +4619,7 @@ def test_workflow_triggers_concurrency_and_permissions():
     assert wf["concurrency"] == {"group": "paper", "cancel-in-progress": False}
     assert wf["permissions"] == {"contents": "write"}
     assert "permissions" not in wf["jobs"]["paper"]
+    assert wf["jobs"]["paper"]["runs-on"] == RUNNER_IMAGE  # never ubuntu-latest: no silent OS upgrade
 
 
 def test_telegram_secrets_reach_only_the_steps_that_can_send():
@@ -4263,6 +4663,32 @@ def test_failure_alert_step():
     assert "EWBOT_FAILURE_MARKER" in run and "sendMessage" in run
     assert "curl" in run and "--fail-with-body" in run and "/dev/null" not in run  # keep Telegram's error
     assert "set -x" not in run and "echo \"${TELEGRAM_BOT_TOKEN" not in run and "echo $TELEGRAM" not in run
+
+
+def test_failure_alert_curl_finishes_within_its_step_timeout():
+    """curl --max-time bounds each attempt; --retry N adds N attempts after waits of 1, 2, 4, ... s.
+    The worst case must end before the step timeout, or the alert step itself is killed silently."""
+    _, steps = _workflow()
+    alert = _step(steps, "alert")
+    retries = int(re.search(r"--retry (\d+)", alert["run"]).group(1))
+    max_time = int(re.search(r"--max-time (\d+)", alert["run"]).group(1))
+    worst = (retries + 1) * max_time + sum(2**i for i in range(retries))
+    assert (retries, max_time, alert["timeout-minutes"]) == (3, 20, 2)
+    assert worst < alert["timeout-minutes"] * 60
+
+
+def test_ci_workflow_runs_the_fingerprint_and_static_guards_without_secrets():
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    wf = yaml.safe_load(text)
+    on = wf[True]
+    assert on == {"pull_request": {"branches": ["master"]}, "push": {"branches": ["master"]}}
+    assert wf["permissions"] == {"contents": "read"} and "secrets." not in text
+    (job,) = wf["jobs"].values()
+    assert job["runs-on"] == RUNNER_IMAGE and job["timeout-minutes"] <= 15
+    uses = [s["uses"] for s in job["steps"] if "uses" in s]
+    assert uses == ["actions/checkout@v7", SETUP_UV] and f"uses: {SETUP_UV} # v10.2.0" in text
+    runs = [s["run"] for s in job["steps"] if "run" in s]
+    assert runs == ["uv sync --frozen", "uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py"]
 ```
 
 **File: `tests/paper/test_paper_sync.py`**
@@ -4575,7 +5001,7 @@ def test_usage_errors(w):
 uv run pytest tests/paper/test_static.py tests/paper/test_paper_sync.py -q
 ```
 
-Expected: `20 failed, 18 passed`: the `allow_holdout` guards and their self-tests pass (Task 7 respected them), and so does `test_usage_errors` (a missing script exits non-zero too); the 4 workflow tests fail with `FileNotFoundError` for `.github/workflows/paper.yml` and 16 sync tests fail because `scripts/paper_sync.sh` does not exist.
+Expected: `23 failed, 18 passed`: the `allow_holdout` guards and their self-tests pass (Task 7 respected them), and so does `test_usage_errors` (a missing script exits non-zero too); the 7 workflow tests fail with `FileNotFoundError` (`.github/workflows/`, `paper.yml` and `ci.yml` do not exist yet) and 16 sync tests fail because `scripts/paper_sync.sh` does not exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -4746,7 +5172,8 @@ permissions:
 
 jobs:
   paper:
-    runs-on: ubuntu-latest
+    # pinned while paper trading runs (spec 8): the runner image is part of each run's recorded environment
+    runs-on: ubuntu-24.04
     # backstop only: the steps below have their own timeouts, so a hang fails its step and alerts
     timeout-minutes: 100
     env:
@@ -4827,11 +5254,51 @@ jobs:
           fi
           text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / timeout / push) · ${JOB_STATUS}"$'\n'"로그: ${EWBOT_RUN_URL}"
           # --fail-with-body: an HTTP error fails the step and prints Telegram's reply (never the token)
-          curl -sS --fail-with-body --retry 3 --max-time 30 -X POST \
+          # worst case 4 x 20 s + 1 + 2 + 4 s of retry waits = 87 s, inside the 2-minute step timeout
+          curl -sS --fail-with-body --retry 3 --max-time 20 -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${text}"
           echo
+```
+
+**File: `.github/workflows/ci.yml`**
+
+```yaml
+# Strategy-fingerprint guard (Plan 2 spec 8): on every pull request to master and every push to master,
+# check that the strategy files still hash to the holdout baseline (the value is pinned in the test, so
+# no git history is needed) and run the static allow_holdout / workflow guards. No secrets, read-only.
+# It reports; it does not block a merge unless you make this check required (docs/paper-trading.md).
+name: ci
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv (with its cache)
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Strategy fingerprint and static guards
+        run: uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py
 ```
 
 **File: `docs/paper-trading.md`**
@@ -4843,18 +5310,20 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
 ## What runs
 
-- `.github/workflows/paper.yml` runs `uv run ewbot paper run --ledger-dir <paper worktree>` every hour at minute 7 (and on demand). `scripts/paper_sync.sh` does the git side: the `paper` worktree, the commit, the push and its retries.
+- `.github/workflows/paper.yml` runs `uv run ewbot paper run --ledger-dir <paper worktree>` every hour at minute 7 (and on demand) on `ubuntu-24.04`. `scripts/paper_sync.sh` does the git side: the `paper` worktree, the commit, the push and its retries.
+- GitHub can start a scheduled run late (minutes, sometimes much more when Actions is busy), so a run can slip into the next hour and leave an hour without a successful run. Criterion 4's 95% coverage target tolerates up to 33 missed hours in 28 days (5% of 672 hours is 33.6).
+- `.github/workflows/ci.yml` runs the strategy-fingerprint and static guards on every pull request to `master` and every push to `master` (see Strict fingerprint policy).
 - Each run recomputes the whole engine deterministically from 2017 with the params in the committed `holdout.lock` (K4 = 2.0, Q_MIN = 0.7, S_MIN = 0.5), conservative risk, breakers on and Plan 1 costs. Trading starts at the holdout start (2024-01-01), so the run reproduces the holdout's A run and continues it.
 - Paper trades are the trades that **enter after the holdout's last bar** (`entry_ts > 1790938800`, 2026-10-02 11:00 UTC). A position already open at that bar belongs to the holdout and is never counted twice.
 - Results go to the orphan branch `paper` (never to `master`). Only the workflow writes to `paper`: never push to it by hand (see Failures).
-  - `ledger.json`: baseline fingerprint and commit, holdout summary, epochs, closed trades, open position, decisions, discrepancies, runs, sent and pending Telegram events, the last criteria 1–2 result.
+  - `ledger.json`: baseline fingerprint and commit, holdout summary, epochs, closed trades, open position, decisions, discrepancies, runs (each with its runtime environment), sent and pending Telegram events, the last criteria 1–2 result.
   - `report.html`: go-live status at the top, out-of-sample equity and drawdown, trade tables with snapshot charts, current top count, discrepancy list, epochs.
   - `runs.log`: one line per successful run (time, status, last bar, data hash, N/50, epoch).
 - The candle cache `data/cache/BTC-USD_1h.parquet` lives in the Actions cache (a new entry per run, restored from the newest one). A missing cache means a full download (about 70 s).
 
 ## One-time setup (you)
 
-1. Merge `feat/plan2-paper` into `master`. Scheduled workflows only run from the default branch.
+1. Merge `feat/plan2-paper` into `master` through a pull request, after its `ci` check has passed. Scheduled workflows only run from the default branch.
 2. Telegram bot:
    1. In Telegram, open **@BotFather**, send `/newbot`, choose a name and a username ending in `bot`. BotFather replies with the token (digits, a colon, then letters and digits). Keep it private.
    2. Open a chat with your new bot and send it any message (for example `hi`). A bot cannot write to you before you have written to it.
@@ -4875,7 +5344,8 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
    ```
 
    Without these secrets the runtime still runs and records everything; it only skips Telegram.
-4. Start the first run by hand and watch it:
+4. Set a small Actions budget, for example $5, at <https://github.com/settings/billing> (budgets and alerts, product Actions). With the default $0 budget GitHub stops running the workflow once the month's free minutes are used up, and every missed hour counts against criterion 4; a small budget keeps the runs going and caps what they can cost (see Cost).
+5. Start the first run by hand and watch it:
 
    ```bash
    gh workflow run paper.yml
@@ -4899,15 +5369,38 @@ Locally, with a worktree of the `paper` branch (`git worktree add ../paper-ledge
 | 신규 진입 | a new entry fill (setup, side, entry, stop, TP1/TP2, blended R, top count q / S_rev) |
 | 손절 이동 (본전 / 추적) | breakeven after TP1, or a structural trailing move |
 | 청산 | the fill that closed a trade (reason, PnL, R, out-of-sample N/50) |
-| 일일 요약 | first run at/after 09:00 New York time each day: position, equity, N/50, go-live status (criteria 1–2 are recomputed in this run: A/HYBRID vs C/BH/EMA/RANDOM x100; if that recompute fails the run still completes, a warning is sent once, and the summary comes from the next run that recomputes successfully) |
-| 경고 | strategy fingerprint change (new epoch), decision discrepancy, holdout data hash mismatch, run gap over 3 hours |
+| 일일 요약 | first run at/after 09:00 New York time each day: position, equity, N/50, go-live status (criteria 1–2 are recomputed in this run: A/HYBRID vs C/BH/EMA/RANDOM x100). If that recompute fails, the run still completes, a warning is sent and the next run retries once; if the retry fails too, the summary is sent marked `기준 미갱신(stale)` with the previous criteria 1–2 result, and the next try is on the next New York date |
+| 경고 | strategy fingerprint change (new epoch), decision discrepancy (with its cause, see Frozen runtime environment), holdout data hash mismatch, run gap over 3 hours |
 | 실패 | the failed stage and the Actions log link (sent by `ewbot`; the workflow sends a fallback for checkout / setup / sync / push failures, step timeouts and cancellations) |
 
-Each message has an id `kind:ts:trade_key`; an id is sent at most once. A failed send is retried 3 times and then kept pending for the next run.
+Each message has an id `kind:ts:trade_key`; an id is sent at most once per pushed ledger. A run killed after sending, or whose pushes all fail, may send it again in the next run, but a message is never lost. A failed send is retried 3 times and then kept pending for the next run.
 
 ## Strict fingerprint policy
 
-The strategy fingerprint covers `types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/` (every byte, comments included). Its baseline is the same file set at the holdout commit `64e628a`. If any of these files changes, the next run opens a new epoch, sends a warning and resets the go-live counter to 0; the holdout's 36 trades no longer count. `tests/paper/test_fingerprint.py::test_baseline_recomputes_from_git_and_equals_the_working_tree` fails in that case, before anything is merged.
+The strategy fingerprint covers `types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/` (every byte, comments included). Its baseline is the same file set at the holdout commit `64e628a` (`e0435223a3f9…`). If any of these files changes, the next run opens a new epoch, sends a warning and resets the go-live counter to 0; the holdout's 36 trades no longer count.
+
+Reverting the change does not bring the 36 back. The revert opens yet another epoch, with the baseline fingerprint, so it is eligible for go-live again, but its count starts at 0 paper trades and the holdout's 36 trades never count again.
+
+The guard is `.github/workflows/ci.yml`. On every pull request to `master` and every push to `master` it runs `tests/paper/test_fingerprint.py`, which compares the working tree with the pinned baseline value (no git history needed), and `tests/paper/test_static.py` (the `allow_holdout` and workflow guards). A red `ci` check on a pull request means that merging it resets the counter; on a push to `master` it means the next hourly run will. The check only reports: GitHub merges a pull request with a red check unless you make the `guard` check required in the branch protection settings.
+
+The precheck also binds the run to the lock's whole configuration: it refuses to run when the lock's `sha256` is not `lock_digest(BotConfig(), params, random_runs, code_sha256)`. A changed `BotConfig` default (in `config.py`) or walk-forward grid therefore stops the hourly runs with a precheck failure alert instead of opening a new epoch.
+
+## Frozen runtime environment
+
+Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
+
+1. `DATA_REVISION`: a bar up to the decision changed.
+2. `FINGERPRINT_CHANGE`: it was recorded in another epoch.
+3. `ENVIRONMENT_CHANGE`: the run that recorded it (or should have) had another runtime environment. It is warned on Telegram and listed in the report and in the go-live block, but criterion 4 does not count it as `UNEXPLAINED`.
+4. `UNEXPLAINED`: anything else. One is enough to fail criterion 4.
+
+While paper trading runs, keep the environment frozen:
+
+- Do not change `uv.lock`: no `uv lock --upgrade`, no dependency bumps, no merged dependency-update pull requests.
+- Do not change the Python version: `python-version: "3.12"` in `paper.yml` and `requires-python` in `pyproject.toml`.
+- Do not change the runner image: `runs-on: ubuntu-24.04` in `paper.yml`, never `ubuntu-latest`.
+
+Some changes happen underneath anyway. GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly), and `python-version: "3.12"` takes whichever 3.12 patch release uv finds or downloads. Both show up as a new environment digest in `runs[].env`, and a discrepancy across one is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
 
 ## Failures
 
@@ -4932,26 +5425,26 @@ Inputs: about 1–2 minutes per hourly run, plus the daily criteria 1–2 recomp
 
 The high end is above the 2,000 free minutes a month of a private repository on GitHub Free, and it is the likely end once an hourly run takes just over a minute. Check the real usage in your GitHub billing settings after the first week.
 
-Do not lower the cost by changing what runs: the 100 RANDOM runs are part of criteria 1–2 (fewer runs change the criteria), and the hourly schedule is what criterion 4 counts. If a month would go over the free minutes, either allow paid Actions minutes (set a budget above $0: with the default $0, GitHub stops running the workflow once the free minutes are used up, and every missed hour counts against criterion 4), or move the job to a self-hosted runner (`runs-on: self-hosted`: no Actions minutes, but that machine has to be online every hour).
+Do not lower the cost by changing what runs: the 100 RANDOM runs are part of criteria 1–2 (fewer runs change the criteria), and the hourly schedule is what criterion 4 counts. If a month would go over the free minutes, either allow paid Actions minutes (the small budget of One-time setup step 4: with the default $0, GitHub stops running the workflow once the free minutes are used up, and every missed hour counts against criterion 4), or move the job to a self-hosted runner (`runs-on: self-hosted`: no Actions minutes, but that machine has to be online every hour, and its own image becomes the recorded environment).
 ````
 
 - [ ] **Step 4: Run test to verify it passes**
 
 ```bash
 uv run pytest tests/paper/test_static.py tests/paper/test_paper_sync.py -q
-uv run python -c "import yaml; yaml.safe_load(open('.github/workflows/paper.yml'))" && echo yaml-ok
-command -v actionlint >/dev/null && actionlint .github/workflows/paper.yml && echo actionlint-ok || echo 'actionlint not installed (optional)'
+uv run python -c "import yaml; [yaml.safe_load(open(f'.github/workflows/{n}.yml')) for n in ('paper', 'ci')]" && echo yaml-ok
+command -v actionlint >/dev/null && actionlint .github/workflows/paper.yml .github/workflows/ci.yml && echo actionlint-ok || echo 'actionlint not installed (optional)'
 command -v shellcheck >/dev/null && shellcheck scripts/paper_sync.sh && echo shellcheck-ok || echo 'shellcheck not installed (optional)'
 uv run pytest -q
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest holdout.lock pyproject.toml uv.lock
 ```
 
-Expected: `38 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `594 passed, 1 skipped` without a candle cache (`595 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
+Expected: `41 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `615 passed, 1 skipped` without a candle cache (`616 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .github/workflows/paper.yml scripts/paper_sync.sh docs/paper-trading.md tests/paper/test_static.py tests/paper/test_paper_sync.py
+git add .github/workflows/paper.yml .github/workflows/ci.yml scripts/paper_sync.sh docs/paper-trading.md tests/paper/test_static.py tests/paper/test_paper_sync.py
 git commit -m "$(cat <<'EOF'
 ci(paper): hourly paper workflow, allow_holdout static guard and ops guide
 
@@ -4980,7 +5473,7 @@ uv run pytest -q
 uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 ```
 
-Expected: clean tree; `595 passed` (with the real cache present); the fingerprint tripwire passes, i.e. the working-tree fingerprint equals the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
+Expected: clean tree; `616 passed` (with the real cache present); both fingerprint tripwires pass, i.e. the working-tree fingerprint equals the pinned value and the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
 
 - [ ] **Step 2: One local run on real data (no Telegram, throw-away ledger)**
 
@@ -5016,7 +5509,7 @@ Expected: only trades with entry after 2026-10-02 11:00 UTC; 0 discrepancies; th
 
 - [ ] **Step 4: Merge and configure (user)**
 
-Open a PR from `feat/plan2-paper` to `master` and merge it (scheduled workflows run only from the default branch). Then follow `docs/paper-trading.md` → "One-time setup": create the bot with @BotFather, message it once, read the chat ID with the guide's `curl … getUpdates` command (token typed at a hidden prompt), and run `gh secret set TELEGRAM_BOT_TOKEN` / `gh secret set TELEGRAM_CHAT_ID` (values typed by the user at the prompt).
+Open a PR from `feat/plan2-paper` to `master`, check that its `ci` run (fingerprint and static guards) is green, and merge it (scheduled workflows run only from the default branch). Then follow `docs/paper-trading.md` → "One-time setup": create the bot with @BotFather, message it once, read the chat ID with the guide's `curl … getUpdates` command (token typed at a hidden prompt), and run `gh secret set TELEGRAM_BOT_TOKEN` / `gh secret set TELEGRAM_CHAT_ID` (values typed by the user at the prompt). Set a small Actions budget (for example $5) at github.com/settings/billing, so the hourly runs do not stop when the free minutes run out (guide, One-time setup step 4).
 
 - [ ] **Step 5: First Actions run**
 
