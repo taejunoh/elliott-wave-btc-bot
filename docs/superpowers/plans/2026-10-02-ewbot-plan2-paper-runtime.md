@@ -31,7 +31,7 @@
 2. **Stop moves, TP1 partials and order sizes** are not in `EngineResult`. `paper/trace.py` swaps the names `PaperBroker` / `WaveEngine` that `ewbot.engine.loop` looks up at run time for pass-through subclasses that only log (no file is edited; a test proves the traced run is bit-identical to `run_backtest`).
 3. **When a decision is known.** A run whose last closed bar is T knows every fill and stop move with `ts <= T` and every signal with `ts <= T - 1h` (the engine never evaluates entries on the last bar); the END close of a still-open position is not a decision. Decisions are recorded by the first run that knows them (`known_at > epoch.through_ts`).
 4. **Epochs.** `started_ts` of epoch 1 is the holdout's last bar; a new epoch starts at the last bar of the run that saw the new fingerprint. Earlier epochs' trades are frozen; the current epoch's closed trades are recomputed every run. Reverting the code opens a new epoch with the baseline fingerprint: eligible again, but the holdout's 36 never count again (spec §8).
-5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). `ENVIRONMENT_CHANGE` (spec §5.3 as amended 2026-10-02) = the run that recorded the decision (for `APPEARED`: the first run that should have known it) has another runtime-environment digest than the current run; the environment (`paper/environment.py`) is the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and `ImageOS` (None off Actions) are compared; `ImageVersion` is recorded in every run but excluded from the digest (GitHub refreshes the image weekly, comparing it would mask real `UNEXPLAINED` discrepancies); and an unknown recording environment never counts as a change. Each discrepancy is stored and alerted once.
+5. **Discrepancies** are `CHANGED` / `VANISHED` (a recorded decision differs / is gone) and `APPEARED` (the current epoch recomputes a decision an earlier run should have recorded). `DATA_REVISION` = the hash of all bars with `ts <=` the decision's ts changed (for `APPEARED`: the hash of the bars seen by the first run that should have known it). `ENVIRONMENT_CHANGE` (spec §5.3 as amended 2026-10-02) = the run that recorded the decision (for `APPEARED`: the first run that should have known it) has another runtime-environment digest than the current run, and so has the previous successful run (the current run is the first in its environment: every run rechecks every recorded decision, so once a run in the new environment has reproduced a decision, a later difference is `UNEXPLAINED`); the environment (`paper/environment.py`) is the Python version, `platform.system()`, `platform.machine()`, the numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and `ImageOS` (None off Actions), all compared; `ImageVersion` is recorded in every run but excluded from the digest (GitHub refreshes the image weekly, comparing it would mask real `UNEXPLAINED` discrepancies); and an unknown recording or previous environment never counts as a change. Each discrepancy is stored and alerted once.
 6. **Telegram without secrets** drops events instead of queueing them (a token added later must not flood the chat). A failed send keeps that event and every later one pending, in order.
 7. **Criteria 1–2** = `backtest.holdout.evaluate_criteria(compare(cfg, df, HOLDOUT_START, last_bar + 1h, random_runs, workers, allow_holdout=True))`, i.e. over `[HOLDOUT_START, last bar + 1h)`, only while the current epoch is eligible; the stored result is ignored once the epoch changes. The go-live candidate is A, the only strategy the runtime trades and counts (criteria 3–4 are about A's trades), so — like `evaluate_criteria`'s `passing` — one candidate must meet all four: criterion 1 = `"A" in winners`, criterion 2 = criterion 1 and A's max drawdown <= 15%. HYBRID is still compared and shown. A failed recompute is tried at most `CRITERIA_ATTEMPTS = 2` times per New York date (the daily run and the next run, counted from `runs[].criteria_recompute`); after the second failure the daily summary is sent marked `기준 미갱신(stale)` with the previous result and `daily_summary_date` is set, so the next try is on the next New York date.
 8. **Failure alerts** are sent by `ewbot paper run` (stage + `EWBOT_RUN_URL`); it touches `EWBOT_FAILURE_MARKER`, and the workflow's `if: failure() || cancelled()` step only sends its own alert when that marker is missing (checkout / setup / sync / push failures, step timeouts, cancellations).
@@ -67,16 +67,16 @@
 | 1 | Strategy fingerprint | 19 |
 | 2 | Ledger model, atomic IO, epochs | 9 |
 | 3 | Engine trace + shared test helpers | 6 |
-| 4 | Out-of-sample extraction, decisions, replay check | 13 |
+| 4 | Out-of-sample extraction, decisions, replay check | 14 |
 | 5 | Telegram notifier, formats, timing, events | 27 |
 | 6 | Go-live criteria + paper HTML report | 7 |
-| 7 | Runtime environment + paper runner orchestration | 37 |
+| 7 | Runtime environment + paper runner orchestration | 39 |
 | 8 | CLI `paper run` / `paper status` | 6 |
 | 9 | Time-walk integration test | 8 |
 | 10 | Static `allow_holdout` guard, paper and CI workflows, git sync script, ops guide | 42 |
 | 11 | Manual pre-deploy checklist (controller) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 174 more tests.
+Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 177 more tests.
 
 ---
 
@@ -1209,7 +1209,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `EngineResult(trades, equity, signals, events)`, `Trade`, `Signal(ts, setup, direction, entry_ref, stop, tp1, tp2, risk_mult, time_stop_4h, instance, lineage, reason)`, `EngineTrace` / `traced_engine` (Task 3), `H1`, `WaveState`, `tests.paper.helpers` (Task 3).
-- Produces (`ewbot.paper.decisions`): `REL_TOL = 1e-9`, `DECISION_KINDS`, `CAUSES`, `split_result(res, trace) -> tuple[list[Trade], Trade | None]`, `paper_trades(closed, boundary_ts) -> list[Trade]`, `decision_id(kind, ts, trade_key) -> str`, `known_at(d) -> int`, `build_decisions(res, trace, trades) -> list[dict]` (keys `id, kind, ts, price, contracts, reason, trade_key, levels, setup, direction`), `same_decision(a, b) -> bool`, `classify(recorded, data_revised, current_epoch_id, env_changed=False) -> str` (`CAUSES` order: `DATA_REVISION`, `FINGERPRINT_CHANGE`, `ENVIRONMENT_CHANGE`, `UNEXPLAINED`), `verify_decisions(recorded, recomputed, epoch, revised_at, appeared_revised, *, appeared_after=None, env_sha256=None, appeared_env=None) -> list[dict]` (keys `id, type, decision_id, cause, recorded, recomputed`; the APPEARED window is known_at in `(appeared_after or epoch started_ts, epoch through_ts]`; a recorded decision's `env_sha256`, or `appeared_env(recomputed)` for APPEARED, is compared with the current `env_sha256`, None never counting as a change), `decisions_to_record(recomputed, epoch, recorded_ids) -> list[dict]`, `open_position_record(open_trade, trace, epoch_start) -> dict`, `top_count_summary(ws) -> dict | None`.
+- Produces (`ewbot.paper.decisions`): `REL_TOL = 1e-9`, `DECISION_KINDS`, `CAUSES`, `split_result(res, trace) -> tuple[list[Trade], Trade | None]`, `paper_trades(closed, boundary_ts) -> list[Trade]`, `decision_id(kind, ts, trade_key) -> str`, `known_at(d) -> int`, `build_decisions(res, trace, trades) -> list[dict]` (keys `id, kind, ts, price, contracts, reason, trade_key, levels, setup, direction`), `same_decision(a, b) -> bool`, `classify(recorded, data_revised, current_epoch_id, env_changed=False) -> str` (`CAUSES` order: `DATA_REVISION`, `FINGERPRINT_CHANGE`, `ENVIRONMENT_CHANGE`, `UNEXPLAINED`), `verify_decisions(recorded, recomputed, epoch, revised_at, appeared_revised, *, appeared_after=None, env_sha256=None, appeared_env=None, previous_env_sha256=None) -> list[dict]` (keys `id, type, decision_id, cause, recorded, recomputed`; the APPEARED window is known_at in `(appeared_after or epoch started_ts, epoch through_ts]`; `ENVIRONMENT_CHANGE` when a recorded decision's `env_sha256`, or `appeared_env(recomputed)` for APPEARED, and the previous successful run's `previous_env_sha256` both differ from the current `env_sha256`, None never counting as a change), `decisions_to_record(recomputed, epoch, recorded_ids) -> list[dict]`, `open_position_record(open_trade, trace, epoch_start) -> dict`, `top_count_summary(ws) -> dict | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1396,9 +1396,9 @@ def test_replay_check_environment_change_against_the_recording_run(full):
     tampered = _record(decs[1:], df)  # recorded under environment "env-a"; decs[0] was never recorded
     tampered[0] = {**tampered[0], "price": tampered[0]["price"] + 1.0}
 
-    def check(current, appeared_env):
+    def check(current, appeared_env):  # the previous successful run ran in "env-a"
         found = verify_decisions(tampered, full[4], epoch1, lambda d: False, lambda r: False,
-                                 env_sha256=current, appeared_env=appeared_env)
+                                 env_sha256=current, appeared_env=appeared_env, previous_env_sha256="env-a")
         return [(f["type"], f["cause"]) for f in found]
 
     assert check("env-b", lambda r: "env-a") == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "ENVIRONMENT_CHANGE")]
@@ -1406,8 +1406,29 @@ def test_replay_check_environment_change_against_the_recording_run(full):
     # unknown recording environment (no run should have known it yet / not recorded): not an environment change
     assert check("env-b", lambda r: None) == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "UNEXPLAINED")]
     unstamped = [{k: v for k, v in d.items() if k != "env_sha256"} for d in tampered]
-    found = verify_decisions(unstamped, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b")
+    found = verify_decisions(unstamped, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b",
+                             previous_env_sha256="env-a")
     assert [(f["type"], f["cause"]) for f in found] == [("CHANGED", "UNEXPLAINED"), ("APPEARED", "UNEXPLAINED")]
+
+
+def test_environment_change_explains_only_the_first_run_in_the_new_environment(full):
+    df = synth_frame()
+    decs = [d for d in full[4] if known_at(d) > BOUNDARY]
+    epoch1 = {"id": 1, "started_ts": BOUNDARY, "through_ts": int(df["ts"].iloc[-1])}
+    tampered = _record(decs[1:], df)  # recorded under "env-a"; decs[0] was never recorded (APPEARED)
+    tampered[0] = {**tampered[0], "price": tampered[0]["price"] + 1.0}  # CHANGED
+    tampered.append({**tampered[1], "id": "ENTRY:1:1", "ts": 1, "trade_key": 1})  # VANISHED
+
+    def check(previous):  # the current run is in "env-b"
+        found = verify_decisions(tampered, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b",
+                                 appeared_env=lambda r: "env-a", previous_env_sha256=previous)
+        return [(f["type"], f["cause"]) for f in found]
+
+    types = ["CHANGED", "VANISHED", "APPEARED"]
+    assert check("env-a") == [(t, "ENVIRONMENT_CHANGE") for t in types]  # the first run in env-b
+    assert check("env-b") == [(t, "UNEXPLAINED") for t in types]  # an env-b run already reproduced them
+    assert check("env-c") == [(t, "ENVIRONMENT_CHANGE") for t in types]  # the previous run had yet another one
+    assert check(None) == [(t, "UNEXPLAINED") for t in types]  # no previous run, or one without a digest
 
 
 def test_appeared_only_inside_the_epochs_recorded_window(full):
@@ -1576,8 +1597,9 @@ def classify(
     recorded: dict[str, Any] | None, data_revised: bool, current_epoch_id: int, env_changed: bool = False
 ) -> str:
     """DATA_REVISION if a bar up to the decision changed; else FINGERPRINT_CHANGE if the decision
-    was recorded under another epoch; else ENVIRONMENT_CHANGE if the run that recorded it (or should
-    have) ran in another runtime environment (paper.environment); else UNEXPLAINED."""
+    was recorded under another epoch; else ENVIRONMENT_CHANGE if env_changed (see _env_changed: this
+    is the first run in a new runtime environment and the run that recorded the decision, or should
+    have, ran in another one); else UNEXPLAINED."""
     if data_revised:
         return "DATA_REVISION"
     if recorded is not None and int(recorded["epoch_id"]) != int(current_epoch_id):
@@ -1587,9 +1609,14 @@ def classify(
     return "UNEXPLAINED"
 
 
-def _env_changed(recording: str | None, current: str | None) -> bool:
-    """Only a known recording environment that differs from the current one counts."""
-    return recording is not None and current is not None and recording != current
+def _env_changed(recording: str | None, previous: str | None, current: str | None) -> bool:
+    """The environment changed under this decision: the previous successful run ran in another
+    environment than the current one (this is the first run in it) and so did the run that recorded
+    the decision. Once a run in the current environment has rechecked a decision (every run rechecks
+    them all), a later difference is not explained by the change. Unknown digests never count."""
+    if recording is None or previous is None or current is None:
+        return False
+    return previous != current and recording != current
 
 
 def verify_decisions(
@@ -1602,6 +1629,7 @@ def verify_decisions(
     appeared_after: int | None = None,
     env_sha256: str | None = None,
     appeared_env: Callable[[dict[str, Any]], str | None] | None = None,
+    previous_env_sha256: str | None = None,
 ) -> list[dict[str, Any]]:
     """Replay check. Every recorded decision must reappear unchanged (else CHANGED / VANISHED); a
     recomputed decision of the current epoch that a previous run should already have known but did
@@ -1611,7 +1639,8 @@ def verify_decisions(
     (the runner passes where the epoch began recording, see runner._recording_floor).
     env_sha256 is the current run's environment digest; it is compared with a recorded decision's
     env_sha256 and, for APPEARED, with appeared_env(recomputed) - the environment digest of the run
-    that should have recorded it (None: unknown, never an environment change)."""
+    that should have recorded it - and with previous_env_sha256, the digest of the previous successful
+    run: ENVIRONMENT_CHANGE needs both to differ from it (None: unknown, never an environment change)."""
     by_id = {d["id"]: d for d in recomputed}
     rec_ids = {d["id"] for d in recorded}
     found: list[dict[str, Any]] = []
@@ -1620,7 +1649,8 @@ def verify_decisions(
         if r is not None and same_decision(d, r):
             continue
         kind = "VANISHED" if r is None else "CHANGED"
-        cause = classify(d, revised_at(d), epoch["id"], _env_changed(d.get("env_sha256"), env_sha256))
+        moved = _env_changed(d.get("env_sha256"), previous_env_sha256, env_sha256)
+        cause = classify(d, revised_at(d), epoch["id"], moved)
         found.append({"id": f"{kind}:{d['id']}", "type": kind, "decision_id": d["id"], "cause": cause,
                       "recorded": d, "recomputed": r})
     lo = int(epoch["started_ts"]) if appeared_after is None else int(appeared_after)
@@ -1629,7 +1659,8 @@ def verify_decisions(
         if r["id"] in rec_ids or not lo < known_at(r) <= hi:
             continue
         recording_env = None if appeared_env is None else appeared_env(r)
-        cause = classify(None, appeared_revised(r), epoch["id"], _env_changed(recording_env, env_sha256))
+        moved = _env_changed(recording_env, previous_env_sha256, env_sha256)
+        cause = classify(None, appeared_revised(r), epoch["id"], moved)
         found.append({"id": f"APPEARED:{r['id']}", "type": "APPEARED", "decision_id": r["id"], "cause": cause,
                       "recorded": None, "recomputed": r})
     return found
@@ -1697,7 +1728,7 @@ def top_count_summary(ws: WaveState | None) -> dict[str, Any] | None:
 uv run pytest tests/paper/test_decisions.py -q
 ```
 
-Expected: `13 passed`.
+Expected: `14 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2225,8 +2256,8 @@ def discrepancy_text(items: Sequence[Mapping[str, Any]]) -> str:
         lines.append(f"외 {len(items) - 10}건 더 (report.html 참고)")
     if any(d["cause"] == "ENVIRONMENT_CHANGE" for d in items):
         lines.append(
-            "ENVIRONMENT_CHANGE: 결정을 기록한 실행과 실행 환경(Python·numpy·pandas·pyarrow·uv.lock·실행기 이미지)이 "
-            "다름 - 4번 기준 원인 불명 집계에서 제외"
+            "ENVIRONMENT_CHANGE: 실행 환경(Python·OS·numpy·pandas·pyarrow·uv.lock·실행기 이미지)이 바뀐 뒤 첫 실행이고 "
+            "결정을 기록한 실행과도 환경이 다름 - 4번 기준 원인 불명 집계에서 제외"
         )
     return "\n".join(lines)
 
@@ -2827,7 +2858,7 @@ EOF
 **Interfaces:**
 - Consumes: every `ewbot.paper` module above; `ewbot.backtest.holdout.DEFAULT_LOCK_PATH`, `data_fingerprint`, `holdout_config`, `lock_digest`; `ewbot.backtest.runner.run_backtest`, `compare(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False) -> dict`; `ewbot.backtest.walkforward.HOLDOUT_START`, `grid_combos()`; `ewbot.data.candles.fill_gaps`, `load_1h`; `ewbot.data.coinbase_history.update_cache(product, cache_dir)`.
 - Produces (`ewbot.paper.runner`): `PRODUCT = "BTC-USD"`, `FETCH_ATTEMPTS = 3`, `class PaperRunError(RuntimeError)` (`.stage`, `.message`), `default_fetch(cache_dir) -> Path`, `@dataclass PaperEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch, sender=None, clock=_wall_clock, fingerprint=current_fingerprint, baseline=baseline_fingerprint, random_runs=100, workers=max(1, os.cpu_count() or 1), sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)` (`_wall_clock() -> int` = `int(time.time())`), `@dataclass(frozen=True) RunOutcome(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, status)`, `precheck_lock(lock_path) -> dict` (also requires `lock["sha256"] == lock_digest(BotConfig(), params, random_runs, code_sha256)`), `run_paper(env) -> RunOutcome`.
-- Produces (`ewbot.paper.environment`): `PACKAGES = ("numpy", "pandas", "pyarrow")`, `DIGEST_EXCLUDED = ("image_version",)`, `runtime_environment(repo_root=None, environ=None) -> dict` (`python, numpy, pandas, pyarrow, uv_lock_sha256, image_os, image_version`), `environment_digest(env) -> str` (sha256 of the sorted JSON of `env` without the `DIGEST_EXCLUDED` keys).
+- Produces (`ewbot.paper.environment`): `PACKAGES = ("numpy", "pandas", "pyarrow")`, `DIGEST_EXCLUDED = ("image_version",)`, `runtime_environment(repo_root=None, environ=None) -> dict` (`python, system, machine, numpy, pandas, pyarrow, uv_lock_sha256, image_os, image_version`), `environment_digest(env) -> str` (sha256 of the sorted JSON of `env` without the `DIGEST_EXCLUDED` keys).
 - Run record in `ledger.runs`: `id, ts, status, last_bar_ts, data_sha256, holdout_data_ok, holdout_trades_recomputed, epoch_id, paper_trades, count_total, new_decisions, new_discrepancies, env, env_sha256, warnings, notify`, plus `criteria_recompute: {ny_date, ok}` in a run that recomputed criteria 1–2. Each new decision is stamped `run_id, data_sha256, epoch_id, env_sha256`.
 - Failure stages: `precheck`, `ledger`, `fingerprint`, `data`, `recompute`, `events`, `write`, `notify`. Every step runs in a named `_stage`, so an unexpected exception surfaces as `PaperRunError(stage)`; the `notify` stage keeps only the exception type (the Telegram token is part of the API URL) and does not chain the cause. The daily criteria 1-2 recompute is the one step that never fails the run: an error there is a warning (`criteria_error_text`, once per New York date), the previous `ledger.criteria` stays and the next run retries it once (no daily summary yet); if that retry fails too, the daily summary goes out marked `기준 미갱신(stale)` (`daily_text(..., stale=error)`) with the previous result and the next try is on the next New York date.
 - Epoch boundary: the run that creates a new epoch records the decisions first known since the previous epoch's `through_ts` (`_recording_floor`), and passes that floor to `verify_decisions(..., appeared_after=floor)`. `ledger.json` is bound to the whole `holdout_summary(lock)`, not only its sha256 and last bar. A recomputed holdout A trade count different from the lock's `n_trades["A"]` warns once per distinct value (`holdout_trades_text`) and the run continues.
@@ -2854,6 +2885,8 @@ def test_runtime_environment_records_versions_lock_hash_and_runner_image(tmp_pat
     env = runtime_environment(tmp_path, {"ImageOS": "ubuntu24", "ImageVersion": "20261001.1.0", "OTHER": "x"})
     assert env == {
         "python": platform.python_version(),
+        "system": platform.system(),
+        "machine": platform.machine(),
         "numpy": np.__version__,
         "pandas": pd.__version__,
         "pyarrow": pyarrow.__version__,
@@ -2870,10 +2903,11 @@ def test_runtime_environment_off_actions_and_without_a_lock_file(tmp_path):
 
 
 def test_environment_digest_is_order_independent_and_sensitive_to_every_compared_value():
-    a = {"python": "3.12.7", "numpy": "2.1.0", "image_os": None}
+    a = {"python": "3.12.7", "system": "Linux", "machine": "x86_64", "numpy": "2.1.0", "image_os": None}
     assert environment_digest(a) == environment_digest(dict(reversed(list(a.items()))))
     assert len(environment_digest(a)) == 64
-    for key, value in (("python", "3.12.8"), ("numpy", "2.1.1"), ("image_os", "ubuntu24")):
+    for key, value in (("python", "3.12.8"), ("system", "Darwin"), ("machine", "arm64"), ("numpy", "2.1.1"),
+                       ("image_os", "ubuntu24")):
         assert environment_digest({**a, key: value}) != environment_digest(a), key
 
 
@@ -2883,6 +2917,14 @@ def test_environment_digest_ignores_the_runner_image_version_but_not_the_image_o
     assert environment_digest({k: v for k, v in a.items() if k != "image_version"}) == environment_digest(a)
     assert environment_digest({**a, "numpy": "2.1.1"}) != environment_digest(a)
     assert environment_digest({**a, "image_os": "ubuntu22"}) != environment_digest(a)
+
+
+def test_the_platform_is_part_of_the_digest_of_a_recorded_environment(tmp_path):
+    env = runtime_environment(tmp_path, {"ImageOS": "ubuntu24"})
+    assert (env["system"], env["machine"]) == (platform.system(), platform.machine())
+    other = "Linux" if env["system"] != "Linux" else "Darwin"
+    assert environment_digest({**env, "system": other}) != environment_digest(env)
+    assert environment_digest({**env, "machine": env["machine"] + "-other"}) != environment_digest(env)
 ```
 
 **File: `tests/paper/test_runner.py`**
@@ -2897,6 +2939,7 @@ import pytest
 
 from ewbot.paper import runner
 from ewbot.paper.criteria import criterion4
+from ewbot.paper.decisions import decision_id
 from ewbot.paper.environment import environment_digest
 from ewbot.paper.ledger import LEDGER_FILE, REPORT_FILE, RUNS_LOG, load_ledger
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
@@ -3206,6 +3249,36 @@ def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, 
     assert (c4["unexplained"], c4["environment"]) == ((0, 2) if env_changed else (2, 0))
 
 
+def test_an_environment_change_explains_only_the_first_run_in_the_new_environment(make_env):
+    box = {"env": dict(ENV_A)}
+    env = make_env(environment=lambda: dict(box["env"]))
+    run_paper(env)  # environment A records the decisions
+    box["env"] = {**ENV_A, "numpy": "2.1.1"}
+    env.clock.now += H1
+    run_paper(env)  # environment B reproduces every one of them
+    path = env.ledger_dir / LEDGER_FILE
+    data = json.loads(path.read_text())
+    assert data["discrepancies"] == []
+    entry = next(d for d in data["decisions"] if d["kind"] == "ENTRY")
+    lost = next(d for d in data["decisions"] if d["kind"] == "EXIT")
+    assert entry["env_sha256"] == lost["env_sha256"] == environment_digest(ENV_A)
+    key = entry["trade_key"] + 1
+    ghost = {**entry, "id": decision_id("ENTRY", entry["ts"], key), "trade_key": key}  # a record nothing recomputes
+    entry["price"] += 1.0
+    data["decisions"].remove(lost)
+    data["decisions"].append(ghost)
+    path.write_text(json.dumps(data))
+    env.clock.now += H1
+    run_paper(env)  # environment B again: it already reproduced them, so its change explains nothing
+    led = load_ledger(env.ledger_dir)
+    assert [(d["type"], d["decision_id"], d["cause"]) for d in led.discrepancies] == [
+        ("CHANGED", entry["id"], "UNEXPLAINED"), ("VANISHED", ghost["id"], "UNEXPLAINED"),
+        ("APPEARED", lost["id"], "UNEXPLAINED")]
+    assert "4번 기준 원인 불명 집계에서 제외" not in env.sender.texts[-1]
+    c4 = criterion4(led, env.clock.now)
+    assert (c4["unexplained"], c4["environment"]) == (3, 0)
+
+
 RETRY_NOTE = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
 
 
@@ -3337,13 +3410,16 @@ Expected: 2 collection errors, `ModuleNotFoundError: No module named 'ewbot.pape
 """Runtime environment of a paper run (Plan 2 spec 5.3, ENVIRONMENT_CHANGE; spec 8 freezes it).
 
 The environment is what can change a recompute without touching the strategy code: the Python
-version, the numpy / pandas / pyarrow versions, the sha256 of uv.lock and the GitHub Actions runner
-image (the ImageOS / ImageVersion variables the hosted runners set; None elsewhere). Every run
-records all of it; every decision carries the digest of the environment of the run that recorded it.
+version, the operating system and machine architecture (platform.system() / platform.machine(): fixed
+on the pinned runner, another platform brings another libm), the numpy / pandas / pyarrow versions, the
+sha256 of uv.lock and the GitHub Actions runner image (the ImageOS / ImageVersion variables the hosted
+runners set; None elsewhere). Every run records all of it; every decision carries the digest of the
+environment of the run that recorded it.
 
-The digest compares the Python (full patch), numpy, pandas and pyarrow versions, the uv.lock sha256 and
-ImageOS. ImageVersion is recorded but left out of the digest: GitHub refreshes the ubuntu-24.04 image
-weekly, so comparing it would turn every later UNEXPLAINED discrepancy into ENVIRONMENT_CHANGE."""
+The digest compares the Python (full patch), system, machine, numpy, pandas and pyarrow versions, the
+uv.lock sha256 and ImageOS. ImageVersion is recorded but left out of the digest: GitHub refreshes the
+ubuntu-24.04 image weekly, so comparing it would turn every later UNEXPLAINED discrepancy into
+ENVIRONMENT_CHANGE."""
 
 from __future__ import annotations
 
@@ -3376,11 +3452,14 @@ def _sha256_of(path: Path) -> str | None:
 
 
 def runtime_environment(repo_root: Path | None = None, environ: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """{"python", "numpy", "pandas", "pyarrow", "uv_lock_sha256", "image_os", "image_version"}."""
+    """{"python", "system", "machine", "numpy", "pandas", "pyarrow", "uv_lock_sha256", "image_os",
+    "image_version"}."""
     root = PROJECT_ROOT if repo_root is None else Path(repo_root)
     environ = os.environ if environ is None else environ
     return {
         "python": platform.python_version(),
+        "system": platform.system(),
+        "machine": platform.machine(),
         **{name: _version(name) for name in PACKAGES},
         "uv_lock_sha256": _sha256_of(root / "uv.lock"),
         "image_os": environ.get("ImageOS"),
@@ -3408,7 +3487,8 @@ lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. whose configura
 run would use. The recompute starts trading at the holdout start, so it reproduces the holdout's A run
 and continues it; trades entering after the holdout's last bar are paper trades. Every run records its
 runtime environment (paper.environment); decisions carry the digest of the environment that recorded
-them, for the ENVIRONMENT_CHANGE cause of the replay check.
+them, for the ENVIRONMENT_CHANGE cause of the replay check (only in the first run after the environment
+changed: the previous successful run's digest is compared too).
 
 Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
 the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it): the next run
@@ -3743,6 +3823,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         holdout_sha = data_fingerprint(df, hs["holdout_start"], hs["last_bar_ts"])
         holdout_ok = holdout_sha == hs["data_sha256"]
         ok_runs = sorted((r for r in ledger.runs if r.get("status") == "ok"), key=lambda r: r["last_bar_ts"])
+        prev_run = next((r for r in reversed(ledger.runs) if r.get("status") == "ok"), None)
+        prev_env = None if prev_run is None else prev_run.get("env_sha256")
 
         def revised_at(d: dict[str, Any]) -> bool:
             return prefix(d["ts"]) != d["data_sha256"]
@@ -3761,7 +3843,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
 
         recomputed = build_decisions(res, trace, all_trades)
         found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised,
-                                 appeared_after=floor, env_sha256=env_sha, appeared_env=appeared_env)
+                                 appeared_after=floor, env_sha256=env_sha, appeared_env=appeared_env,
+                                 previous_env_sha256=prev_env)
         known = {d["id"] for d in ledger.discrepancies}
         new_disc = [
             {**d, "epoch_id": epoch["id"], "detected_ts": last_bar, "detected_run": run_id}
@@ -3886,7 +3969,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
 uv run pytest tests/paper/test_environment.py tests/paper/test_runner.py -q
 ```
 
-Expected: `37 passed`.
+Expected: `39 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4428,7 +4511,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run pytest tests/paper -q
 ```
 
-Expected: `131 passed` (all paper tests so far, about 50 s; the walk fixture alone takes about 25 s).
+Expected: `135 passed` (all paper tests so far, about 50 s; the walk fixture alone takes about 25 s).
 
 - [ ] **Step 5: Commit**
 
@@ -5405,17 +5488,17 @@ The strategy fingerprint covers `types.py`, `config.py`, `indicators.py`, `data/
 
 Reverting the change does not bring the 36 back. The revert opens yet another epoch, with the baseline fingerprint, so it is eligible for go-live again, but its count starts at 0 paper trades and the holdout's 36 trades never count again.
 
-The guard is `.github/workflows/ci.yml`. On every pull request to `master` and every push to `master` it runs `tests/paper/test_fingerprint.py`, which compares the working tree with the pinned baseline value (no git history needed), and `tests/paper/test_static.py` (the `allow_holdout` and workflow guards). A red `ci` check on a pull request means that merging it resets the counter; on a push to `master` it means the next hourly run will. The check only reports: GitHub merges a pull request with a red check unless you make the `guard` check required in the branch protection settings.
+The guard is `.github/workflows/ci.yml`. On every pull request to `master` and every push to `master` it runs `tests/paper/test_fingerprint.py`, which compares the working tree with the pinned baseline value (no git history needed), and `tests/paper/test_static.py` (the `allow_holdout` and workflow guards). A red `ci` check on a pull request means that merging it resets the counter; on a push to `master` it means the next hourly run will. The check only reports: GitHub merges a pull request with a red check unless you make the `guard` check required in the branch protection settings. On GitHub Free, branch protection rules and rulesets are not available for private repositories, so for a private repository there the `guard` check stays advisory: never merge a pull request whose `guard` check is red.
 
-The precheck also binds the run to the lock's whole configuration: it refuses to run when the lock's `sha256` is not `lock_digest(BotConfig(), params, random_runs, code_sha256)`. A changed `BotConfig` default (in `config.py`) or walk-forward grid therefore stops the hourly runs with a precheck failure alert instead of opening a new epoch.
+The precheck also binds the run to the lock's whole configuration: it refuses to run when the lock's `sha256` is not `lock_digest(BotConfig(), params, random_runs, code_sha256)`. A changed `BotConfig` default (in `config.py`) or walk-forward grid therefore stops the hourly runs with a precheck failure alert instead of opening a new epoch. Revert it to resume: no epoch was opened, so epoch 1 and the holdout's 36 trades still count, but the hours without a successful run count against criterion 4's coverage.
 
 ## Frozen runtime environment
 
-Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). `ImageVersion` is recorded but not compared: it is left out of the digest, because GitHub refreshes the image weekly and comparing it would hide real `UNEXPLAINED` discrepancies behind `ENVIRONMENT_CHANGE`. Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
+Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python version, the operating system and machine architecture (`platform.system()` / `platform.machine()`), the numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). `ImageVersion` is recorded but not compared: it is left out of the digest, because GitHub refreshes the image weekly and comparing it would hide real `UNEXPLAINED` discrepancies behind `ENVIRONMENT_CHANGE`. Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
 
 1. `DATA_REVISION`: a bar up to the decision changed.
 2. `FINGERPRINT_CHANGE`: it was recorded in another epoch.
-3. `ENVIRONMENT_CHANGE`: the run that recorded it (or should have) had another runtime environment. It is warned on Telegram and listed in the report and in the go-live block, but criterion 4 does not count it as `UNEXPLAINED`.
+3. `ENVIRONMENT_CHANGE`: this is the first run since the runtime environment changed (the previous successful run had another one), and the run that recorded the decision (or should have) had another one too. Every run rechecks every recorded decision, so once a run in the new environment has reproduced a decision, a later difference is `UNEXPLAINED`. It is warned on Telegram and listed in the report and in the go-live block, but criterion 4 does not count it as `UNEXPLAINED`.
 4. `UNEXPLAINED`: anything else. One is enough to fail criterion 4.
 
 While paper trading runs, keep the environment frozen:
@@ -5424,7 +5507,7 @@ While paper trading runs, keep the environment frozen:
 - Do not change the Python version: `python-version: "3.12.13"` in `paper.yml` and `ci.yml` and `requires-python` in `pyproject.toml`.
 - Do not change the runner image: `runs-on: ubuntu-24.04` in `paper.yml`, never `ubuntu-latest`.
 
-GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly). That is recorded in `runs[].env` but does not change the digest, so it never turns a discrepancy into `ENVIRONMENT_CHANGE`. The Python patch is pinned to `3.12.13`, so a different patch (or a new `ImageOS`, numpy, pandas, pyarrow or `uv.lock`) is what changes the digest, and a discrepancy across one is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
+GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly). That is recorded in `runs[].env` but does not change the digest, so it never turns a discrepancy into `ENVIRONMENT_CHANGE`. The Python patch is pinned to `3.12.13`, so a different patch (or a new `ImageOS`, operating system, machine architecture, numpy, pandas, pyarrow or `uv.lock`) is what changes the digest, and a discrepancy found by the first run after such a change is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
 
 ## Failures
 
@@ -5463,7 +5546,7 @@ uv run pytest -q
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest holdout.lock pyproject.toml uv.lock
 ```
 
-Expected: `42 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `617 passed, 1 skipped` without a candle cache (`618 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
+Expected: `42 passed`; `yaml-ok`; `actionlint-ok` / `shellcheck-ok` when installed; the full suite `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists); the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, the lock and the dependencies are byte-identical to `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -5497,7 +5580,7 @@ uv run pytest -q
 uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 ```
 
-Expected: clean tree; `618 passed` (with the real cache present); both fingerprint tripwires pass, i.e. the working-tree fingerprint equals the pinned value and the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
+Expected: clean tree; `621 passed` (with the real cache present); both fingerprint tripwires pass, i.e. the working-tree fingerprint equals the pinned value and the `64e628a` baseline `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`.
 
 - [ ] **Step 2: One local run on real data (no Telegram, throw-away ledger)**
 
@@ -5560,4 +5643,4 @@ gh run list --workflow paper.yml --limit 30
 git fetch origin paper && git show origin/paper:runs.log | tail -n 30
 ```
 
-Expected: about 24 successful runs (one per hour at minute ~7, delays of a few minutes are normal), no `실행 공백` warning, exactly one `일일 요약` after 09:00 New York, `ewbot paper status` (on a worktree of `paper`) showing coverage near 100% and 0 unexplained discrepancies. Note the billed minutes of an hourly run and of the daily-summary run against the guide's Cost table (its high end, 2,040–2,108 minutes a month, is above the 2,000 free minutes). Record the outcome in the PR or the project notes.
+Expected: about 24 successful runs (one per hour at minute ~7, delays of a few minutes are normal), no `실행 공백` warning, exactly one `일일 요약` after 09:00 New York, `ewbot paper status` (on a worktree of `paper`) showing coverage near 100% and 0 unexplained discrepancies. Note the billed minutes of an hourly run and of the daily-summary run against the guide's Cost table (its high end, 2,040–2,108 minutes a month, is above the 2,000 free minutes). The daily-summary run must finish under ~20 min; otherwise investigate before leaving the workflow unattended. Record the outcome in the PR or the project notes.
