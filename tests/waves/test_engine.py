@@ -164,7 +164,8 @@ def test_upper_wick_through_w5_cap_kills_count() -> None:
     ok = _run(bars)
     w5 = next(c for c in ok[h5].counts if c.prices == pts)
     assert (w5.phase, w5.inval) == ("W5", Invalidation(1110.0, 1200.0))
-    assert ok[h5 - 1].ts < ok[h5].ts and any(c.prices == pts for c in ok[h5 + 1].counts)
+    # without the spike the count lives until P5 (every high stays below the cap)
+    assert bars[h5].high < 1200.0 and all(any(c.prices == pts for c in s.counts) for s in ok[h5 - 1:hours[12] + 1])
     bars[h5] = dataclasses.replace(bars[h5], high=1200.5)      # one 1h spike above the H3 cap
     hit = _run(bars)
     assert any(c.prices == pts for c in hit[h5 - 1].counts)
@@ -172,8 +173,68 @@ def test_upper_wick_through_w5_cap_kills_count() -> None:
     assert hit[h5].E_live == 1200.5 and hit[h5].E_live_ts == bars[h5].ts
 
 
-def test_sub_bars_must_end_with_the_closing_1h_bar() -> None:
-    eng = WaveEngine(P)
+def test_wick_before_a_count_is_enumerable_still_kills_it() -> None:
+    # S=1000 P1=1100 P2=1045, a small 1080/1050 swing, then up to 1200 and back to 1150. (S, P1, P2) as W3
+    # skips 1080/1050, so it is only enumerable once E >= 1080. A 1h wick to 1040 (< P2) before that must
+    # kill it when it first shows up, and every W4/W5 built on it.
+    way = WAY[:7] + [1000.0, 1100.0, 1045.0, 1080.0, 1050.0, 1200.0, 1150.0]
+    bars, hours = _linear(way)
+    w3 = (1000.0, 1100.0, 1045.0)
+    has = lambda s: any(c.pattern == "IMP" and c.d == 1 and c.prices[:3] == w3 for c in s.counts)  # noqa: E731
+    ok = _run(bars)
+    up = next(k for k in range(hours[11], len(ok)) if ok[k].pivots4h[-1].price == 1050.0)
+    hw = _first_non_4h_hour(up + 1)                       # leg up from 1050, E still below 1080
+    assert ok[hw].E_live < 1080.0 and not has(ok[hw])
+    appear = next(k for k in range(hw, len(ok)) if has(ok[k]))
+    assert ok[appear].closed_4h and ok[appear].top.prices == w3
+    assert ok[-1].top.prices == w3 + (1200.0,) and ok[-1].top.phase == "W4"
+    bars[hw] = dataclasses.replace(bars[hw], low=1040.0)  # wick 5 below P2, close unchanged
+    states = _run(bars)
+    assert [p.price for p in states[-1].pivots4h] == [p.price for p in ok[-1].pivots4h]
+    assert not any(has(s) for s in states[hw:])
+    assert _check_probs_and_s_rev(states, P) > 0
+
+
+REF = 2000.0                                              # mirror p' = 2*REF - p
+
+
+def _mirror(bars: list[Bar]) -> list[Bar]:
+    return [Bar(b.ts, 2 * REF - b.open, 2 * REF - b.low, 2 * REF - b.high, 2 * REF - b.close, b.volume)
+            for b in bars]
+
+
+def test_mirrored_leg_down_tracks_lows_and_dies_on_an_upper_wick() -> None:
+    m = lambda *xs: tuple(2 * REF - x for x in xs)  # noqa: E731
+    bars = _mirror(BARS)
+    states = _run(bars)
+    assert [p.price for p in states[-1].pivots4h] == list(m(*WAY[:-1]))
+    h = H["S"] + 40                                       # mid W1, now a leg down
+    while not states[h].closed_4h:
+        h += 1
+    for k in range(h + 1, h + 4):
+        s = states[k]
+        assert not s.closed_4h and s.leg_dir == -1
+        assert s.E_live == bars[k].low and s.E_live_ts == bars[k].ts
+    t3 = states[H["3"]].top
+    assert (t3.pattern, t3.d, t3.phase, t3.prices) == ("IMP", -1, "W3", m(1000.0, 1100.0, 1045.0))
+    hw = _first_non_4h_hour(H["2"] + 29)
+    w3 = m(1000.0, 1100.0, 1045.0)
+    assert t3.inval == Invalidation(None, w3[2])
+    bars[hw] = dataclasses.replace(bars[hw], high=w3[2] + 2.0)       # wick 2 above P2
+    hit = _run(bars)
+    has = lambda s: any(c.pattern == "IMP" and c.d == -1 and c.prices[:3] == w3 for c in s.counts)  # noqa: E731
+    assert has(hit[hw - 1]) and not any(has(s) for s in hit[hw:H["5"] + 1])
+    assert _check_probs_and_s_rev(hit, P) > 0
+
+
+def test_4h_close_inputs_are_validated() -> None:
     b = BARS[:4]
-    with pytest.raises(ValueError):
-        eng.on_1h_close(b[3], Bar(b[0].ts, b[0].open, 1300.0, 1200.0, b[3].close, 4.0), b[:3])
+    agg = Bar(b[0].ts, b[0].open, max(x.high for x in b), min(x.low for x in b), b[3].close, 4.0)
+    eng = WaveEngine(P)
+    with pytest.raises(ValueError):                       # sub_bars must end with the closing 1h bar
+        eng.on_1h_close(b[3], agg, b[:3])
+    with pytest.raises(ValueError):                       # bar1h does not close a 4h bucket
+        eng.on_1h_close(b[2], agg, b[:3])
+    with pytest.raises(ValueError):                       # bar4h is not the bucket bar1h closes
+        eng.on_1h_close(b[3], dataclasses.replace(agg, ts=b[0].ts + H4), b)
+    assert eng.on_1h_close(b[3], agg, b).i4h == 0          # rejected calls left no trace
