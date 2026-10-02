@@ -66,13 +66,13 @@
 | 4 | Out-of-sample extraction, decisions, replay check | 12 |
 | 5 | Telegram notifier, formats, timing, events | 21 |
 | 6 | Go-live criteria + paper HTML report | 7 |
-| 7 | Paper runner orchestration | 19 |
+| 7 | Paper runner orchestration | 26 |
 | 8 | CLI `paper run` / `paper status` | 6 |
 | 9 | Time-walk integration test | 8 |
 | 10 | Static `allow_holdout` guard, workflow, ops guide | 4 |
 | 11 | Manual pre-deploy checklist (controller) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 110 more tests.
+Baseline before Task 1: `uv run pytest -q` → `443 passed, 1 skipped` without a candle cache (`444 passed` when `data/cache/BTC-USD_1h.parquet` exists and the real-data smoke test runs). After Task 10: 117 more tests.
 
 ---
 
@@ -1188,7 +1188,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `EngineResult(trades, equity, signals, events)`, `Trade`, `Signal(ts, setup, direction, entry_ref, stop, tp1, tp2, risk_mult, time_stop_4h, instance, lineage, reason)`, `EngineTrace` / `traced_engine` (Task 3), `H1`, `WaveState`, `tests.paper.helpers` (Task 3).
-- Produces (`ewbot.paper.decisions`): `REL_TOL = 1e-9`, `DECISION_KINDS`, `CAUSES`, `split_result(res, trace) -> tuple[list[Trade], Trade | None]`, `paper_trades(closed, boundary_ts) -> list[Trade]`, `decision_id(kind, ts, trade_key) -> str`, `known_at(d) -> int`, `build_decisions(res, trace, trades) -> list[dict]` (keys `id, kind, ts, price, contracts, reason, trade_key, levels, setup, direction`), `same_decision(a, b) -> bool`, `classify(recorded, data_revised, current_epoch_id) -> str`, `verify_decisions(recorded, recomputed, epoch, revised_at, appeared_revised) -> list[dict]` (keys `id, type, decision_id, cause, recorded, recomputed`), `decisions_to_record(recomputed, epoch, recorded_ids) -> list[dict]`, `open_position_record(open_trade, trace, epoch_start) -> dict`, `top_count_summary(ws) -> dict | None`.
+- Produces (`ewbot.paper.decisions`): `REL_TOL = 1e-9`, `DECISION_KINDS`, `CAUSES`, `split_result(res, trace) -> tuple[list[Trade], Trade | None]`, `paper_trades(closed, boundary_ts) -> list[Trade]`, `decision_id(kind, ts, trade_key) -> str`, `known_at(d) -> int`, `build_decisions(res, trace, trades) -> list[dict]` (keys `id, kind, ts, price, contracts, reason, trade_key, levels, setup, direction`), `same_decision(a, b) -> bool`, `classify(recorded, data_revised, current_epoch_id) -> str`, `verify_decisions(recorded, recomputed, epoch, revised_at, appeared_revised, *, appeared_after=None) -> list[dict]` (keys `id, type, decision_id, cause, recorded, recomputed`; the APPEARED window is known_at in `(appeared_after or epoch started_ts, epoch through_ts]`), `decisions_to_record(recomputed, epoch, recorded_ids) -> list[dict]`, `open_position_record(open_trade, trace, epoch_start) -> dict`, `top_count_summary(ws) -> dict | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1541,11 +1541,15 @@ def verify_decisions(
     epoch: dict[str, Any],
     revised_at: Callable[[dict[str, Any]], bool],
     appeared_revised: Callable[[dict[str, Any]], bool],
+    *,
+    appeared_after: int | None = None,
 ) -> list[dict[str, Any]]:
     """Replay check. Every recorded decision must reappear unchanged (else CHANGED / VANISHED); a
     recomputed decision of the current epoch that a previous run should already have known but did
     not record is APPEARED. revised_at(recorded) / appeared_revised(recomputed) say whether the bars
-    up to that decision changed since it was (or should have been) recorded."""
+    up to that decision changed since it was (or should have been) recorded. The APPEARED window is
+    known_at in (appeared_after, epoch through_ts]; appeared_after defaults to the epoch's started_ts
+    (the runner passes where the epoch began recording, see runner._recording_floor)."""
     by_id = {d["id"]: d for d in recomputed}
     rec_ids = {d["id"] for d in recorded}
     found: list[dict[str, Any]] = []
@@ -1557,7 +1561,8 @@ def verify_decisions(
         cause = classify(d, revised_at(d), epoch["id"])
         found.append({"id": f"{kind}:{d['id']}", "type": kind, "decision_id": d["id"], "cause": cause,
                       "recorded": d, "recomputed": r})
-    lo, hi = int(epoch["started_ts"]), int(epoch["through_ts"])
+    lo = int(epoch["started_ts"]) if appeared_after is None else int(appeared_after)
+    hi = int(epoch["through_ts"])
     for r in recomputed:
         if r["id"] in rec_ids or not lo < known_at(r) <= hi:
             continue
@@ -1653,7 +1658,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `Ledger`, `new_ledger` (Task 2), `Trade`, `ewbot.strategy.base.blended_r(direction, entry, stop, tp1, tp2, tp1_frac) -> float`, `H1`, `requests`, `tests.paper.helpers.FakeSender`, `ts` (Task 3).
-- Produces (`ewbot.paper.notify`): `NY = ZoneInfo("America/New_York")`, `DAILY_HOUR_NY = 9`, `GAP_WARN_S = 10800`, `SEND_ATTEMPTS = 3`, `TELEGRAM_API`, `HEAD = "[ewbot paper]"`, `class SendError`, `Sender` protocol `(text) -> None`, `TelegramSender(token, chat_id, session=None, timeout=15.0)`, `sender_from_env(env=None) -> TelegramSender | None`, `make_event(kind, ts, trade_key, text) -> dict` (`id, kind, text, attempts`), `deliver(pending, sent_ids, sender, attempts=3, sleep=time.sleep) -> tuple[list[dict], list[str], list[str]]` (still pending, newly sent ids, notes), `daily_summary_due(now_ts, last_date) -> str | None`, `last_ok_run_ts(runs) -> int | None`, `gap_seconds(now_ts, runs) -> int | None`, formats `entry_text(t, tp1_frac)`, `stop_move_text(dec, t)`, `close_text(t, count, counted)`, `daily_text(ny_date, position, equity, count, status)`, `epoch_text(epoch)`, `discrepancy_text(items)`, `data_hash_text(expected, got)`, `gap_text(seconds, last_ts)`, `failure_text(stage, message, run_url)`, `position_line(pos)`, `decision_events(fresh, trades, open_key, epoch_start, count, cur_closed, tp1_frac) -> list[dict]`, `queue_events(ledger, events) -> list[str]`.
+- Produces (`ewbot.paper.notify`): `NY = ZoneInfo("America/New_York")`, `DAILY_HOUR_NY = 9`, `GAP_WARN_S = 10800`, `SEND_ATTEMPTS = 3`, `TELEGRAM_API`, `HEAD = "[ewbot paper]"`, `class SendError`, `Sender` protocol `(text) -> None`, `TelegramSender(token, chat_id, session=None, timeout=15.0)`, `sender_from_env(env=None) -> TelegramSender | None`, `make_event(kind, ts, trade_key, text) -> dict` (`id, kind, text, attempts`), `deliver(pending, sent_ids, sender, attempts=3, sleep=time.sleep) -> tuple[list[dict], list[str], list[str]]` (still pending, newly sent ids, notes), `daily_summary_due(now_ts, last_date) -> str | None`, `last_ok_run_ts(runs) -> int | None`, `gap_seconds(now_ts, runs) -> int | None`, formats `entry_text(t, tp1_frac)`, `stop_move_text(dec, t)`, `close_text(t, count, counted)`, `daily_text(ny_date, position, equity, count, status)`, `epoch_text(epoch)`, `discrepancy_text(items)`, `data_hash_text(expected, got)`, `holdout_trades_text(expected, got)`, `criteria_error_text(ny_date, error)`, `gap_text(seconds, last_ts)`, `failure_text(stage, message, run_url)`, `position_line(pos)`, `decision_events(fresh, trades, open_key, epoch_start, count, cur_closed, tp1_frac) -> list[dict]`, `queue_events(ledger, events) -> list[str]`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2104,6 +2109,26 @@ def data_hash_text(expected: str, got: str) -> str:
             f"{HEAD} 경고: 홀드아웃 구간 데이터 해시 불일치",
             f"잠금 파일 {expected[:12]} · 이번 데이터 {got[:12]}",
             "실행은 계속함 (표본 외 카운트에는 영향 없음, 재현성 손상 기록)",
+        ]
+    )
+
+
+def holdout_trades_text(expected: int, got: int) -> str:
+    return "\n".join(
+        [
+            f"{HEAD} 경고: 홀드아웃 재현 불일치",
+            f"재계산한 홀드아웃 구간 A 거래 {got}건 · 잠금 파일 {expected}건",
+            "실행은 계속함 (표본 외 카운트는 잠금 파일 값을 씀, 재현성 손상 기록)",
+        ]
+    )
+
+
+def criteria_error_text(ny_date: str, error: str) -> str:
+    return "\n".join(
+        [
+            f"{HEAD} 경고: 실거래 전환 판정 1·2번 재계산 실패 ({ny_date} 뉴욕)",
+            error[:300],
+            "이전 결과를 유지하고 다음 실행에서 다시 계산함 (일일 요약은 계산에 성공한 실행에서 보냄)",
         ]
     )
 
@@ -2646,8 +2671,9 @@ EOF
 **Interfaces:**
 - Consumes: every `ewbot.paper` module above; `ewbot.backtest.holdout.DEFAULT_LOCK_PATH`, `data_fingerprint`, `holdout_config`; `ewbot.backtest.runner.run_backtest`, `compare(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False) -> dict`; `ewbot.backtest.walkforward.HOLDOUT_START`, `grid_combos()`; `ewbot.data.candles.fill_gaps`, `load_1h`; `ewbot.data.coinbase_history.update_cache(product, cache_dir)`.
 - Produces (`ewbot.paper.runner`): `PRODUCT = "BTC-USD"`, `FETCH_ATTEMPTS = 3`, `class PaperRunError(RuntimeError)` (`.stage`, `.message`), `default_fetch(cache_dir) -> Path`, `@dataclass PaperEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch, sender=None, clock=_wall_clock, fingerprint=current_fingerprint, baseline=baseline_fingerprint, random_runs=100, workers=max(1, os.cpu_count() or 1), sleep=time.sleep, fetch_backoff_s=10.0)` (`_wall_clock() -> int` = `int(time.time())`), `@dataclass(frozen=True) RunOutcome(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, status)`, `precheck_lock(lock_path) -> dict`, `run_paper(env) -> RunOutcome`.
-- Run record in `ledger.runs`: `id, ts, status, last_bar_ts, data_sha256, holdout_data_ok, holdout_trades_recomputed, epoch_id, paper_trades, count_total, new_decisions, new_discrepancies, notify`.
-- Failure stages: `precheck`, `ledger`, `fingerprint`, `data`, `recompute`, `criteria`, `write`.
+- Run record in `ledger.runs`: `id, ts, status, last_bar_ts, data_sha256, holdout_data_ok, holdout_trades_recomputed, epoch_id, paper_trades, count_total, new_decisions, new_discrepancies, warnings, notify`.
+- Failure stages: `precheck`, `ledger`, `fingerprint`, `data`, `recompute`, `events`, `write`, `notify`. Every step runs in a named `_stage`, so an unexpected exception surfaces as `PaperRunError(stage)`; the `notify` stage keeps only the exception type (the Telegram token is part of the API URL) and does not chain the cause. The daily criteria 1-2 recompute is the one step that never fails the run: an error there is a warning (`criteria_error_text`, once per New York date), the previous `ledger.criteria` stays and the next hourly run retries it (no daily summary until it succeeds).
+- Epoch boundary: the run that creates a new epoch records the decisions first known since the previous epoch's `through_ts` (`_recording_floor`), and passes that floor to `verify_decisions(..., appeared_after=floor)`. `ledger.json` is bound to the whole `holdout_summary(lock)`, not only its sha256 and last bar. A recomputed holdout A trade count different from the lock's `n_trades["A"]` warns once per distinct value (`holdout_trades_text`) and the run continues.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2661,6 +2687,7 @@ import os
 
 import pytest
 
+from ewbot.paper import runner
 from ewbot.paper.ledger import LEDGER_FILE, REPORT_FILE, RUNS_LOG, load_ledger
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
 from ewbot.types import H1
@@ -2889,6 +2916,116 @@ def test_holdout_data_hash_mismatch_warns_and_continues(make_env, df):
     env.clock.now += H1
     run_paper(env)
     assert sum("데이터 해시 불일치" in t for t in env.sender.texts) == 1  # one warning per distinct hash
+
+
+def test_new_epoch_records_the_decisions_known_since_the_previous_run(make_env):
+    env = make_env(now=ts("2024-02-16 02:07"))  # last bar 01:00: the 01:00 short signal is not known yet
+    run_paper(env)
+    n_texts = len(env.sender.texts)
+    env.fingerprint = lambda: "fp-edited"
+    env.clock.now = ts("2024-02-16 03:07")  # last bar 02:00: that signal and its entry fill, seen by the new code
+    out = run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    assert out.epoch_id == 2 and out.new_decisions == 2
+    assert [(d["kind"], d["ts"], d["epoch_id"]) for d in led.decisions if d["run_id"] == out.run_id] == [
+        ("SIGNAL", ts("2024-02-16 01:00"), 2), ("ENTRY", ts("2024-02-16 02:00"), 2)]
+    assert led.epochs[1]["started_ts"] == led.epochs[1]["through_ts"] == ts("2024-02-16 02:00")
+    for t in ("2024-02-16 04:07", "2024-02-16 05:07"):
+        env.clock.now = ts(t)
+        assert run_paper(env).epoch_id == 2
+    entries = [t for t in env.sender.texts[n_texts:] if "신규 진입" in t]
+    assert len(entries) == 1 and "W3 숏" in entries[0]
+    led = load_ledger(env.ledger_dir)
+    assert led.discrepancies == [] and len(led.sent_event_ids) == len(set(led.sent_event_ids)) == len(env.sender.texts)
+    # the replay check of epoch 2 covers what its first run recorded: a lost record shows up as APPEARED
+    sig = f"SIGNAL:{ts('2024-02-16 01:00')}:{ts('2024-02-16 01:00')}"
+    path = env.ledger_dir / LEDGER_FILE
+    data = json.loads(path.read_text())
+    data["decisions"] = [d for d in data["decisions"] if d["id"] != sig]
+    path.write_text(json.dumps(data))
+    env.clock.now = ts("2024-02-16 06:07")
+    run_paper(env)
+    found = load_ledger(env.ledger_dir).discrepancies
+    assert [(d["type"], d["decision_id"], d["cause"]) for d in found] == [("APPEARED", sig, "UNEXPLAINED")]
+
+
+def test_criteria_failure_warns_once_and_is_retried_next_hour(make_env, monkeypatch):
+    env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
+    run_paper(env)
+    before = load_ledger(env.ledger_dir).criteria
+    real = runner.compare
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("compare blew up")
+
+    monkeypatch.setattr(runner, "compare", broken)
+    for t in ("2024-02-13 14:07", "2024-02-13 15:07"):
+        env.clock.now = ts(t)
+        out = run_paper(env)
+        led = load_ledger(env.ledger_dir)
+        note = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
+        assert led.runs[-1]["status"] == "ok" and led.runs[-1]["warnings"] == [note] and note in out.notes
+    assert led.criteria == before and led.daily_summary_date == "2024-02-12"
+    warned = [t for t in env.sender.texts if "1·2번 재계산 실패" in t]
+    assert len(warned) == 1 and "2024-02-13" in warned[0] and "compare blew up" in warned[0]
+    assert not any("일일 요약 2024-02-13" in t for t in env.sender.texts)
+    assert (env.ledger_dir / RUNS_LOG).read_text().count("\n") == 3
+
+    monkeypatch.setattr(runner, "compare", real)
+    env.clock.now = ts("2024-02-13 16:07")
+    run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    assert led.daily_summary_date == "2024-02-13" and led.criteria["computed_ts"] == ts("2024-02-13 16:07")
+    assert sum("일일 요약 2024-02-13" in t for t in env.sender.texts) == 1 and led.runs[-1]["warnings"] == []
+
+
+def test_holdout_trade_count_mismatch_warns_once(make_env, df):
+    env = make_env(lock=make_lock(df, n_a=3))  # the lock says 3 A trades, the recompute finds 2
+    out = run_paper(env)
+    note = "holdout trades recomputed 2 != lock 3"
+    assert load_ledger(env.ledger_dir).runs[-1]["warnings"] == [note] and note in out.notes
+    env.clock.now += H1
+    run_paper(env)
+    warned = [t for t in env.sender.texts if "홀드아웃 재현 불일치" in t]
+    assert len(warned) == 1 and "A 거래 2건 · 잠금 파일 3건" in warned[0]
+
+
+@pytest.mark.parametrize("key", ["params", "data_sha256", "n_trades"])
+def test_ledger_is_bound_to_the_whole_holdout_summary(make_env, df, key):
+    env = make_env()
+    run_paper(env)
+    before = {p.name: p.read_bytes() for p in env.ledger_dir.iterdir()}
+    lock = make_lock(df, params=(2.0, 0.7, 0.5)) if key == "params" else make_lock(df, n_a=3 if key == "n_trades" else 2)
+    if key == "data_sha256":
+        lock["data"]["sha256"] = "0" * 64
+    other = make_env(lock=lock)  # same lock sha256 and last bar as the ledger's
+    with pytest.raises(PaperRunError, match=f"different holdout lock .*{key}") as exc:
+        run_paper(other)
+    assert exc.value.stage == "precheck" and other.fetch.calls == 0 and other.sender.texts == []
+    assert {p.name: p.read_bytes() for p in env.ledger_dir.iterdir()} == before
+
+
+def test_unexpected_errors_name_their_stage_and_withhold_secret_details(make_env, monkeypatch):
+    env = make_env()
+
+    def leaky(*args, **kwargs):
+        raise RuntimeError("POST https://api.telegram.org/bot123:SECRET/sendMessage failed")
+
+    monkeypatch.setattr(runner, "deliver", leaky)
+    with pytest.raises(PaperRunError) as exc:
+        run_paper(env)
+    assert exc.value.stage == "notify" and "SECRET" not in str(exc.value) and exc.value.__cause__ is None
+    assert "RuntimeError" in exc.value.message
+
+    def no_git():
+        raise OSError("git not found")
+
+    fresh = make_env(baseline=no_git)
+    fresh.ledger_dir = fresh.ledger_dir.parent / "paper2"
+    with pytest.raises(PaperRunError) as exc:
+        run_paper(fresh)
+    assert exc.value.stage == "fingerprint" and "git not found" in exc.value.message
+    assert not (fresh.ledger_dir / LEDGER_FILE).exists()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2913,6 +3050,10 @@ Inputs are frozen: the params come from holdout.lock only, the rest of the confi
 BotConfig defaults (conservative risk, breakers on, Plan 1 costs) - holdout_config(BotConfig(), params),
 exactly how the holdout ran. The recompute starts trading at the holdout start, so it reproduces the
 holdout's A run and continues it; trades entering after the holdout's last bar are paper trades.
+
+Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
+the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it) and is
+retried by the next run.
 
 This module is the only non-holdout caller of allow_holdout=True (a static test enforces it)."""
 
@@ -2950,12 +3091,15 @@ from ewbot.paper.decisions import (
 )
 from ewbot.paper.fingerprint import FingerprintError, baseline_fingerprint, current_fingerprint
 from ewbot.paper.ledger import (
+    GO_LIVE_STRATEGY,
     REPORT_FILE,
     RUNS_LOG,
+    Ledger,
     LedgerError,
     append_log_line,
     ensure_epoch,
     golive_count,
+    holdout_summary,
     load_ledger,
     new_ledger,
     replace_epoch_trades,
@@ -2965,6 +3109,7 @@ from ewbot.paper.notify import (
     GAP_WARN_S,
     NY,
     Sender,
+    criteria_error_text,
     daily_summary_due,
     daily_text,
     data_hash_text,
@@ -2974,6 +3119,7 @@ from ewbot.paper.notify import (
     epoch_text,
     gap_seconds,
     gap_text,
+    holdout_trades_text,
     last_ok_run_ts,
     make_event,
     position_line,
@@ -2988,7 +3134,8 @@ FETCH_ATTEMPTS = 3
 
 
 class PaperRunError(RuntimeError):
-    """A run stopped before writing anything; `stage` names the step for the failure alert."""
+    """A run failed at `stage` (named in the failure alert). Before the write stage nothing has been
+    written; the workflow commits nothing after a failed run either way."""
 
     def __init__(self, stage: str, message: str) -> None:
         super().__init__(f"[{stage}] {message}")
@@ -3037,13 +3184,18 @@ class RunOutcome:
 
 
 @contextmanager
-def _stage(name: str) -> Iterator[None]:
+def _stage(name: str, *, detail: bool = True) -> Iterator[None]:
+    """Any failure inside becomes PaperRunError(name). detail=False is for the Telegram stage, whose
+    exceptions may carry the bot token (it is part of the API URL): only the exception type is kept
+    and the original exception is not chained."""
     try:
         yield
     except PaperRunError:
         raise
     except Exception as exc:  # noqa: BLE001 - every failure is reported with its stage
-        raise PaperRunError(name, f"{type(exc).__name__}: {exc}") from exc
+        if detail:
+            raise PaperRunError(name, f"{type(exc).__name__}: {exc}") from exc
+        raise PaperRunError(name, f"{type(exc).__name__} (details withheld: may contain the Telegram token)") from None
 
 
 # ----------------------------------------------------------------------------- precheck
@@ -3084,6 +3236,31 @@ def precheck_lock(lock_path: Path) -> dict[str, Any]:
     return lock
 
 
+def _open_ledger(env: PaperEnv, ledger_dir: Path, lock: dict[str, Any]) -> Ledger:
+    """ledger.json, which must have been started from this very lock (its whole holdout summary), or
+    a new ledger whose epoch 1 carries the baseline fingerprint."""
+    with _stage("ledger"):
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            ledger = load_ledger(ledger_dir)
+        except LedgerError as exc:
+            raise PaperRunError("ledger", str(exc)) from exc
+        if ledger is not None:
+            bound = holdout_summary(lock)
+            diff = sorted(k for k in bound.keys() | ledger.holdout.keys() if ledger.holdout.get(k) != bound.get(k))
+            if diff:
+                raise PaperRunError(
+                    "precheck", f"ledger.json was started from a different holdout lock (differs in: {', '.join(diff)})"
+                )
+            return ledger
+    with _stage("fingerprint"):
+        try:
+            fp0, commit = env.baseline()
+        except FingerprintError as exc:
+            raise PaperRunError("fingerprint", f"baseline at the holdout commit: {exc}") from exc
+        return new_ledger(fp0, commit, lock)
+
+
 def _load_data(env: PaperEnv) -> pd.DataFrame:
     last: Exception | None = None
     path: Path | None = None
@@ -3118,6 +3295,15 @@ class _PrefixHash:
         return self._memo[ts]
 
 
+def _recording_floor(ledger: Ledger) -> int:
+    """known_at bound (exclusive) of the current epoch's decisions: epoch 1 records after the
+    holdout's last bar; a later epoch from where the previous one stopped recording (its through_ts,
+    frozen since), so the decisions first known by the run that opens the epoch belong to it."""
+    if len(ledger.epochs) == 1:
+        return int(ledger.epochs[0]["started_ts"])
+    return int(ledger.epochs[-2]["through_ts"])
+
+
 def _ny9_ts(ny_date: str) -> int:
     y, m, d = (int(x) for x in ny_date.split("-"))
     return int(datetime(y, m, d, 9, tzinfo=NY).timestamp())
@@ -3131,40 +3317,31 @@ def _run_id(now: int) -> str:
 
 
 def run_paper(env: PaperEnv) -> RunOutcome:
-    now = int(env.clock())
-    run_id = _run_id(now)
-    lock = precheck_lock(env.lock_path)
-    cfg = holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
-    ledger_dir = Path(env.ledger_dir)
+    with _stage("precheck"):
+        now = int(env.clock())
+        run_id = _run_id(now)
+        lock = precheck_lock(env.lock_path)
+        cfg = holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
+        ledger_dir = Path(env.ledger_dir)
 
+    ledger = _open_ledger(env, ledger_dir, lock)
     with _stage("ledger"):
-        ledger_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            ledger = load_ledger(ledger_dir)
-        except LedgerError as exc:
-            raise PaperRunError("ledger", str(exc)) from exc
-    if ledger is None:
-        try:
-            fp0, commit = env.baseline()
-        except FingerprintError as exc:
-            raise PaperRunError("fingerprint", f"baseline at the holdout commit: {exc}") from exc
-        ledger = new_ledger(fp0, commit, lock)
-    elif ledger.holdout["lock_sha256"] != lock["sha256"] or ledger.holdout["last_bar_ts"] != int(
-        lock["data"]["last_bar_ts"]
-    ):
-        raise PaperRunError("precheck", "ledger.json was started from a different holdout lock")
-    hs = ledger.holdout
+        hs = ledger.holdout
+        gap = gap_seconds(now, ledger.runs)
+        prev_ok = last_ok_run_ts(ledger.runs)
 
     df = _load_data(env)
-    last_bar = int(df["ts"].iloc[-1])
-    if last_bar < hs["last_bar_ts"]:
-        raise PaperRunError("data", f"data ends at {last_bar}, before the holdout's last bar {hs['last_bar_ts']}")
+    with _stage("data"):
+        last_bar = int(df["ts"].iloc[-1])
+        if last_bar < hs["last_bar_ts"]:
+            raise PaperRunError("data", f"data ends at {last_bar}, before the holdout's last bar {hs['last_bar_ts']}")
 
     with _stage("fingerprint"):
         fp = env.fingerprint()
-    gap = gap_seconds(now, ledger.runs)
-    prev_ok = last_ok_run_ts(ledger.runs)
-    epoch, created = ensure_epoch(ledger, fp, last_bar)
+        epoch, created = ensure_epoch(ledger, fp, last_bar)
+        floor = _recording_floor(ledger)
+        if created:  # this run records the decisions first known in (floor, last bar] under the new epoch
+            epoch["through_ts"] = floor
 
     with _stage("recompute"):
         with traced_engine() as trace:
@@ -3172,6 +3349,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         closed, open_trade = split_result(res, trace)
         all_trades = closed + ([open_trade] if open_trade is not None else [])
         by_entry = {t.entry_ts: t for t in all_trades}
+        holdout_n = sum(1 for t in all_trades if hs["holdout_start"] <= t.entry_ts <= hs["last_bar_ts"])
         cur_closed = paper_trades(closed, int(epoch["started_ts"]))
         replace_epoch_trades(ledger, epoch["id"], cur_closed)
         ledger.open_position = (
@@ -3192,7 +3370,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
             return run is not None and prefix(run["last_bar_ts"]) != run["data_sha256"]
 
         recomputed = build_decisions(res, trace, all_trades)
-        found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised)
+        found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised,
+                                 appeared_after=floor)
         known = {d["id"] for d in ledger.discrepancies}
         new_disc = [
             {**d, "epoch_id": epoch["id"], "detected_ts": last_bar, "detected_run": run_id}
@@ -3206,57 +3385,74 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         ledger.decisions.extend(fresh)
         epoch["through_ts"] = max(int(epoch["through_ts"]), last_bar)
 
-    count = golive_count(ledger)
-    events: list[dict[str, Any]] = []
-    if created:
-        events.append(make_event("EPOCH", epoch["started_ts"], epoch["id"], epoch_text(epoch)))
-    events += decision_events(fresh, by_entry, None if open_trade is None else open_trade.entry_ts,
-                              int(epoch["started_ts"]), count, cur_closed, cfg.strategy.tp1_frac)
-    if new_disc:
-        events.append(make_event("DISCREPANCY", last_bar, len(ledger.discrepancies), discrepancy_text(new_disc)))
-    if not holdout_ok:
-        events.append(make_event("DATA_HASH", hs["last_bar_ts"], holdout_sha[:12], data_hash_text(hs["data_sha256"], holdout_sha)))
-    if gap is not None and prev_ok is not None and gap > GAP_WARN_S:
-        events.append(make_event("GAP", now // H1 * H1, 0, gap_text(gap, prev_ok)))
+    with _stage("events"):
+        count = golive_count(ledger)
+        lock_n = int(hs["n_trades"][GO_LIVE_STRATEGY])
+        warnings: list[str] = []
+        events: list[dict[str, Any]] = []
+        if created:
+            events.append(make_event("EPOCH", epoch["started_ts"], epoch["id"], epoch_text(epoch)))
+        events += decision_events(fresh, by_entry, None if open_trade is None else open_trade.entry_ts,
+                                  int(epoch["started_ts"]), count, cur_closed, cfg.strategy.tp1_frac)
+        if new_disc:
+            events.append(make_event("DISCREPANCY", last_bar, len(ledger.discrepancies), discrepancy_text(new_disc)))
+        if not holdout_ok:
+            warnings.append(f"holdout data hash {holdout_sha[:12]} != lock {hs['data_sha256'][:12]}")
+            events.append(make_event("DATA_HASH", hs["last_bar_ts"], holdout_sha[:12],
+                                     data_hash_text(hs["data_sha256"], holdout_sha)))
+        if holdout_n != lock_n:  # one warning per distinct recomputed count
+            warnings.append(f"holdout trades recomputed {holdout_n} != lock {lock_n}")
+            events.append(make_event("HOLDOUT_TRADES", hs["last_bar_ts"], holdout_n, holdout_trades_text(lock_n, holdout_n)))
+        if gap is not None and prev_ok is not None and gap > GAP_WARN_S:
+            events.append(make_event("GAP", now // H1 * H1, 0, gap_text(gap, prev_ok)))
 
-    run: dict[str, Any] = {
-        "id": run_id,
-        "ts": now,
-        "status": "ok",
-        "last_bar_ts": last_bar,
-        "data_sha256": data_sha,
-        "holdout_data_ok": holdout_ok,
-        "holdout_trades_recomputed": sum(1 for t in all_trades if hs["holdout_start"] <= t.entry_ts <= hs["last_bar_ts"]),
-        "epoch_id": epoch["id"],
-        "paper_trades": count["paper"],
-        "count_total": count["total"],
-        "new_decisions": len(fresh),
-        "new_discrepancies": len(new_disc),
-    }
-    ledger.runs.append(run)
+        run: dict[str, Any] = {
+            "id": run_id,
+            "ts": now,
+            "status": "ok",
+            "last_bar_ts": last_bar,
+            "data_sha256": data_sha,
+            "holdout_data_ok": holdout_ok,
+            "holdout_trades_recomputed": holdout_n,
+            "epoch_id": epoch["id"],
+            "paper_trades": count["paper"],
+            "count_total": count["total"],
+            "new_decisions": len(fresh),
+            "new_discrepancies": len(new_disc),
+            "warnings": warnings,
+        }
+        ledger.runs.append(run)
+        due = daily_summary_due(now, ledger.daily_summary_date)
 
-    due = daily_summary_due(now, ledger.daily_summary_date)
-    if due is not None:
-        if count["eligible"]:
-            with _stage("criteria"):
-                end = last_bar + H1
-                cmp = compare(cfg, df, hs["holdout_start"], end, random_runs=env.random_runs, workers=env.workers,
-                              allow_holdout=True)
-                ledger.criteria = summarize_compare(cmp, hs["holdout_start"], end, epoch["id"], now)
-        eq = {p.ts: p.equity for p in res.equity}
-        base_eq = eq.get(hs["last_bar_ts"], cfg.initial_equity)
-        last_eq = res.equity[-1].equity if res.equity else cfg.initial_equity
-        equity_line = f"자산 {last_eq:,.2f} USD (홀드아웃 이후 {last_eq / base_eq - 1:+.2%})"
-        count_line = (
-            f"표본 외 누적 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}) · "
-            f"구간 {epoch['id']}"
-        )
-        st = golive_status(ledger, now)
-        text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st))
-        events.append(make_event("DAILY", _ny9_ts(due), 0, text))
-        ledger.daily_summary_date = due
-    queued = queue_events(ledger, events)
-    status = golive_status(ledger, now)
+    if due is not None and count["eligible"]:
+        try:
+            end = last_bar + H1
+            cmp = compare(cfg, df, hs["holdout_start"], end, random_runs=env.random_runs, workers=env.workers,
+                          allow_holdout=True)
+            ledger.criteria = summarize_compare(cmp, hs["holdout_start"], end, epoch["id"], now)
+        except Exception as exc:  # noqa: BLE001 - criteria 1-2 are a daily extra: never block the hourly run
+            err = f"{type(exc).__name__}: {exc}"
+            warnings.append(f"criteria 1-2 not recomputed (retried next run): {err}")
+            with _stage("events"):  # one warning per New York date; the previous ledger.criteria stays
+                events.append(make_event("CRITERIA", _ny9_ts(due), 0, criteria_error_text(due, err)))
+            due = None  # no daily summary and no daily_summary_date until the criteria are recomputed
+
+    with _stage("events"):
+        if due is not None:
+            eq = {p.ts: p.equity for p in res.equity}
+            base_eq = eq.get(hs["last_bar_ts"], cfg.initial_equity)
+            last_eq = res.equity[-1].equity if res.equity else cfg.initial_equity
+            equity_line = f"자산 {last_eq:,.2f} USD (홀드아웃 이후 {last_eq / base_eq - 1:+.2%})"
+            count_line = (
+                f"표본 외 누적 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}) · "
+                f"구간 {epoch['id']}"
+            )
+            st = golive_status(ledger, now)
+            text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st))
+            events.append(make_event("DAILY", _ny9_ts(due), 0, text))
+            ledger.daily_summary_date = due
+        queued = queue_events(ledger, events)
+        status = golive_status(ledger, now)
 
     with _stage("write"):  # report first: if it fails, the previous ledger.json is left untouched
         write_paper_report(ledger_dir / REPORT_FILE, ledger, status, res.equity, cur_closed, df,
@@ -3269,14 +3465,15 @@ def run_paper(env: PaperEnv) -> RunOutcome:
             f"trades={count['total']}/{count['required']}\tepoch={epoch['id']}\tnew_decisions={len(fresh)}",
         )
 
-    remaining, sent, errors = deliver(ledger.pending_events, ledger.sent_event_ids, env.sender, sleep=env.sleep)
-    ledger.pending_events = remaining
-    ledger.sent_event_ids.extend(sent)
-    run["notify"] = {"sent": len(sent), "pending": len(remaining), "errors": errors}
+    with _stage("notify", detail=False):
+        remaining, sent, errors = deliver(ledger.pending_events, ledger.sent_event_ids, env.sender, sleep=env.sleep)
+        ledger.pending_events = remaining
+        ledger.sent_event_ids.extend(sent)
+        run["notify"] = {"sent": len(sent), "pending": len(remaining), "errors": errors}
     with _stage("write"):
         save_ledger(ledger_dir, ledger)
     return RunOutcome(run_id, last_bar, int(epoch["id"]), len(fresh), len(new_disc), queued, sent, len(remaining),
-                      errors, status)
+                      warnings + errors, status)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -3285,7 +3482,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
 uv run pytest tests/paper/test_runner.py -q
 ```
 
-Expected: `19 passed`.
+Expected: `26 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4133,7 +4330,7 @@ Locally, with a worktree of the `paper` branch (`git worktree add ../paper-ledge
 | 신규 진입 | a new entry fill (setup, side, entry, stop, TP1/TP2, blended R, top count q / S_rev) |
 | 손절 이동 (본전 / 추적) | breakeven after TP1, or a structural trailing move |
 | 청산 | the fill that closed a trade (reason, PnL, R, out-of-sample N/50) |
-| 일일 요약 | first run at/after 09:00 New York time each day: position, equity, N/50, go-live status (criteria 1–2 are recomputed in this run: A/HYBRID vs C/BH/EMA/RANDOM x100) |
+| 일일 요약 | first run at/after 09:00 New York time each day: position, equity, N/50, go-live status (criteria 1–2 are recomputed in this run: A/HYBRID vs C/BH/EMA/RANDOM x100; if that recompute fails the run still completes, a warning is sent once, and the summary comes from the next run that recomputes successfully) |
 | 경고 | strategy fingerprint change (new epoch), decision discrepancy, holdout data hash mismatch, run gap over 3 hours |
 | 실패 | the failed stage and the Actions log link (sent by `ewbot`; the workflow sends a fallback for checkout/setup/push failures) |
 
