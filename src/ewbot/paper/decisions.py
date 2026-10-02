@@ -131,11 +131,15 @@ def verify_decisions(
     epoch: dict[str, Any],
     revised_at: Callable[[dict[str, Any]], bool],
     appeared_revised: Callable[[dict[str, Any]], bool],
+    *,
+    appeared_after: int | None = None,
 ) -> list[dict[str, Any]]:
     """Replay check. Every recorded decision must reappear unchanged (else CHANGED / VANISHED); a
     recomputed decision of the current epoch that a previous run should already have known but did
     not record is APPEARED. revised_at(recorded) / appeared_revised(recomputed) say whether the bars
-    up to that decision changed since it was (or should have been) recorded."""
+    up to that decision changed since it was (or should have been) recorded. The APPEARED window is
+    known_at in (appeared_after, epoch through_ts]; appeared_after defaults to the epoch's started_ts
+    (the runner passes where the epoch began recording, see runner._recording_floor)."""
     by_id = {d["id"]: d for d in recomputed}
     rec_ids = {d["id"] for d in recorded}
     found: list[dict[str, Any]] = []
@@ -147,7 +151,8 @@ def verify_decisions(
         cause = classify(d, revised_at(d), epoch["id"])
         found.append({"id": f"{kind}:{d['id']}", "type": kind, "decision_id": d["id"], "cause": cause,
                       "recorded": d, "recomputed": r})
-    lo, hi = int(epoch["started_ts"]), int(epoch["through_ts"])
+    lo = int(epoch["started_ts"]) if appeared_after is None else int(appeared_after)
+    hi = int(epoch["through_ts"])
     for r in recomputed:
         if r["id"] in rec_ids or not lo < known_at(r) <= hi:
             continue

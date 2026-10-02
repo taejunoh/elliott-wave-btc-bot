@@ -233,6 +233,26 @@ def data_hash_text(expected: str, got: str) -> str:
     )
 
 
+def holdout_trades_text(expected: int, got: int) -> str:
+    return "\n".join(
+        [
+            f"{HEAD} 경고: 홀드아웃 재현 불일치",
+            f"재계산한 홀드아웃 구간 A 거래 {got}건 · 잠금 파일 {expected}건",
+            "실행은 계속함 (표본 외 카운트는 잠금 파일 값을 씀, 재현성 손상 기록)",
+        ]
+    )
+
+
+def criteria_error_text(ny_date: str, error: str) -> str:
+    return "\n".join(
+        [
+            f"{HEAD} 경고: 실거래 전환 판정 1·2번 재계산 실패 ({ny_date} 뉴욕)",
+            error[:300],
+            "이전 결과를 유지하고 다음 실행에서 다시 계산함 (일일 요약은 계산에 성공한 실행에서 보냄)",
+        ]
+    )
+
+
 def gap_text(seconds: int, last_ts: int) -> str:
     return f"{HEAD} 경고: 실행 공백 {seconds / H1:.1f}시간 (직전 성공 실행 {_utc(last_ts)})"
 

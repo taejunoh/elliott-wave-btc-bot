@@ -6,6 +6,10 @@ BotConfig defaults (conservative risk, breakers on, Plan 1 costs) - holdout_conf
 exactly how the holdout ran. The recompute starts trading at the holdout start, so it reproduces the
 holdout's A run and continues it; trades entering after the holdout's last bar are paper trades.
 
+Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
+the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it) and is
+retried by the next run.
+
 This module is the only non-holdout caller of allow_holdout=True (a static test enforces it)."""
 
 from __future__ import annotations
@@ -42,12 +46,15 @@ from ewbot.paper.decisions import (
 )
 from ewbot.paper.fingerprint import FingerprintError, baseline_fingerprint, current_fingerprint
 from ewbot.paper.ledger import (
+    GO_LIVE_STRATEGY,
     REPORT_FILE,
     RUNS_LOG,
+    Ledger,
     LedgerError,
     append_log_line,
     ensure_epoch,
     golive_count,
+    holdout_summary,
     load_ledger,
     new_ledger,
     replace_epoch_trades,
@@ -57,6 +64,7 @@ from ewbot.paper.notify import (
     GAP_WARN_S,
     NY,
     Sender,
+    criteria_error_text,
     daily_summary_due,
     daily_text,
     data_hash_text,
@@ -66,6 +74,7 @@ from ewbot.paper.notify import (
     epoch_text,
     gap_seconds,
     gap_text,
+    holdout_trades_text,
     last_ok_run_ts,
     make_event,
     position_line,
@@ -80,7 +89,8 @@ FETCH_ATTEMPTS = 3
 
 
 class PaperRunError(RuntimeError):
-    """A run stopped before writing anything; `stage` names the step for the failure alert."""
+    """A run failed at `stage` (named in the failure alert). Before the write stage nothing has been
+    written; the workflow commits nothing after a failed run either way."""
 
     def __init__(self, stage: str, message: str) -> None:
         super().__init__(f"[{stage}] {message}")
@@ -129,13 +139,18 @@ class RunOutcome:
 
 
 @contextmanager
-def _stage(name: str) -> Iterator[None]:
+def _stage(name: str, *, detail: bool = True) -> Iterator[None]:
+    """Any failure inside becomes PaperRunError(name). detail=False is for the Telegram stage, whose
+    exceptions may carry the bot token (it is part of the API URL): only the exception type is kept
+    and the original exception is not chained."""
     try:
         yield
     except PaperRunError:
         raise
     except Exception as exc:  # noqa: BLE001 - every failure is reported with its stage
-        raise PaperRunError(name, f"{type(exc).__name__}: {exc}") from exc
+        if detail:
+            raise PaperRunError(name, f"{type(exc).__name__}: {exc}") from exc
+        raise PaperRunError(name, f"{type(exc).__name__} (details withheld: may contain the Telegram token)") from None
 
 
 # ----------------------------------------------------------------------------- precheck
@@ -176,6 +191,31 @@ def precheck_lock(lock_path: Path) -> dict[str, Any]:
     return lock
 
 
+def _open_ledger(env: PaperEnv, ledger_dir: Path, lock: dict[str, Any]) -> Ledger:
+    """ledger.json, which must have been started from this very lock (its whole holdout summary), or
+    a new ledger whose epoch 1 carries the baseline fingerprint."""
+    with _stage("ledger"):
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            ledger = load_ledger(ledger_dir)
+        except LedgerError as exc:
+            raise PaperRunError("ledger", str(exc)) from exc
+        if ledger is not None:
+            bound = holdout_summary(lock)
+            diff = sorted(k for k in bound.keys() | ledger.holdout.keys() if ledger.holdout.get(k) != bound.get(k))
+            if diff:
+                raise PaperRunError(
+                    "precheck", f"ledger.json was started from a different holdout lock (differs in: {', '.join(diff)})"
+                )
+            return ledger
+    with _stage("fingerprint"):
+        try:
+            fp0, commit = env.baseline()
+        except FingerprintError as exc:
+            raise PaperRunError("fingerprint", f"baseline at the holdout commit: {exc}") from exc
+        return new_ledger(fp0, commit, lock)
+
+
 def _load_data(env: PaperEnv) -> pd.DataFrame:
     last: Exception | None = None
     path: Path | None = None
@@ -210,6 +250,15 @@ class _PrefixHash:
         return self._memo[ts]
 
 
+def _recording_floor(ledger: Ledger) -> int:
+    """known_at bound (exclusive) of the current epoch's decisions: epoch 1 records after the
+    holdout's last bar; a later epoch from where the previous one stopped recording (its through_ts,
+    frozen since), so the decisions first known by the run that opens the epoch belong to it."""
+    if len(ledger.epochs) == 1:
+        return int(ledger.epochs[0]["started_ts"])
+    return int(ledger.epochs[-2]["through_ts"])
+
+
 def _ny9_ts(ny_date: str) -> int:
     y, m, d = (int(x) for x in ny_date.split("-"))
     return int(datetime(y, m, d, 9, tzinfo=NY).timestamp())
@@ -223,40 +272,31 @@ def _run_id(now: int) -> str:
 
 
 def run_paper(env: PaperEnv) -> RunOutcome:
-    now = int(env.clock())
-    run_id = _run_id(now)
-    lock = precheck_lock(env.lock_path)
-    cfg = holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
-    ledger_dir = Path(env.ledger_dir)
+    with _stage("precheck"):
+        now = int(env.clock())
+        run_id = _run_id(now)
+        lock = precheck_lock(env.lock_path)
+        cfg = holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
+        ledger_dir = Path(env.ledger_dir)
 
+    ledger = _open_ledger(env, ledger_dir, lock)
     with _stage("ledger"):
-        ledger_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            ledger = load_ledger(ledger_dir)
-        except LedgerError as exc:
-            raise PaperRunError("ledger", str(exc)) from exc
-    if ledger is None:
-        try:
-            fp0, commit = env.baseline()
-        except FingerprintError as exc:
-            raise PaperRunError("fingerprint", f"baseline at the holdout commit: {exc}") from exc
-        ledger = new_ledger(fp0, commit, lock)
-    elif ledger.holdout["lock_sha256"] != lock["sha256"] or ledger.holdout["last_bar_ts"] != int(
-        lock["data"]["last_bar_ts"]
-    ):
-        raise PaperRunError("precheck", "ledger.json was started from a different holdout lock")
-    hs = ledger.holdout
+        hs = ledger.holdout
+        gap = gap_seconds(now, ledger.runs)
+        prev_ok = last_ok_run_ts(ledger.runs)
 
     df = _load_data(env)
-    last_bar = int(df["ts"].iloc[-1])
-    if last_bar < hs["last_bar_ts"]:
-        raise PaperRunError("data", f"data ends at {last_bar}, before the holdout's last bar {hs['last_bar_ts']}")
+    with _stage("data"):
+        last_bar = int(df["ts"].iloc[-1])
+        if last_bar < hs["last_bar_ts"]:
+            raise PaperRunError("data", f"data ends at {last_bar}, before the holdout's last bar {hs['last_bar_ts']}")
 
     with _stage("fingerprint"):
         fp = env.fingerprint()
-    gap = gap_seconds(now, ledger.runs)
-    prev_ok = last_ok_run_ts(ledger.runs)
-    epoch, created = ensure_epoch(ledger, fp, last_bar)
+        epoch, created = ensure_epoch(ledger, fp, last_bar)
+        floor = _recording_floor(ledger)
+        if created:  # this run records the decisions first known in (floor, last bar] under the new epoch
+            epoch["through_ts"] = floor
 
     with _stage("recompute"):
         with traced_engine() as trace:
@@ -264,6 +304,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         closed, open_trade = split_result(res, trace)
         all_trades = closed + ([open_trade] if open_trade is not None else [])
         by_entry = {t.entry_ts: t for t in all_trades}
+        holdout_n = sum(1 for t in all_trades if hs["holdout_start"] <= t.entry_ts <= hs["last_bar_ts"])
         cur_closed = paper_trades(closed, int(epoch["started_ts"]))
         replace_epoch_trades(ledger, epoch["id"], cur_closed)
         ledger.open_position = (
@@ -284,7 +325,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
             return run is not None and prefix(run["last_bar_ts"]) != run["data_sha256"]
 
         recomputed = build_decisions(res, trace, all_trades)
-        found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised)
+        found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised,
+                                 appeared_after=floor)
         known = {d["id"] for d in ledger.discrepancies}
         new_disc = [
             {**d, "epoch_id": epoch["id"], "detected_ts": last_bar, "detected_run": run_id}
@@ -298,57 +340,74 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         ledger.decisions.extend(fresh)
         epoch["through_ts"] = max(int(epoch["through_ts"]), last_bar)
 
-    count = golive_count(ledger)
-    events: list[dict[str, Any]] = []
-    if created:
-        events.append(make_event("EPOCH", epoch["started_ts"], epoch["id"], epoch_text(epoch)))
-    events += decision_events(fresh, by_entry, None if open_trade is None else open_trade.entry_ts,
-                              int(epoch["started_ts"]), count, cur_closed, cfg.strategy.tp1_frac)
-    if new_disc:
-        events.append(make_event("DISCREPANCY", last_bar, len(ledger.discrepancies), discrepancy_text(new_disc)))
-    if not holdout_ok:
-        events.append(make_event("DATA_HASH", hs["last_bar_ts"], holdout_sha[:12], data_hash_text(hs["data_sha256"], holdout_sha)))
-    if gap is not None and prev_ok is not None and gap > GAP_WARN_S:
-        events.append(make_event("GAP", now // H1 * H1, 0, gap_text(gap, prev_ok)))
+    with _stage("events"):
+        count = golive_count(ledger)
+        lock_n = int(hs["n_trades"][GO_LIVE_STRATEGY])
+        warnings: list[str] = []
+        events: list[dict[str, Any]] = []
+        if created:
+            events.append(make_event("EPOCH", epoch["started_ts"], epoch["id"], epoch_text(epoch)))
+        events += decision_events(fresh, by_entry, None if open_trade is None else open_trade.entry_ts,
+                                  int(epoch["started_ts"]), count, cur_closed, cfg.strategy.tp1_frac)
+        if new_disc:
+            events.append(make_event("DISCREPANCY", last_bar, len(ledger.discrepancies), discrepancy_text(new_disc)))
+        if not holdout_ok:
+            warnings.append(f"holdout data hash {holdout_sha[:12]} != lock {hs['data_sha256'][:12]}")
+            events.append(make_event("DATA_HASH", hs["last_bar_ts"], holdout_sha[:12],
+                                     data_hash_text(hs["data_sha256"], holdout_sha)))
+        if holdout_n != lock_n:  # one warning per distinct recomputed count
+            warnings.append(f"holdout trades recomputed {holdout_n} != lock {lock_n}")
+            events.append(make_event("HOLDOUT_TRADES", hs["last_bar_ts"], holdout_n, holdout_trades_text(lock_n, holdout_n)))
+        if gap is not None and prev_ok is not None and gap > GAP_WARN_S:
+            events.append(make_event("GAP", now // H1 * H1, 0, gap_text(gap, prev_ok)))
 
-    run: dict[str, Any] = {
-        "id": run_id,
-        "ts": now,
-        "status": "ok",
-        "last_bar_ts": last_bar,
-        "data_sha256": data_sha,
-        "holdout_data_ok": holdout_ok,
-        "holdout_trades_recomputed": sum(1 for t in all_trades if hs["holdout_start"] <= t.entry_ts <= hs["last_bar_ts"]),
-        "epoch_id": epoch["id"],
-        "paper_trades": count["paper"],
-        "count_total": count["total"],
-        "new_decisions": len(fresh),
-        "new_discrepancies": len(new_disc),
-    }
-    ledger.runs.append(run)
+        run: dict[str, Any] = {
+            "id": run_id,
+            "ts": now,
+            "status": "ok",
+            "last_bar_ts": last_bar,
+            "data_sha256": data_sha,
+            "holdout_data_ok": holdout_ok,
+            "holdout_trades_recomputed": holdout_n,
+            "epoch_id": epoch["id"],
+            "paper_trades": count["paper"],
+            "count_total": count["total"],
+            "new_decisions": len(fresh),
+            "new_discrepancies": len(new_disc),
+            "warnings": warnings,
+        }
+        ledger.runs.append(run)
+        due = daily_summary_due(now, ledger.daily_summary_date)
 
-    due = daily_summary_due(now, ledger.daily_summary_date)
-    if due is not None:
-        if count["eligible"]:
-            with _stage("criteria"):
-                end = last_bar + H1
-                cmp = compare(cfg, df, hs["holdout_start"], end, random_runs=env.random_runs, workers=env.workers,
-                              allow_holdout=True)
-                ledger.criteria = summarize_compare(cmp, hs["holdout_start"], end, epoch["id"], now)
-        eq = {p.ts: p.equity for p in res.equity}
-        base_eq = eq.get(hs["last_bar_ts"], cfg.initial_equity)
-        last_eq = res.equity[-1].equity if res.equity else cfg.initial_equity
-        equity_line = f"자산 {last_eq:,.2f} USD (홀드아웃 이후 {last_eq / base_eq - 1:+.2%})"
-        count_line = (
-            f"표본 외 누적 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}) · "
-            f"구간 {epoch['id']}"
-        )
-        st = golive_status(ledger, now)
-        text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st))
-        events.append(make_event("DAILY", _ny9_ts(due), 0, text))
-        ledger.daily_summary_date = due
-    queued = queue_events(ledger, events)
-    status = golive_status(ledger, now)
+    if due is not None and count["eligible"]:
+        try:
+            end = last_bar + H1
+            cmp = compare(cfg, df, hs["holdout_start"], end, random_runs=env.random_runs, workers=env.workers,
+                          allow_holdout=True)
+            ledger.criteria = summarize_compare(cmp, hs["holdout_start"], end, epoch["id"], now)
+        except Exception as exc:  # noqa: BLE001 - criteria 1-2 are a daily extra: never block the hourly run
+            err = f"{type(exc).__name__}: {exc}"
+            warnings.append(f"criteria 1-2 not recomputed (retried next run): {err}")
+            with _stage("events"):  # one warning per New York date; the previous ledger.criteria stays
+                events.append(make_event("CRITERIA", _ny9_ts(due), 0, criteria_error_text(due, err)))
+            due = None  # no daily summary and no daily_summary_date until the criteria are recomputed
+
+    with _stage("events"):
+        if due is not None:
+            eq = {p.ts: p.equity for p in res.equity}
+            base_eq = eq.get(hs["last_bar_ts"], cfg.initial_equity)
+            last_eq = res.equity[-1].equity if res.equity else cfg.initial_equity
+            equity_line = f"자산 {last_eq:,.2f} USD (홀드아웃 이후 {last_eq / base_eq - 1:+.2%})"
+            count_line = (
+                f"표본 외 누적 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}) · "
+                f"구간 {epoch['id']}"
+            )
+            st = golive_status(ledger, now)
+            text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st))
+            events.append(make_event("DAILY", _ny9_ts(due), 0, text))
+            ledger.daily_summary_date = due
+        queued = queue_events(ledger, events)
+        status = golive_status(ledger, now)
 
     with _stage("write"):  # report first: if it fails, the previous ledger.json is left untouched
         write_paper_report(ledger_dir / REPORT_FILE, ledger, status, res.equity, cur_closed, df,
@@ -361,11 +420,12 @@ def run_paper(env: PaperEnv) -> RunOutcome:
             f"trades={count['total']}/{count['required']}\tepoch={epoch['id']}\tnew_decisions={len(fresh)}",
         )
 
-    remaining, sent, errors = deliver(ledger.pending_events, ledger.sent_event_ids, env.sender, sleep=env.sleep)
-    ledger.pending_events = remaining
-    ledger.sent_event_ids.extend(sent)
-    run["notify"] = {"sent": len(sent), "pending": len(remaining), "errors": errors}
+    with _stage("notify", detail=False):
+        remaining, sent, errors = deliver(ledger.pending_events, ledger.sent_event_ids, env.sender, sleep=env.sleep)
+        ledger.pending_events = remaining
+        ledger.sent_event_ids.extend(sent)
+        run["notify"] = {"sent": len(sent), "pending": len(remaining), "errors": errors}
     with _stage("write"):
         save_ledger(ledger_dir, ledger)
     return RunOutcome(run_id, last_bar, int(epoch["id"]), len(fresh), len(new_disc), queued, sent, len(remaining),
-                      errors, status)
+                      warnings + errors, status)

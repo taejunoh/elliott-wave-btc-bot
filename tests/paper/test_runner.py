@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from ewbot.paper import runner
 from ewbot.paper.ledger import LEDGER_FILE, REPORT_FILE, RUNS_LOG, load_ledger
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
 from ewbot.types import H1
@@ -233,3 +234,113 @@ def test_holdout_data_hash_mismatch_warns_and_continues(make_env, df):
     env.clock.now += H1
     run_paper(env)
     assert sum("데이터 해시 불일치" in t for t in env.sender.texts) == 1  # one warning per distinct hash
+
+
+def test_new_epoch_records_the_decisions_known_since_the_previous_run(make_env):
+    env = make_env(now=ts("2024-02-16 02:07"))  # last bar 01:00: the 01:00 short signal is not known yet
+    run_paper(env)
+    n_texts = len(env.sender.texts)
+    env.fingerprint = lambda: "fp-edited"
+    env.clock.now = ts("2024-02-16 03:07")  # last bar 02:00: that signal and its entry fill, seen by the new code
+    out = run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    assert out.epoch_id == 2 and out.new_decisions == 2
+    assert [(d["kind"], d["ts"], d["epoch_id"]) for d in led.decisions if d["run_id"] == out.run_id] == [
+        ("SIGNAL", ts("2024-02-16 01:00"), 2), ("ENTRY", ts("2024-02-16 02:00"), 2)]
+    assert led.epochs[1]["started_ts"] == led.epochs[1]["through_ts"] == ts("2024-02-16 02:00")
+    for t in ("2024-02-16 04:07", "2024-02-16 05:07"):
+        env.clock.now = ts(t)
+        assert run_paper(env).epoch_id == 2
+    entries = [t for t in env.sender.texts[n_texts:] if "신규 진입" in t]
+    assert len(entries) == 1 and "W3 숏" in entries[0]
+    led = load_ledger(env.ledger_dir)
+    assert led.discrepancies == [] and len(led.sent_event_ids) == len(set(led.sent_event_ids)) == len(env.sender.texts)
+    # the replay check of epoch 2 covers what its first run recorded: a lost record shows up as APPEARED
+    sig = f"SIGNAL:{ts('2024-02-16 01:00')}:{ts('2024-02-16 01:00')}"
+    path = env.ledger_dir / LEDGER_FILE
+    data = json.loads(path.read_text())
+    data["decisions"] = [d for d in data["decisions"] if d["id"] != sig]
+    path.write_text(json.dumps(data))
+    env.clock.now = ts("2024-02-16 06:07")
+    run_paper(env)
+    found = load_ledger(env.ledger_dir).discrepancies
+    assert [(d["type"], d["decision_id"], d["cause"]) for d in found] == [("APPEARED", sig, "UNEXPLAINED")]
+
+
+def test_criteria_failure_warns_once_and_is_retried_next_hour(make_env, monkeypatch):
+    env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
+    run_paper(env)
+    before = load_ledger(env.ledger_dir).criteria
+    real = runner.compare
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("compare blew up")
+
+    monkeypatch.setattr(runner, "compare", broken)
+    for t in ("2024-02-13 14:07", "2024-02-13 15:07"):
+        env.clock.now = ts(t)
+        out = run_paper(env)
+        led = load_ledger(env.ledger_dir)
+        note = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
+        assert led.runs[-1]["status"] == "ok" and led.runs[-1]["warnings"] == [note] and note in out.notes
+    assert led.criteria == before and led.daily_summary_date == "2024-02-12"
+    warned = [t for t in env.sender.texts if "1·2번 재계산 실패" in t]
+    assert len(warned) == 1 and "2024-02-13" in warned[0] and "compare blew up" in warned[0]
+    assert not any("일일 요약 2024-02-13" in t for t in env.sender.texts)
+    assert (env.ledger_dir / RUNS_LOG).read_text().count("\n") == 3
+
+    monkeypatch.setattr(runner, "compare", real)
+    env.clock.now = ts("2024-02-13 16:07")
+    run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    assert led.daily_summary_date == "2024-02-13" and led.criteria["computed_ts"] == ts("2024-02-13 16:07")
+    assert sum("일일 요약 2024-02-13" in t for t in env.sender.texts) == 1 and led.runs[-1]["warnings"] == []
+
+
+def test_holdout_trade_count_mismatch_warns_once(make_env, df):
+    env = make_env(lock=make_lock(df, n_a=3))  # the lock says 3 A trades, the recompute finds 2
+    out = run_paper(env)
+    note = "holdout trades recomputed 2 != lock 3"
+    assert load_ledger(env.ledger_dir).runs[-1]["warnings"] == [note] and note in out.notes
+    env.clock.now += H1
+    run_paper(env)
+    warned = [t for t in env.sender.texts if "홀드아웃 재현 불일치" in t]
+    assert len(warned) == 1 and "A 거래 2건 · 잠금 파일 3건" in warned[0]
+
+
+@pytest.mark.parametrize("key", ["params", "data_sha256", "n_trades"])
+def test_ledger_is_bound_to_the_whole_holdout_summary(make_env, df, key):
+    env = make_env()
+    run_paper(env)
+    before = {p.name: p.read_bytes() for p in env.ledger_dir.iterdir()}
+    lock = make_lock(df, params=(2.0, 0.7, 0.5)) if key == "params" else make_lock(df, n_a=3 if key == "n_trades" else 2)
+    if key == "data_sha256":
+        lock["data"]["sha256"] = "0" * 64
+    other = make_env(lock=lock)  # same lock sha256 and last bar as the ledger's
+    with pytest.raises(PaperRunError, match=f"different holdout lock .*{key}") as exc:
+        run_paper(other)
+    assert exc.value.stage == "precheck" and other.fetch.calls == 0 and other.sender.texts == []
+    assert {p.name: p.read_bytes() for p in env.ledger_dir.iterdir()} == before
+
+
+def test_unexpected_errors_name_their_stage_and_withhold_secret_details(make_env, monkeypatch):
+    env = make_env()
+
+    def leaky(*args, **kwargs):
+        raise RuntimeError("POST https://api.telegram.org/bot123:SECRET/sendMessage failed")
+
+    monkeypatch.setattr(runner, "deliver", leaky)
+    with pytest.raises(PaperRunError) as exc:
+        run_paper(env)
+    assert exc.value.stage == "notify" and "SECRET" not in str(exc.value) and exc.value.__cause__ is None
+    assert "RuntimeError" in exc.value.message
+
+    def no_git():
+        raise OSError("git not found")
+
+    fresh = make_env(baseline=no_git)
+    fresh.ledger_dir = fresh.ledger_dir.parent / "paper2"
+    with pytest.raises(PaperRunError) as exc:
+        run_paper(fresh)
+    assert exc.value.stage == "fingerprint" and "git not found" in exc.value.message
+    assert not (fresh.ledger_dir / LEDGER_FILE).exists()
