@@ -1,0 +1,111 @@
+# ewbot paper-trading runtime (Plan 2 spec 6.1): one deterministic recompute per hour.
+# Code comes from master; ledger.json / report.html / runs.log live on the orphan `paper` branch,
+# which only this workflow writes (docs/paper-trading.md: never push to it by hand).
+# Every fetch is shallow: the paper branch gets one commit per hour and its history is never needed here.
+# The git side (paper worktree, commit, push and retry) is scripts/paper_sync.sh.
+# The Telegram secrets reach only the steps that can send: the paper run, the push step (it reruns
+# ewbot when origin/paper moved) and the failure alert.
+name: paper
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: paper
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  paper:
+    # pinned while paper trading runs (spec 8): the runner image is part of each run's recorded environment
+    runs-on: ubuntu-24.04
+    # backstop only: the steps below have their own timeouts, so a hang fails its step and alerts
+    timeout-minutes: 100
+    env:
+      EWBOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - name: Fetch the holdout commit and check out the paper branch (orphan on first use)
+        id: checkout-paper
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          echo "PAPER_DIR=$RUNNER_TEMP/paper" >> "$GITHUB_ENV"
+          echo "EWBOT_FAILURE_MARKER=$RUNNER_TEMP/ewbot-failure-notified" >> "$GITHUB_ENV"
+          git config --global user.name "ewbot-paper"
+          git config --global user.email "ewbot-paper@users.noreply.github.com"
+          # 64e628a: the fingerprint baseline, read once when ledger.json is created (spec 5.1)
+          git fetch --no-tags --depth=1 origin 64e628ad4865b3b04571a7cba2886881eae19176
+          PAPER_DIR="$RUNNER_TEMP/paper" bash scripts/paper_sync.sh checkout
+
+      - name: Install uv (with its cache)
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Restore the candle cache
+        uses: actions/cache@v6
+        with:
+          path: data/cache
+          key: btc-usd-1h-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            btc-usd-1h-
+
+      - name: Sync dependencies
+        timeout-minutes: 10
+        run: uv sync --frozen
+
+      # 1-2 min per hourly run, 10-20 min for the daily criteria 1-2 recompute
+      - name: Paper run
+        id: paper
+        timeout-minutes: 35
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run ewbot paper run --ledger-dir "$PAPER_DIR"
+
+      # 3 pushes at most; the same commit again when origin/paper did not move, ewbot reruns only when it did
+      - name: Commit and push the ledger
+        id: push
+        timeout-minutes: 35
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: bash scripts/paper_sync.sh push uv run ewbot paper run --ledger-dir "$PAPER_DIR"
+
+      - name: Telegram failure alert (fallback when ewbot did not send one)
+        id: alert
+        if: failure() || cancelled()
+        timeout-minutes: 2
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          if [ -f "${EWBOT_FAILURE_MARKER:-/nonexistent}" ]; then
+            echo "ewbot already sent the failure alert"
+            exit 0
+          fi
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "no Telegram secrets: skipping the alert"
+            exit 0
+          fi
+          text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / timeout / push) · ${JOB_STATUS}"$'\n'"로그: ${EWBOT_RUN_URL}"
+          # --fail-with-body: an HTTP error fails the step and prints Telegram's reply (never the token)
+          # worst case 4 x 20 s + 1 + 2 + 4 s of retry waits = 87 s, inside the 2-minute step timeout
+          curl -sS --fail-with-body --retry 3 --max-time 20 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}"
+          echo
