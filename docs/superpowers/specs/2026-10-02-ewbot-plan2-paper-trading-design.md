@@ -109,7 +109,7 @@ paper 브랜치(코드 이력과 분리):
 - 다르면 불일치로 기록하고 원인을 다음과 같이 분류한다.
   - `DATA_REVISION`: 해당 시점 이전 봉의 해시가 변함
   - `FINGERPRINT_CHANGE`: 구간이 바뀜
-  - `ENVIRONMENT_CHANGE`: 결정을 기록한 실행과 현재 실행의 실행 환경이 다름. 실행 환경은 Python·numpy·pandas·pyarrow 버전, `uv.lock` 해시, 실행기 이미지(`ImageOS`/`ImageVersion`)다. 이 경우 경고하고 리포트에 표시하지만 4번 기준의 `UNEXPLAINED` 집계에는 넣지 않는다(2026-10-02 사용자 결정).
+  - `ENVIRONMENT_CHANGE`: 결정을 기록한 실행과 현재 실행의 실행 환경이 다름. 실행 환경은 Python·numpy·pandas·pyarrow 버전, `uv.lock` 해시, 실행기 이미지의 `ImageOS`다. `ImageVersion`은 매 실행에 기록하지만 비교하지 않는다(GitHub가 이미지를 매주 갱신해서, 비교하면 이후 모든 `UNEXPLAINED`가 `ENVIRONMENT_CHANGE`로 가려진다). Python은 패치 버전까지 `3.12.13`으로 고정한다. 이 경우 경고하고 리포트에 표시하지만 4번 기준의 `UNEXPLAINED` 집계에는 넣지 않는다(2026-10-02 사용자 결정).
   - `UNEXPLAINED`: 그 밖의 경우
   - 분류 우선순위: `DATA_REVISION` → `FINGERPRINT_CHANGE` → `ENVIRONMENT_CHANGE` → `UNEXPLAINED`
 - 4번 기준은 다음을 모두 만족하면 충족이다.

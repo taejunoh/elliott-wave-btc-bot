@@ -3,7 +3,11 @@
 The environment is what can change a recompute without touching the strategy code: the Python
 version, the numpy / pandas / pyarrow versions, the sha256 of uv.lock and the GitHub Actions runner
 image (the ImageOS / ImageVersion variables the hosted runners set; None elsewhere). Every run
-records it; every decision carries the digest of the environment of the run that recorded it."""
+records all of it; every decision carries the digest of the environment of the run that recorded it.
+
+The digest compares the Python (full patch), numpy, pandas and pyarrow versions, the uv.lock sha256 and
+ImageOS. ImageVersion is recorded but left out of the digest: GitHub refreshes the ubuntu-24.04 image
+weekly, so comparing it would turn every later UNEXPLAINED discrepancy into ENVIRONMENT_CHANGE."""
 
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ from typing import Any, Mapping
 from ewbot.paper.fingerprint import PROJECT_ROOT
 
 PACKAGES = ("numpy", "pandas", "pyarrow")
+DIGEST_EXCLUDED = ("image_version",)  # recorded in every run, not compared
 
 
 def _version(dist: str) -> str | None:
@@ -48,6 +53,7 @@ def runtime_environment(repo_root: Path | None = None, environ: Mapping[str, str
 
 
 def environment_digest(env: Mapping[str, Any]) -> str:
-    """sha256 of the sorted, compact JSON of an environment record."""
-    blob = json.dumps(dict(env), sort_keys=True, separators=(",", ":"))
+    """sha256 of the sorted, compact JSON of an environment record, without the DIGEST_EXCLUDED keys."""
+    compared = {key: value for key, value in env.items() if key not in DIGEST_EXCLUDED}
+    blob = json.dumps(compared, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()

@@ -301,7 +301,7 @@ def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, 
     data["decisions"].remove(lost)  # as if the recording run had not seen this exit
     path.write_text(json.dumps(data))
     if env_changed:
-        box["env"] = {**ENV_A, "image_version": "20261008.1.0"}  # GitHub rolled out a new runner image
+        box["env"] = {**ENV_A, "numpy": "2.1.1"}  # a dependency version moved under the frozen lock
     env.clock.now += H1
     out = run_paper(env)
     led = load_ledger(env.ledger_dir)

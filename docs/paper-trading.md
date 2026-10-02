@@ -81,7 +81,7 @@ The precheck also binds the run to the lock's whole configuration: it refuses to
 
 ## Frozen runtime environment
 
-Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
+Each run records its runtime environment in `ledger.json` (`runs[].env`): the Python, numpy, pandas and pyarrow versions, the sha256 of `uv.lock` and the runner image (`ImageOS` / `ImageVersion`, set by GitHub's hosted runners). `ImageVersion` is recorded but not compared: it is left out of the digest, because GitHub refreshes the image weekly and comparing it would hide real `UNEXPLAINED` discrepancies behind `ENVIRONMENT_CHANGE`. Each decision keeps the digest of the environment of the run that recorded it, and `report.html` shows the current one. A decision that no longer reproduces is classified in this order:
 
 1. `DATA_REVISION`: a bar up to the decision changed.
 2. `FINGERPRINT_CHANGE`: it was recorded in another epoch.
@@ -91,10 +91,10 @@ Each run records its runtime environment in `ledger.json` (`runs[].env`): the Py
 While paper trading runs, keep the environment frozen:
 
 - Do not change `uv.lock`: no `uv lock --upgrade`, no dependency bumps, no merged dependency-update pull requests.
-- Do not change the Python version: `python-version: "3.12"` in `paper.yml` and `requires-python` in `pyproject.toml`.
+- Do not change the Python version: `python-version: "3.12.13"` in `paper.yml` and `ci.yml` and `requires-python` in `pyproject.toml`.
 - Do not change the runner image: `runs-on: ubuntu-24.04` in `paper.yml`, never `ubuntu-latest`.
 
-Some changes happen underneath anyway. GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly), and `python-version: "3.12"` takes whichever 3.12 patch release uv finds or downloads. Both show up as a new environment digest in `runs[].env`, and a discrepancy across one is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
+GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often weekly). That is recorded in `runs[].env` but does not change the digest, so it never turns a discrepancy into `ENVIRONMENT_CHANGE`. The Python patch is pinned to `3.12.13`, so a different patch (or a new `ImageOS`, numpy, pandas, pyarrow or `uv.lock`) is what changes the digest, and a discrepancy across one is `ENVIRONMENT_CHANGE`. Criterion 4 does not count those, so look at every `ENVIRONMENT_CHANGE` in the report yourself: it is a decision that did not reproduce.
 
 ## Failures
 

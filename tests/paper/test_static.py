@@ -16,6 +16,7 @@ ROOT = SRC.parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "paper.yml"
 CI_WORKFLOW = WORKFLOWS / "ci.yml"
+PYTHON_PATCH = "3.12.13"  # the exact patch both workflows resolve; part of the compared environment
 RUNNER_IMAGE = "ubuntu-24.04"  # pinned while paper trading runs (spec 8): part of the recorded environment
 ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py"}  # Plan 2 spec 7.1
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
@@ -241,3 +242,12 @@ def test_ci_workflow_runs_the_fingerprint_and_static_guards_without_secrets():
     assert uses == ["actions/checkout@v7", SETUP_UV] and f"uses: {SETUP_UV} # v10.2.0" in text
     runs = [s["run"] for s in job["steps"] if "run" in s]
     assert runs == ["uv sync --frozen", "uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py"]
+
+
+def test_both_workflows_pin_the_exact_python_patch():
+    """Python is part of the compared environment, so setup-uv gets the full patch, not "3.12"."""
+    for path in (WORKFLOW, CI_WORKFLOW):
+        wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+        pins = [s["with"]["python-version"] for job in wf["jobs"].values() for s in job["steps"]
+                if str(s.get("uses", "")).startswith(SETUP_UV)]
+        assert pins == [PYTHON_PATCH], path.name
