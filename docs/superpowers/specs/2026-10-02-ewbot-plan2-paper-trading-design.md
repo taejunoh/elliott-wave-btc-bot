@@ -65,6 +65,7 @@ paper 브랜치(코드 이력과 분리):
 2. **사전 검증** (하나라도 실패하면 아무것도 커밋하지 않고 종료하며 실패를 알린다)
    - `holdout.lock`이 존재하고 git에 커밋되어 있으며 작업 트리에서 변경되지 않았다.
    - 잠금 파일의 `params`가 grid 조합이다.
+   - 잠금 파일의 `sha256`이 현재 `BotConfig` 기본값으로 다시 계산한 `lock_digest(BotConfig(), params, random_runs, code_sha256)`와 같다. 기본값(`config.py`)이 바뀌면 새 구간을 여는 대신 매 실행이 사전 검증에서 멈추고 실패를 알린다. 되돌리면 다시 실행된다. 새 구간이 열리지 않았으므로 구간 1과 홀드아웃 36건은 그대로 합산된다(멈춘 시간은 4번 기준의 커버리지에서 빠진다).
 3. **데이터 갱신**
    - Actions 캐시에서 `data/cache/BTC-USD_1h.parquet`을 복원한다. 캐시가 없으면 전체를 받는다.
    - `update_cache`로 마감된 봉을 뒤에 덧붙인다. 재시도는 3회까지다.
@@ -109,7 +110,7 @@ paper 브랜치(코드 이력과 분리):
 - 다르면 불일치로 기록하고 원인을 다음과 같이 분류한다.
   - `DATA_REVISION`: 해당 시점 이전 봉의 해시가 변함
   - `FINGERPRINT_CHANGE`: 구간이 바뀜
-  - `ENVIRONMENT_CHANGE`: 결정을 기록한 실행과 현재 실행의 실행 환경이 다름. 실행 환경은 Python·numpy·pandas·pyarrow 버전, `uv.lock` 해시, 실행기 이미지의 `ImageOS`다. `ImageVersion`은 매 실행에 기록하지만 비교하지 않는다(GitHub가 이미지를 매주 갱신해서, 비교하면 이후 모든 `UNEXPLAINED`가 `ENVIRONMENT_CHANGE`로 가려진다). Python은 패치 버전까지 `3.12.13`으로 고정한다. 이 경우 경고하고 리포트에 표시하지만 4번 기준의 `UNEXPLAINED` 집계에는 넣지 않는다(2026-10-02 사용자 결정).
+  - `ENVIRONMENT_CHANGE`: 결정을 기록한 실행과 현재 실행의 실행 환경이 다름. 단, 실행 환경 다이제스트가 직전 성공 실행과 달라진 뒤의 첫 실행에서만 적용한다. 매 실행이 기록된 결정을 모두 다시 검사하므로, 새 환경의 실행이 한 번 재현한 결정이 이후 달라지면 `UNEXPLAINED`다. 실행 환경은 Python 버전, OS와 머신 아키텍처(`platform.system()`·`platform.machine()`), numpy·pandas·pyarrow 버전, `uv.lock` 해시, 실행기 이미지의 `ImageOS`다. `ImageVersion`은 매 실행에 기록하지만 비교하지 않는다(GitHub가 이미지를 매주 갱신해서, 비교하면 이후 모든 `UNEXPLAINED`가 `ENVIRONMENT_CHANGE`로 가려진다). Python은 패치 버전까지 `3.12.13`으로 고정한다. 이 경우 경고하고 리포트에 표시하지만 4번 기준의 `UNEXPLAINED` 집계에는 넣지 않는다(2026-10-02 사용자 결정).
   - `UNEXPLAINED`: 그 밖의 경우
   - 분류 우선순위: `DATA_REVISION` → `FINGERPRINT_CHANGE` → `ENVIRONMENT_CHANGE` → `UNEXPLAINED`
 - 4번 기준은 다음을 모두 만족하면 충족이다.
@@ -202,7 +203,7 @@ paper 브랜치(코드 이력과 분리):
 | 구간 | 지문이 바뀌면 새 구간이 생기고 기준 구간 카운트가 0이 되는지, 이전 구간 거래가 보존되는지 |
 | 표본 외 추출 | 홀드아웃 종료 시점에 열려 있던 포지션 제외, `entry_ts == last_bar_ts` 경계 |
 | 직전 기록과 비교 | 진입·손절 이동·청산 이벤트 생성, 같은 이벤트 중복 방지 |
-| 재현 검사 | 과거 봉 1개 변경 시 `DATA_REVISION`, 구간 전환 시 `FINGERPRINT_CHANGE`, 실행 환경 차이 시 `ENVIRONMENT_CHANGE`, 그 밖은 `UNEXPLAINED` |
+| 재현 검사 | 과거 봉 1개 변경 시 `DATA_REVISION`, 구간 전환 시 `FINGERPRINT_CHANGE`, 실행 환경이 바뀐 뒤 첫 실행에서 `ENVIRONMENT_CHANGE`(이미 새 환경에서 재현된 결정은 `UNEXPLAINED`), 그 밖은 `UNEXPLAINED` |
 | 사전 검증 | 잠금 파일이 없거나, 커밋되지 않았거나, 변경되었거나, params가 grid 밖이면 실행 거부. 정적 검사로 `allow_holdout=True`를 쓰는 곳이 `backtest/holdout.py`와 `paper/runner.py`뿐인지 확인 |
 | 텔레그램 | 가짜 전송기로 메시지 포맷 확인, 토큰이 없으면 건너뜀, 재시도, 미전송 이벤트 재시도. 실제 네트워크 호출 없음 |
 | 일일 요약 시각 | 뉴욕 09:00 이후 첫 실행에만 보내는지, 서머타임 전환일, 하루 1회 |

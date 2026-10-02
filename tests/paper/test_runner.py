@@ -7,6 +7,7 @@ import pytest
 
 from ewbot.paper import runner
 from ewbot.paper.criteria import criterion4
+from ewbot.paper.decisions import decision_id
 from ewbot.paper.environment import environment_digest
 from ewbot.paper.ledger import LEDGER_FILE, REPORT_FILE, RUNS_LOG, load_ledger
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
@@ -314,6 +315,36 @@ def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, 
     assert ("4번 기준 원인 불명 집계에서 제외" in warning) is env_changed
     c4 = criterion4(led, env.clock.now)
     assert (c4["unexplained"], c4["environment"]) == ((0, 2) if env_changed else (2, 0))
+
+
+def test_an_environment_change_explains_only_the_first_run_in_the_new_environment(make_env):
+    box = {"env": dict(ENV_A)}
+    env = make_env(environment=lambda: dict(box["env"]))
+    run_paper(env)  # environment A records the decisions
+    box["env"] = {**ENV_A, "numpy": "2.1.1"}
+    env.clock.now += H1
+    run_paper(env)  # environment B reproduces every one of them
+    path = env.ledger_dir / LEDGER_FILE
+    data = json.loads(path.read_text())
+    assert data["discrepancies"] == []
+    entry = next(d for d in data["decisions"] if d["kind"] == "ENTRY")
+    lost = next(d for d in data["decisions"] if d["kind"] == "EXIT")
+    assert entry["env_sha256"] == lost["env_sha256"] == environment_digest(ENV_A)
+    key = entry["trade_key"] + 1
+    ghost = {**entry, "id": decision_id("ENTRY", entry["ts"], key), "trade_key": key}  # a record nothing recomputes
+    entry["price"] += 1.0
+    data["decisions"].remove(lost)
+    data["decisions"].append(ghost)
+    path.write_text(json.dumps(data))
+    env.clock.now += H1
+    run_paper(env)  # environment B again: it already reproduced them, so its change explains nothing
+    led = load_ledger(env.ledger_dir)
+    assert [(d["type"], d["decision_id"], d["cause"]) for d in led.discrepancies] == [
+        ("CHANGED", entry["id"], "UNEXPLAINED"), ("VANISHED", ghost["id"], "UNEXPLAINED"),
+        ("APPEARED", lost["id"], "UNEXPLAINED")]
+    assert "4번 기준 원인 불명 집계에서 제외" not in env.sender.texts[-1]
+    c4 = criterion4(led, env.clock.now)
+    assert (c4["unexplained"], c4["environment"]) == (3, 0)
 
 
 RETRY_NOTE = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"

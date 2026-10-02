@@ -119,8 +119,9 @@ def classify(
     recorded: dict[str, Any] | None, data_revised: bool, current_epoch_id: int, env_changed: bool = False
 ) -> str:
     """DATA_REVISION if a bar up to the decision changed; else FINGERPRINT_CHANGE if the decision
-    was recorded under another epoch; else ENVIRONMENT_CHANGE if the run that recorded it (or should
-    have) ran in another runtime environment (paper.environment); else UNEXPLAINED."""
+    was recorded under another epoch; else ENVIRONMENT_CHANGE if env_changed (see _env_changed: this
+    is the first run in a new runtime environment and the run that recorded the decision, or should
+    have, ran in another one); else UNEXPLAINED."""
     if data_revised:
         return "DATA_REVISION"
     if recorded is not None and int(recorded["epoch_id"]) != int(current_epoch_id):
@@ -130,9 +131,14 @@ def classify(
     return "UNEXPLAINED"
 
 
-def _env_changed(recording: str | None, current: str | None) -> bool:
-    """Only a known recording environment that differs from the current one counts."""
-    return recording is not None and current is not None and recording != current
+def _env_changed(recording: str | None, previous: str | None, current: str | None) -> bool:
+    """The environment changed under this decision: the previous successful run ran in another
+    environment than the current one (this is the first run in it) and so did the run that recorded
+    the decision. Once a run in the current environment has rechecked a decision (every run rechecks
+    them all), a later difference is not explained by the change. Unknown digests never count."""
+    if recording is None or previous is None or current is None:
+        return False
+    return previous != current and recording != current
 
 
 def verify_decisions(
@@ -145,6 +151,7 @@ def verify_decisions(
     appeared_after: int | None = None,
     env_sha256: str | None = None,
     appeared_env: Callable[[dict[str, Any]], str | None] | None = None,
+    previous_env_sha256: str | None = None,
 ) -> list[dict[str, Any]]:
     """Replay check. Every recorded decision must reappear unchanged (else CHANGED / VANISHED); a
     recomputed decision of the current epoch that a previous run should already have known but did
@@ -154,7 +161,8 @@ def verify_decisions(
     (the runner passes where the epoch began recording, see runner._recording_floor).
     env_sha256 is the current run's environment digest; it is compared with a recorded decision's
     env_sha256 and, for APPEARED, with appeared_env(recomputed) - the environment digest of the run
-    that should have recorded it (None: unknown, never an environment change)."""
+    that should have recorded it - and with previous_env_sha256, the digest of the previous successful
+    run: ENVIRONMENT_CHANGE needs both to differ from it (None: unknown, never an environment change)."""
     by_id = {d["id"]: d for d in recomputed}
     rec_ids = {d["id"] for d in recorded}
     found: list[dict[str, Any]] = []
@@ -163,7 +171,8 @@ def verify_decisions(
         if r is not None and same_decision(d, r):
             continue
         kind = "VANISHED" if r is None else "CHANGED"
-        cause = classify(d, revised_at(d), epoch["id"], _env_changed(d.get("env_sha256"), env_sha256))
+        moved = _env_changed(d.get("env_sha256"), previous_env_sha256, env_sha256)
+        cause = classify(d, revised_at(d), epoch["id"], moved)
         found.append({"id": f"{kind}:{d['id']}", "type": kind, "decision_id": d["id"], "cause": cause,
                       "recorded": d, "recomputed": r})
     lo = int(epoch["started_ts"]) if appeared_after is None else int(appeared_after)
@@ -172,7 +181,8 @@ def verify_decisions(
         if r["id"] in rec_ids or not lo < known_at(r) <= hi:
             continue
         recording_env = None if appeared_env is None else appeared_env(r)
-        cause = classify(None, appeared_revised(r), epoch["id"], _env_changed(recording_env, env_sha256))
+        moved = _env_changed(recording_env, previous_env_sha256, env_sha256)
+        cause = classify(None, appeared_revised(r), epoch["id"], moved)
         found.append({"id": f"APPEARED:{r['id']}", "type": "APPEARED", "decision_id": r["id"], "cause": cause,
                       "recorded": None, "recomputed": r})
     return found

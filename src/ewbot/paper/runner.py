@@ -8,7 +8,8 @@ lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. whose configura
 run would use. The recompute starts trading at the holdout start, so it reproduces the holdout's A run
 and continues it; trades entering after the holdout's last bar are paper trades. Every run records its
 runtime environment (paper.environment); decisions carry the digest of the environment that recorded
-them, for the ENVIRONMENT_CHANGE cause of the replay check.
+them, for the ENVIRONMENT_CHANGE cause of the replay check (only in the first run after the environment
+changed: the previous successful run's digest is compared too).
 
 Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
 the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it): the next run
@@ -343,6 +344,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         holdout_sha = data_fingerprint(df, hs["holdout_start"], hs["last_bar_ts"])
         holdout_ok = holdout_sha == hs["data_sha256"]
         ok_runs = sorted((r for r in ledger.runs if r.get("status") == "ok"), key=lambda r: r["last_bar_ts"])
+        prev_run = next((r for r in reversed(ledger.runs) if r.get("status") == "ok"), None)
+        prev_env = None if prev_run is None else prev_run.get("env_sha256")
 
         def revised_at(d: dict[str, Any]) -> bool:
             return prefix(d["ts"]) != d["data_sha256"]
@@ -361,7 +364,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
 
         recomputed = build_decisions(res, trace, all_trades)
         found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised,
-                                 appeared_after=floor, env_sha256=env_sha, appeared_env=appeared_env)
+                                 appeared_after=floor, env_sha256=env_sha, appeared_env=appeared_env,
+                                 previous_env_sha256=prev_env)
         known = {d["id"] for d in ledger.discrepancies}
         new_disc = [
             {**d, "epoch_id": epoch["id"], "detected_ts": last_bar, "detected_run": run_id}

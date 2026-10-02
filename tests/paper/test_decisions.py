@@ -178,9 +178,9 @@ def test_replay_check_environment_change_against_the_recording_run(full):
     tampered = _record(decs[1:], df)  # recorded under environment "env-a"; decs[0] was never recorded
     tampered[0] = {**tampered[0], "price": tampered[0]["price"] + 1.0}
 
-    def check(current, appeared_env):
+    def check(current, appeared_env):  # the previous successful run ran in "env-a"
         found = verify_decisions(tampered, full[4], epoch1, lambda d: False, lambda r: False,
-                                 env_sha256=current, appeared_env=appeared_env)
+                                 env_sha256=current, appeared_env=appeared_env, previous_env_sha256="env-a")
         return [(f["type"], f["cause"]) for f in found]
 
     assert check("env-b", lambda r: "env-a") == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "ENVIRONMENT_CHANGE")]
@@ -188,8 +188,29 @@ def test_replay_check_environment_change_against_the_recording_run(full):
     # unknown recording environment (no run should have known it yet / not recorded): not an environment change
     assert check("env-b", lambda r: None) == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "UNEXPLAINED")]
     unstamped = [{k: v for k, v in d.items() if k != "env_sha256"} for d in tampered]
-    found = verify_decisions(unstamped, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b")
+    found = verify_decisions(unstamped, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b",
+                             previous_env_sha256="env-a")
     assert [(f["type"], f["cause"]) for f in found] == [("CHANGED", "UNEXPLAINED"), ("APPEARED", "UNEXPLAINED")]
+
+
+def test_environment_change_explains_only_the_first_run_in_the_new_environment(full):
+    df = synth_frame()
+    decs = [d for d in full[4] if known_at(d) > BOUNDARY]
+    epoch1 = {"id": 1, "started_ts": BOUNDARY, "through_ts": int(df["ts"].iloc[-1])}
+    tampered = _record(decs[1:], df)  # recorded under "env-a"; decs[0] was never recorded (APPEARED)
+    tampered[0] = {**tampered[0], "price": tampered[0]["price"] + 1.0}  # CHANGED
+    tampered.append({**tampered[1], "id": "ENTRY:1:1", "ts": 1, "trade_key": 1})  # VANISHED
+
+    def check(previous):  # the current run is in "env-b"
+        found = verify_decisions(tampered, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b",
+                                 appeared_env=lambda r: "env-a", previous_env_sha256=previous)
+        return [(f["type"], f["cause"]) for f in found]
+
+    types = ["CHANGED", "VANISHED", "APPEARED"]
+    assert check("env-a") == [(t, "ENVIRONMENT_CHANGE") for t in types]  # the first run in env-b
+    assert check("env-b") == [(t, "UNEXPLAINED") for t in types]  # an env-b run already reproduced them
+    assert check("env-c") == [(t, "ENVIRONMENT_CHANGE") for t in types]  # the previous run had yet another one
+    assert check(None) == [(t, "UNEXPLAINED") for t in types]  # no previous run, or one without a digest
 
 
 def test_appeared_only_inside_the_epochs_recorded_window(full):
