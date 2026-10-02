@@ -1,0 +1,272 @@
+{
+  "version": 3,
+  "keys": [
+    "wave.K4",
+    "strategy.Q_MIN",
+    "strategy.S_MIN"
+  ],
+  "params": [
+    2.0,
+    0.7,
+    0.5
+  ],
+  "sha256": "d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45",
+  "params_sha256": "5cb306b84fb8bffebc94c4e0adeef0d4e0f201954b3eda428e590dc2178f0e78",
+  "code_sha256": "7218df41029fb60fe203a034a11cb574b4becc7d9e2b54d6be14d088a881761f",
+  "config": {
+    "wave": {
+      "K4": 2.0,
+      "atr_len": 14,
+      "M": 12,
+      "sigma": 0.12,
+      "w0": 1.0,
+      "T": 0.05,
+      "h": 0.05,
+      "top_k": 5,
+      "wick_clip_atr1h": 6.0,
+      "warmup_4h": 200
+    },
+    "strategy": {
+      "mode": "A",
+      "setups_enabled": [
+        "W3",
+        "W5",
+        "W5_REV",
+        "C_END"
+      ],
+      "Q_MIN": 0.7,
+      "S_MIN": 0.5,
+      "r_gate": 1.5,
+      "tp1_frac": 0.5,
+      "time_stop_mult": 1.5,
+      "time_stop_min_4h": 12,
+      "time_stop_max_4h": 60,
+      "setup3_risk_mult": 0.5,
+      "buf_struct_atr": 0.25,
+      "buf_ext_atr": 0.5,
+      "choch_bars": 3
+    },
+    "risk": {
+      "name": "conservative",
+      "risk_pct": 0.01,
+      "max_leverage": 3.0
+    },
+    "breakers": {
+      "daily_loss": 0.03,
+      "total_dd": 0.15,
+      "max_consec_losses": 5,
+      "consec_pause_hours": 24,
+      "enabled": true
+    },
+    "costs": {
+      "fee_rate": 0.0005,
+      "fee_min_per_contract": 0.15,
+      "apply_min_fee": false,
+      "slippage": 0.0005,
+      "funding_apr_long": 0.1,
+      "contract_size": 0.01
+    },
+    "initial_equity": 10000.0,
+    "seed": 0
+  },
+  "grid": {
+    "wave.K4": [
+      2.0,
+      2.5,
+      3.0,
+      4.0
+    ],
+    "strategy.Q_MIN": [
+      0.5,
+      0.55,
+      0.6,
+      0.65,
+      0.7
+    ],
+    "strategy.S_MIN": [
+      0.0,
+      0.25,
+      0.5
+    ]
+  },
+  "holdout_start": 1704067200,
+  "random_runs": 100,
+  "data": {
+    "start_ts": 1704067200,
+    "last_bar_ts": 1790938800,
+    "n_bars": 24132,
+    "sha256": "f8512fdbcd8d52340b0a8a43fad89c0a57ea2ef666248fe2dfc61877e01541cb"
+  },
+  "first_run": {
+    "started": "2026-10-02T12:06:39+00:00",
+    "completed": "2026-10-02T12:09:07+00:00",
+    "start_ts": 1704067200,
+    "end_ts": 1790942400,
+    "last_bar_ts": 1790938800,
+    "headline": {
+      "A": {
+        "total_return": 0.07347576714970105,
+        "cagr": 0.026072753268241364,
+        "max_dd": 0.02901823651410427,
+        "sharpe": 0.9671223034573732,
+        "calmar": 0.8984954428767146,
+        "n_trades": 36
+      },
+      "HYBRID": {
+        "total_return": 0.06837024471495634,
+        "cagr": 0.024298506792115794,
+        "max_dd": 0.033375998621576156,
+        "sharpe": 0.8875529890750803,
+        "calmar": 0.7280233639633437,
+        "n_trades": 40
+      },
+      "C": {
+        "total_return": 0.005060146808769872,
+        "cagr": 0.0018339747623096654,
+        "max_dd": 0.04043125107459275,
+        "sharpe": 0.08477420303296565,
+        "calmar": 0.04536032681566331,
+        "n_trades": 47
+      },
+      "BH": {
+        "total_return": 1.0313728649426466,
+        "cagr": 0.29340144934928425,
+        "max_dd": 0.5385379861984871,
+        "sharpe": 0.7791614765693813,
+        "calmar": 0.5448110567285893,
+        "n_trades": 1
+      },
+      "EMA": {
+        "total_return": 0.9692865673395119,
+        "cagr": 0.27890883970290964,
+        "max_dd": 0.38939518012585905,
+        "sharpe": 0.7910082677513063,
+        "calmar": 0.71626166408316,
+        "n_trades": 35
+      },
+      "RANDOM": {
+        "runs": 100,
+        "n_signals": 36,
+        "sharpe": {
+          "mean": -0.15683651430270334,
+          "p05": -1.124055561909841,
+          "p50": -0.12924715974733578,
+          "p95": 0.7409013895369007
+        },
+        "calmar": {
+          "mean": 0.019474185097739183,
+          "p05": -0.32010607777165145,
+          "p50": -0.07964402988358824,
+          "p95": 0.5922833891202682
+        },
+        "total_return": {
+          "mean": -0.011116765502038413,
+          "p05": -0.08111075230062009,
+          "p50": -0.011155379579367852,
+          "p95": 0.06415966585533273
+        }
+      }
+    },
+    "criteria": {
+      "winners": [
+        "A",
+        "HYBRID"
+      ],
+      "passing": [],
+      "n_trades": {
+        "A": 36,
+        "HYBRID": 40
+      },
+      "random_control_evaluated": true,
+      "automatic_criteria_met": false
+    }
+  },
+  "runs": [
+    {
+      "started": "2026-10-02T12:06:39+00:00",
+      "end_ts": 1790942400,
+      "last_bar_ts": 1790938800,
+      "params_source": "walkforward:reports/walkforward.json#chosen_final",
+      "git_head": "27b7b9f5b98d157de350c3d18ca0a7892c8f9a24",
+      "git_dirty": false,
+      "completed": "2026-10-02T12:09:07+00:00",
+      "headline": {
+        "A": {
+          "total_return": 0.07347576714970105,
+          "cagr": 0.026072753268241364,
+          "max_dd": 0.02901823651410427,
+          "sharpe": 0.9671223034573732,
+          "calmar": 0.8984954428767146,
+          "n_trades": 36
+        },
+        "HYBRID": {
+          "total_return": 0.06837024471495634,
+          "cagr": 0.024298506792115794,
+          "max_dd": 0.033375998621576156,
+          "sharpe": 0.8875529890750803,
+          "calmar": 0.7280233639633437,
+          "n_trades": 40
+        },
+        "C": {
+          "total_return": 0.005060146808769872,
+          "cagr": 0.0018339747623096654,
+          "max_dd": 0.04043125107459275,
+          "sharpe": 0.08477420303296565,
+          "calmar": 0.04536032681566331,
+          "n_trades": 47
+        },
+        "BH": {
+          "total_return": 1.0313728649426466,
+          "cagr": 0.29340144934928425,
+          "max_dd": 0.5385379861984871,
+          "sharpe": 0.7791614765693813,
+          "calmar": 0.5448110567285893,
+          "n_trades": 1
+        },
+        "EMA": {
+          "total_return": 0.9692865673395119,
+          "cagr": 0.27890883970290964,
+          "max_dd": 0.38939518012585905,
+          "sharpe": 0.7910082677513063,
+          "calmar": 0.71626166408316,
+          "n_trades": 35
+        },
+        "RANDOM": {
+          "runs": 100,
+          "n_signals": 36,
+          "sharpe": {
+            "mean": -0.15683651430270334,
+            "p05": -1.124055561909841,
+            "p50": -0.12924715974733578,
+            "p95": 0.7409013895369007
+          },
+          "calmar": {
+            "mean": 0.019474185097739183,
+            "p05": -0.32010607777165145,
+            "p50": -0.07964402988358824,
+            "p95": 0.5922833891202682
+          },
+          "total_return": {
+            "mean": -0.011116765502038413,
+            "p05": -0.08111075230062009,
+            "p50": -0.011155379579367852,
+            "p95": 0.06415966585533273
+          }
+        }
+      },
+      "criteria": {
+        "winners": [
+          "A",
+          "HYBRID"
+        ],
+        "passing": [],
+        "n_trades": {
+          "A": 36,
+          "HYBRID": 40
+        },
+        "random_control_evaluated": true,
+        "automatic_criteria_met": false
+      }
+    }
+  ]
+}
