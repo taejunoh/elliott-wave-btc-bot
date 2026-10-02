@@ -38,7 +38,10 @@ class Sender(Protocol):
 
 
 class TelegramSender:
-    """POST sendMessage (plain text, no parse mode). Raises SendError on any failure."""
+    """POST sendMessage (plain text, no parse mode). Raises SendError on any failure: an HTTP status
+    other than 200 or a reply that is not a JSON object with "ok": true (message: the status and the
+    start of Telegram's reply), or any exception while posting or reading the reply (message: its
+    type name only - the API URL holds the token)."""
 
     def __init__(self, token: str, chat_id: str, session: Any | None = None, timeout: float = 15.0) -> None:
         self._url = TELEGRAM_API.format(token=token)
@@ -50,11 +53,17 @@ class TelegramSender:
         payload = {"chat_id": self._chat_id, "text": text, "disable_web_page_preview": True}
         try:
             resp = self._session.post(self._url, json=payload, timeout=self._timeout)
-        except requests.RequestException as exc:
-            raise SendError(f"telegram request failed: {type(exc).__name__}") from None  # no token in messages
-        ok = resp.status_code == 200 and bool(resp.json().get("ok"))
+            status = int(resp.status_code)
+            try:
+                body = resp.json()
+            except ValueError:  # not JSON (requests' JSONDecodeError is a ValueError)
+                body = None
+            ok = status == 200 and isinstance(body, dict) and bool(body.get("ok"))
+            reply = "" if ok else str(resp.text)[:200]
+        except Exception as exc:  # noqa: BLE001 - transport or reply errors: type name only, no token
+            raise SendError(f"telegram request failed: {type(exc).__name__}") from None
         if not ok:
-            raise SendError(f"telegram HTTP {resp.status_code}: {resp.text[:200]}")
+            raise SendError(f"telegram HTTP {status}: {reply}")
 
 
 def sender_from_env(env: Mapping[str, str] | None = None) -> TelegramSender | None:
@@ -77,7 +86,8 @@ def deliver(
     """Send pending events in order. Returns (still pending, newly sent ids, error notes).
     No sender: the events are dropped unsent (not kept, so a later token does not flood the chat).
     Ids already sent are dropped silently. The first event that fails `attempts` times stops the
-    batch: it and every later event stay pending, in order."""
+    batch: it and every later event stay pending, in order. The error note keeps a SendError's
+    message (token-free by construction) and only the type name of any other exception."""
     if sender is None:
         return [], [], [f"telegram not configured: {len(pending)} event(s) not sent"] if pending else []
     done = set(sent_ids)
@@ -98,7 +108,8 @@ def deliver(
         if err is not None:
             rest = [dict(e) for e in pending[i:] if e["id"] not in done]
             rest[0]["attempts"] = int(rest[0].get("attempts", 0)) + 1
-            return rest, newly, [f"send failed for {ev['id']}: {err}"]
+            why = str(err) if isinstance(err, SendError) else type(err).__name__
+            return rest, newly, [f"send failed for {ev['id']}: {why}"]
         newly.append(ev["id"])
         done.add(ev["id"])
     return [], newly, []

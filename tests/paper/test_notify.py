@@ -30,12 +30,16 @@ TOKEN = "123456:SECRET"
 
 
 class _Resp:
-    def __init__(self, status: int, body: dict) -> None:
+    """`body` is the parsed JSON reply, or an exception that json() raises (a non-JSON reply)."""
+
+    def __init__(self, status: int, body: object) -> None:
         self.status_code = status
         self._body = body
         self.text = str(body)
 
-    def json(self) -> dict:
+    def json(self) -> object:
+        if isinstance(self._body, Exception):
+            raise self._body
         return self._body
 
 
@@ -75,6 +79,36 @@ def test_telegram_sender_raises_without_leaking_the_token(resp):
     with pytest.raises(SendError) as exc:
         TelegramSender(TOKEN, "42", session=_Session(resp))("hello")
     assert TOKEN not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "resp, expected",
+    [
+        (_Resp(502, ValueError("<html>bad gateway</html>")), "telegram HTTP 502"),  # non-JSON reply
+        (_Resp(200, ValueError("not json")), "telegram HTTP 200"),
+        (_Resp(200, ["ok"]), "telegram HTTP 200"),  # JSON, but not an object
+        (_Resp(200, None), "telegram HTTP 200"),
+        (_Resp(200, RuntimeError(f"decoder broke on {TOKEN}")), "RuntimeError"),  # any other failure: type only
+    ],
+)
+def test_telegram_sender_turns_odd_replies_into_send_errors(resp, expected):
+    with pytest.raises(SendError) as exc:
+        TelegramSender(TOKEN, "42", session=_Session(resp))("hello")
+    assert expected in str(exc.value) and TOKEN not in str(exc.value) and exc.value.__cause__ is None
+
+
+def test_deliver_notes_only_the_error_type_unless_it_is_a_send_error():
+    def leaky(text: str) -> None:
+        raise ConnectionError(f"POST https://api.telegram.org/bot{TOKEN}/sendMessage failed")
+
+    _, _, notes = deliver(_events(1), [], leaky, sleep=lambda s: None)
+    assert notes == ["send failed for ENTRY:1000:0: ConnectionError"]
+
+    def rejected(text: str) -> None:
+        raise SendError("telegram HTTP 429: too many requests")
+
+    _, _, notes = deliver(_events(1), [], rejected, sleep=lambda s: None)
+    assert notes == ["send failed for ENTRY:1000:0: telegram HTTP 429: too many requests"]
 
 
 def test_sender_from_env():
