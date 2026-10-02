@@ -1,0 +1,113 @@
+# ewbot paper-trading runtime (Plan 2 spec 6.1): one deterministic recompute per hour.
+# Code comes from master; ledger.json / report.html / runs.log live on the orphan `paper` branch.
+# Every fetch is shallow: the paper branch gets one commit per hour and its history is never needed here.
+name: paper
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: paper
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      EWBOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - name: Fetch the holdout commit and check out the paper branch (orphan on first use)
+        run: |
+          set -euo pipefail
+          echo "PAPER_DIR=$RUNNER_TEMP/paper" >> "$GITHUB_ENV"
+          echo "EWBOT_FAILURE_MARKER=$RUNNER_TEMP/ewbot-failure-notified" >> "$GITHUB_ENV"
+          git config --global user.name "ewbot-paper"
+          git config --global user.email "ewbot-paper@users.noreply.github.com"
+          # 64e628a: the fingerprint baseline, read once when ledger.json is created (spec 5.1)
+          git fetch --no-tags --depth=1 origin 64e628ad4865b3b04571a7cba2886881eae19176
+          if git ls-remote --exit-code --heads origin paper >/dev/null; then
+            git fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
+            git worktree add -B paper "$RUNNER_TEMP/paper" origin/paper
+          else
+            git worktree add --orphan -b paper "$RUNNER_TEMP/paper"
+          fi
+
+      - name: Install uv (with its cache)
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Restore the candle cache
+        uses: actions/cache@v6
+        with:
+          path: data/cache
+          key: btc-usd-1h-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            btc-usd-1h-
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Paper run
+        id: paper
+        run: uv run ewbot paper run --ledger-dir "$PAPER_DIR"
+
+      - name: Commit and push the ledger (recompute and retry on conflict, 3 attempts)
+        run: |
+          set -euo pipefail
+          commit() {
+            git -C "$PAPER_DIR" add ledger.json report.html runs.log
+            if git -C "$PAPER_DIR" diff --cached --quiet; then
+              return 1
+            fi
+            git -C "$PAPER_DIR" commit -q -m "paper: run $(date -u +%Y-%m-%dT%H:%MZ)"
+          }
+          if ! commit; then
+            echo "no ledger change"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if git -C "$PAPER_DIR" push origin HEAD:refs/heads/paper; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt): refresh the paper branch and recompute"
+            git -C "$PAPER_DIR" fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
+            git -C "$PAPER_DIR" reset -q --hard origin/paper
+            uv run ewbot paper run --ledger-dir "$PAPER_DIR"
+            if ! commit; then
+              exit 0
+            fi
+          done
+          echo "push failed 3 times" >&2
+          exit 1
+
+      - name: Telegram failure alert (fallback when ewbot did not send one)
+        if: failure()
+        run: |
+          if [ -f "${EWBOT_FAILURE_MARKER:-/nonexistent}" ]; then
+            echo "ewbot already sent the failure alert"
+            exit 0
+          fi
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "no Telegram secrets: skipping the alert"
+            exit 0
+          fi
+          text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / push)"$'\n'"로그: ${EWBOT_RUN_URL}"
+          curl -sS --retry 3 -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}"
