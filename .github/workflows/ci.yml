@@ -1,0 +1,34 @@
+# Strategy-fingerprint guard (Plan 2 spec 8): on every pull request to master and every push to master,
+# check that the strategy files still hash to the holdout baseline (the value is pinned in the test, so
+# no git history is needed) and run the static allow_holdout / workflow guards. No secrets, read-only.
+# It reports; it does not block a merge unless you make this check required (docs/paper-trading.md).
+name: ci
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv (with its cache)
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Strategy fingerprint and static guards
+        run: uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py

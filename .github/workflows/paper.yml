@@ -21,7 +21,8 @@ permissions:
 
 jobs:
   paper:
-    runs-on: ubuntu-latest
+    # pinned while paper trading runs (spec 8): the runner image is part of each run's recorded environment
+    runs-on: ubuntu-24.04
     # backstop only: the steps below have their own timeouts, so a hang fails its step and alerts
     timeout-minutes: 100
     env:
@@ -102,7 +103,8 @@ jobs:
           fi
           text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / timeout / push) · ${JOB_STATUS}"$'\n'"로그: ${EWBOT_RUN_URL}"
           # --fail-with-body: an HTTP error fails the step and prints Telegram's reply (never the token)
-          curl -sS --fail-with-body --retry 3 --max-time 30 -X POST \
+          # worst case 4 x 20 s + 1 + 2 + 4 s of retry waits = 87 s, inside the 2-minute step timeout
+          curl -sS --fail-with-body --retry 3 --max-time 20 -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${text}"

@@ -17,6 +17,10 @@ from ewbot.paper.fingerprint import (
     tree_files,
 )
 
+# The baseline value at the holdout commit 64e628a (spec 5.1). Pinned here so the guard below needs no
+# git history: .github/workflows/ci.yml runs it on every pull request to master and every push to master.
+FROZEN = "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1"
+
 EXPECTED = {
     "src/ewbot/types.py",
     "src/ewbot/config.py",
@@ -54,6 +58,13 @@ def _has_commit(commit: str) -> bool:
     except OSError:
         return False
     return r.returncode == 0
+
+
+def test_the_working_tree_fingerprint_is_the_frozen_baseline():
+    """Tripwire that never skips: if this fails, a fingerprinted file changed after the holdout. Merged
+    and run, that change opens a new epoch and resets the go-live counter; reverting it later does not
+    bring the holdout's 36 trades back (spec 8)."""
+    assert current_fingerprint() == FROZEN
 
 
 def test_the_file_set_is_exactly_the_spec_list():
@@ -105,7 +116,7 @@ def test_baseline_recomputes_from_git_and_equals_the_working_tree():
     """Tripwire: if this fails, a fingerprinted file changed after the holdout and the paper go-live
     counter will reset (new epoch) on the next `ewbot paper run`."""
     fp, sha = baseline_fingerprint()
-    assert sha == HOLDOUT_COMMIT and len(fp) == 64
+    assert sha == HOLDOUT_COMMIT and fp == FROZEN
     assert fp == current_fingerprint()
 
 

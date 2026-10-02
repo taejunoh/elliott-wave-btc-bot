@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,10 @@ import ewbot
 
 SRC = Path(ewbot.__file__).resolve().parent  # src/ewbot
 ROOT = SRC.parents[1]
-WORKFLOW = ROOT / ".github" / "workflows" / "paper.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
+WORKFLOW = WORKFLOWS / "paper.yml"
+CI_WORKFLOW = WORKFLOWS / "ci.yml"
+RUNNER_IMAGE = "ubuntu-24.04"  # pinned while paper trading runs (spec 8): part of the recorded environment
 ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py"}  # Plan 2 spec 7.1
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
 # backtest/runner.py helpers that skip the holdout check or forward allow_holdout unchecked
@@ -156,6 +160,10 @@ def _step(steps, step_id):
     return next(s for s in steps if s.get("id") == step_id)
 
 
+def test_the_repository_has_exactly_the_paper_and_ci_workflows():
+    assert sorted(p.name for p in WORKFLOWS.iterdir()) == ["ci.yml", "paper.yml"]
+
+
 def test_workflow_triggers_concurrency_and_permissions():
     wf, _ = _workflow()
     on = wf[True]  # YAML 1.1 reads the bare key `on` as boolean True
@@ -163,6 +171,7 @@ def test_workflow_triggers_concurrency_and_permissions():
     assert wf["concurrency"] == {"group": "paper", "cancel-in-progress": False}
     assert wf["permissions"] == {"contents": "write"}
     assert "permissions" not in wf["jobs"]["paper"]
+    assert wf["jobs"]["paper"]["runs-on"] == RUNNER_IMAGE  # never ubuntu-latest: no silent OS upgrade
 
 
 def test_telegram_secrets_reach_only_the_steps_that_can_send():
@@ -206,3 +215,29 @@ def test_failure_alert_step():
     assert "EWBOT_FAILURE_MARKER" in run and "sendMessage" in run
     assert "curl" in run and "--fail-with-body" in run and "/dev/null" not in run  # keep Telegram's error
     assert "set -x" not in run and "echo \"${TELEGRAM_BOT_TOKEN" not in run and "echo $TELEGRAM" not in run
+
+
+def test_failure_alert_curl_finishes_within_its_step_timeout():
+    """curl --max-time bounds each attempt; --retry N adds N attempts after waits of 1, 2, 4, ... s.
+    The worst case must end before the step timeout, or the alert step itself is killed silently."""
+    _, steps = _workflow()
+    alert = _step(steps, "alert")
+    retries = int(re.search(r"--retry (\d+)", alert["run"]).group(1))
+    max_time = int(re.search(r"--max-time (\d+)", alert["run"]).group(1))
+    worst = (retries + 1) * max_time + sum(2**i for i in range(retries))
+    assert (retries, max_time, alert["timeout-minutes"]) == (3, 20, 2)
+    assert worst < alert["timeout-minutes"] * 60
+
+
+def test_ci_workflow_runs_the_fingerprint_and_static_guards_without_secrets():
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    wf = yaml.safe_load(text)
+    on = wf[True]
+    assert on == {"pull_request": {"branches": ["master"]}, "push": {"branches": ["master"]}}
+    assert wf["permissions"] == {"contents": "read"} and "secrets." not in text
+    (job,) = wf["jobs"].values()
+    assert job["runs-on"] == RUNNER_IMAGE and job["timeout-minutes"] <= 15
+    uses = [s["uses"] for s in job["steps"] if "uses" in s]
+    assert uses == ["actions/checkout@v7", SETUP_UV] and f"uses: {SETUP_UV} # v10.2.0" in text
+    runs = [s["run"] for s in job["steps"] if "run" in s]
+    assert runs == ["uv sync --frozen", "uv run pytest -q tests/paper/test_fingerprint.py tests/paper/test_static.py"]
