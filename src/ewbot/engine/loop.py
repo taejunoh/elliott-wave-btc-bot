@@ -12,6 +12,7 @@ Per closed 1h bar:
   3. wave.on_1h_close(cbar, bar4h, sub_bars)      bar4h built here from UTC 4h buckets of clipped bars
   4. choch.update(cbar)
   5. position management                          trailing on new 4h pivot, time stop, lineage kill
+                                                  (only while the lineage's S is in the last-M pivots)
   6. breakers.on_equity(close instant, equity)    TOTAL_HALT -> flatten at next open, no more entries
   7. cooldown release; entry / flip evaluation    (bar.ts >= start_ts, no pending entry, can_enter,
                                                    no blackout on this bar or the fill bar, not the last bar)
@@ -45,10 +46,18 @@ from ewbot.strategy.base import Signal, Strategy
 from ewbot.strategy.choch import ChochDetector
 from ewbot.types import H1, H4, Bar
 from ewbot.waves.engine import WaveEngine, WaveState
+from ewbot.waves.zigzag import Pivot
 
 __all__ = ["EngineResult", "EquityPoint", "Trade", "TradingEngine"]
 
 _CLOSING_KIND_REASON = {"STOP": "STOP", "TP1": "TP1", "TP2": "TP2"}
+
+
+def _in_window(lineage: Sequence, pivots4h: Sequence[Pivot], m: int) -> bool:
+    """True while the lineage's S pivot (lineage[2] = S.i) is inside the last-M-pivot enumeration
+    window. Outside it the enumerator cannot see the lineage at all, so its absence from
+    ws.lineages is not a hard-rule break (spec 5.4) and must not trigger a LINEAGE exit."""
+    return len(pivots4h) < m or lineage[2] >= pivots4h[-m].i
 
 
 def _agg_4h(sub: Sequence[Bar]) -> Bar:
@@ -223,7 +232,12 @@ class _Run:
             if ot.sig.time_stop_4h is not None and ot.n4h >= ot.sig.time_stop_4h:
                 self._request_exit("TIME")
         lineage = ot.sig.lineage
-        if lineage is not None and ws.ready and tuple(lineage) not in ws.lineages:
+        if (
+            lineage is not None
+            and ws.ready
+            and tuple(lineage) not in ws.lineages
+            and _in_window(lineage, ws.pivots4h, self.cfg.wave.M)
+        ):
             self._request_exit("LINEAGE")
 
     def _request_exit(self, reason: str) -> None:

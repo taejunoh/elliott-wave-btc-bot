@@ -5,14 +5,16 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from ewbot.config import BotConfig, BreakerParams, CostParams
+from ewbot.config import BotConfig, BreakerParams, CostParams, WaveParams
 from ewbot.engine.loop import EngineResult, TradingEngine
 from ewbot.strategy.base import Signal
 from ewbot.types import H1, Bar
-from ewbot.waves.engine import WaveState
+from ewbot.waves.engine import WaveEngine, WaveState
 from ewbot.waves.enumerate import Count
 from ewbot.waves.patterns import N_POINTS
 from ewbot.waves.zigzag import Pivot
+from tests.synth import T0 as SYNTH_T0
+from tests.synth import Waypoint, make_path, q64
 
 T0 = 1_704_067_200    # Mon 2024-01-01 00:00 UTC (4h aligned)
 FRI = 1_704_412_800   # Fri 2024-01-05 00:00 UTC; bar 20 = 15:00 EST, 21 = 16:00, 22 = 17:00 (closed)
@@ -273,6 +275,20 @@ def test_lineage_kill_exits_at_next_open() -> None:
     assert t.pnl == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize("s_i, reason", [(9, "END"), (10, "LINEAGE")], ids=["S-aged-out", "S-oldest-in-window"])
+def test_lineage_absence_exits_only_while_s_is_in_the_m_pivot_window(s_i: int, reason: str) -> None:
+    # 12 pivots with .i = 10..21: the enumeration window (M = 12) starts at .i 10
+    piv = tuple(Pivot(i=10 + k, sub_ts=ts(0), price=50_000.0, kind=1 if k % 2 else -1, confirmed_at=11 + k)
+                for k in range(12))
+    lin = ("IMP", 1, s_i)
+    wave = StubWave(default=dict(lineages=frozenset({lin}), pivots4h=piv),
+                    at={ts(5): dict(lineages=frozenset(), pivots4h=piv)})
+    res, _, _ = run(frame(10), {ts(1): sig(ts(1), lineage=lin)}, wave)
+    [t] = res.trades
+    assert t.exit_reason == reason
+    assert t.exit_ts == (ts(6) if reason == "LINEAGE" else ts(9))
+
+
 def test_flip_on_opposite_signal_and_ignore_same_direction() -> None:
     long1, long2, short = sig(ts(1)), sig(ts(3)), sig(ts(5), d=-1, setup="W5_REV")
     rows = {6: (50_200.0, 50_300.0, 50_100.0, 50_200.0), 9: (50_100.0, 50_200.0, 50_000.0, 50_100.0)}
@@ -334,3 +350,107 @@ def test_total_halt_flattens_and_blocks_entries() -> None:
     assert (t.exit_ts, t.exit_reason, t.exit_price_avg) == (ts(4), "BREAKER", 49_450.0)
     assert t.pnl == pytest.approx(-55.0)
     assert ts(6) not in strat.calls
+
+
+# ----------------------------------------------------------------------------- lineage window (real WaveEngine)
+
+_LEAD = (1400, 1300, 1360, 1250, 1310, 1200, 1260, 1150, 1210, 1080, 1130, 1040, 1090)  # 13 falling pivots
+
+
+class _RecordingWave:
+    """The real WaveEngine, recording every WaveState it returns."""
+
+    def __init__(self, params: WaveParams) -> None:
+        self.inner = WaveEngine(params)
+        self.states: list[WaveState] = []
+
+    def on_1h_close(self, bar1h: Bar, bar4h: Bar | None, sub_bars: Any) -> WaveState:
+        st = self.inner.on_1h_close(bar1h, bar4h, sub_bars)
+        self.states.append(st)
+        return st
+
+
+class _LineageProbe:
+    """Emits ONE signal tied to lineage ("IMP", +1, S.i) as soon as the 4h pivot `after` is the last
+    confirmed pivot and the lineage is alive. Stop and targets are far outside the path."""
+
+    name = "PROBE"
+
+    def __init__(self, s_ts: int, after: float, d: int, stop: float, tp1: float, tp2: float) -> None:
+        self.s_ts, self.after, self.d = s_ts, after, d
+        self.levels = (stop, tp1, tp2)
+        self.lineage: tuple[str, int, int] | None = None
+        self.done = False
+
+    def on_bar(self, bar: Bar, ws: WaveState, choch: Any) -> Signal | None:
+        if self.done or not ws.pivots4h or ws.pivots4h[-1].price != self.after:
+            return None
+        s = [p for p in ws.pivots4h if p.sub_ts == self.s_ts]
+        if not s or ("IMP", 1, s[0].i) not in ws.lineages:
+            return None
+        self.done, self.lineage = True, ("IMP", 1, s[0].i)
+        stop, tp1, tp2 = self.levels
+        return Signal(ts=bar.ts, setup="W3", direction=self.d, entry_ref=bar.close, stop=stop, tp1=tp1, tp2=tp2,
+                      risk_mult=1.0, time_stop_4h=None, instance=None, lineage=self.lineage, reason="probe")
+
+
+def _path_frame(way: list[Waypoint], params: WaveParams) -> tuple[pd.DataFrame, list[int]]:
+    bars, hours = make_path(way, 0.0, 0, params)
+    df = pd.DataFrame({"ts": [b.ts for b in bars], "open": [b.open for b in bars], "high": [b.high for b in bars],
+                       "low": [b.low for b in bars], "close": [b.close for b in bars], "volume": [1.0] * len(bars)})
+    return df, hours
+
+
+def _in_window(lineage: tuple[str, int, int], ws: WaveState, m: int) -> bool:
+    return len(ws.pivots4h) < m or lineage[2] >= ws.pivots4h[-m].i
+
+
+def test_lineage_that_ages_out_of_the_pivot_window_does_not_exit() -> None:
+    """Bull impulse S..P5, then six lower-high / lower-low swings that never exceed P5: the completed
+    impulse stays valid (no hard rule broken), but once S is older than the last M=12 pivots the
+    enumerator no longer sees it and the lineage vanishes from ws.lineages. That is not a lineage
+    kill (spec 5.4: a hard-rule break caused by a new pivot), so the short must not exit LINEAGE."""
+    params = WaveParams(warmup_4h=20)
+    p5 = 1100.0 - 55.0 + 161.8 - 0.3 * 161.8 + 100.0
+    swings = (60, 25, 90, 50, 120, 80, 150, 110, 180, 140, 210, 170)  # P5 - x: lower highs, lower lows
+    way = [Waypoint(float(x), "") for x in _LEAD]
+    way += [Waypoint(q64(x), lab) for x, lab in ((1000.0, "S"), (1100.0, "1"), (1045.0, "2"),
+                                                (1045.0 + 161.8, "3"), (1045.0 + 0.7 * 161.8, "4"), (p5, "5"))]
+    way += [Waypoint(q64(p5 - x), "") for x in swings]
+    df, hours = _path_frame(way, params)
+    s_ts, p5 = SYNTH_T0 + hours[len(_LEAD)] * H1, q64(p5)
+    probe = _LineageProbe(s_ts, after=p5, d=-1, stop=p5 + 300.0, tp1=500.0, tp2=400.0)
+    wave = _RecordingWave(params)
+    cfg = BotConfig(costs=ZERO, wave=params)
+    res = TradingEngine(cfg, probe, wave_engine=wave, choch=NullChoch()).run(df)  # type: ignore[arg-type]
+
+    [t] = res.trades
+    lin = probe.lineage
+    assert lin is not None and t.direction == -1
+    during = [st for st in wave.states if t.entry_ts <= st.ts < t.exit_ts]
+    assert float(df.loc[df["ts"] >= t.entry_ts, "high"].max()) <= p5  # P5 never exceeded: no rule broken
+    aged_out = [st for st in during if lin not in st.lineages and not _in_window(lin, st, params.M)]
+    assert aged_out, "scenario must reproduce a lineage that left the 12-pivot window"
+    assert not [st for st in during if lin not in st.lineages and _in_window(lin, st, params.M)]
+    assert t.exit_reason == "END"
+
+
+def test_lineage_killed_by_a_rule_break_inside_the_window_still_exits() -> None:
+    """Same lead-in (15 pivots, so the window check is not trivially true), S, P1, then W2 falls
+    below S: H1 (P2 > S) is broken while S is in the window -> LINEAGE exit at the next open."""
+    params = WaveParams(warmup_4h=20)
+    way = [Waypoint(float(x), "") for x in _LEAD]
+    way += [Waypoint(1000.0, "S"), Waypoint(1100.0, "1"), Waypoint(960.0, ""), Waypoint(1050.0, "")]
+    df, hours = _path_frame(way, params)
+    s_ts = SYNTH_T0 + hours[len(_LEAD)] * H1
+    probe = _LineageProbe(s_ts, after=1100.0, d=1, stop=700.0, tp1=2000.0, tp2=2100.0)
+    wave = _RecordingWave(params)
+    res = TradingEngine(BotConfig(costs=ZERO, wave=params), probe, wave_engine=wave, choch=NullChoch()).run(df)  # type: ignore[arg-type]
+
+    [t] = res.trades
+    lin = probe.lineage
+    assert lin is not None and t.exit_reason == "LINEAGE"
+    kill = next(st for st in wave.states if st.ts >= t.entry_ts and lin not in st.lineages)
+    assert len(kill.pivots4h) >= params.M and _in_window(lin, kill, params.M)
+    assert float(df.loc[df["ts"] == kill.ts, "low"].iloc[0]) < 1000.0  # the bar that went below S
+    assert t.exit_ts == kill.ts + H1  # exit at the next 1h open
