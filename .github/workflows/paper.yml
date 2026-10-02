@@ -1,6 +1,10 @@
 # ewbot paper-trading runtime (Plan 2 spec 6.1): one deterministic recompute per hour.
-# Code comes from master; ledger.json / report.html / runs.log live on the orphan `paper` branch.
+# Code comes from master; ledger.json / report.html / runs.log live on the orphan `paper` branch,
+# which only this workflow writes (docs/paper-trading.md: never push to it by hand).
 # Every fetch is shallow: the paper branch gets one commit per hour and its history is never needed here.
+# The git side (paper worktree, commit, push and retry) is scripts/paper_sync.sh.
+# The Telegram secrets reach only the steps that can send: the paper run, the push step (it reruns
+# ewbot when origin/paper moved) and the failure alert.
 name: paper
 
 on:
@@ -18,10 +22,9 @@ permissions:
 jobs:
   paper:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # backstop only: the steps below have their own timeouts, so a hang fails its step and alerts
+    timeout-minutes: 100
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       EWBOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Check out master
@@ -30,6 +33,8 @@ jobs:
           ref: master
 
       - name: Fetch the holdout commit and check out the paper branch (orphan on first use)
+        id: checkout-paper
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           echo "PAPER_DIR=$RUNNER_TEMP/paper" >> "$GITHUB_ENV"
@@ -38,15 +43,10 @@ jobs:
           git config --global user.email "ewbot-paper@users.noreply.github.com"
           # 64e628a: the fingerprint baseline, read once when ledger.json is created (spec 5.1)
           git fetch --no-tags --depth=1 origin 64e628ad4865b3b04571a7cba2886881eae19176
-          if git ls-remote --exit-code --heads origin paper >/dev/null; then
-            git fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
-            git worktree add -B paper "$RUNNER_TEMP/paper" origin/paper
-          else
-            git worktree add --orphan -b paper "$RUNNER_TEMP/paper"
-          fi
+          PAPER_DIR="$RUNNER_TEMP/paper" bash scripts/paper_sync.sh checkout
 
       - name: Install uv (with its cache)
-        uses: astral-sh/setup-uv@v10.2.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true
@@ -61,44 +61,37 @@ jobs:
             btc-usd-1h-
 
       - name: Sync dependencies
+        timeout-minutes: 10
         run: uv sync --frozen
 
+      # 1-2 min per hourly run, 10-20 min for the daily criteria 1-2 recompute
       - name: Paper run
         id: paper
+        timeout-minutes: 35
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: uv run ewbot paper run --ledger-dir "$PAPER_DIR"
 
-      - name: Commit and push the ledger (recompute and retry on conflict, 3 attempts)
-        run: |
-          set -euo pipefail
-          commit() {
-            git -C "$PAPER_DIR" add ledger.json report.html runs.log
-            if git -C "$PAPER_DIR" diff --cached --quiet; then
-              return 1
-            fi
-            git -C "$PAPER_DIR" commit -q -m "paper: run $(date -u +%Y-%m-%dT%H:%MZ)"
-          }
-          if ! commit; then
-            echo "no ledger change"
-            exit 0
-          fi
-          for attempt in 1 2 3; do
-            if git -C "$PAPER_DIR" push origin HEAD:refs/heads/paper; then
-              exit 0
-            fi
-            echo "push rejected (attempt $attempt): refresh the paper branch and recompute"
-            git -C "$PAPER_DIR" fetch --no-tags --depth=1 origin +refs/heads/paper:refs/remotes/origin/paper
-            git -C "$PAPER_DIR" reset -q --hard origin/paper
-            uv run ewbot paper run --ledger-dir "$PAPER_DIR"
-            if ! commit; then
-              exit 0
-            fi
-          done
-          echo "push failed 3 times" >&2
-          exit 1
+      # 3 pushes at most; the same commit again when origin/paper did not move, ewbot reruns only when it did
+      - name: Commit and push the ledger
+        id: push
+        timeout-minutes: 35
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: bash scripts/paper_sync.sh push uv run ewbot paper run --ledger-dir "$PAPER_DIR"
 
       - name: Telegram failure alert (fallback when ewbot did not send one)
-        if: failure()
+        id: alert
+        if: failure() || cancelled()
+        timeout-minutes: 2
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
         run: |
+          set -euo pipefail
           if [ -f "${EWBOT_FAILURE_MARKER:-/nonexistent}" ]; then
             echo "ewbot already sent the failure alert"
             exit 0
@@ -107,7 +100,10 @@ jobs:
             echo "no Telegram secrets: skipping the alert"
             exit 0
           fi
-          text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / push)"$'\n'"로그: ${EWBOT_RUN_URL}"
-          curl -sS --retry 3 -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          text="[ewbot paper] 실패 · 단계 workflow (checkout / setup / sync / timeout / push) · ${JOB_STATUS}"$'\n'"로그: ${EWBOT_RUN_URL}"
+          # --fail-with-body: an HTTP error fails the step and prints Telegram's reply (never the token)
+          curl -sS --fail-with-body --retry 3 --max-time 30 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${text}"
+          echo
