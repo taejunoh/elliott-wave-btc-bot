@@ -22,6 +22,7 @@ from ewbot.types import H1
 
 NY = ZoneInfo("America/New_York")
 DAILY_HOUR_NY = 9
+CRITERIA_ATTEMPTS = 2  # criteria 1-2 recomputes per New York date: the daily-summary run and one retry
 GAP_WARN_S = 3 * H1
 SEND_ATTEMPTS = 3
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
@@ -211,8 +212,16 @@ def close_text(t: Trade, count: Mapping[str, Any], counted: bool) -> str:
     )
 
 
-def daily_text(ny_date: str, position: str, equity: str, count: str, status: Sequence[str]) -> str:
-    return "\n".join([f"{HEAD} 일일 요약 {ny_date} (뉴욕)", position, equity, count, *status])
+def daily_text(
+    ny_date: str, position: str, equity: str, count: str, status: Sequence[str], stale: str | None = None
+) -> str:
+    """stale: why criteria 1-2 could not be recomputed on this date (the status block then shows the
+    previous result and the summary is marked 기준 미갱신(stale))."""
+    head = f"{HEAD} 일일 요약 {ny_date} (뉴욕)"
+    if stale is None:
+        return "\n".join([head, position, equity, count, *status])
+    note = f"실거래 전환 판정 1·2번 재계산 {CRITERIA_ATTEMPTS}회 실패: 이전 결과 표시 ({stale[:200]})"
+    return "\n".join([f"{head} · 기준 미갱신(stale)", position, equity, count, note, *status])
 
 
 def epoch_text(epoch: Mapping[str, Any]) -> str:
@@ -264,7 +273,7 @@ def criteria_error_text(ny_date: str, error: str) -> str:
         [
             f"{HEAD} 경고: 실거래 전환 판정 1·2번 재계산 실패 ({ny_date} 뉴욕)",
             error[:300],
-            "이전 결과를 유지하고 다음 실행에서 다시 계산함 (일일 요약은 계산에 성공한 실행에서 보냄)",
+            "이전 결과를 유지하고 다음 실행에서 1회 다시 계산함 (다시 실패하면 일일 요약을 '기준 미갱신(stale)'으로 보냄)",
         ]
     )
 

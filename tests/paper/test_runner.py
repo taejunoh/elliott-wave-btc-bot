@@ -316,34 +316,68 @@ def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, 
     assert (c4["unexplained"], c4["environment"]) == ((0, 2) if env_changed else (2, 0))
 
 
-def test_criteria_failure_warns_once_and_is_retried_next_hour(make_env, monkeypatch):
-    env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
-    run_paper(env)
-    before = load_ledger(env.ledger_dir).criteria
-    real = runner.compare
+RETRY_NOTE = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
 
+
+def _broken_compare(calls: list[int]):
     def broken(*args, **kwargs):
+        calls.append(1)
         raise RuntimeError("compare blew up")
 
-    monkeypatch.setattr(runner, "compare", broken)
-    for t in ("2024-02-13 14:07", "2024-02-13 15:07"):
-        env.clock.now = ts(t)
-        out = run_paper(env)
-        led = load_ledger(env.ledger_dir)
-        note = "criteria 1-2 not recomputed (retried next run): RuntimeError: compare blew up"
-        assert led.runs[-1]["status"] == "ok" and led.runs[-1]["warnings"] == [note] and note in out.notes
-    assert led.criteria == before and led.daily_summary_date == "2024-02-12"
+    return broken
+
+
+def test_criteria_failure_warns_once_and_is_retried_by_the_next_run(make_env, monkeypatch):
+    env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
+    run_paper(env)
+    real, calls = runner.compare, []
+    monkeypatch.setattr(runner, "compare", _broken_compare(calls))
+    env.clock.now = ts("2024-02-13 14:07")
+    out = run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    run = led.runs[-1]
+    assert run["status"] == "ok" and run["warnings"] == [RETRY_NOTE] and RETRY_NOTE in out.notes
+    assert run["criteria_recompute"] == {"ny_date": "2024-02-13", "ok": False}
+    assert led.daily_summary_date == "2024-02-12" and not any("일일 요약 2024-02-13" in t for t in env.sender.texts)
     warned = [t for t in env.sender.texts if "1·2번 재계산 실패" in t]
     assert len(warned) == 1 and "2024-02-13" in warned[0] and "compare blew up" in warned[0]
-    assert not any("일일 요약 2024-02-13" in t for t in env.sender.texts)
-    assert (env.ledger_dir / RUNS_LOG).read_text().count("\n") == 3
 
     monkeypatch.setattr(runner, "compare", real)
-    env.clock.now = ts("2024-02-13 16:07")
+    env.clock.now = ts("2024-02-13 15:07")  # the one retry succeeds: a normal daily summary
     run_paper(env)
     led = load_ledger(env.ledger_dir)
-    assert led.daily_summary_date == "2024-02-13" and led.criteria["computed_ts"] == ts("2024-02-13 16:07")
-    assert sum("일일 요약 2024-02-13" in t for t in env.sender.texts) == 1 and led.runs[-1]["warnings"] == []
+    assert led.daily_summary_date == "2024-02-13" and led.criteria["computed_ts"] == ts("2024-02-13 15:07")
+    daily = [t for t in env.sender.texts if "일일 요약 2024-02-13" in t]
+    assert len(daily) == 1 and "stale" not in daily[0] and led.runs[-1]["warnings"] == []
+    assert led.runs[-1]["criteria_recompute"] == {"ny_date": "2024-02-13", "ok": True} and len(calls) == 1
+
+
+def test_second_criteria_failure_sends_a_stale_daily_summary_and_stops_retrying_that_date(make_env, monkeypatch):
+    env = make_env(now=ts("2024-02-12 14:07"))
+    run_paper(env)
+    before = load_ledger(env.ledger_dir).criteria
+    calls: list[int] = []
+    monkeypatch.setattr(runner, "compare", _broken_compare(calls))
+    for t in ("2024-02-13 14:07", "2024-02-13 15:07", "2024-02-13 16:07"):
+        env.clock.now = ts(t)
+        run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    assert len(calls) == 2  # the daily run and one retry; 16:07 does not try again
+    assert led.criteria == before and led.daily_summary_date == "2024-02-13"
+    assert [r["warnings"] for r in led.runs[1:]] == [
+        [RETRY_NOTE],
+        ["criteria 1-2 not recomputed (attempt 2/2 on 2024-02-13 failed: daily summary sent stale, next try on "
+         "the next New York date): RuntimeError: compare blew up"],
+        [],
+    ]
+    assert sum("1·2번 재계산 실패" in t for t in env.sender.texts) == 1  # one warning per New York date
+    daily = [t for t in env.sender.texts if "일일 요약 2024-02-13" in t]
+    assert len(daily) == 1 and "기준 미갱신(stale)" in daily[0] and "compare blew up" in daily[0]
+    assert "2024-02-12 계산" in daily[0]  # the previous criteria 1-2 result is what the summary shows
+    assert (env.ledger_dir / RUNS_LOG).read_text().count("\n") == 4
+    env.clock.now = ts("2024-02-14 14:07")  # the next New York date tries again
+    run_paper(env)
+    assert len(calls) == 3 and load_ledger(env.ledger_dir).runs[-1]["warnings"] == [RETRY_NOTE]
 
 
 def test_holdout_trade_count_mismatch_warns_once(make_env, df):

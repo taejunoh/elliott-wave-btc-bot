@@ -11,8 +11,9 @@ runtime environment (paper.environment); decisions carry the digest of the envir
 them, for the ENVIRONMENT_CHANGE cause of the replay check.
 
 Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
-the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it) and is
-retried by the next run.
+the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it): the next run
+retries it once; if that fails too, the daily summary goes out marked stale with the previous result
+and the next try is on the next New York date (CRITERIA_ATTEMPTS per date).
 
 This module is the only non-holdout caller of allow_holdout=True (a static test enforces it)."""
 
@@ -66,6 +67,7 @@ from ewbot.paper.ledger import (
     save_ledger,
 )
 from ewbot.paper.notify import (
+    CRITERIA_ATTEMPTS,
     GAP_WARN_S,
     NY,
     Sender,
@@ -282,6 +284,11 @@ def _ny9_ts(ny_date: str) -> int:
     return int(datetime(y, m, d, 9, tzinfo=NY).timestamp())
 
 
+def _criteria_failures(runs: list[dict[str, Any]], ny_date: str) -> int:
+    """Failed criteria 1-2 recomputes recorded for this New York date."""
+    return sum(1 for r in runs if r.get("criteria_recompute") == {"ny_date": ny_date, "ok": False})
+
+
 def _run_id(now: int) -> str:
     return datetime.fromtimestamp(now, UTC).strftime("%Y%m%dT%H%M%SZ")
 
@@ -409,18 +416,29 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         ledger.runs.append(run)
         due = daily_summary_due(now, ledger.daily_summary_date)
 
+    stale: str | None = None  # why today's daily summary shows the previous criteria 1-2 result
     if due is not None and count["eligible"]:
+        failed = _criteria_failures(ledger.runs, due)
         try:
             end = last_bar + H1
             cmp = compare(cfg, df, hs["holdout_start"], end, random_runs=env.random_runs, workers=env.workers,
                           allow_holdout=True)
             ledger.criteria = summarize_compare(cmp, hs["holdout_start"], end, epoch["id"], now)
+            run["criteria_recompute"] = {"ny_date": due, "ok": True}
         except Exception as exc:  # noqa: BLE001 - criteria 1-2 are a daily extra: never block the hourly run
             err = f"{type(exc).__name__}: {exc}"
-            warnings.append(f"criteria 1-2 not recomputed (retried next run): {err}")
-            with _stage("events"):  # one warning per New York date; the previous ledger.criteria stays
-                events.append(make_event("CRITERIA", _ny9_ts(due), 0, criteria_error_text(due, err)))
-            due = None  # no daily summary and no daily_summary_date until the criteria are recomputed
+            run["criteria_recompute"] = {"ny_date": due, "ok": False}
+            if failed + 1 < CRITERIA_ATTEMPTS:
+                warnings.append(f"criteria 1-2 not recomputed (retried next run): {err}")
+                with _stage("events"):  # one warning per New York date; the previous ledger.criteria stays
+                    events.append(make_event("CRITERIA", _ny9_ts(due), 0, criteria_error_text(due, err)))
+                due = None  # no daily summary and no daily_summary_date: the next run retries
+            else:
+                warnings.append(
+                    f"criteria 1-2 not recomputed (attempt {failed + 1}/{CRITERIA_ATTEMPTS} on {due} failed: daily "
+                    f"summary sent stale, next try on the next New York date): {err}"
+                )
+                stale = err
 
     with _stage("events"):
         if due is not None:
@@ -433,7 +451,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
                 f"구간 {epoch['id']}"
             )
             st = golive_status(ledger, now)
-            text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st))
+            text = daily_text(due, position_line(ledger.open_position), equity_line, count_line, status_lines(st),
+                              stale=stale)
             events.append(make_event("DAILY", _ny9_ts(due), 0, text))
             ledger.daily_summary_date = due
         queued = queue_events(ledger, events)

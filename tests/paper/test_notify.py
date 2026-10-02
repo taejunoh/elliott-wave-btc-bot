@@ -10,6 +10,7 @@ from ewbot.paper.notify import (
     SendError,
     TelegramSender,
     close_text,
+    criteria_error_text,
     daily_summary_due,
     daily_text,
     decision_events,
@@ -191,6 +192,11 @@ def test_entry_close_stop_and_failure_formats():
     assert "단계 data" in text and "coinbase down" in text and "actions/runs/1" in text
     assert "로그" not in failure_text("data", "x", None)
     assert daily_text("2024-02-08", "p", "e", "c", ["s1", "s2"]).splitlines()[1:] == ["p", "e", "c", "s1", "s2"]
+    stale = daily_text("2024-02-08", "p", "e", "c", ["s1"], stale="RuntimeError: boom").splitlines()
+    assert stale[0].endswith("일일 요약 2024-02-08 (뉴욕) · 기준 미갱신(stale)") and stale[1:4] == ["p", "e", "c"]
+    assert "재계산 2회 실패" in stale[4] and "RuntimeError: boom" in stale[4] and stale[5] == "s1"
+    text = criteria_error_text("2024-02-08", "RuntimeError: boom")
+    assert "2024-02-08" in text and "다음 실행에서 1회 다시 계산" in text and "기준 미갱신(stale)" in text
     assert position_line(None) == "포지션: 없음"
 
 
