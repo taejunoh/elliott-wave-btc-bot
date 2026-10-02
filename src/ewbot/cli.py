@@ -427,9 +427,10 @@ def _paper_status(args: argparse.Namespace) -> int:
             f"holdout trades recomputed {r['holdout_trades_recomputed']} (lock: {led.holdout['n_trades']['A']})"
         )
     unexplained = sum(1 for d in led.discrepancies if d["cause"] == "UNEXPLAINED")
+    environment = sum(1 for d in led.discrepancies if d["cause"] == "ENVIRONMENT_CHANGE")
     print(
-        f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)} (unexplained {unexplained}), "
-        f"pending events {len(led.pending_events)}"
+        f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)} (unexplained {unexplained}, "
+        f"environment change {environment}), pending events {len(led.pending_events)}"
     )
     return 0
 

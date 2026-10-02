@@ -22,7 +22,7 @@ from ewbot.waves.engine import WaveState
 
 REL_TOL = 1e-9
 DECISION_KINDS = ("SIGNAL", "ENTRY", "TP1", "TP2", "STOP", "EXIT", "BREAKEVEN", "TRAIL")
-CAUSES = ("DATA_REVISION", "FINGERPRINT_CHANGE", "UNEXPLAINED")
+CAUSES = ("DATA_REVISION", "FINGERPRINT_CHANGE", "ENVIRONMENT_CHANGE", "UNEXPLAINED")  # in priority order
 _ORDER = {k: i for i, k in enumerate(("EXIT", "ENTRY", "STOP", "TP1", "TP2", "BREAKEVEN", "TRAIL", "SIGNAL"))}
 _COMPARED = ("kind", "ts", "trade_key", "contracts", "reason", "setup", "direction")
 
@@ -115,14 +115,24 @@ def same_decision(a: dict[str, Any], b: dict[str, Any]) -> bool:
     return all(_close(x, y) for x, y in zip(a["levels"], b["levels"], strict=True))
 
 
-def classify(recorded: dict[str, Any] | None, data_revised: bool, current_epoch_id: int) -> str:
+def classify(
+    recorded: dict[str, Any] | None, data_revised: bool, current_epoch_id: int, env_changed: bool = False
+) -> str:
     """DATA_REVISION if a bar up to the decision changed; else FINGERPRINT_CHANGE if the decision
-    was recorded under another epoch; else UNEXPLAINED."""
+    was recorded under another epoch; else ENVIRONMENT_CHANGE if the run that recorded it (or should
+    have) ran in another runtime environment (paper.environment); else UNEXPLAINED."""
     if data_revised:
         return "DATA_REVISION"
     if recorded is not None and int(recorded["epoch_id"]) != int(current_epoch_id):
         return "FINGERPRINT_CHANGE"
+    if env_changed:
+        return "ENVIRONMENT_CHANGE"
     return "UNEXPLAINED"
+
+
+def _env_changed(recording: str | None, current: str | None) -> bool:
+    """Only a known recording environment that differs from the current one counts."""
+    return recording is not None and current is not None and recording != current
 
 
 def verify_decisions(
@@ -133,13 +143,18 @@ def verify_decisions(
     appeared_revised: Callable[[dict[str, Any]], bool],
     *,
     appeared_after: int | None = None,
+    env_sha256: str | None = None,
+    appeared_env: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Replay check. Every recorded decision must reappear unchanged (else CHANGED / VANISHED); a
     recomputed decision of the current epoch that a previous run should already have known but did
     not record is APPEARED. revised_at(recorded) / appeared_revised(recomputed) say whether the bars
     up to that decision changed since it was (or should have been) recorded. The APPEARED window is
     known_at in (appeared_after, epoch through_ts]; appeared_after defaults to the epoch's started_ts
-    (the runner passes where the epoch began recording, see runner._recording_floor)."""
+    (the runner passes where the epoch began recording, see runner._recording_floor).
+    env_sha256 is the current run's environment digest; it is compared with a recorded decision's
+    env_sha256 and, for APPEARED, with appeared_env(recomputed) - the environment digest of the run
+    that should have recorded it (None: unknown, never an environment change)."""
     by_id = {d["id"]: d for d in recomputed}
     rec_ids = {d["id"] for d in recorded}
     found: list[dict[str, Any]] = []
@@ -148,7 +163,7 @@ def verify_decisions(
         if r is not None and same_decision(d, r):
             continue
         kind = "VANISHED" if r is None else "CHANGED"
-        cause = classify(d, revised_at(d), epoch["id"])
+        cause = classify(d, revised_at(d), epoch["id"], _env_changed(d.get("env_sha256"), env_sha256))
         found.append({"id": f"{kind}:{d['id']}", "type": kind, "decision_id": d["id"], "cause": cause,
                       "recorded": d, "recomputed": r})
     lo = int(epoch["started_ts"]) if appeared_after is None else int(appeared_after)
@@ -156,7 +171,8 @@ def verify_decisions(
     for r in recomputed:
         if r["id"] in rec_ids or not lo < known_at(r) <= hi:
             continue
-        cause = classify(None, appeared_revised(r), epoch["id"])
+        recording_env = None if appeared_env is None else appeared_env(r)
+        cause = classify(None, appeared_revised(r), epoch["id"], _env_changed(recording_env, env_sha256))
         found.append({"id": f"APPEARED:{r['id']}", "type": "APPEARED", "decision_id": r["id"], "cause": cause,
                       "recorded": None, "recomputed": r})
     return found

@@ -3,8 +3,12 @@ out-of-sample extraction -> replay check -> ledger / report / runs.log -> Telegr
 
 Inputs are frozen: the params come from holdout.lock only, the rest of the configuration is the
 BotConfig defaults (conservative risk, breakers on, Plan 1 costs) - holdout_config(BotConfig(), params),
-exactly how the holdout ran. The recompute starts trading at the holdout start, so it reproduces the
-holdout's A run and continues it; trades entering after the holdout's last bar are paper trades.
+exactly how the holdout ran; the precheck refuses a lock whose sha256 is not
+lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. whose configuration is not the one this
+run would use. The recompute starts trading at the holdout start, so it reproduces the holdout's A run
+and continues it; trades entering after the holdout's last bar are paper trades. Every run records its
+runtime environment (paper.environment); decisions carry the digest of the environment that recorded
+them, for the ENVIRONMENT_CHANGE cause of the replay check.
 
 Every step runs inside a named stage: any failure raises PaperRunError(stage). The one exception is
 the daily criteria 1-2 recompute, which only warns (the hourly run must not depend on it) and is
@@ -27,7 +31,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.holdout import DEFAULT_LOCK_PATH, data_fingerprint, holdout_config
+from ewbot.backtest.holdout import DEFAULT_LOCK_PATH, data_fingerprint, holdout_config, lock_digest
 from ewbot.backtest.runner import compare, run_backtest
 from ewbot.backtest.walkforward import HOLDOUT_START, grid_combos
 from ewbot.config import BotConfig
@@ -44,6 +48,7 @@ from ewbot.paper.decisions import (
     top_count_summary,
     verify_decisions,
 )
+from ewbot.paper.environment import environment_digest, runtime_environment
 from ewbot.paper.fingerprint import FingerprintError, baseline_fingerprint, current_fingerprint
 from ewbot.paper.ledger import (
     GO_LIVE_STRATEGY,
@@ -122,6 +127,7 @@ class PaperEnv:
     workers: int = field(default_factory=lambda: max(1, os.cpu_count() or 1))
     sleep: Callable[[float], None] = time.sleep
     fetch_backoff_s: float = 10.0
+    environment: Callable[[], dict[str, Any]] = runtime_environment
 
 
 @dataclass(frozen=True)
@@ -165,8 +171,11 @@ def _git_ok(cwd: Path, *args: str) -> bool:
 
 
 def precheck_lock(lock_path: Path) -> dict[str, Any]:
-    """holdout.lock exists, is committed (in HEAD), has no staged or unstaged change, and its params
-    are a walk-forward grid combo. Returns the parsed lock."""
+    """holdout.lock exists, is committed (in HEAD), has no staged or unstaged change, its params are
+    a walk-forward grid combo, its holdout start is HOLDOUT_START and its sha256 equals
+    lock_digest(BotConfig(), params, random_runs, code_sha256): the full configuration this run uses
+    (BotConfig defaults with the lock's params), the grid and the holdout start are the ones the
+    holdout ran with. Returns the parsed lock."""
     p = Path(lock_path)
     if not p.is_file():
         raise PaperRunError("precheck", f"{p} not found: the paper runtime needs the committed holdout lock")
@@ -182,12 +191,21 @@ def precheck_lock(lock_path: Path) -> dict[str, Any]:
         str(lock["sha256"])
         int(lock["first_run"]["criteria"]["n_trades"]["A"])
         holdout_start = int(lock["holdout_start"])
+        random_runs = int(lock["random_runs"])
+        code_sha = str(lock["code_sha256"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise PaperRunError("precheck", f"{p} is not a completed holdout lock: {exc!r}") from exc
     if params not in grid_combos():
         raise PaperRunError("precheck", f"lock params {list(params)} are not a walk-forward grid combo")
     if holdout_start != HOLDOUT_START:
         raise PaperRunError("precheck", f"lock holdout_start {holdout_start} != {HOLDOUT_START}")
+    digest = lock_digest(BotConfig(), params, random_runs, code_sha)
+    if digest != lock["sha256"]:
+        raise PaperRunError(
+            "precheck",
+            f"lock sha256 {str(lock['sha256'])[:12]} != lock_digest(BotConfig(), params, random_runs, code_sha256) "
+            f"{digest[:12]}: this run's configuration is not the one the holdout ran with",
+        )
     return lock
 
 
@@ -278,6 +296,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         lock = precheck_lock(env.lock_path)
         cfg = holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
         ledger_dir = Path(env.ledger_dir)
+        run_env = dict(env.environment())
+        env_sha = environment_digest(run_env)
 
     ledger = _open_ledger(env, ledger_dir, lock)
     with _stage("ledger"):
@@ -320,13 +340,21 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         def revised_at(d: dict[str, Any]) -> bool:
             return prefix(d["ts"]) != d["data_sha256"]
 
+        def first_knowing_run(r: dict[str, Any]) -> dict[str, Any] | None:
+            """The first successful run that should have recorded r."""
+            return next((x for x in ok_runs if x["last_bar_ts"] >= known_at(r)), None)
+
         def appeared_revised(r: dict[str, Any]) -> bool:
-            run = next((x for x in ok_runs if x["last_bar_ts"] >= known_at(r)), None)
+            run = first_knowing_run(r)
             return run is not None and prefix(run["last_bar_ts"]) != run["data_sha256"]
+
+        def appeared_env(r: dict[str, Any]) -> str | None:
+            run = first_knowing_run(r)
+            return None if run is None else run.get("env_sha256")
 
         recomputed = build_decisions(res, trace, all_trades)
         found = verify_decisions(ledger.decisions, recomputed, epoch, revised_at, appeared_revised,
-                                 appeared_after=floor)
+                                 appeared_after=floor, env_sha256=env_sha, appeared_env=appeared_env)
         known = {d["id"] for d in ledger.discrepancies}
         new_disc = [
             {**d, "epoch_id": epoch["id"], "detected_ts": last_bar, "detected_run": run_id}
@@ -336,7 +364,7 @@ def run_paper(env: PaperEnv) -> RunOutcome:
         ledger.discrepancies.extend(new_disc)
         fresh = decisions_to_record(recomputed, epoch, {d["id"] for d in ledger.decisions})
         for d in fresh:
-            d.update(run_id=run_id, data_sha256=prefix(d["ts"]), epoch_id=epoch["id"])
+            d.update(run_id=run_id, data_sha256=prefix(d["ts"]), epoch_id=epoch["id"], env_sha256=env_sha)
         ledger.decisions.extend(fresh)
         epoch["through_ts"] = max(int(epoch["through_ts"]), last_bar)
 
@@ -374,6 +402,8 @@ def run_paper(env: PaperEnv) -> RunOutcome:
             "count_total": count["total"],
             "new_decisions": len(fresh),
             "new_discrepancies": len(new_disc),
+            "env": run_env,
+            "env_sha256": env_sha,
             "warnings": warnings,
         }
         ledger.runs.append(run)

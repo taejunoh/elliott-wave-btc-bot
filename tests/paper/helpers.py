@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.holdout import data_fingerprint, holdout_config
+from ewbot.backtest.holdout import data_fingerprint, holdout_config, lock_digest
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.config import BotConfig
 from ewbot.types import H1
@@ -26,6 +26,7 @@ SEED = 2
 N_BARS = 3000  # 2023-11-15 00:00 .. 2024-03-18 23:00 UTC
 BOUNDARY = 1_704_844_800  # 2024-01-10 00:00 UTC: the synthetic holdout's last bar
 HOLDOUT_A_TRADES = 2  # synthetic A trades entering in [HOLDOUT_START, BOUNDARY]
+CODE_SHA = "c0de" * 16  # stands in for the holdout's code_fingerprint (bound through lock_digest)
 
 
 def ts(text: str) -> int:
@@ -49,13 +50,16 @@ def synth_frame(n: int = N_BARS, seed: int = SEED) -> pd.DataFrame:
 
 def make_lock(df: pd.DataFrame, boundary: int = BOUNDARY, params: tuple[float, ...] = PARAMS,
               n_a: int = HOLDOUT_A_TRADES, **overrides: Any) -> dict[str, Any]:
-    """A completed-holdout lock with the real schema (v3) for synthetic data."""
+    """A completed-holdout lock with the real schema (v3) for synthetic data. Its sha256 is the real
+    lock_digest(BotConfig(), params, random_runs, code_sha256) of the final lock (after `overrides`),
+    unless `sha256` itself is overridden."""
     cfg = holdout_config(BotConfig(), params)
     lock = {
         "version": 3,
         "keys": ["wave.K4", "strategy.Q_MIN", "strategy.S_MIN"],
         "params": list(params),
-        "sha256": "d" * 64,
+        "sha256": None,
+        "code_sha256": CODE_SHA,
         "config": json.loads(json.dumps(dataclasses.asdict(cfg))),
         "holdout_start": HOLDOUT_START,
         "random_runs": 100,
@@ -69,6 +73,8 @@ def make_lock(df: pd.DataFrame, boundary: int = BOUNDARY, params: tuple[float, .
         "runs": [],
     }
     lock.update(overrides)
+    if lock["sha256"] is None:
+        lock["sha256"] = lock_digest(BotConfig(), lock["params"], lock["random_runs"], lock["code_sha256"])
     return lock
 
 

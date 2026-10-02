@@ -117,13 +117,18 @@ def test_same_decision_tolerance():
 def test_classify_order():
     rec = {"epoch_id": 1}
     assert classify(rec, True, 2) == "DATA_REVISION"
+    assert classify(rec, True, 2, env_changed=True) == "DATA_REVISION"
     assert classify(rec, False, 2) == "FINGERPRINT_CHANGE"
+    assert classify(rec, False, 2, env_changed=True) == "FINGERPRINT_CHANGE"
+    assert classify(rec, False, 1, env_changed=True) == "ENVIRONMENT_CHANGE"
+    assert classify(None, False, 2, env_changed=True) == "ENVIRONMENT_CHANGE"
     assert classify(rec, False, 1) == "UNEXPLAINED"
     assert classify(None, False, 2) == "UNEXPLAINED"
 
 
-def _record(decs, df, epoch_id=1):
-    return [{**d, "run_id": "r1", "epoch_id": epoch_id, "data_sha256": data_fingerprint(df, 0, d["ts"])} for d in decs]
+def _record(decs, df, epoch_id=1, env_sha256="env-a"):
+    return [{**d, "run_id": "r1", "epoch_id": epoch_id, "data_sha256": data_fingerprint(df, 0, d["ts"]),
+             "env_sha256": env_sha256} for d in decs]
 
 
 def test_replay_check_classifies_a_revised_bar_as_data_revision(full):
@@ -164,6 +169,27 @@ def test_replay_check_fingerprint_change_and_unexplained(full):
     gone = _record(decs, df) + [{**_record(decs[:1], df)[0], "id": "ENTRY:1:1", "ts": 1, "trade_key": 1}]
     found = verify_decisions(gone, full[4], epoch1, lambda d: False, lambda r: False)
     assert [(f["type"], f["decision_id"], f["cause"]) for f in found] == [("VANISHED", "ENTRY:1:1", "UNEXPLAINED")]
+
+
+def test_replay_check_environment_change_against_the_recording_run(full):
+    df = synth_frame()
+    decs = [d for d in full[4] if known_at(d) > BOUNDARY]
+    epoch1 = {"id": 1, "started_ts": BOUNDARY, "through_ts": int(df["ts"].iloc[-1])}
+    tampered = _record(decs[1:], df)  # recorded under environment "env-a"; decs[0] was never recorded
+    tampered[0] = {**tampered[0], "price": tampered[0]["price"] + 1.0}
+
+    def check(current, appeared_env):
+        found = verify_decisions(tampered, full[4], epoch1, lambda d: False, lambda r: False,
+                                 env_sha256=current, appeared_env=appeared_env)
+        return [(f["type"], f["cause"]) for f in found]
+
+    assert check("env-b", lambda r: "env-a") == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "ENVIRONMENT_CHANGE")]
+    assert check("env-a", lambda r: "env-a") == [("CHANGED", "UNEXPLAINED"), ("APPEARED", "UNEXPLAINED")]
+    # unknown recording environment (no run should have known it yet / not recorded): not an environment change
+    assert check("env-b", lambda r: None) == [("CHANGED", "ENVIRONMENT_CHANGE"), ("APPEARED", "UNEXPLAINED")]
+    unstamped = [{k: v for k, v in d.items() if k != "env_sha256"} for d in tampered]
+    found = verify_decisions(unstamped, full[4], epoch1, lambda d: False, lambda r: False, env_sha256="env-b")
+    assert [(f["type"], f["cause"]) for f in found] == [("CHANGED", "UNEXPLAINED"), ("APPEARED", "UNEXPLAINED")]
 
 
 def test_appeared_only_inside_the_epochs_recorded_window(full):

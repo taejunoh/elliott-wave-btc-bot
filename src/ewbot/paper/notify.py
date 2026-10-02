@@ -231,6 +231,11 @@ def discrepancy_text(items: Sequence[Mapping[str, Any]]) -> str:
         lines.append(f"{d['type']} {d['decision_id']} · {d['cause']}")
     if len(items) > 10:
         lines.append(f"외 {len(items) - 10}건 더 (report.html 참고)")
+    if any(d["cause"] == "ENVIRONMENT_CHANGE" for d in items):
+        lines.append(
+            "ENVIRONMENT_CHANGE: 결정을 기록한 실행과 실행 환경(Python·numpy·pandas·pyarrow·uv.lock·실행기 이미지)이 "
+            "다름 - 4번 기준 원인 불명 집계에서 제외"
+        )
     return "\n".join(lines)
 
 

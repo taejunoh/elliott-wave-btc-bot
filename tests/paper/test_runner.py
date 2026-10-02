@@ -6,6 +6,8 @@ import os
 import pytest
 
 from ewbot.paper import runner
+from ewbot.paper.criteria import criterion4
+from ewbot.paper.environment import environment_digest
 from ewbot.paper.ledger import LEDGER_FILE, REPORT_FILE, RUNS_LOG, load_ledger
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
 from ewbot.types import H1
@@ -22,6 +24,8 @@ from tests.paper.helpers import (
 )
 
 FIRST = ts("2024-02-10 12:07")  # 07:07 New York: no daily summary
+ENV_A = {"python": "3.12.7", "numpy": "2.1.0", "pandas": "2.2.3", "pyarrow": "18.0.0", "uv_lock_sha256": "a" * 64,
+         "image_os": "ubuntu24", "image_version": "20261001.1.0"}
 
 
 @pytest.fixture(scope="module")
@@ -38,7 +42,7 @@ def make_env(tmp_path, df):
             ledger_dir=tmp_path / "paper", lock_path=lock_path, cache_dir=tmp_path / "cache",
             fetch=FakeFetch(df, clock), sender=FakeSender() if sender is None else sender, clock=clock,
             fingerprint=lambda: "fp-base", baseline=lambda: ("fp-base", "c" * 40), random_runs=2, workers=1,
-            sleep=lambda s: None,
+            sleep=lambda s: None, environment=lambda: dict(ENV_A),
         )
         defaults.update(kw)
         return PaperEnv(**defaults)
@@ -60,6 +64,8 @@ def test_first_run_writes_ledger_report_log_and_notifies(make_env):
     assert min(d["ts"] for d in led.decisions) == ts("2024-01-12 14:00")  # SIGNAL bar of the first paper trade
     run = led.runs[0]
     assert run["status"] == "ok" and run["holdout_data_ok"] is True and run["last_bar_ts"] == ts("2024-02-10 11:00")
+    assert run["env"] == ENV_A and run["env_sha256"] == environment_digest(ENV_A)
+    assert all(d["env_sha256"] == run["env_sha256"] for d in led.decisions)  # stamped by the recording run
     assert run["holdout_trades_recomputed"] == 2 and run["count_total"] == 4  # 2 holdout + 2 paper
     texts = env.sender.texts
     assert sum("신규 진입" in t for t in texts) == 2 and sum("청산" in t for t in texts) == 2
@@ -103,7 +109,9 @@ def _modify(path):
     path.write_text(json.dumps(data))
 
 
-@pytest.mark.parametrize("case", ["missing", "untracked", "modified", "staged", "grid", "start", "incomplete"])
+@pytest.mark.parametrize(
+    "case", ["missing", "untracked", "modified", "staged", "grid", "start", "incomplete", "digest", "random_runs", "code"]
+)
 def test_precheck_refuses_and_writes_nothing(make_env, df, tmp_path, case):
     lock = make_lock(df)
     if case == "grid":
@@ -112,6 +120,12 @@ def test_precheck_refuses_and_writes_nothing(make_env, df, tmp_path, case):
         lock["holdout_start"] = lock["holdout_start"] + H1
     if case == "incomplete":
         del lock["first_run"]
+    if case == "digest":  # sha256 is not lock_digest(BotConfig(), params, random_runs, code_sha256)
+        lock["sha256"] = "d" * 64
+    if case == "random_runs":  # the holdout ran another random-control size than the digest says
+        lock["random_runs"] = 99
+    if case == "code":
+        del lock["code_sha256"]
     env = make_env(lock=lock)
     path = env.lock_path
     if case == "missing":
@@ -149,9 +163,16 @@ def test_fetch_is_retried_three_times(make_env, df):
 def test_ledger_of_another_holdout_is_refused(make_env, df):
     env = make_env()
     run_paper(env)
-    other = make_env(lock=make_lock(df, sha256="e" * 64))
+    other = make_env(lock=make_lock(df, code_sha256="e" * 64))  # a valid lock with another digest
     with pytest.raises(PaperRunError, match="different holdout lock"):
         run_paper(other)
+
+
+def test_precheck_names_the_lock_digest_mismatch(make_env, df):
+    env = make_env(lock=make_lock(df, sha256="d" * 64))
+    with pytest.raises(PaperRunError, match="lock_digest") as exc:
+        run_paper(env)
+    assert exc.value.stage == "precheck"
 
 
 def test_corrupt_ledger_stops_at_the_ledger_stage(make_env):
@@ -267,6 +288,34 @@ def test_new_epoch_records_the_decisions_known_since_the_previous_run(make_env):
     assert [(d["type"], d["decision_id"], d["cause"]) for d in found] == [("APPEARED", sig, "UNEXPLAINED")]
 
 
+@pytest.mark.parametrize("env_changed", [True, False])
+def test_a_discrepancy_after_an_environment_change_is_not_unexplained(make_env, env_changed):
+    box = {"env": dict(ENV_A)}
+    env = make_env(environment=lambda: dict(box["env"]))
+    run_paper(env)
+    path = env.ledger_dir / LEDGER_FILE
+    data = json.loads(path.read_text())
+    changed = next(d for d in data["decisions"] if d["kind"] == "ENTRY")
+    changed["price"] += 1.0  # as if the recording run had computed another fill price
+    lost = next(d for d in data["decisions"] if d["kind"] == "EXIT")
+    data["decisions"].remove(lost)  # as if the recording run had not seen this exit
+    path.write_text(json.dumps(data))
+    if env_changed:
+        box["env"] = {**ENV_A, "image_version": "20261008.1.0"}  # GitHub rolled out a new runner image
+    env.clock.now += H1
+    out = run_paper(env)
+    led = load_ledger(env.ledger_dir)
+    cause = "ENVIRONMENT_CHANGE" if env_changed else "UNEXPLAINED"
+    assert [(d["type"], d["decision_id"], d["cause"]) for d in led.discrepancies] == [
+        ("CHANGED", changed["id"], cause), ("APPEARED", lost["id"], cause)]
+    assert out.new_discrepancies == 2 and led.runs[-1]["env_sha256"] == environment_digest(box["env"])
+    warning = env.sender.texts[-1]
+    assert "결정 불일치 2건" in warning and cause in warning
+    assert ("4번 기준 원인 불명 집계에서 제외" in warning) is env_changed
+    c4 = criterion4(led, env.clock.now)
+    assert (c4["unexplained"], c4["environment"]) == ((0, 2) if env_changed else (2, 0))
+
+
 def test_criteria_failure_warns_once_and_is_retried_next_hour(make_env, monkeypatch):
     env = make_env(now=ts("2024-02-12 14:07"))  # 09:07 EST: daily summary with criteria 1-2
     run_paper(env)
@@ -316,7 +365,7 @@ def test_ledger_is_bound_to_the_whole_holdout_summary(make_env, df, key):
     lock = make_lock(df, params=(2.0, 0.7, 0.5)) if key == "params" else make_lock(df, n_a=3 if key == "n_trades" else 2)
     if key == "data_sha256":
         lock["data"]["sha256"] = "0" * 64
-    other = make_env(lock=lock)  # same lock sha256 and last bar as the ledger's
+    other = make_env(lock=lock)  # same last bar (data_sha256 / n_trades: same lock sha256 too) as the ledger's
     with pytest.raises(PaperRunError, match=f"different holdout lock .*{key}") as exc:
         run_paper(other)
     assert exc.value.stage == "precheck" and other.fetch.calls == 0 and other.sender.texts == []

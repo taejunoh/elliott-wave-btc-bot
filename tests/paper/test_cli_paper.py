@@ -59,6 +59,7 @@ def test_paper_run_then_status(fake_env, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "실거래 전환 판정" in out and "3. 표본 외 거래 4/50" in out and "포지션: 없음" in out
     assert "holdout trades recomputed 2 (lock: 2)" in out and "holdout data ok" in out
+    assert "discrepancies 0 (unexplained 0, environment change 0)" in out
 
 
 def test_status_without_a_ledger_fails(tmp_path, capsys):

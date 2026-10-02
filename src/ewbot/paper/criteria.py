@@ -62,14 +62,14 @@ def run_coverage(runs: list[dict[str, Any]], epoch_id: int, now_ts: int) -> dict
 
 
 def criterion4(ledger: Ledger, now_ts: int) -> dict[str, Any]:
-    """>= 28 days of paper runs, 0 UNEXPLAINED discrepancies in the epoch, >= 95% hourly coverage."""
+    """>= 28 days of paper runs, 0 UNEXPLAINED discrepancies in the epoch, >= 95% hourly coverage.
+    ENVIRONMENT_CHANGE discrepancies are counted for display only (spec 5.3: not UNEXPLAINED)."""
     cur = current_epoch(ledger)
     cov = run_coverage(ledger.runs, cur["id"], now_ts)
-    unexplained = sum(
-        1 for d in ledger.discrepancies if d["cause"] == "UNEXPLAINED" and int(d["epoch_id"]) == int(cur["id"])
-    )
+    causes = [d["cause"] for d in ledger.discrepancies if int(d["epoch_id"]) == int(cur["id"])]
+    unexplained = causes.count("UNEXPLAINED")
     met = cov["days"] >= PAPER_MIN_DAYS and unexplained == 0 and cov["coverage"] >= COVERAGE_MIN
-    return {**cov, "unexplained": unexplained, "met": met}
+    return {**cov, "unexplained": unexplained, "environment": causes.count("ENVIRONMENT_CHANGE"), "met": met}
 
 
 def golive_status(ledger: Ledger, now_ts: int) -> dict[str, Any]:
@@ -112,9 +112,10 @@ def status_lines(st: dict[str, Any]) -> list[str]:
         f"3. 표본 외 거래 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}): "
         f"{_mark(st['c3'])}"
     )
+    env = f", 실행 환경 변경 불일치 {c4['environment']}건(4번 집계 제외)" if c4.get("environment") else ""
     lines.append(
         f"4. 모의매매 재현: {_mark(c4['met'])} (운영 {c4['days']:.1f}/{PAPER_MIN_DAYS}일, 커버리지 "
-        f"{c4['coverage'] * 100:.1f}%, 원인 불명 불일치 {c4['unexplained']}건)"
+        f"{c4['coverage'] * 100:.1f}%, 원인 불명 불일치 {c4['unexplained']}건{env})"
     )
     lines.append("=> 실거래 전환 검토 가능 (자동 전환하지 않음)" if st["all_met"] else "=> 실거래 전환 검토 불가")
     return lines

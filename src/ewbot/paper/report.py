@@ -38,6 +38,18 @@ def _top_note(top: dict[str, Any] | None) -> str:
     )
 
 
+def _env_note(run: dict[str, Any] | None) -> str:
+    env = (run or {}).get("env")
+    if not env:
+        return "실행 환경: -"
+    lock = (env.get("uv_lock_sha256") or "-")[:12]
+    image = f"{env.get('image_os') or '-'} {env.get('image_version') or '-'}"
+    return (
+        f"실행 환경 {str(run.get('env_sha256', ''))[:12]}: Python {env.get('python')} · numpy {env.get('numpy')} · "
+        f"pandas {env.get('pandas')} · pyarrow {env.get('pyarrow')} · uv.lock {lock} · 이미지 {image}"
+    )
+
+
 def write_paper_report(
     path: Path,
     ledger: Ledger,
@@ -61,6 +73,7 @@ def write_paper_report(
         f"{ledger.baseline['fingerprint'][:12]} @ {ledger.baseline['commit'][:7]}",
         "홀드아웃 데이터 해시: "
         + ("일치" if last_run is None or last_run.get("holdout_data_ok", True) else "불일치 (재현성 손상 기록)"),
+        _env_note(last_run),
         position_line(ledger.open_position),
         _top_note(top_count),
         f"표본 외 구간: {_utc(start)} 이후 (홀드아웃 마지막 봉 {_utc(boundary)})",

@@ -71,6 +71,11 @@ def test_criterion4_needs_28_days_95_percent_and_no_unexplained():
     assert not criterion4(led, now)["met"]
     led.discrepancies[0]["cause"] = "DATA_REVISION"
     assert criterion4(led, now)["met"]
+    led.discrepancies[0]["cause"] = "ENVIRONMENT_CHANGE"  # warned and shown, not counted (spec 5.3)
+    c4 = criterion4(led, now)
+    assert c4["met"] and c4["unexplained"] == 0 and c4["environment"] == 1
+    line = status_lines(golive_status(led, now))[4]
+    assert "원인 불명 불일치 0건" in line and "실행 환경 변경 불일치 1건(4번 집계 제외)" in line
     led.runs = _hourly_runs(T0, hours, skip=set(range(10, 60)))  # 50 missing hours: < 95%
     assert not criterion4(led, now)["met"]
 
@@ -81,6 +86,7 @@ def test_summarize_compare_and_status_lines():
     assert st["c1"] is None and st["c2"] is None and st["c3"] is False and not st["all_met"]
     lines = status_lines(st)
     assert "미계산" in lines[1] and "3. 표본 외 거래 36/50 (홀드아웃 36 + 모의 0): 미충족" in lines[3]
+    assert "실행 환경 변경" not in lines[4]  # shown only when there is one
     assert lines[-1] == "=> 실거래 전환 검토 불가"
 
     led.criteria = summarize_compare(_cmp(), 1_704_067_200, T0, 1, T0)
@@ -122,9 +128,15 @@ def _ledger_for_report():
     led = new_ledger("fp" * 32, "c" * 40, LOCK)
     replace_epoch_trades(led, 1, [_trade(T0, T0 + 5 * H1)])
     led.runs = [{"id": "r1", "ts": T0 + 30 * H1, "status": "ok", "epoch_id": 1, "last_bar_ts": T0 + 29 * H1,
-                 "holdout_data_ok": False}]
+                 "holdout_data_ok": False,
+                 "env": {"python": "3.12.7", "numpy": "2.1.0", "pandas": "2.2.3", "pyarrow": "18.0.0",
+                         "uv_lock_sha256": "f" * 64, "image_os": "ubuntu24", "image_version": "20261001.1.0"},
+                 "env_sha256": "e" * 64}]
     led.discrepancies = [{"id": "CHANGED:ENTRY:1:1", "type": "CHANGED", "decision_id": "ENTRY:1:1",
                           "cause": "DATA_REVISION", "epoch_id": 1, "detected_ts": T0, "detected_run": "r1",
+                          "recorded": None, "recomputed": None},
+                         {"id": "CHANGED:EXIT:2:1", "type": "CHANGED", "decision_id": "EXIT:2:1",
+                          "cause": "ENVIRONMENT_CHANGE", "epoch_id": 1, "detected_ts": T0, "detected_run": "r1",
                           "recorded": None, "recomputed": None}]
     led.open_position = {"entry_ts": T0 + 20 * H1, "setup": "C_END", "direction": -1, "contracts": 4, "remaining": 2,
                          "entry_price": 100.0, "stop": 101.0, "pnl_if_closed": -3.0, "counted": True}
@@ -141,7 +153,9 @@ def test_paper_report_sections(tmp_path):
     html = path.read_text(encoding="utf-8")
     for part in ("실거래 전환 판정", "1. 위험 대비 수익", "4. 모의매매 재현", "현재 1등 카운트", "IMP d=1 W3",
                  "포지션: C_END 숏 2/4계약", "불일치 (재현성 손상 기록)", "Trades - epoch 1 (current) (1)",
-                 "CHANGED:ENTRY:1:1", "DATA_REVISION", "eq-chart", "dd-chart", "A paper", "criteria 1-2 window"):
+                 "CHANGED:ENTRY:1:1", "DATA_REVISION", "ENVIRONMENT_CHANGE", "eq-chart", "dd-chart", "A paper",
+                 "criteria 1-2 window", "실행 환경 eeeeeeeeeeee: Python 3.12.7 · numpy 2.1.0 · pandas 2.2.3 · "
+                 "pyarrow 18.0.0 · uv.lock ffffffffffff · 이미지 ubuntu24 20261001.1.0"):
         assert part in html, part
     assert html.index("실거래 전환 판정") < html.index("eq-chart")  # the go-live block is at the top
     assert sorted(os.listdir(tmp_path)) == ["report.html"]
