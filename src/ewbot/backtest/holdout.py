@@ -1,4 +1,5 @@
-"""One-shot holdout [WF_END, end) behind a lock file bound to the full run configuration."""
+"""One-shot holdout [WF_END, end) behind a lock file bound to the full run configuration, the code
+and the holdout candles."""
 
 from __future__ import annotations
 
@@ -6,24 +7,28 @@ import dataclasses
 import hashlib
 import json
 import os
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
 import pandas as pd
 
-from ewbot.backtest.runner import compare, utc_ts
-from ewbot.backtest.walkforward import GRID, WF_END, config_for, grid_combos
+from ewbot.backtest.runner import compare
+from ewbot.backtest.walkforward import GRID, HOLDOUT_START, WF_END, config_for, grid_combos
 from ewbot.config import CONSERVATIVE, BotConfig, with_overrides
 from ewbot.types import H1
 
-HOLDOUT_START = utc_ts(WF_END)  # single source: the holdout starts exactly where the walk-forward ends
+# HOLDOUT_START (imported above) is defined once, in walkforward, as utc_ts(WF_END).
 GO_LIVE_MIN_TRADES = 50  # spec 9.6 criterion 3: out-of-sample trades with frozen params (holdout + paper)
 # src/ewbot/backtest/holdout.py -> parents[3] is the repository root (src layout, editable install).
 # The default lock lives there, never in the current working directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout.lock"
-LOCK_VERSION = 2
+PACKAGE_DIR = Path(__file__).resolve().parents[1]  # src/ewbot: every *.py below it is fingerprinted
+LOCK_VERSION = 3
+_BAR_COLUMNS = ("open", "high", "low", "close", "volume")
 _CANDIDATES = ("A", "HYBRID")
 _HEADLINE_STRATEGIES = ("A", "HYBRID", "C", "BH", "EMA")
 _HEADLINE_KEYS = ("total_return", "cagr", "max_dd", "sharpe", "calmar", "n_trades")
@@ -46,14 +51,56 @@ def holdout_config(cfg: BotConfig, params: Sequence[float]) -> BotConfig:
     return with_overrides(config_for(cfg, tuple(float(p) for p in params)), **{"strategy.mode": "A"})
 
 
-def lock_digest(cfg: BotConfig, params: Sequence[float], random_runs: int = 100) -> str:
+def code_fingerprint(pkg_dir: Path | None = None) -> str:
+    """sha256 over every *.py file below pkg_dir (default PACKAGE_DIR = src/ewbot), in sorted
+    relative-path order, each as <relative path> NUL <bytes> NUL. Any edit, addition, removal or
+    rename of a source file changes it; caches and non-Python files do not."""
+    root = PACKAGE_DIR if pkg_dir is None else Path(pkg_dir)
+    h = hashlib.sha256()
+    for rel in sorted(f.relative_to(root).as_posix() for f in root.rglob("*.py") if f.is_file()):
+        h.update(rel.encode("utf-8") + b"\0" + (root / rel).read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def _git(*args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(PROJECT_ROOT), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def git_state() -> dict[str, Any]:
+    """Informational only (the binding is code_fingerprint): HEAD commit and whether tracked files
+    have uncommitted changes; None when git is unavailable."""
+    head = _git("rev-parse", "HEAD")
+    status = _git("status", "--porcelain", "--untracked-files=no")
+    return {"git_head": head.strip() if head else None, "git_dirty": None if status is None else bool(status.strip())}
+
+
+def data_fingerprint(df1h: pd.DataFrame, start_ts: int, last_ts: int) -> str:
+    """sha256 of the bars with start_ts <= ts <= last_ts: their ts (int64) and open/high/low/close/
+    volume (float64), in ts order. Bars after last_ts (newer data) do not change it."""
+    w = df1h[(df1h["ts"] >= start_ts) & (df1h["ts"] <= last_ts)].sort_values("ts")
+    h = hashlib.sha256()
+    h.update(w["ts"].to_numpy(dtype=np.int64).tobytes())
+    for col in _BAR_COLUMNS:
+        h.update(w[col].to_numpy(dtype=np.float64).tobytes())
+    return h.hexdigest()
+
+
+def lock_digest(
+    cfg: BotConfig, params: Sequence[float], random_runs: int = 100, code_sha256: str | None = None
+) -> str:
     """sha256 of the sorted JSON of everything that determines the holdout result: every field of
-    holdout_config(cfg, params), the grid values, the holdout start and the random-control size."""
+    holdout_config(cfg, params), the grid values, the holdout start, the random-control size and
+    the code fingerprint (default: code_fingerprint() of the running package)."""
     payload = {
         "config": dataclasses.asdict(holdout_config(cfg, params)),
         "grid": {k: list(v) for k, v in GRID.items()},
         "holdout_start": HOLDOUT_START,
         "random_runs": int(random_runs),
+        "code_sha256": code_fingerprint() if code_sha256 is None else code_sha256,
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -186,6 +233,25 @@ def _headline(cmp: dict[str, Any], criteria: dict[str, Any]) -> dict[str, Any]:
 # ----------------------------------------------------------------------------- run
 
 
+def _check_data(lock: dict[str, Any], df1h: pd.DataFrame, lock_path: Path) -> None:
+    """Refuse a rerun whose holdout bars up to the first run's last bar differ from the first run's
+    (revised, missing or shorter data). Newer bars after it are allowed."""
+    rec = lock.get("data")
+    if not isinstance(rec, dict) or "last_bar_ts" not in rec or "sha256" not in rec:
+        raise HoldoutError(f"{lock_path} has no data fingerprint; refusing to run - inspect it by hand")
+    last = int(rec["last_bar_ts"])
+    if int(df1h["ts"].iloc[-1]) < last:
+        raise HoldoutError(
+            f"{lock_path}: the data ends before the first run's last bar ({last}); refusing to run on "
+            "fewer holdout bars than the locked run"
+        )
+    if data_fingerprint(df1h, HOLDOUT_START, last) != rec["sha256"]:
+        raise HoldoutError(
+            f"{lock_path}: the holdout bars {HOLDOUT_START}..{last} differ from the locked run's data "
+            "(revised or missing candles); refusing to run"
+        )
+
+
 def run_holdout(
     cfg: BotConfig,
     df1h: pd.DataFrame,
@@ -195,18 +261,23 @@ def run_holdout(
     *,
     random_runs: int = 100,
     workers: int = 1,
+    params_source: str = "explicit",
 ) -> dict[str, Any]:
     """Run A / C / HYBRID / BH / EMA / RANDOM on [HOLDOUT_START, last bar] with `params`
     (K4, Q_MIN, S_MIN), once per configuration.
 
     Checked before anything is written: confirm=True; params are a GRID combo; circuit breakers on;
     the conservative risk profile; random_runs >= 1; data at/after HOLDOUT_START.
-    The lock (default DEFAULT_LOCK_PATH = <project root>/holdout.lock, independent of the CWD) is
-    bound to lock_digest(cfg, params, random_runs) - every config field, the grid, the holdout start
-    and the random-control size - and is written BEFORE the run, so a crash cannot be used to retune.
-    Re-running the identical configuration is allowed (e.g. later, with more data); anything else is
-    refused. The first completed run's window and headline metrics are recorded in the lock and
-    never overwritten."""
+    The lock (DEFAULT_LOCK_PATH = <project root>/holdout.lock, independent of the CWD; `lock_path`
+    exists for tests only - the CLI cannot change it) is bound to lock_digest(cfg, params,
+    random_runs) - every config field, the grid, the holdout start, the random-control size and the
+    code fingerprint of src/ewbot - and to data_fingerprint of the holdout bars the first attempt saw.
+    It is written BEFORE the run, so a crash cannot be used to retune. Re-running is allowed only
+    with the identical configuration and code and the identical holdout bars up to the first
+    attempt's last bar (newer bars may be appended); anything else is refused.
+    Every run records params_source ("explicit" or "walkforward:<path>#chosen_final"), the git HEAD
+    and dirty flag (informational) and, once completed, its headline metrics. The first completed
+    run's window and headline are also kept in `first_run` and never overwritten."""
     if not confirm:
         raise HoldoutError("the holdout is single-use: pass confirm=True (CLI: --confirm) to run it")
     combo = _validate(cfg, params, random_runs)
@@ -217,21 +288,36 @@ def run_holdout(
     end_ts = last_bar + H1
     lock_path = _default_lock_path() if lock_path is None else Path(lock_path)
     run_cfg = holdout_config(cfg, combo)
-    digest = lock_digest(cfg, combo, random_runs)
+    code_sha = code_fingerprint()
+    digest = lock_digest(cfg, combo, random_runs, code_sha256=code_sha)
     config_json = json.loads(json.dumps(dataclasses.asdict(run_cfg)))
 
-    run: dict[str, Any] = {"started": _now(), "end_ts": end_ts, "last_bar_ts": last_bar, "completed": None}
+    run: dict[str, Any] = {
+        "started": _now(),
+        "end_ts": end_ts,
+        "last_bar_ts": last_bar,
+        "params_source": params_source,
+        **git_state(),
+        "completed": None,
+    }
     if lock_path.exists():
         lock = _read_lock(lock_path)
         if lock.get("sha256") != digest:
             changed = _changed_keys(
-                {"params": lock.get("params"), "config": lock.get("config"), "random_runs": lock.get("random_runs")},
-                {"params": list(combo), "config": config_json, "random_runs": int(random_runs)},
+                {
+                    "params": lock.get("params"),
+                    "config": lock.get("config"),
+                    "random_runs": lock.get("random_runs"),
+                    "code_sha256": lock.get("code_sha256"),
+                },
+                {"params": list(combo), "config": config_json, "random_runs": int(random_runs), "code_sha256": code_sha},
             )
             raise HoldoutError(
                 f"{lock_path} is locked to params {lock.get('params')} (sha256 {str(lock.get('sha256'))[:12]}); "
-                f"refusing to run a different configuration (params {list(combo)}; changed: {changed or 'unknown'})"
+                f"refusing to run a different configuration or code (params {list(combo)}; changed: "
+                f"{changed or 'unknown'})"
             )
+        _check_data(lock, df1h, lock_path)
         lock.setdefault("runs", []).append(run)
     else:
         lock = {
@@ -240,19 +326,27 @@ def run_holdout(
             "params": list(combo),
             "sha256": digest,
             "params_sha256": params_digest(combo),
+            "code_sha256": code_sha,
             "config": config_json,
             "grid": {k: list(v) for k, v in GRID.items()},
             "holdout_start": HOLDOUT_START,
             "random_runs": int(random_runs),
+            "data": {
+                "start_ts": HOLDOUT_START,
+                "last_bar_ts": last_bar,
+                "n_bars": int((ts >= HOLDOUT_START).sum()),
+                "sha256": data_fingerprint(df1h, HOLDOUT_START, last_bar),
+            },
             "first_run": None,
             "runs": [run],
         }
     _write_lock(lock_path, lock)
 
-    cmp = compare(run_cfg, df1h, HOLDOUT_START, end_ts, random_runs=random_runs, workers=workers)
+    cmp = compare(run_cfg, df1h, HOLDOUT_START, end_ts, random_runs=random_runs, workers=workers, allow_holdout=True)
     criteria = evaluate_criteria(cmp)
 
     run["completed"] = _now()
+    run.update(_headline(cmp, criteria))
     if lock.get("first_run") is None:
         lock["first_run"] = {
             "started": run["started"],

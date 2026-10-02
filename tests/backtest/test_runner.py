@@ -6,6 +6,7 @@ import pytest
 from ewbot.backtest import runner
 from ewbot.backtest.benchmarks import RandomEntryStrategy
 from ewbot.backtest.runner import breakdowns, compare, utc_ts
+from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.config import BotConfig
 from ewbot.engine.loop import EngineResult, EquityPoint
 
@@ -14,11 +15,11 @@ H = 3600
 N = 1000
 
 
-def _df() -> pd.DataFrame:
+def _df(t0: int = T0) -> pd.DataFrame:
     px = [100.0 + 10.0 * ((i // 50) % 4) - 0.01 * i for i in range(N)]  # saw-tooth, positive
     return pd.DataFrame(
         {
-            "ts": [T0 + i * H for i in range(N)],
+            "ts": [t0 + i * H for i in range(N)],
             "open": px,
             "high": [p + 1 for p in px],
             "low": [p - 1 for p in px],
@@ -34,12 +35,14 @@ class FakeEngine:
 
     random_strategies: list = []
     trade_factory = None
+    runs: list = []
 
     def __init__(self, cfg, strategy):
         self.strategy = strategy
 
     def run(self, df1h, start_ts=None, end_ts=None):
         name = self.strategy.name
+        FakeEngine.runs.append((name, start_ts, end_ts))
         mk = FakeEngine.trade_factory
         if name == "A":
             trades = (
@@ -65,6 +68,7 @@ def patched(monkeypatch, mk_trade):
     from types import SimpleNamespace
 
     FakeEngine.random_strategies = []
+    FakeEngine.runs = []
     FakeEngine.trade_factory = staticmethod(mk_trade)
     monkeypatch.setattr(runner, "TradingEngine", FakeEngine)
     monkeypatch.setattr(runner, "make_strategy", lambda sp: SimpleNamespace(name=sp.mode))
@@ -129,3 +133,27 @@ def test_breakdowns_per_year_boundaries(mk_trade):
     assert list(bd["per_year"]) == ["2020", "2021"]
     assert bd["per_year"]["2020"]["n_trades"] == 1 and bd["per_year"]["2021"]["n_trades"] == 1
     assert bd["per_year"]["2021"]["total_return"] > 0
+
+
+def test_run_backtest_refuses_the_holdout_unless_allowed(patched):
+    cfg = BotConfig()
+    with pytest.raises(ValueError, match="holdout"):
+        runner.run_backtest(cfg, _df(), T0, HOLDOUT_START + H)  # end after the walk-forward boundary
+    spanning = _df(t0=HOLDOUT_START - 500 * H)  # 500 bars before 2024-01-01, 500 at/after it
+    with pytest.raises(ValueError, match="holdout"):
+        runner.run_backtest(cfg, spanning)  # no end_ts: the engine would run into the holdout bars
+    assert patched.runs == []  # refused before the engine ran
+    runner.run_backtest(cfg, spanning, None, HOLDOUT_START)  # ends exactly at the boundary: fine
+    runner.run_backtest(cfg, spanning, None, None, allow_holdout=True)  # holdout.run_holdout only
+    assert [r[2] for r in patched.runs] == [HOLDOUT_START, None]
+
+
+def test_compare_refuses_the_holdout_unless_allowed(patched):
+    end = utc_ts("2025-01-01")
+    with pytest.raises(ValueError, match="holdout"):
+        compare(BotConfig(), _df(), T0, end, random_runs=1)
+    assert patched.runs == []  # nothing ran: not A/C/HYBRID, not the random control
+    cmp = compare(BotConfig(), _df(), T0, end, random_runs=1, allow_holdout=True)
+    assert cmp["period"] == {"start": T0, "end": end}
+    assert {r[0] for r in patched.runs} == {"A", "C", "HYBRID", "RANDOM"}
+    compare(BotConfig(), _df(), T0, HOLDOUT_START, random_runs=0)  # up to the boundary: fine

@@ -2,7 +2,9 @@
 
 candles (fill_gaps, wick clip) -> WaveEngine -> ChochDetector -> strategies A / C / HYBRID ->
 sizing + breakers -> PaperBroker -> Trade / EquityPoint -> metrics, benchmarks, random control.
-Two years of 1h bars from tests/synth.py (seed 0 stays between ~7.4k and ~24.8k).
+Two years of 1h bars from tests/synth.py (seed 0 stays between ~7.4k and ~24.8k), moved back by
+156 whole weeks (2020-11-18 .. 2022-11-18) so that nothing reaches the 2024-01-01 holdout boundary
+that run_backtest / compare refuse to cross.
 """
 
 from __future__ import annotations
@@ -14,12 +16,14 @@ import pandas as pd
 import pytest
 
 from ewbot.backtest.runner import compare, run_backtest
+from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.config import SETUPS, BotConfig, BreakerParams, CostParams, with_overrides
 from ewbot.data.candles import fill_gaps
 from ewbot.types import H1
 from tests.synth import random_bars
 
 N_BARS = 2 * 8760  # two years of 1h bars
+SHIFT = 156 * 7 * 24 * H1  # whole weeks keep the weekday / hour-of-week layout of tests/synth
 WARMUP_H = 40 * 24  # > 200 4h bars of wave-engine warm-up before entries are allowed
 MODES = ("A", "C", "HYBRID")
 SETUPS_OF = {"A": set(SETUPS), "C": {"FIB"}, "HYBRID": set(SETUPS) | {"FIB"}}
@@ -30,7 +34,7 @@ def synth_frame() -> pd.DataFrame:
     bars = random_bars(seed=0, n=N_BARS, vol=30.0, start=20_000.0)
     df = pd.DataFrame(
         {
-            "ts": np.array([b.ts for b in bars], dtype=np.int64),
+            "ts": np.array([b.ts - SHIFT for b in bars], dtype=np.int64),
             "open": [b.open for b in bars],
             "high": [b.high for b in bars],
             "low": [b.low for b in bars],
@@ -60,6 +64,7 @@ def cmp(synth):
 def test_synthetic_frame_is_a_valid_positive_price_path(synth):
     df = synth[0]
     assert len(df) == N_BARS and int(df["synthetic"].sum()) == 3
+    assert int(df["ts"].max()) < HOLDOUT_START
     assert float(df["low"].min()) > 1_000.0
 
 

@@ -29,10 +29,42 @@ def equity_pairs(equity: Sequence[EquityPoint]) -> list[tuple[int, float]]:
     return [(p.ts, p.equity) for p in equity]
 
 
+def _holdout_start() -> int:
+    from ewbot.backtest.walkforward import HOLDOUT_START  # deferred: walkforward imports this module
+
+    return HOLDOUT_START
+
+
+def check_before_holdout(df1h: pd.DataFrame, end_ts: int | None, allow_holdout: bool = False) -> None:
+    """Raise ValueError if a run over df1h up to end_ts (exclusive; None = every bar) would see a bar
+    at/after HOLDOUT_START. Only holdout.run_holdout passes allow_holdout=True."""
+    if allow_holdout:
+        return
+    hs = _holdout_start()
+    if end_ts is None:
+        if len(df1h) and int(df1h["ts"].max()) >= hs:
+            raise ValueError(
+                "df1h has bars in the holdout (2024-01-01 onwards) and no end_ts: pass end_ts <= "
+                "HOLDOUT_START (only holdout.run_holdout may pass allow_holdout=True)"
+            )
+    elif end_ts > hs:
+        raise ValueError(
+            f"end_ts {end_ts} reaches into the holdout (HOLDOUT_START = {hs}); research runs must end by "
+            "it (only holdout.run_holdout may pass allow_holdout=True)"
+        )
+
+
 def run_backtest(
-    cfg: BotConfig, df1h: pd.DataFrame, start_ts: int | None = None, end_ts: int | None = None
+    cfg: BotConfig,
+    df1h: pd.DataFrame,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    *,
+    allow_holdout: bool = False,
 ) -> EngineResult:
-    """One TradingEngine run with the strategy selected by cfg.strategy.mode."""
+    """One TradingEngine run with the strategy selected by cfg.strategy.mode. Refuses (ValueError)
+    to run into the holdout unless allow_holdout=True (see check_before_holdout)."""
+    check_before_holdout(df1h, end_ts, allow_holdout)
     engine = TradingEngine(cfg, make_strategy(cfg.strategy))
     return engine.run(df1h, start_ts, end_ts)
 
@@ -66,25 +98,32 @@ def breakdowns(res: EngineResult, start_ts: int, end_ts: int) -> dict[str, Any]:
 _STATE: dict[str, Any] = {}
 
 
-def _init_worker(cfg: BotConfig, df1h: pd.DataFrame, start_ts: int, end_ts: int) -> None:
-    _STATE.update(cfg=cfg, df=df1h, start=start_ts, end=end_ts)
+def _init_worker(cfg: BotConfig, df1h: pd.DataFrame, start_ts: int, end_ts: int, allow_holdout: bool) -> None:
+    _STATE.update(cfg=cfg, df=df1h, start=start_ts, end=end_ts, allow_holdout=allow_holdout)
 
 
 def _task(spec: tuple) -> EngineResult:
     cfg: BotConfig = _STATE["cfg"]
-    df, start, end = _STATE["df"], _STATE["start"], _STATE["end"]
+    df, start, end, allow = _STATE["df"], _STATE["start"], _STATE["end"], _STATE["allow_holdout"]
     if spec[0] == "mode":
-        return run_backtest(with_overrides(cfg, **{"strategy.mode": spec[1]}), df, start, end)
+        return run_backtest(with_overrides(cfg, **{"strategy.mode": spec[1]}), df, start, end, allow_holdout=allow)
     _, seed, refs, n_signals = spec
+    check_before_holdout(df, end, allow)
     strat = RandomEntryStrategy(cfg.strategy, refs, n_signals, (start, end), seed)
     res = TradingEngine(cfg, strat).run(df, start, end)
     return dataclasses.replace(res, signals=())  # keep the pickle back to the parent small
 
 
 def _map_tasks(
-    specs: list[tuple], workers: int, cfg: BotConfig, df1h: pd.DataFrame, start_ts: int, end_ts: int
+    specs: list[tuple],
+    workers: int,
+    cfg: BotConfig,
+    df1h: pd.DataFrame,
+    start_ts: int,
+    end_ts: int,
+    allow_holdout: bool,
 ) -> list[EngineResult]:
-    initargs = (cfg, df1h, start_ts, end_ts)
+    initargs = (cfg, df1h, start_ts, end_ts, allow_holdout)
     if workers <= 1 or len(specs) <= 1:
         _init_worker(*initargs)
         return [_task(s) for s in specs]
@@ -112,14 +151,20 @@ def compare(
     end_ts: int,
     random_runs: int = 100,
     workers: int = 1,
+    *,
+    allow_holdout: bool = False,
 ) -> dict[str, Any]:
     """Run A, C, HYBRID (same cfg, only strategy.mode differs), buy&hold, EMA 50/200 and
     `random_runs` RandomEntryStrategy runs over [start_ts, end_ts) with identical costs.
+    Refuses (ValueError, before anything runs) an end_ts after HOLDOUT_START unless
+    allow_holdout=True, which only holdout.run_holdout passes.
 
     Returns {"period", "comparison": {name: Metrics dict}, "random": {...}, "equity": {name:
     [(ts, equity)]}, "ci": {name: {...}}, "breakdown": {name: {...}}, "trades": {name: [Trade]}}.
     """
-    results = dict(zip(MODES, _map_tasks([("mode", m) for m in MODES], workers, cfg, df1h, start_ts, end_ts)))
+    check_before_holdout(df1h, end_ts, allow_holdout)
+    mode_specs = [("mode", m) for m in MODES]
+    results = dict(zip(MODES, _map_tasks(mode_specs, workers, cfg, df1h, start_ts, end_ts, allow_holdout)))
 
     equity: dict[str, list[tuple[int, float]]] = {}
     trades: dict[str, list[Trade]] = {}
@@ -157,7 +202,7 @@ def compare(
     rand_metrics: list[Metrics] = []
     if random_runs > 0 and n_signals > 0:
         specs = [("random", cfg.seed + k, a_trades, n_signals) for k in range(random_runs)]
-        for r in _map_tasks(specs, workers, cfg, df1h, start_ts, end_ts):
+        for r in _map_tasks(specs, workers, cfg, df1h, start_ts, end_ts, allow_holdout):
             rand_metrics.append(compute_metrics(r.equity, r.trades, start_ts, end_ts))
     random: dict[str, Any] = {"runs": len(rand_metrics), "n_signals": n_signals, "dist": {}, "beaten_by": {}}
     if rand_metrics:

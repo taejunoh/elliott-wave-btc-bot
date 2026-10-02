@@ -25,9 +25,11 @@ GRID: dict[str, tuple[float, ...]] = {
     "strategy.S_MIN": (0.0, 0.25, 0.5),
 }
 WF_START = "2017-01-01"
-# Single source of the walk-forward / holdout boundary: the holdout (holdout.HOLDOUT_START) starts
-# here, and walk_forward() drops every bar at/after it before anything runs.
+# Single source of the walk-forward / holdout boundary: the holdout starts here, walk_forward() drops
+# every bar at/after it before anything runs, runner.run_backtest / compare refuse to cross it unless
+# holdout.run_holdout asks them to, and every CLI command except `holdout` cuts its data here.
 WF_END = "2024-01-01"
+HOLDOUT_START = utc_ts(WF_END)
 # spec 9.3: a combo needs this many trades in a 24-month training window. A degeneracy floor for
 # the Calmar objective, not a power criterion (2017-2023: about 8-13 trades/year).
 MIN_TRAIN_TRADES = 12

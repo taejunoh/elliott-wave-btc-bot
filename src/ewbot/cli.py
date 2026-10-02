@@ -1,4 +1,9 @@
-"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout."""
+"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout.
+
+Holdout isolation: every command except `holdout` cuts the candle frame to ts < HOLDOUT_START
+(2024-01-01) right after loading it, before any engine run, benchmark or report candle sees it, and
+an explicit --start at/after HOLDOUT_START or --end after it is refused (exit 2). runner.run_backtest
+and runner.compare refuse the holdout on their own as well (defence in depth)."""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 import pandas as pd
 
@@ -17,7 +22,7 @@ from ewbot.backtest.holdout import HoldoutError, run_holdout
 from ewbot.backtest.metrics import compute_metrics, reliability_by_q
 from ewbot.backtest.report import to_jsonable, write_report
 from ewbot.backtest.runner import breakdowns, compare, equity_pairs, run_backtest, utc_ts
-from ewbot.backtest.walkforward import GRID, MIN_TRAIN_TRADES, walk_forward
+from ewbot.backtest.walkforward import GRID, HOLDOUT_START, MIN_TRAIN_TRADES, WF_END, walk_forward
 from ewbot.config import AGGRESSIVE, CONSERVATIVE, BotConfig, load_config, with_overrides
 from ewbot.data.candles import aggregate_4h, check_integrity, fill_gaps, load_1h
 from ewbot.data.coinbase_history import update_cache
@@ -35,7 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--profile", choices=("conservative", "aggressive"), default=None, help="risk profile override")
     common.add_argument("--mode", choices=("A", "C", "HYBRID"), default=None, help="strategy for `backtest` (compare runs all three)")
     common.add_argument("--start", default=None, help="UTC date YYYY-MM-DD (default: first bar)")
-    common.add_argument("--end", default=None, help="UTC date YYYY-MM-DD, exclusive (default: after the last bar)")
+    common.add_argument(
+        "--end", default=None, help=f"UTC date YYYY-MM-DD, exclusive, at most {WF_END} (default: after the last bar before it)"
+    )
     common.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1), help="parallel processes")
     common.add_argument("--out", type=Path, default=None, help="output HTML path (default: reports/<command>.html)")
     common.add_argument("--product", default="BTC-USD")
@@ -46,11 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_cmp = sub.add_parser("compare", parents=[common], help="A, C, HYBRID vs buy&hold, EMA 50/200 and random entries")
     p_cmp.add_argument("--random-runs", type=int, default=100)
     sub.add_parser("walkforward", parents=[common], help="60-combo walk-forward on 2017-01..2023-12")
-    p_ho = sub.add_parser("holdout", parents=[common], help="ONE-SHOT evaluation on 2024-01-01..end")
+    p_ho = sub.add_parser(
+        "holdout", parents=[common], help="ONE-SHOT evaluation on 2024-01-01..end (lock: <project root>/holdout.lock)"
+    )
     p_ho.add_argument("--random-runs", type=int, default=100)
     p_ho.add_argument("--params", default=None, help="K4,Q_MIN,S_MIN e.g. 3.0,0.6,0.25")
     p_ho.add_argument("--params-from", type=Path, default=None, help="reports/walkforward.json (uses chosen_final)")
-    p_ho.add_argument("--lock", type=Path, default=None, help="lock file (default: <project root>/holdout.lock)")
     p_ho.add_argument("--confirm", action="store_true", help="required: acknowledge the holdout is single-use")
     return parser
 
@@ -68,19 +76,52 @@ def _load_cfg(args: argparse.Namespace) -> BotConfig:
     return cfg
 
 
-def _load_df(args: argparse.Namespace) -> pd.DataFrame:
+def _refuse(msg: str) -> NoReturn:
+    print(f"refusing: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _load_df(args: argparse.Namespace, *, holdout: bool = False) -> pd.DataFrame:
+    """The gap-filled 1h frame. Unless holdout=True (only `ewbot holdout`), every bar at/after
+    HOLDOUT_START is dropped HERE, before anything else can see it."""
     path = Path(args.cache_dir) / f"{args.product}_1h.parquet"
     if not path.exists():
         raise SystemExit(f"candle cache not found: {path} - run `ewbot fetch` first")
     raw = load_1h(path)
+    note = ""
+    if not holdout:
+        n_all = len(raw)
+        raw = raw[raw["ts"] < HOLDOUT_START].reset_index(drop=True)
+        if raw.empty:
+            raise SystemExit(f"no bars before {WF_END} in {path}")
+        note = f", {n_all - len(raw)} bars at/after {WF_END} excluded (holdout)"
     rep = check_integrity(raw)
-    print(f"[data] {rep.n} bars, {len(rep.missing_ts)} missing, {len(rep.duplicate_ts)} duplicate", file=sys.stderr)
+    print(
+        f"[data] {rep.n} bars, {len(rep.missing_ts)} missing, {len(rep.duplicate_ts)} duplicate{note}",
+        file=sys.stderr,
+    )
     return fill_gaps(raw)
 
 
+def _requested_window(args: argparse.Namespace) -> tuple[int | None, int | None]:
+    """Explicit --start/--end as epoch seconds (None when not given). Research commands never reach
+    into the holdout: --start at/after HOLDOUT_START or --end after it is refused with exit code 2."""
+    start = utc_ts(args.start) if args.start else None
+    end = utc_ts(args.end) if args.end else None
+    if (start is not None and start >= HOLDOUT_START) or (end is not None and end > HOLDOUT_START):
+        _refuse(
+            f"--start {args.start} / --end {args.end} reach into the holdout ({WF_END} onwards). Research "
+            f"windows must end by {WF_END}; the holdout is evaluated once, with `ewbot holdout`."
+        )
+    return start, end
+
+
 def _range(args: argparse.Namespace, df: pd.DataFrame) -> tuple[int, int]:
-    start = utc_ts(args.start) if args.start else int(df["ts"].iloc[0])
-    end = utc_ts(args.end) if args.end else int(df["ts"].iloc[-1]) + H1
+    """[start, end): explicit --start/--end (checked by _requested_window), else the first bar and
+    one hour after the last bar of the (already cut) frame."""
+    req_start, req_end = _requested_window(args)
+    start = req_start if req_start is not None else int(df["ts"].iloc[0])
+    end = req_end if req_end is not None else int(df["ts"].iloc[-1]) + H1
     if end <= start:
         raise SystemExit("--end must be after --start")
     return start, end
@@ -142,6 +183,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
+    _requested_window(args)  # refuse holdout dates before touching any data
     cfg, df = _load_cfg(args), _load_df(args)
     start, end = _range(args, df)
     t0 = time.perf_counter()
@@ -168,6 +210,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
+    _requested_window(args)  # refuse holdout dates before touching any data
     cfg, df = _load_cfg(args), _load_df(args)
     start, end = _range(args, df)
     t0 = time.perf_counter()
@@ -229,9 +272,11 @@ def cmd_walkforward(args: argparse.Namespace) -> int:
     return 0
 
 
-def _parse_params(args: argparse.Namespace) -> tuple[float, ...]:
+def _parse_params(args: argparse.Namespace) -> tuple[tuple[float, ...], str]:
+    """(K4, Q_MIN, S_MIN) and their provenance: "explicit" or "walkforward:<path>#chosen_final"."""
     if args.params:
         vals = tuple(float(x) for x in args.params.split(","))
+        source = "explicit"
     elif args.params_from:
         wf = json.loads(Path(args.params_from).read_text(encoding="utf-8"))
         chosen = wf.get("chosen_final")
@@ -243,21 +288,24 @@ def _parse_params(args: argparse.Namespace) -> tuple[float, ...]:
                 "last fold (no selectable combo there); pass --params explicitly if you accept it"
             )
         vals = tuple(float(x) for x in chosen)
+        source = f"walkforward:{args.params_from}#chosen_final"
     else:
         raise SystemExit("holdout needs --params K4,Q_MIN,S_MIN or --params-from reports/walkforward.json")
     if len(vals) != len(GRID):
         raise SystemExit(f"expected {len(GRID)} params for {list(GRID)}, got {len(vals)}")
-    return vals
+    return vals, source
 
 
 def cmd_holdout(args: argparse.Namespace) -> int:
     if not args.confirm:
         print("refusing: the holdout is single-use. Re-run with --confirm once you are done tuning.", file=sys.stderr)
         return 2
-    params = _parse_params(args)
-    cfg, df = _load_cfg(args), _load_df(args)
-    try:
-        out = run_holdout(cfg, df, params, lock_path=args.lock, confirm=True, random_runs=args.random_runs, workers=args.workers)
+    params, source = _parse_params(args)
+    cfg, df = _load_cfg(args), _load_df(args, holdout=True)
+    try:  # the lock is always DEFAULT_LOCK_PATH (<project root>/holdout.lock): not a CLI choice
+        out = run_holdout(
+            cfg, df, params, confirm=True, random_runs=args.random_runs, workers=args.workers, params_source=source
+        )
     except HoldoutError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 2
@@ -271,6 +319,13 @@ def cmd_holdout(args: argparse.Namespace) -> int:
     sections = _compare_sections(cmp, df, out["criteria"]["trade_count"] + notes)
     sections["criteria"] = out["criteria"]
     print(f"report: {write_report(_out(args), 'Holdout 2024-01-01..end (one-shot)', sections)}")
+    lock = out["lock_path"]
+    print(
+        f"\nholdout lock written: {lock} (sha256 {out['sha256'][:12]}).\n"
+        "Commit it NOW - it is the permanent record that the holdout has been used (not done automatically):\n"
+        f'  git add "{lock}"\n'
+        f'  git commit -m "chore(holdout): record holdout run {out["sha256"][:12]}"'
+    )
     return 0
 
 

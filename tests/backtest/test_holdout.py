@@ -29,9 +29,11 @@ def _m(sharpe, calmar, dd=0.1, n=60):
     return {"sharpe": sharpe, "calmar": calmar, "max_dd": dd, "n_trades": n}
 
 
-def _fake_compare_factory(calls):
-    def fake(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1):
+def _fake_compare_factory(calls, allowed=None):
+    def fake(cfg, df1h, start_ts, end_ts, random_runs=100, workers=1, *, allow_holdout=False):
         calls.append((cfg, start_ts, end_ts, random_runs))
+        if allowed is not None:
+            allowed.append(allow_holdout)
         return {
             "comparison": {
                 "A": _m(1.0, 2.0),
@@ -77,8 +79,8 @@ def test_requires_confirm_and_writes_nothing(tmp_path, df, monkeypatch):
 
 
 def test_lock_created_rerun_same_ok_different_refused(tmp_path, df, monkeypatch):
-    calls = []
-    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls))
+    calls, allowed = [], []
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls, allowed))
     lock = tmp_path / "sub" / "holdout.lock"
     out = run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=7)
     data = json.loads(lock.read_text())
@@ -91,6 +93,7 @@ def test_lock_created_rerun_same_ok_different_refused(tmp_path, df, monkeypatch)
     assert (cfg_used.wave.K4, cfg_used.strategy.Q_MIN, cfg_used.strategy.S_MIN) == PARAMS
     assert out["window"] == (start, end) and out["sha256"] == data["sha256"]
     assert out["lock_path"] == str(lock)
+    assert allowed == [True]  # the only caller that may let compare() into the holdout
 
     run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=7)  # identical: allowed
     assert len(json.loads(lock.read_text())["runs"]) == 2
@@ -319,3 +322,103 @@ def test_trade_count_lines_state_out_of_sample_progress():
     assert crit["n_trades"] == {"A": 27, "HYBRID": 60}
     assert crit["trade_count"][0] == "A: 표본 외 거래 27/50 — paper 모드로 누적 필요; 실거래 전환 기준 미충족"
     assert crit["n_trades_ok"] is False and crit["automatic_criteria_met"] is False
+
+
+# ----------------------------------------------------------------------------- code / data fingerprints
+
+
+def test_code_fingerprint_covers_every_package_source_file(tmp_path):
+    pkg = tmp_path / "pkg"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "a.py").write_text("x = 1\n")
+    (pkg / "sub" / "b.py").write_text("y = 2\n")
+    base = holdout.code_fingerprint(pkg)
+    assert len(base) == 64 and base == holdout.code_fingerprint(pkg)
+    (pkg / "sub" / "__pycache__").mkdir()
+    (pkg / "sub" / "__pycache__" / "b.cpython-312.pyc").write_bytes(b"\0junk")
+    (pkg / "notes.txt").write_text("not code")
+    assert holdout.code_fingerprint(pkg) == base  # only *.py sources count
+    (pkg / "sub" / "b.py").write_text("y = 3\n")
+    changed = holdout.code_fingerprint(pkg)
+    assert changed != base
+    (pkg / "c.py").write_text("")
+    assert holdout.code_fingerprint(pkg) != changed  # a new module counts too
+    assert holdout.PACKAGE_DIR == Path(holdout.__file__).resolve().parents[1]  # src/ewbot
+
+
+def test_lock_digest_binds_the_code_fingerprint(monkeypatch):
+    base = holdout.lock_digest(BotConfig(), PARAMS)
+    assert base == holdout.lock_digest(BotConfig(), PARAMS, code_sha256=holdout.code_fingerprint())
+    assert base != holdout.lock_digest(BotConfig(), PARAMS, code_sha256="0" * 64)
+
+
+def test_rerun_after_a_code_change_is_refused(tmp_path, df, monkeypatch):
+    calls = []
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls))
+    lock = tmp_path / "holdout.lock"
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    data = json.loads(lock.read_text())
+    assert data["code_sha256"] == holdout.code_fingerprint() and data["version"] == holdout.LOCK_VERSION
+    run0 = data["runs"][0]
+    assert "git_head" in run0 and "git_dirty" in run0  # informational only
+    before = lock.read_text()
+    monkeypatch.setattr(holdout, "code_fingerprint", lambda pkg=None: "f" * 64)  # e.g. a retuned strategy file
+    with pytest.raises(HoldoutError, match="code_sha256"):
+        run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    assert lock.read_text() == before and len(calls) == 1
+
+
+def test_data_fingerprint_is_the_holdout_window_prefix(df):
+    last = int(df["ts"].iloc[-1])
+    fp = holdout.data_fingerprint(df, HOLDOUT_START, last)
+    assert len(fp) == 64
+    warm = df.copy()
+    warm.loc[warm["ts"] < HOLDOUT_START, "close"] = 2.0  # warm-up bars are not part of it
+    assert holdout.data_fingerprint(warm, HOLDOUT_START, last) == fp
+    longer = pd.concat([df, df.tail(1).assign(ts=last + H)], ignore_index=True)
+    assert holdout.data_fingerprint(longer, HOLDOUT_START, last) == fp  # appended bars: same prefix
+    for col in ("open", "high", "low", "close", "volume"):
+        moved = df.copy()
+        moved.loc[moved["ts"] == HOLDOUT_START + H, col] = 1.5
+        assert holdout.data_fingerprint(moved, HOLDOUT_START, last) != fp, col
+    assert holdout.data_fingerprint(df.iloc[:-1], HOLDOUT_START, last) != fp  # a missing bar
+
+
+def test_rerun_with_changed_holdout_bars_is_refused(tmp_path, df, monkeypatch):
+    calls = []
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory(calls))
+    lock = tmp_path / "holdout.lock"
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    data = json.loads(lock.read_text())
+    last_bar = int(df["ts"].iloc[-1])
+    assert data["data"] == {
+        "start_ts": HOLDOUT_START,
+        "last_bar_ts": last_bar,
+        "n_bars": int((df["ts"] >= HOLDOUT_START).sum()),
+        "sha256": holdout.data_fingerprint(df, HOLDOUT_START, last_bar),
+    }
+    before = lock.read_text()
+    edited = df.copy()
+    edited.loc[edited["ts"] == HOLDOUT_START + 2 * H, "close"] = 0.9  # a revised holdout candle
+    with pytest.raises(HoldoutError, match="data"):
+        run_holdout(BotConfig(), edited, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    with pytest.raises(HoldoutError, match="data"):
+        run_holdout(BotConfig(), df.iloc[:-2], PARAMS, lock_path=lock, confirm=True, random_runs=5)  # shorter
+    assert lock.read_text() == before and len(calls) == 1
+    longer = pd.concat([df, df.tail(3).assign(ts=[last_bar + k * H for k in (1, 2, 3)])], ignore_index=True)
+    run_holdout(BotConfig(), longer, PARAMS, lock_path=lock, confirm=True, random_runs=5)  # newer bars: fine
+    assert len(calls) == 2 and json.loads(lock.read_text())["data"]["last_bar_ts"] == last_bar
+
+
+def test_runs_record_params_provenance_and_their_own_headline(tmp_path, df, monkeypatch):
+    monkeypatch.setattr(holdout, "compare", _fake_compare_factory([]))
+    lock = tmp_path / "holdout.lock"
+    src = "walkforward:reports/walkforward.json#chosen_final"
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5, params_source=src)
+    run_holdout(BotConfig(), df, PARAMS, lock_path=lock, confirm=True, random_runs=5)
+    runs = json.loads(lock.read_text())["runs"]
+    assert [r["params_source"] for r in runs] == [src, "explicit"]
+    for r in runs:
+        assert r["completed"] is not None
+        assert r["headline"]["A"] == {"sharpe": 1.0, "calmar": 2.0, "max_dd": 0.1, "n_trades": 60}
+        assert r["criteria"]["automatic_criteria_met"] is True
