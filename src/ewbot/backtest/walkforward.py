@@ -25,10 +25,15 @@ GRID: dict[str, tuple[float, ...]] = {
     "strategy.S_MIN": (0.0, 0.25, 0.5),
 }
 WF_START = "2017-01-01"
-WF_END = "2024-01-01"  # holdout starts here; nothing at/after this date is touched
+# Single source of the walk-forward / holdout boundary: the holdout (holdout.HOLDOUT_START) starts
+# here, and walk_forward() drops every bar at/after it before anything runs.
+WF_END = "2024-01-01"
 # spec 9.3: a combo needs this many trades in a 24-month training window. A degeneracy floor for
 # the Calmar objective, not a power criterion (2017-2023: about 8-13 trades/year).
 MIN_TRAIN_TRADES = 12
+# A combo is selectable only if at least this fraction of its in-grid neighbours (itself excluded)
+# is eligible too, so a lone eligible cell cannot "win" a plateau made of itself.
+MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5
 
 Combo = tuple[float, ...]
 
@@ -61,10 +66,12 @@ def run_grid(
 ) -> dict[Combo, EngineResult]:
     """Run every combo ONCE over [start_ts, end_ts); folds later slice these single runs.
 
+    Bars at/after end_ts are dropped before any run (the engine never sees them).
     Circuit breakers are DISABLED here (breakers.enabled = False): they are a risk overlay validated
     in the holdout and in paper mode, and a TOTAL_HALT latched early in this single continuous run
-    would zero the trades of every later fold. The caller's cfg is not modified."""
+    would zero the trades of every later fold. The caller's cfg and frame are not modified."""
     cfg = with_overrides(cfg, **{"breakers.enabled": False})
+    df1h = df1h[df1h["ts"] < end_ts].reset_index(drop=True)
     combos = grid_combos()
     out: dict[Combo, EngineResult] = {}
     initargs = (cfg, df1h, start_ts, end_ts)
@@ -96,7 +103,7 @@ def folds(
     train_months: int = 24,
     test_months: int = 6,
     first_test: str = "2019-01-01",
-    last_test_end: str = "2024-01-01",
+    last_test_end: str = WF_END,
 ) -> list[tuple[int, int, int, int]]:
     """[(train_start, train_end, test_start, test_end)] as epoch seconds, rolling by test_months.
     Defaults give the 10 folds of spec 9.3 (test windows 2019H1 .. 2023H2)."""
@@ -117,13 +124,27 @@ def _grid_index(combo: Combo) -> tuple[int, ...]:
     return tuple(axis.index(v) for axis, v in zip(GRID.values(), combo))
 
 
+def _n_grid_neighbours(index: tuple[int, ...]) -> int:
+    """Number of grid cells at Chebyshev index distance exactly 1 from `index` (edges clipped)."""
+    n = 1
+    for i, axis in zip(index, GRID.values()):
+        n *= min(i + 1, len(axis) - 1) - max(i - 1, 0) + 1
+    return n - 1
+
+
+def _tie_key(x: float) -> float:
+    """x rounded to 12 significant digits: equal means of differently sized sets compare equal."""
+    return float(f"{x:.12g}")
+
+
 def pick_plateau(
     calmar: Mapping[Combo, float], n_trades: Mapping[Combo, int], min_trades: int = MIN_TRAIN_TRADES
 ) -> Combo:
     """Score(c) = mean Calmar over c's grid neighbours (Chebyshev index distance <= 1 on every
-    axis, c included), counting only combos with >= min_trades trades. Highest score wins; ties
-    go to the higher own Calmar, then to the smallest grid index. Raises ValueError if no combo
-    has enough trades."""
+    axis, c included), counting only eligible combos (>= min_trades trades, finite Calmar). A combo
+    is selectable only if it is eligible and at least MIN_ELIGIBLE_NEIGHBOUR_FRAC of its in-grid
+    neighbours (itself excluded) are eligible. Highest score wins; ties go to the higher own Calmar,
+    then to the smallest grid index. Raises ValueError if no combo is selectable."""
     valid = {
         c: float(v) for c, v in calmar.items() if n_trades.get(c, 0) >= min_trades and math.isfinite(v)
     }
@@ -132,11 +153,17 @@ def pick_plateau(
     idx = {c: _grid_index(c) for c in valid}
     best: tuple[tuple[float, float], Combo] | None = None
     for c in sorted(valid, key=lambda k: idx[k]):
-        near = [valid[o] for o in valid if max(abs(a - b) for a, b in zip(idx[c], idx[o])) <= 1]
-        key = (round(float(np.mean(near)), 12), round(valid[c], 12))
+        near = [o for o in valid if max(abs(a - b) for a, b in zip(idx[c], idx[o])) <= 1]
+        if len(near) - 1 < MIN_ELIGIBLE_NEIGHBOUR_FRAC * _n_grid_neighbours(idx[c]):
+            continue  # an (almost) isolated eligible cell is a spike, not a plateau
+        key = (_tie_key(float(np.mean([valid[o] for o in near]))), _tie_key(valid[c]))
         if best is None or key > best[0]:
             best = (key, c)
-    assert best is not None
+    if best is None:
+        raise ValueError(
+            f"no grid combo with >= {min_trades} trades has at least {MIN_ELIGIBLE_NEIGHBOUR_FRAC:.0%} "
+            "of its grid neighbours eligible"
+        )
     return best[1]
 
 
@@ -185,7 +212,11 @@ def evaluate_folds(
 ) -> dict[str, Any]:
     """Pick the plateau combo on each training window, then stitch each fold's OOS slice of
     that combo's (single-run) equity returns into one compounded equity curve. A fold with no
-    eligible combo stays flat (chosen = None)."""
+    selectable combo stays flat (chosen = None).
+
+    chosen_final is the pick of the LAST fold that picked anything; chosen_final_from_fold is that
+    fold's index and chosen_final_fallback is True when it is not the last fold (the most recent
+    training window had no selectable combo - treat that pick with suspicion)."""
     rows: list[dict[str, Any]] = []
     stitched: list[EquityPoint] = []
     oos_trades = []
@@ -193,7 +224,8 @@ def evaluate_folds(
     if fold_list:
         stitched.append(EquityPoint(ts=fold_list[0][2] - H1, equity=cur))
     chosen_final: Combo | None = None
-    for tr0, tr1, te0, te1 in fold_list:
+    chosen_final_from_fold: int | None = None
+    for k, (tr0, tr1, te0, te1) in enumerate(fold_list):
         calmar, ntr = _train_scores(results, tr0, tr1)
         try:
             chosen: Combo | None = pick_plateau(calmar, ntr, min_trades)
@@ -215,8 +247,9 @@ def evaluate_folds(
                 stitched.append(EquityPoint(ts=t, equity=cur))
             oos_trades.extend(t for t in res.trades if te0 <= t.entry_ts < te1)
             row["oos"] = dataclasses.asdict(compute_metrics(res.equity, res.trades, te0, te1))
-            chosen_final = chosen
+            chosen_final, chosen_final_from_fold = chosen, k
         rows.append(row)
+    fallback = chosen_final_from_fold is not None and chosen_final_from_fold != len(fold_list) - 1
     return {
         "keys": list(GRID),
         "folds": rows,
@@ -224,13 +257,17 @@ def evaluate_folds(
         "stitched_metrics": dataclasses.asdict(compute_metrics(stitched, oos_trades)),
         "oos_trades": oos_trades,
         "chosen_final": chosen_final,
+        "chosen_final_from_fold": chosen_final_from_fold,
+        "chosen_final_fallback": fallback,
     }
 
 
 def walk_forward(cfg: BotConfig, df1h: pd.DataFrame, workers: int) -> dict[str, Any]:
-    """Full walk-forward over [2017-01-01, 2024-01-01). Nothing from the holdout is used.
+    """Full walk-forward over [WF_START, WF_END) = [2017-01-01, 2024-01-01). Every bar at/after
+    WF_END is dropped here, before anything runs, so nothing from the holdout can leak in.
     Grid runs have circuit breakers disabled (see run_grid); folds need MIN_TRAIN_TRADES trades."""
     start_ts, end_ts = utc_ts(WF_START), utc_ts(WF_END)
+    df1h = df1h[df1h["ts"] < end_ts].reset_index(drop=True)
     results = run_grid(cfg, df1h, start_ts, end_ts, workers)
     out = evaluate_folds(results, folds(), cfg.initial_equity)
     full = {c: compute_metrics(r.equity, r.trades, start_ts, end_ts) for c, r in results.items()}
