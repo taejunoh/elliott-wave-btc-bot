@@ -1,9 +1,12 @@
-"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout.
+"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout | paper.
 
-Holdout isolation: every command except `holdout` cuts the candle frame to ts < HOLDOUT_START
-(2024-01-01) right after loading it, before any engine run, benchmark or report candle sees it, and
-an explicit --start at/after HOLDOUT_START or --end after it is refused (exit 2). runner.run_backtest
-and runner.compare refuse the holdout on their own as well (defence in depth)."""
+Holdout isolation: every research command (backtest, compare, walkforward) cuts the candle
+frame to ts < HOLDOUT_START (2024-01-01) right after loading it, before any engine run, benchmark or
+report candle sees it, and an explicit --start at/after HOLDOUT_START or --end after it is refused
+(exit 2). runner.run_backtest and runner.compare refuse the holdout on their own as well (defence in
+depth). `holdout` is the one-shot evaluation. `paper run` (Plan 2) works on the period AFTER the
+holdout: it reads the params from the committed holdout.lock only and has no strategy or config
+options (ewbot.paper.runner)."""
 
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, NoReturn, Sequence
 
@@ -26,6 +30,10 @@ from ewbot.backtest.walkforward import GRID, HOLDOUT_START, MIN_TRAIN_TRADES, WF
 from ewbot.config import AGGRESSIVE, CONSERVATIVE, BotConfig, load_config, with_overrides
 from ewbot.data.candles import aggregate_4h, check_integrity, fill_gaps, load_1h
 from ewbot.data.coinbase_history import update_cache
+from ewbot.paper.criteria import golive_status, status_lines
+from ewbot.paper.ledger import LedgerError, current_epoch, load_ledger
+from ewbot.paper.notify import deliver, failure_text, make_event, position_line, sender_from_env
+from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
 from ewbot.types import H1
 
 DEFAULT_CONFIG = Path("config/default.yaml")
@@ -60,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_ho.add_argument("--params", default=None, help="K4,Q_MIN,S_MIN e.g. 3.0,0.6,0.25")
     p_ho.add_argument("--params-from", type=Path, default=None, help="reports/walkforward.json (uses chosen_final)")
     p_ho.add_argument("--confirm", action="store_true", help="required: acknowledge the holdout is single-use")
+
+    p_paper = sub.add_parser("paper", help="paper-trading runtime (Plan 2): hourly recompute, ledger, Telegram")
+    paper_sub = p_paper.add_subparsers(dest="paper_cmd", required=True)
+    p_run = paper_sub.add_parser("run", help="one paper run; params come from holdout.lock only")
+    p_run.add_argument("--ledger-dir", type=Path, required=True, help="paper branch worktree (ledger.json, report.html, runs.log)")
+    p_run.add_argument("--cache-dir", type=Path, default=Path("data/cache"), help="candle cache directory")
+    p_status = paper_sub.add_parser("status", help="print the ledger's go-live status (read-only, no network)")
+    p_status.add_argument("--ledger-dir", type=Path, required=True)
     return parser
 
 
@@ -338,12 +354,97 @@ def cmd_holdout(args: argparse.Namespace) -> int:
     return 0
 
 
+RUN_URL_ENV = "EWBOT_RUN_URL"  # set by .github/workflows/paper.yml: link to the Actions run log
+FAILURE_MARKER_ENV = "EWBOT_FAILURE_MARKER"  # file the workflow checks before its own fallback alert
+
+
+def _paper_env(args: argparse.Namespace) -> PaperEnv:
+    """Production wiring (tests replace this function): real lock, Coinbase, git and Telegram."""
+    return PaperEnv(ledger_dir=args.ledger_dir, cache_dir=args.cache_dir, sender=sender_from_env())
+
+
+def _alert_failure(env: PaperEnv, stage: str, message: str) -> None:
+    """Failure alert with the stage and the run-log link; on success touch the marker file so the
+    workflow's fallback step does not send a second one."""
+    if env.sender is None:
+        return
+    event = make_event("FAILURE", env.clock(), stage, failure_text(stage, message, os.environ.get(RUN_URL_ENV)))
+    _, sent, errors = deliver([event], [], env.sender, sleep=env.sleep)
+    if not sent:
+        print(f"failure alert not sent: {errors}", file=sys.stderr)
+        return
+    marker = os.environ.get(FAILURE_MARKER_ENV)
+    if marker:
+        Path(marker).write_text(stage, encoding="utf-8")
+
+
+def _paper_run(args: argparse.Namespace) -> int:
+    env = _paper_env(args)
+    try:
+        out = run_paper(env)
+    except PaperRunError as exc:
+        print(f"paper run failed at stage {exc.stage}: {exc.message}", file=sys.stderr)
+        _alert_failure(env, exc.stage, exc.message)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - alert on anything, then fail the step
+        traceback.print_exc()
+        _alert_failure(env, "unexpected", f"{type(exc).__name__}: {exc}")
+        return 1
+    count = out.status["count"]
+    print(
+        f"paper run {out.run_id}: last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(out.last_bar_ts))} UTC, "
+        f"epoch {out.epoch_id}, out-of-sample {count['total']}/{count['required']}, {out.new_decisions} new "
+        f"decision(s), {out.new_discrepancies} new discrepancy(ies), {len(out.sent)} sent, {out.pending} pending"
+    )
+    for note in out.notes:
+        print(f"note: {note}", file=sys.stderr)
+    return 0
+
+
+def _paper_status(args: argparse.Namespace) -> int:
+    try:
+        led = load_ledger(args.ledger_dir)
+    except LedgerError as exc:
+        print(f"ledger unreadable: {exc}", file=sys.stderr)
+        return 1
+    if led is None:
+        print(f"no ledger.json in {args.ledger_dir}", file=sys.stderr)
+        return 1
+    st = golive_status(led, int(time.time()))
+    for line in status_lines(st):
+        print(line)
+    print(position_line(led.open_position))
+    cur = current_epoch(led)
+    print(
+        f"epoch {cur['id']} of {len(led.epochs)}: fingerprint {cur['fingerprint'][:12]} "
+        f"(baseline {led.baseline['fingerprint'][:12]} @ {led.baseline['commit'][:7]})"
+    )
+    if led.runs:
+        r = led.runs[-1]
+        print(
+            f"last run {r['id']}: last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(r['last_bar_ts']))} UTC, "
+            f"data {r['data_sha256'][:12]}, holdout data {'ok' if r['holdout_data_ok'] else 'MISMATCH'}, "
+            f"holdout trades recomputed {r['holdout_trades_recomputed']} (lock: {led.holdout['n_trades']['A']})"
+        )
+    unexplained = sum(1 for d in led.discrepancies if d["cause"] == "UNEXPLAINED")
+    print(
+        f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)} (unexplained {unexplained}), "
+        f"pending events {len(led.pending_events)}"
+    )
+    return 0
+
+
+def cmd_paper(args: argparse.Namespace) -> int:
+    return _paper_status(args) if args.paper_cmd == "status" else _paper_run(args)
+
+
 _COMMANDS = {
     "fetch": cmd_fetch,
     "backtest": cmd_backtest,
     "compare": cmd_compare,
     "walkforward": cmd_walkforward,
     "holdout": cmd_holdout,
+    "paper": cmd_paper,
 }
 
 
