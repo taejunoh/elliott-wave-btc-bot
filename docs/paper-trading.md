@@ -25,11 +25,16 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
       ```bash
       printf 'Bot token: '; read -rs TELEGRAM_BOT_TOKEN; echo
-      curl -sS --fail-with-body "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | grep -o '"chat":{"id":-*[0-9]*' | sort -u
+      curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d if not d.get('ok') else {m['chat']['id'] for u in d['result'] for m in u.values() if isinstance(m,dict) and 'chat' in m})"
       unset TELEGRAM_BOT_TOKEN
       ```
 
-      The number after `"chat":{"id":` is your chat ID (a group chat ID starts with `-`). If nothing is printed, send the bot another message and run the three lines again.
+      The number printed in braces is your chat ID (a group chat ID starts with `-`). `set()` means the bot has not received a message yet — message the bot (not BotFather) and retry. If a dictionary with `'ok': False` is printed instead, Telegram rejected the request; its `description` says why (usually a mistyped token).
+   4. Optionally check both values with a test message (the commands are the same in bash and zsh; they print `OK` or `FAILED`):
+
+      ```bash
+      printf 'Bot token: '; read -rs TOKEN; echo; printf 'Chat ID: '; read -r CHAT; curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d chat_id="$CHAT" -d text="ewbot test" | python3 -c "import sys,json; print('OK' if json.load(sys.stdin).get('ok') else 'FAILED')"; unset TOKEN CHAT
+      ```
 3. Store both values as repository secrets. Run each command and paste the value at the prompt (so it does not end up in your shell history):
 
    ```bash
