@@ -10,30 +10,38 @@ trigger_bracket_gtc legs. Working protection is never removed before its replace
 moves edit the resting bracket when `edit_stops` is on (unconfirmed for CFM brackets: off until CANARY
 confirms it; the edit sends the order's total size, filled + left), otherwise the new bracket is placed
 first and the old one cancelled (brackets only reduce, so a short overlap cannot over-close). Only when
-the venue refuses the replacement (REJECTED: it refuses the overlap) is the old one cancelled first -
-LEG_GAP, the designed path on such a venue and not an order failure - and when the replacement then fails
-as well, the old terms are placed again at once (LEG_RESTORED). A replacement whose outcome is unknown
-(PENDING: 429 / 5xx / timeout) or that is refused for its prices (a stop through the market, an off-grid
-level: it would be refused again) keeps the old leg. A resting bracket of ours the trade does not list
-(accepted right before a crash, or a PENDING replacement that reached the venue) is taken over when its
-client order id names the trade and leg and its terms are the wanted ones (LEG_ADOPTED), else replaced
-like a leg of the trade; other brackets of ours are cancelled only once every wanted leg is in place,
-and the trade records a new stop only once every leg rests at it (STOP_MOVED). A leg that left the book is
-looked up before it is placed again: one with fills is not placed again for LEG_SETTLE_S (the position
-read may not show the fill yet, and a take-profit placed again below the market would sell at once what
-the leg already sold) - the next observe folds the fill.
+the venue refuses the replacement with a known overlap refusal (`OVERLAP_REFUSALS`, reason codes to be
+confirmed in CANARY) and our brackets plus the new leg really exceed the position is the old one
+cancelled first - LEG_GAP, the designed path on such a venue and not an order failure - and when the
+replacement then fails as well, the old terms are placed again at once (LEG_RESTORED). Any other refusal
+(order entry disabled, a price refused, an unknown reason) or an unknown outcome (PENDING: 429 / 5xx /
+timeout) keeps the old leg; an unconfirmed new leg that rests on the book (its answer lost) is found
+among the open orders at once, so two legs of one name never rest for long. A resting bracket of ours
+the trade does not list (accepted right before a crash, an unconfirmed replacement) is taken over when
+its client order id names the trade and leg and its terms are the wanted ones (LEG_ADOPTED), else
+replaced like a leg of the trade - never one whose cancel is queued; other brackets of ours are cancelled
+only once every wanted leg is in place, and the trade records a new stop only once every leg rests at it
+(STOP_MOVED). A leg that left the book is looked up before it is placed again: one with fills is not
+placed again for LEG_SETTLE_S (the position read may not show the fill yet, and a take-profit placed
+again below the market would sell at once what the leg already sold) - the next observe folds the fill.
 
-Closes cancel our brackets (a refused cancel is recorded, CANCEL_FAILED, and never blocks the close) and
-call close_position; the flat position is awaited (30 s; at once over when the IOC close ended without
-closing everything). A close that fails or is not confirmed puts the legs back at the stop in force for
-the position left, so a close that keeps failing never leaves it unprotected. Reductions (close_position
+Closes never cancel protection before the venue took the close: close_position goes out with the brackets
+resting (both only reduce); only a known close-conflict refusal (`CLOSE_CONFLICTS`: the venue refuses a
+close while brackets rest) cancels them - after a session read, deferring while it is not OPEN - and the
+close is sent again at once. The flat position is awaited (30 s; at once over when the IOC close ended
+without closing everything); the legs are then resized to the position left, or placed again when they
+were cancelled for a close that failed. Reductions (close_position
 with a size) are recorded on the trade before they are sent (`LiveTrade.pending_reduce`): a reduce with
 an unknown outcome is resolved by its client order id (`resolve_reduce`, before every read of the exchange
 state) and never followed by a second one, and a Protect planned with a reduce waits until the reduce is
 known to have filled. Market orders wait for an OPEN session; a deferred close is retried on every pass
 (spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`). An entry skipped once is never sent later (never chase).
 Client order ids are never reused: a trade rebuilt or taken over under the id of an earlier one goes on
-from the journal's highest bracket generation and close number.
+from the journal's highest bracket generation and close number. A position whose entry outcome is still
+unknown (our entry PENDING and its lookup failing) is protected at once with a provisional trade built from
+the entry's intent, settled as ours or foreign once the lookup answers; a foreign position without quotes
+is protected at the spot levels (ratio 1.0, approximate) and re-mapped at the first pass with quotes. At
+restart the trade's resting brackets are its legs again (no false UNPROTECTED).
 
 The same code runs every stage: in SHADOW the exchange is a ShadowExchange (virtual fills, real
 previews)."""
@@ -42,10 +50,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ewbot.engine.position_mgr import _tp1_split
-from ewbot.live.exchange import Exchange, ExchangeError, Order, PlaceResult
+from ewbot.live.exchange import Exchange, ExchangeError, Order, PlaceResult, Position
 from ewbot.live.journal import Journal
 from ewbot.live.pricing import map_levels
 from ewbot.live.reconcile import (
@@ -83,6 +91,14 @@ TRADE_KEY = "trade"
 SKIPS_KEY = "skipped_signals"
 ORPHAN_KEY = "orphan_closes"
 SCRATCH_KEY = "trade_scratch"  # one trade's bookkeeping (alerts sent once, legs seen filled): replaced with the trade
+CANCEL_QUEUED = "CANCEL_QUEUED"  # still on the book, about to leave it: never a leg
+# Refusal reason codes (the first token of PlaceResult.error), to be confirmed in CANARY (Task 16 step 8):
+# a bracket refused because our brackets would exceed the position (SimExchange: INSUFFICIENT_POSITION_SIZE)...
+OVERLAP_REFUSALS = frozenset({"INSUFFICIENT_POSITION_SIZE", "BRACKET_ORDER_SIZE_EXCEEDS_POSITION",
+                              "PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION"})
+# ...and a close refused because brackets rest on the position
+CLOSE_CONFLICTS = frozenset({"OPEN_BRACKET_ORDERS", "ORDER_SIZE_EXCEEDS_BRACKETED_POSITION",
+                             "PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION"})
 
 Alerter = Callable[[str, str], None]
 
@@ -103,10 +119,11 @@ def _terms(o: Order) -> tuple[int, float | None, float | None]:
     return o.size - o.filled, o.limit_price, o.stop_price
 
 
-def _refuses_prices(sent: Sent) -> bool:
-    """A refusal of the order's prices (a stop through the market, an off-grid level): a replacement refused so
-    is refused again after a cancel - not the overlap refusal the cancel-first fallback answers."""
-    return sent.status == "REJECTED" and "PRICE" in str(sent.error or "").upper()
+def _code(sent: Sent) -> str | None:
+    """The venue's reason code of a refusal (PlaceResult.error is `CODE` or `CODE: message`); None otherwise."""
+    if sent.status != "REJECTED" or not sent.error:
+        return None
+    return str(sent.error).split(":", 1)[0].strip()
 
 
 def _leg_of(name: str, o: Order) -> Leg:
@@ -129,6 +146,8 @@ class Executor:
         fill_timeout: float = FILL_TIMEOUT_S,
         flat_timeout: float = FLAT_TIMEOUT_S,
         poll_s: float = POLL_S,
+        overlap_refusals: Iterable[str] = OVERLAP_REFUSALS,
+        close_conflicts: Iterable[str] = CLOSE_CONFLICTS,
     ) -> None:
         self.ex = exchange
         self.journal = journal
@@ -140,6 +159,8 @@ class Executor:
         self.fill_timeout = fill_timeout
         self.flat_timeout = flat_timeout
         self.poll_s = poll_s
+        self.overlap_refusals = frozenset(overlap_refusals)
+        self.close_conflicts = frozenset(close_conflicts)
 
     # ------------------------------------------------------------------ state
     def trade(self) -> LiveTrade | None:
@@ -273,6 +294,7 @@ class Executor:
 
     # ------------------------------------------------------------------ actions
     def execute(self, actions: Sequence[Action], ctx: PlanContext) -> None:
+        self._settle(ctx)
         closed = True
         reduced = True  # a Protect planned with a Reduce assumes it: kept back while the reduce is not known filled
         for a in actions:
@@ -394,12 +416,12 @@ class Executor:
         own = self.journal.intent(cid)
         if own is not None and own["status"] == "PENDING":  # our entry's outcome is unknown: look it up first
             found, known = self._lookup(cid, float(own["created_ts"]))
-            if not known:
-                self._alert_once("ADOPT_DEFERRED", f"{cid}: the entry's outcome is unknown (lookup failed)")
-                return
             if found is not None:
                 self.journal.update_intent(cid, "ACCEPTED", self.clock(), order_id=found.order_id, note="found by lookup")
                 own = self.journal.intent(cid)
+            elif not known and not self._recorded(tp.signal_ts):  # protected now, settled once the lookup answers
+                self._provisional(own, pos, self._take(pos, ctx, contracts), ctx)
+                return
         if (own is not None and own["status"] == "ACCEPTED" and own["order_id"]
                 and not self._recorded(tp.signal_ts)):
             order = self.ex.get_order(str(own["order_id"]))
@@ -412,18 +434,11 @@ class Executor:
                 legs, stop = desired_legs(trade, size, trade.stop_spot, ctx.ratio, ctx.tick)
                 self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
                 return
-        if ctx.ratio is None:
-            covered = sum(o.size - o.filled for o in self.ex.open_orders()
-                          if o.kind == "BRACKET" and o.side == -pos.side and o.stop_price is not None)
-            if covered < pos.contracts:
-                self._alert_once("ADOPT_NO_QUOTES", f"position {pos.side:+d} x{pos.contracts}: no quotes to map the "
-                                                    f"engine levels, unprotected until they are back")
-            return
-        n = pos.contracts if contracts is None else min(contracts, pos.contracts)
-        if ctx.max_contracts is not None:
-            n = min(n, ctx.max_contracts)
+        n = self._take(pos, ctx, contracts)
         after_tp1 = tp.tp1_done and n > 1
-        lv = map_levels(tp.direction, tp.stop, tp.tp1, tp.tp2, ctx.ratio, ctx.tick)
+        approx = ctx.ratio is None  # no quotes: the spot levels as they are (ratio 1.0) until the quotes are back
+        ratio = 1.0 if ctx.ratio is None else ctx.ratio
+        lv = map_levels(tp.direction, tp.stop, tp.tp1, tp.tp2, ratio, ctx.tick)
         gen, closes = self._counters(tp.signal_ts)
         trade = LiveTrade(
             trade_id=tp.signal_ts, setup=tp.setup, direction=tp.direction, contracts=n,
@@ -432,11 +447,94 @@ class Executor:
             gen=gen, closes=closes,
         )
         self.save(trade)
+        if approx:
+            scratch = self._scratch(trade.trade_id)
+            scratch["approx"] = {"stop": tp.stop, "tp1": tp.tp1, "tp2": tp.tp2}
+            self.journal.put(SCRATCH_KEY, scratch)
         self.event("ADOPTED", {"trade_id": trade.trade_id, "contracts": n, "position": pos.contracts},
                    f"[경고] 저널에 없던 포지션 {_side(pos.side)} {pos.contracts}계약 중 {n}계약을 엔진 거래 "
                    f"{tp.signal_ts}로 인수")
+        if approx:
+            self._alert_once("LEVELS_APPROX", f"trade {trade.trade_id}: no quotes - protected at the spot levels "
+                                              f"(ratio 1.0, approximate) until the quotes are back")
+        legs, stop = desired_legs(trade, n, trade.stop_spot, ratio, ctx.tick)
+        self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
+
+    @staticmethod
+    def _take(pos: Position, ctx: PlanContext, contracts: int | None) -> int:
+        """Contracts to take over: at most `contracts` (default the whole position) and the stage maximum."""
+        n = pos.contracts if contracts is None else min(contracts, pos.contracts)
+        return n if ctx.max_contracts is None else min(n, ctx.max_contracts)
+
+    def _provisional(self, own: dict[str, Any], pos: Position, n: int, ctx: PlanContext) -> None:
+        """Our entry's outcome is unknown and its lookup fails, yet a position is there: protect it at once with a
+        provisional trade from the entry's intent (its levels; the position's size and price; opened when the entry
+        was sent). `_settle` decides later whether it was ours (RECOVERED_ENTRY) or foreign (ADOPTED)."""
+        p = own["payload"]
+        trade_id = int(p["signal_ts"])
+        gen, closes = self._counters(trade_id)
+        trade = LiveTrade(
+            trade_id=trade_id, setup=str(p["setup"]), direction=int(p["direction"]), contracts=n,
+            tp1_n=_tp1_split(n, self.tp1_frac), entry_price=pos.avg_entry, tp1_price=float(p["tp1"]),
+            tp2_price=None if p["tp2"] is None else float(p["tp2"]), stop_spot=float(p["stop_spot"]),
+            stop_price=float(p["stop"]), opened_ts=float(own["created_ts"]), gen=gen, closes=closes,
+        )
+        self.save(trade)
+        scratch = self._scratch(trade_id)
+        scratch["provisional"] = own["client_order_id"]
+        self.journal.put(SCRATCH_KEY, scratch)
+        self.event("ADOPTED_PROVISIONAL", {"trade_id": trade_id, "contracts": n, "position": pos.contracts},
+                   f"[경고] 진입 {trade_id} 결과 미확인(조회 실패): 포지션 {_side(pos.side)} {pos.contracts}계약 중 "
+                   f"{n}계약을 진입 주문의 손절·TP로 임시 보호 - 조회되면 정리")
         legs, stop = desired_legs(trade, n, trade.stop_spot, ctx.ratio, ctx.tick)
         self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
+
+    def _entry_outcome(self, cid: str) -> bool | None:
+        """Our entry `cid` reached the venue (True), never did (False), or is still unknown (None)."""
+        row = self.journal.intent(cid)
+        if row is None or row["status"] in ("REJECTED", "ABANDONED"):
+            return False
+        if row["status"] == "ACCEPTED":
+            return True
+        found, known = self._lookup(cid, float(row["created_ts"]))
+        if not known:
+            return None
+        if found is None:
+            return False
+        self.journal.update_intent(cid, "ACCEPTED", self.clock(), order_id=found.order_id, note="found by lookup")
+        return True
+
+    def _settle(self, ctx: PlanContext) -> None:
+        """Before every pass: a provisional trade is settled once its entry's outcome is known (ours:
+        RECOVERED_ENTRY; not on the venue: a foreign position, ADOPTED); levels taken over without quotes are mapped
+        at the first pass with quotes (LEVELS_MAPPED: the next plan re-places the legs)."""
+        t = self.trade()
+        if t is None or t.status != "OPEN":
+            return
+        scratch = self._scratch(t.trade_id)
+        cid, approx = scratch.get("provisional"), scratch.get("approx")
+        if cid:
+            own = self._entry_outcome(str(cid))
+            if own is not None:
+                scratch["provisional"] = None
+                self.journal.put(SCRATCH_KEY, scratch)
+                if own:
+                    self.event("RECOVERED_ENTRY", {"trade_id": t.trade_id, "provisional": True},
+                               f"[복구] 진입 {t.trade_id} 확인: 임시 보호한 {t.contracts}계약은 우리 진입")
+                else:
+                    self.event("ADOPTED", {"trade_id": t.trade_id, "contracts": t.contracts, "provisional": True},
+                               f"[경고] 진입 {t.trade_id}는 거래소에 없음: 임시 보호한 {t.contracts}계약은 저널에 없던 "
+                               f"포지션 (엔진 거래 {t.trade_id}로 인수)")
+        if approx and ctx.ratio is not None:
+            lv = map_levels(t.direction, approx["stop"], approx["tp1"], approx["tp2"], ctx.ratio, ctx.tick)
+            if t.stop_spot == approx["stop"]:  # a stop moved since was mapped with quotes already
+                t.stop_price = lv.stop
+            t.tp1_price, t.tp2_price = lv.tp1, lv.tp2
+            self.save(t)
+            scratch["approx"] = None
+            self.journal.put(SCRATCH_KEY, scratch)
+            self.event("LEVELS_MAPPED", {"trade_id": t.trade_id, "stop": t.stop_price, "tp1": lv.tp1, "tp2": lv.tp2,
+                                         "ratio": ctx.ratio})
 
     # protection --------------------------------------------------------------
     def _place_leg(self, trade: LiveTrade, want: Leg) -> tuple[Leg | None, Sent]:
@@ -446,9 +544,35 @@ class Executor:
         sent = self.send(cid, "BRACKET", trade.trade_id,
                          {"leg": want.name, "size": want.size, "limit": want.limit_price, "stop": want.stop_price},
                          lambda: self.ex.place_bracket(cid, -trade.direction, want.size, want.limit_price, want.stop_price))
+        if sent.status == "PENDING":  # answer and lookup lost: an order resting on the book is ours, found at once
+            found = self._resting(cid)
+            if found is not None:
+                self.journal.update_intent(cid, "ACCEPTED", self.clock(), order_id=found.order_id, note="found resting")
+                sent = Sent("ACCEPTED", found.order_id)
         if sent.status != "ACCEPTED":
             return None, sent
         return Leg(want.name, want.size, want.limit_price, want.stop_price, cid, sent.order_id), sent
+
+    def _resting(self, cid: str) -> Order | None:
+        """Our order `cid` among the open orders (best effort: None when they cannot be read)."""
+        try:
+            return next((o for o in self.ex.open_orders() if o.client_order_id == cid and o.status != CANCEL_QUEUED),
+                        None)
+        except ExchangeError:
+            return None
+
+    def _overlap(self, trade: LiveTrade, want: Leg) -> bool:
+        """Our resting brackets plus `want` exceed the position (fresh reads): the overlap a refusal names exists."""
+        try:
+            pos = self.ex.position()
+            orders = self.ex.open_orders()
+        except ExchangeError:
+            return False
+        if pos is None:
+            return False
+        resting = sum(o.size - o.filled for o in orders
+                      if is_ours(o) and o.kind == "BRACKET" and o.side == -trade.direction)
+        return resting + want.size > pos.contracts
 
     def _bracket_failed(self, trade: LiveTrade, want: Leg, sent: Sent) -> None:
         self.event("BRACKET_FAILED", {"trade_id": trade.trade_id, "leg": want.name, "status": sent.status,
@@ -480,7 +604,7 @@ class Executor:
         trade = self.trade()
         if trade is None or trade.status != "OPEN":
             return
-        orders = {o.order_id: o for o in self.ex.open_orders()}
+        orders = {o.order_id: o for o in self.ex.open_orders() if o.status != CANCEL_QUEUED}  # queued: leaving
         claimed = {str(leg.order_id) for leg in trade.legs if leg.order_id in orders}
         kept: list[Leg] = []
         exact = 0  # wanted legs resting with exactly the wanted terms
@@ -521,9 +645,10 @@ class Executor:
                     continue
             placed, sent = self._place_leg(trade, want)
             moved = placed is not None
-            if placed is None and cur is not None and sent.status == "REJECTED" and not _refuses_prices(sent):
-                placed, moved = self._swap(trade, cur, orders[str(cur.order_id)], want, replaced)  # overlap refused
-            elif placed is None:  # unknown (PENDING), refused for its prices or nothing to replace: the old leg stays
+            if (placed is None and cur is not None and _code(sent) in self.overlap_refusals
+                    and self._overlap(trade, want)):  # the venue refuses overlapping brackets: cancel first
+                placed, moved = self._swap(trade, cur, orders[str(cur.order_id)], want, replaced)
+            elif placed is None:  # unknown (PENDING), any other refusal or nothing to replace: the old leg stays
                 self._bracket_failed(trade, want, sent)
             if placed is not None:
                 if cur is not None and str(cur.order_id) not in replaced:
@@ -554,7 +679,7 @@ class Executor:
         self.save(trade)
 
     def _swap(self, trade: LiveTrade, cur: Leg, o: Order, want: Leg, replaced: set[str]) -> tuple[Leg | None, bool]:
-        """The venue refused `want` while `cur` rests (it refuses overlapping brackets): cancel `cur` first (LEG_GAP:
+        """The venue refused `want` as an overlap while `cur` rests: cancel `cur` first (LEG_GAP:
         the designed path on such a venue, not an order failure), then place `want`; when that fails as well,
         `cur`'s terms are placed again at once (LEG_RESTORED). Returns the leg now resting (None: none) and whether
         it has the wanted terms."""
@@ -600,10 +725,10 @@ class Executor:
                                   "filled": o.filled, "status": o.status})
         return True
 
-    def _protect_rest(self, ctx: PlanContext) -> None:
-        """A close that did not go flat cancelled the brackets: they go back at the stop in force for the position
-        left (brackets only reduce: an excess is covered as well), so a close that keeps failing never leaves the
-        position unprotected. A leg the cancel left resting is taken back by its terms."""
+    def _protect_left(self, ctx: PlanContext, cancelled: bool) -> None:
+        """A close that did not go flat: the legs become the ones for the position left, at the stop in force
+        (resized after a partial close; placed again when they were cancelled for the close - a leg the cancel left
+        resting is taken back by its terms). Brackets only reduce: an excess is covered as well."""
         trade = self.trade()
         if trade is None or trade.status != "OPEN":
             return
@@ -611,8 +736,9 @@ class Executor:
             pos = self.ex.position()
             if pos is None or pos.side != trade.direction:
                 return
-            trade.legs = []  # cancelled for the close: nothing to look up
-            self.save(trade)
+            if cancelled:
+                trade.legs = []  # cancelled for the close: nothing to look up
+                self.save(trade)
             legs, stop = desired_legs(trade, pos.contracts, trade.stop_spot, ctx.ratio, ctx.tick)
             self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
         except ExchangeError as exc:  # observe sees the gap (UNPROTECTED); the next pass places them
@@ -630,30 +756,33 @@ class Executor:
         if not ctx.session_open:
             self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
             return False
-        ours = [o.order_id for o in self.ex.open_orders() if is_ours(o)]
-        if ours:  # a refused cancel never blocks the close: brackets only reduce
-            self._cancel_quietly(ours, trade.trade_id if trade is not None else 0)
         open_trade = trade if trade is not None and trade.status == "OPEN" else None
-        if open_trade is not None:
-            open_trade.closes += 1
-            n, tid = open_trade.closes, open_trade.trade_id
-            self.save(open_trade)
-        else:
-            n, tid = int(self.journal.get(ORPHAN_KEY, 0)) + 1, 0
-            self.journal.put(ORPHAN_KEY, n)
-        cid = close_cid(tid, n)
-        sent = self.send(cid, "CLOSE", tid, {"reason": reason}, lambda: self.ex.close_position(cid))
+        tid = open_trade.trade_id if open_trade is not None else 0
+        sent = self._send_close(open_trade, reason)  # the brackets keep protecting until the venue took the close
+        cancelled = False
+        if _code(sent) in self.close_conflicts:  # refused while brackets rest: cancel them, then close at once
+            if not self._session_open():
+                self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
+                return False
+            ours = [o.order_id for o in self.ex.open_orders() if is_ours(o) and o.status != CANCEL_QUEUED]
+            self.event("CLOSE_CONFLICT", {"trade_id": tid, "reason": reason, "error": sent.error, "cancel": ours})
+            if ours:
+                self._cancel_quietly(ours, tid)
+            cancelled = True
+            sent = self._send_close(open_trade, reason)
         if sent.status != "ACCEPTED":
             self.event("CLOSE_FAILED", {"trade_id": tid, "reason": reason, "status": sent.status, "error": sent.error},
                        f"[청산 실패 - 재시도 중] {reason}: {sent.status} {sent.error}")
-            self._protect_rest(ctx)
+            if cancelled:
+                self._protect_left(ctx, cancelled)
             return False
         if open_trade is not None:  # the position going flat from now on is this close (also after a crash)
+            open_trade = self.trade() or open_trade
             open_trade.exit_reason = reason
             self.save(open_trade)
         if not self._await_flat(sent.order_id):
             self.event("CLOSE_UNCONFIRMED", {"trade_id": tid, "reason": reason}, f"[청산 미확인 - 재시도 중] {reason}")
-            self._protect_rest(ctx)
+            self._protect_left(ctx, cancelled)
             return False
         if open_trade is not None:
             open_trade.status, open_trade.exit_reason = "CLOSED", reason
@@ -661,7 +790,33 @@ class Executor:
         fill = self._fill_of(sent.order_id)
         self.event("CLOSED", {"trade_id": tid, "reason": reason, "order_id": sent.order_id, **fill},
                    f"[청산] {reason}" + (f" @ {fill['price']:,.1f}" if fill.get("price") else ""))
+        try:  # brackets left on the flat position (the venue cancels them as well)
+            left = [o.order_id for o in self.ex.open_orders() if is_ours(o) and o.status != CANCEL_QUEUED]
+        except ExchangeError:
+            left = []
+        if left:
+            self._cancel_quietly(left, tid)
         return True
+
+    def _send_close(self, open_trade: LiveTrade | None, reason: str) -> Sent:
+        """close_position under a new client order id (the trade's next close number; `ewb-x-0-<n>` without one)."""
+        if open_trade is not None:
+            current = self.trade() or open_trade
+            current.closes += 1
+            n, tid = current.closes, current.trade_id
+            self.save(current)
+        else:
+            n, tid = int(self.journal.get(ORPHAN_KEY, 0)) + 1, 0
+            self.journal.put(ORPHAN_KEY, n)
+        cid = close_cid(tid, n)
+        return self.send(cid, "CLOSE", tid, {"reason": reason}, lambda: self.ex.close_position(cid))
+
+    def _session_open(self) -> bool:
+        """A fresh session read (a failed read counts as not OPEN: protection stays)."""
+        try:
+            return self.ex.session().is_open
+        except ExchangeError:
+            return False
 
     def _fill_of(self, order_id: str | None) -> dict[str, Any]:
         """Fill price, size and fee of a market order, for the cost report (best effort)."""
@@ -785,28 +940,62 @@ class Executor:
         out["unknown"] += 1
         self.event("RECOVERY_ERROR", {"what": what, "error": str(exc)[:200]})
 
+    def _claim_legs(self, trade: LiveTrade, pos: Position, orders: list[Order]) -> None:
+        """At restart: a resting bracket of ours named for the trade (`ewb-b-<trade>-<leg>-<gen>`) that the trade does
+        not list - accepted right before the crash - is that leg again (LEG_ADOPTED; the newest per leg, never one
+        whose cancel is queued), so the first observe does not read the position as unprotected. When they cover the
+        position and the trade was not protected yet, it was protected when they were placed (PROTECTED_FIRST)."""
+        resting = {o.order_id: o for o in orders if o.status != CANCEL_QUEUED}
+        names = {leg.name for leg in trade.legs if leg.order_id in resting}
+        listed = {leg.order_id for leg in trade.legs}
+        prefix = f"{PREFIX}b-{trade.trade_id}-"
+        claimed: list[Order] = []
+        for o in sorted(resting.values(), key=lambda o: (o.created_ts or 0.0, o.client_order_id), reverse=True):
+            name, _, gen = o.client_order_id[len(prefix):].partition("-")
+            if (not o.client_order_id.startswith(prefix) or name not in ("tp1", "tp2") or not gen.isdigit()
+                    or o.kind != "BRACKET" or o.side != -trade.direction or o.order_id in listed or name in names):
+                continue
+            trade.legs = [leg for leg in trade.legs if leg.name != name] + [_leg_of(name, o)]
+            names.add(name)
+            claimed.append(o)
+            self.event("LEG_ADOPTED", {"trade_id": trade.trade_id, "leg": name, "order_id": o.order_id,
+                                       "client_order_id": o.client_order_id, "recovered": True})
+        if not claimed:
+            return
+        trade.legs.sort(key=lambda leg: leg.name)
+        covered = sum(resting[str(leg.order_id)].size - resting[str(leg.order_id)].filled
+                      for leg in trade.legs if leg.order_id in resting)
+        if trade.protected_ts is None and covered >= pos.contracts:
+            trade.protected_ts = max(float(o.created_ts or self.clock()) for o in claimed)
+            self.event("PROTECTED_FIRST", {"trade_id": trade.trade_id,
+                                           "after_entry_s": round(trade.protected_ts - trade.opened_ts, 3)})
+        self.save(trade)
+
     def recover(self) -> dict[str, int]:
         """At startup: resolve PENDING intents, record a close accepted right before a crash (the journal's open
         trade, a flat position and an ACCEPTED close of that trade - its reason, not a bracket exit), rebuild the
         trade from an accepted entry the journal did not get to record (only when no trade with that id was
-        recorded). A bracket accepted right before a crash is not in the trade's legs: protect() takes it over
-        by its client order id and terms. A read that fails is recorded (RECOVERY_ERROR, counted unknown) and
-        the recovery goes on."""
+        recorded), and take the open trade's resting brackets back as its legs (`_claim_legs`: a bracket accepted
+        right before a crash). A read that fails is recorded (RECOVERY_ERROR, counted unknown) and the recovery
+        goes on."""
         out, _ = self.resolve_pending()
         trade = self.trade()
         if trade is not None and trade.status == "OPEN":
             try:
-                flat = self.ex.position() is None
+                pos = self.ex.position()
+                orders = [] if pos is None else self.ex.open_orders()
             except ExchangeError as exc:
-                flat = False
                 self._recovery_error(out, "position", exc)
-            mine = self.journal.intents(status="ACCEPTED", kind="CLOSE", trade_id=trade.trade_id)
-            if flat and mine:  # killed after our close was accepted: record it with its reason
-                row = mine[-1]
-                trade.status, trade.exit_reason = "CLOSED", str(row["payload"].get("reason"))
-                self.save(trade)
-                self.event("CLOSED", {"trade_id": trade.trade_id, "reason": trade.exit_reason, "recovered": True,
-                                      "order_id": row["order_id"], **self._fill_of(row["order_id"])})
+            else:
+                mine = self.journal.intents(status="ACCEPTED", kind="CLOSE", trade_id=trade.trade_id)
+                if pos is None and mine:  # killed after our close was accepted: record it with its reason
+                    row = mine[-1]
+                    trade.status, trade.exit_reason = "CLOSED", str(row["payload"].get("reason"))
+                    self.save(trade)
+                    self.event("CLOSED", {"trade_id": trade.trade_id, "reason": trade.exit_reason, "recovered": True,
+                                          "order_id": row["order_id"], **self._fill_of(row["order_id"])})
+                elif pos is not None:
+                    self._claim_legs(trade, pos, orders)
         trade = self.trade()
         entries = self.journal.intents(status="ACCEPTED", kind="ENTRY")
         if entries and (trade is None or trade.status != "OPEN"):

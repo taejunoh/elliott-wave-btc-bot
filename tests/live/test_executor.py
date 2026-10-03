@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
-from ewbot.live.exchange import ExchangeError, RateLimited, Unavailable
+from ewbot.live.exchange import PlaceResult, RateLimited, Unavailable
 from ewbot.live.executor import Executor
 from ewbot.live.reconcile import (
     Adopt,
@@ -168,13 +170,15 @@ def test_close_cancels_brackets_and_waits_for_flat(env):
     assert jr.intent(f"ewb-x-{T0}-1")["status"] == "ACCEPTED" and "CLOSED" in alerts.kinds()
 
 
-def test_a_refused_bracket_cancel_does_not_block_the_close(env):
+def test_a_close_is_sent_with_the_brackets_resting(env):
+    """Protection is never cancelled before the venue took the close: close_position goes out with the brackets
+    resting (both only reduce); the ones left on the flat position go with it."""
     clock, ex, jr, _, exe = env
     exe.enter(Enter(entry(), 3), ctx(clock))
-    ex.fail_next("cancel", ExchangeError("cancel refused: sim-2: NOT_ALLOWED_TO_CANCEL"))
-    assert exe.close("TIME", ctx(clock)) is True  # brackets only reduce: the close goes out anyway
-    assert ex.position() is None and ex.open_orders() == []
-    assert jr.events(kind="CANCEL_FAILED")[0]["data"]["error"].startswith("cancel refused")
+    first = len(ex.calls)
+    assert exe.close("TIME", ctx(clock)) is True
+    assert "cancel" not in ex.calls[first:ex.calls.index("close_position", first)]
+    assert ex.position() is None and ex.open_orders() == [] and not jr.events(kind="CANCEL_FAILED")
 
 
 def test_close_waits_for_an_open_session_and_alerts_once(env):
@@ -427,15 +431,43 @@ def test_a_stop_move_never_removes_a_leg_whose_replacement_is_unconfirmed(env, f
     assert exe.trade().stop_spot == 59_500.0 and len(jr.events(kind="STOP_MOVED")) == 1
 
 
-def test_an_unconfirmed_replacement_found_resting_is_taken_over(env):
+def test_an_unconfirmed_replacement_resting_on_the_book_replaces_the_old_leg_at_once(env):
+    """Probe P3: the new TP1 leg rests but its answer and the lookup were lost. It is found among the open orders
+    right away, so the old TP1 leg is cancelled in the same pass - two TP1 legs resting would sell TP2 contracts
+    at the TP1 price."""
     clock, ex, jr, _, exe = env
     tr = exe.enter(Enter(entry(), 3), ctx(clock))
-    ex.crash_after_accept("place_bracket", Unavailable("read timeout"))  # the new TP1 leg rests, the answer is lost
-    ex.fail_next("find_order", Unavailable("503"))  # and the lookup fails: PENDING
+    ex.crash_after_accept("place_bracket", Unavailable("read timeout"))
+    ex.fail_next("find_order", Unavailable("503"))
     legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
     exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
-    assert not jr.events(kind="LEG_GAP") and sum(n for n, _, _ in resting(ex)) == 4  # both TP1 legs rest
-    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))  # its terms match: taken over, the old one cancelled
+    assert resting(ex) == [(1, 61_000.0, 59_500.0), (2, 62_000.0, 59_500.0)]
+    assert jr.intent(f"ewb-b-{T0}-tp1-3")["status"] == "ACCEPTED" and not jr.events(kind="BRACKET_FAILED")
+    ex.set_prices(61_000.0)
+    assert ex.position().contracts == 2  # only the TP1 portion left at TP1
+
+
+def test_an_unconfirmed_replacement_is_taken_over_on_the_next_pass(env):
+    """When the open orders cannot be read either, both TP1 legs rest until the next pass takes the new one over
+    by its client order id and terms (LEG_ADOPTED) and cancels the old one - nothing is placed a third time."""
+    clock, ex, jr, _, exe = env
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.crash_after_accept("place_bracket", Unavailable("read timeout"))
+    ex.fail_next("find_order", Unavailable("503"))
+    real, reads = ex.open_orders, []
+
+    def flaky_reads():
+        reads.append(1)
+        if len(reads) == 2:  # the check for the unconfirmed leg
+            raise Unavailable("503")
+        return real()
+
+    ex.open_orders = flaky_reads
+    legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    ex.open_orders = real
+    assert not jr.events(kind="LEG_GAP") and sum(n for n, _, _ in resting(ex)) == 4
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
     assert resting(ex) == [(1, 61_000.0, 59_500.0), (2, 62_000.0, 59_500.0)]
     assert ex.calls.count("place_bracket") == 4 and jr.events(kind="LEG_ADOPTED")[0]["data"]["leg"] == "tp1"
 
@@ -508,23 +540,25 @@ def test_brackets_accepted_before_a_crash_are_taken_over_after_the_restart(tmp_p
     jr.close()
     jr2 = journal(tmp_path)
     exe2 = Executor(ex, jr2, clock=clock, sleep=clock.sleep)
-    exe2.recover()
-    assert poll(exe2, ex, clock, target(T0 + 3600, position())) == ["UNPROTECTED"]
+    exe2.recover()  # probe N6: the trade's resting brackets are its legs again - never read as unprotected
+    assert sorted(e["data"]["leg"] for e in jr2.events(kind="LEG_ADOPTED")) == ["tp1", "tp2"]
+    assert jr2.events(kind="PROTECTED_FIRST")
+    assert poll(exe2, ex, clock, target(T0 + 3600, position())) == []
     assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
     assert ex.calls.count("place_bracket") == 2 and not jr2.events(kind="BRACKET_FAILED")
     assert [leg.client_order_id for leg in exe2.trade().legs] == [f"ewb-b-{T0}-tp1-1", f"ewb-b-{T0}-tp2-2"]
-    assert poll(exe2, ex, clock, target(T0 + 3600, position())) == ["PROTECTED"]
     jr2.close()
 
 
-def test_a_failed_close_puts_the_protection_back(env):
-    """Probe D: the close cancels the brackets first; when the close then fails, the legs go back at the stop in
-    force for the position, so a close that keeps failing never leaves it unprotected."""
+def test_a_failed_close_keeps_the_protection(env):
+    """Probe D: a close that fails (429: outcome unknown) never cancelled the brackets, so a close that keeps
+    failing never leaves the position unprotected."""
     clock, ex, jr, alerts, exe = env
     exe.enter(Enter(entry(), 3), ctx(clock))
     ex.fail_next("close_position", RateLimited("429"))
     assert exe.close("TIME", ctx(clock)) is False and "CLOSE_FAILED" in alerts.kinds()
-    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert sorted(o.client_order_id for o in ex.open_orders()) == [f"ewb-b-{T0}-tp1-1", f"ewb-b-{T0}-tp2-2"]
+    assert "cancel" not in ex.calls
     assert poll(exe, ex, clock, target(T0 + 3600, position(), exit_reason="TIME")) == []  # never seen unprotected
     assert ex.position() is None and exe.trade().exit_reason == "TIME"
 
@@ -651,12 +685,19 @@ def test_an_own_entry_still_pending_is_looked_up_before_a_position_is_called_for
     assert "RECOVERED_ENTRY" in alerts.kinds() and "ADOPTED" not in alerts.kinds()
 
 
-def test_a_position_that_cannot_be_adopted_without_quotes_is_alerted_once(env):
+def test_a_foreign_position_without_quotes_is_covered_at_the_spot_levels_until_they_are_back(env):
+    """Probe N7: no quotes to map the engine levels: the position is protected at once at the spot levels (ratio
+    1.0, alerted as approximate) and re-mapped at the first pass with quotes."""
     clock, ex, jr, alerts, exe = env
     ex.place_market("manual-1", 1, 2)
+    exe.execute([Adopt(position(), 2)], ctx(clock, ratio=None))
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (1, 62_000.0, 59_000.0)]
+    assert "ADOPTED" in alerts.kinds() and "LEVELS_APPROX" in alerts.kinds()
+    c = ctx(clock, ratio=1.001)
     for _ in range(2):
-        exe.execute([Adopt(position(), 2)], ctx(clock, ratio=None))
-    assert exe.trade() is None and ex.open_orders() == [] and alerts.kinds() == ["ADOPT_NO_QUOTES"]
+        exe.execute(plan(target(T0 + 3600, position()), exe.trade(), ex.position(), ex.open_orders(), c), c)
+    assert resting(ex) == [(1, 61_060.0, 59_055.0), (1, 62_060.0, 59_055.0)]
+    assert len(jr.events(kind="LEVELS_MAPPED")) == 1
 
 
 def test_alerts_are_once_per_trade_and_the_journal_keys_stay_bounded(env):
@@ -685,4 +726,168 @@ def test_recovery_survives_an_unreadable_exchange(tmp_path):
     assert exe.recover() == {"accepted": 1, "abandoned": 0, "unknown": 1, "rebuilt": 0}
     assert jr.events(kind="RECOVERY_ERROR") and exe.trade() is None
     assert exe.recover()["rebuilt"] == 1 and exe.trade().trade_id == T0
+    jr.close()
+
+
+def entry_disabled(ex, reason: str = "ORDER_ENTRY_DISABLED") -> None:
+    """The venue refuses every new order with `reason` (cancel-only / order entry disabled); cancels still work."""
+    def refuse(name):
+        def call(cid, *args, **kw):
+            ex.calls.append(name)
+            return PlaceResult(cid, None, False, f"{reason}: new orders are not accepted")
+        return call
+    ex.place_bracket = refuse("place_bracket")
+    ex.close_position = refuse("close_position")
+
+
+@pytest.mark.parametrize("reject_overlap", [False, True])
+@pytest.mark.parametrize("reason", ["ORDER_ENTRY_DISABLED", "UNKNOWN_FAILURE_REASON"])
+def test_a_venue_refusing_every_new_order_never_loses_the_old_legs(tmp_path, reason, reject_overlap):
+    """Probes P1, P1b: a refusal that is not a known overlap refusal never cancels the old leg first."""
+    clock = Clock()
+    ex = sim(clock, reject_overlap=reject_overlap)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    entry_disabled(ex, reason)
+    legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert not jr.events(kind="LEG_GAP") and len(jr.events(kind="BRACKET_FAILED")) == 2
+    clock.now += 10
+    assert observe(exe.trade(), ex.position(), ex.open_orders(), clock())[1] == []
+    jr.close()
+
+
+def test_an_overlap_refusal_without_an_overlap_keeps_the_old_leg(env):
+    """A known overlap refusal while our brackets plus the new leg would not exceed the position is not an overlap:
+    the old leg is not cancelled first."""
+    clock, ex, jr, _, exe = env
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.cancel([o.order_id for o in ex.open_orders() if "-tp2-" in o.client_order_id])  # by hand: 1 of 3 covered
+    entry_disabled(ex, "INSUFFICIENT_POSITION_SIZE")
+    legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_000.0)] and not jr.events(kind="LEG_GAP")
+
+
+def test_a_close_refused_by_a_venue_taking_no_new_orders_keeps_the_brackets(env):
+    """Probe P2: cancels work but new orders are refused - the close fails and the brackets were never touched."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    entry_disabled(ex)
+    assert exe.close("TIME", ctx(clock)) is False and "CLOSE_FAILED" in alerts.kinds()
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)] and "cancel" not in ex.calls
+    assert not jr.events(kind="BRACKET_FAILED")
+
+
+def bracket_conflict(ex, closing_session: bool = False) -> None:
+    """The venue refuses close_position while brackets of ours rest (a known close-conflict refusal)."""
+    real = ex.close_position
+
+    def call(cid, size=None):
+        if any(o.kind == "BRACKET" for o in ex.open_orders()):
+            ex.calls.append("close_position")
+            if closing_session:
+                ex.set_session("CLOSE")
+            return PlaceResult(cid, None, False, "OPEN_BRACKET_ORDERS")
+        return real(cid, size)
+
+    ex.close_position = call
+
+
+def test_a_close_refused_for_resting_brackets_cancels_them_then_closes(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    bracket_conflict(ex)
+    assert exe.close("TIME", ctx(clock)) is True and ex.position() is None
+    assert ex.calls.count("close_position") == 2 and not jr.events(kind="CLOSE_FAILED")
+    assert jr.events(kind="CLOSED")[0]["data"]["reason"] == "TIME"
+
+
+def test_a_close_conflict_while_the_session_closes_keeps_the_brackets(env):
+    """The session is read right before the brackets would be cancelled: not OPEN -> the close waits, protected."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    bracket_conflict(ex, closing_session=True)
+    assert exe.close("TIME", ctx(clock)) is False and "CLOSE_DEFERRED" in alerts.kinds()
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)] and "cancel" not in ex.calls
+
+
+def failing_lookups(ex, clock: Clock, until: float) -> None:
+    """find_order raises (the list-orders query is degraded) until `until`."""
+    real = ex.find_order
+
+    def call(cid, since):
+        if clock() < until:
+            ex.calls.append("find_order")
+            raise Unavailable("503")
+        return real(cid, since)
+
+    ex.find_order = call
+
+
+def test_an_unconfirmed_own_entry_is_protected_at_once_and_settled_as_ours(env):
+    """Probe N1: our entry filled, its answer was lost and the lookups fail for a minute. The position is protected
+    from the first pass with a provisional trade built from the entry's intent (its levels, the position's size and
+    price); once the lookup answers, it is settled as our entry - never a foreign position."""
+    clock, ex, jr, alerts, exe = env
+    ex.crash_after_accept("place_market", Unavailable("read timeout"))
+    failing_lookups(ex, clock, clock() + 65)
+    assert exe.enter(Enter(entry(), 3), ctx(clock)) is None and jr.intent(f"ewb-e-{T0}-L")["status"] == "PENDING"
+    tgt = target(T0 + 3600, ent=entry())
+    for _ in range(6):
+        clock.now += 10
+        poll(exe, ex, clock, tgt)
+        assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+        assert exe.trade().trade_id == T0 and "RECOVERED_ENTRY" not in alerts.kinds()
+    assert jr.events(kind="ADOPTED_PROVISIONAL")[0]["data"]["contracts"] == 3
+    assert jr.events(kind="PROTECTED_FIRST")[0]["data"]["after_entry_s"] == 10.0
+    clock.now += 10
+    poll(exe, ex, clock, tgt)
+    assert "RECOVERED_ENTRY" in alerts.kinds() and "ADOPTED" not in alerts.kinds()
+    assert jr.intent(f"ewb-e-{T0}-L")["status"] == "ACCEPTED" and ex.calls.count("place_bracket") == 2
+
+
+def test_a_provisional_trade_whose_entry_never_reached_the_venue_is_settled_as_foreign(env):
+    clock, ex, jr, alerts, exe = env
+    ex.fail_next("place_market", Unavailable("503"))  # never reached the venue
+    failing_lookups(ex, clock, clock() + 30)
+    assert exe.enter(Enter(entry(), 1), ctx(clock)) is None and jr.intent(f"ewb-e-{T0}-L")["status"] == "PENDING"
+    ex.place_market("manual-1", 1, 1)  # a manual position in the engine's direction
+    tgt = target(T0 + 3600, ent=entry())
+    clock.now += 10
+    poll(exe, ex, clock, tgt)
+    assert len(ex.open_orders()) == 1 and "ADOPTED" not in alerts.kinds()
+    clock.now += 30
+    poll(exe, ex, clock, tgt)
+    assert "ADOPTED" in alerts.kinds() and "RECOVERED_ENTRY" not in alerts.kinds() and len(ex.open_orders()) == 1
+
+
+def test_a_bracket_whose_cancel_is_queued_is_not_taken_over(tmp_path):
+    """Probe N5: a resting bracket of ours with a queued cancel is about to leave the book - never a leg."""
+    clock = Clock()
+    ex = sim(clock)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    real, calls = ex.place_bracket, []
+
+    def crash_on_second(*args, **kw):
+        calls.append(args[0])
+        if len(calls) == 2:
+            ex.crash_after_accept("place_bracket")
+        return real(*args, **kw)
+
+    ex.place_bracket = crash_on_second
+    with pytest.raises(SimCrash):
+        exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.place_bracket = real
+    queued = f"ewb-b-{T0}-tp1-1"
+    real_open = ex.open_orders
+    ex.open_orders = lambda: [dataclasses.replace(o, status="CANCEL_QUEUED") if o.client_order_id == queued else o
+                              for o in real_open()]
+    exe.recover()
+    poll(exe, ex, clock, target(T0 + 3600, position()))
+    assert [e["data"]["leg"] for e in jr.events(kind="LEG_ADOPTED")] == ["tp2"]
+    assert queued not in [leg.client_order_id for leg in exe.trade().legs]
     jr.close()
