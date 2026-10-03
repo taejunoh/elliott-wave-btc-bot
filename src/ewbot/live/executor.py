@@ -909,7 +909,7 @@ class Executor:
         return True
 
     def flatten(self, reason: str, ctx: PlanContext) -> bool:
-        """Cancel every order of ours and close the whole position (/flatten, breakers, margin)."""
+        """Close the whole position (/flatten, breakers, margin); our brackets go with it (see `close`)."""
         return self.close(reason, ctx)
 
     # ------------------------------------------------------------------ restart recovery (spec 5.1)
