@@ -36,16 +36,16 @@
 ## Spec Interpretations (decided here, binding for the tasks)
 
 1. **Target at the latest bar.** The engine never evaluates entries on a run's last bar, so the replay gets one placeholder bar T+1h (flat at T's close, volume 0, synthetic). Everything decided at or before T's close is computed before the engine reaches T+1h, so it equals a replay with the real next bar; Task 4's tests prove it at every event bar of the synthetic series and on a sampled sweep of the other holdout bars (every 23rd, every CFM halt bar and the bar before it). Queued exits are recorded by swapping the engine's per-run class `_Run` (looked up at run time, like the paper trace swaps `PaperBroker` / `WaveEngine`) for a subclass that logs each fresh `_request_exit(reason)` with its bar. Nothing fills during the CFM halt (Fri 17–18 New York), so the target reports the exit still pending for the open position, not only one queued at T: an exit queued at the Fri 16:00 close is still `exit_reason` at the halt bar T = 17:00 (`exit_queued_ts` = 16:00 tells a carried exit from a new one), and a stop the halt bar's spot range crossed is flagged (`stop_pending_reopen`: the paper broker stops the position out at the next tradable open). Reconcile closes on both (`STOP_HALT` for the second) at the first poll that sees the session OPEN. The configuration is not a parameter: `compute_target(lock, df, T)` builds `holdout_config(BotConfig(), params)` from the holdout lock (checked like the paper precheck, without its git checks) and always replays from `HOLDOUT_START`. Nothing at T+1h is used.
-2. **Trade identity.** A live trade is identified by its signal bar (`trade_id = signal ts`; the paper trade key is `trade_id + 1h`). Client order ids: entry `ewb-e-<signal ts>-<L|S>`, brackets `ewb-b-<trade>-<tp1|tp2>-<generation>`, closes `ewb-x-<trade>-<n>` (`ewb-x-0-<n>` for a position the journal does not know), reductions `ewb-r-<trade>-<n>`. Within the hour after an entry the replay still shows it as queued (`target.entry`): that queued entry is the engine position of the live trade (`reconcile.pending_position`), never a reason to close.
-3. **Never chase.** Only an entry queued at the latest bar can open a trade, and only within 5 minutes of that bar's close; an entry that was skipped (pause, session, size, margin, breaker, missing TP2), refused or unfilled is recorded once and never sent again; a live trade closed early by its bracket is not re-entered. A position the journal does not know is adopted when the engine holds the same direction, else closed (spec §4.4: the actual position follows the target).
+2. **Trade identity.** A live trade is identified by its signal bar (`trade_id = signal ts`; the paper trade key is `trade_id + 1h`). Client order ids: entry `ewb-e-<signal ts>-<L|S>`, brackets `ewb-b-<trade>-<tp1|tp2>-<generation>`, closes `ewb-x-<trade>-<n>` (`ewb-x-0-<n>` for a position the journal does not know), reductions `ewb-r-<trade>-<n>`. Within the hour after an entry the replay still shows it as queued (`target.entry`): that queued entry is the engine position of the live trade (`reconcile.pending_position`), never a reason to close. Client order ids are never reused: a trade rebuilt or taken over under the id of an earlier trade goes on from the journal's highest bracket generation and close number for that id (a reused id would resolve to the earlier, filled order).
+3. **Never chase.** Only an entry queued at the latest bar can open a trade, and only within 5 minutes of that bar's close; an entry that was skipped (pause, session, size, margin, breaker, missing TP2, a flip whose close was not confirmed, no quotes), refused or unfilled is recorded once and never sent again - the executor refuses a skipped signal even when a later pass plans it again; a live trade closed early by its bracket is not re-entered. A position the journal does not know is adopted when the engine holds the same direction, else closed (spec §4.4: the actual position follows the target).
 4. **Levels.** Futures level = `to_tick(spot level × futures mid / spot mid, $5)`, rounded down for a long and up for a short — for every level: the spec's stop rule, and for a TP it moves the limit toward the entry so the live TP fills no later than the engine's strict-cross TP. The ratio is taken when the order is sent; resting legs are re-placed only when the engine's stop (spot) changes, never for basis drift. Without quotes the stop in force stays (the new engine stop is not recorded) and the move is sent at the first poll with quotes.
-5. **Protection and TP1** (spec §4.2, §4.4). Legs: 1 contract → one bracket (TP1 + stop); more → TP1 size (`engine.position_mgr._tp1_split`) + stop, and the rest + TP2 + stop; after the live TP1 one bracket (rest + TP2) with the stop tightened to at least the live entry price (break-even). A 1-contract CANARY trade therefore exits whole at TP1 while the engine keeps its remainder. When the engine's TP1 has filled but the live TP1 has not, what the resting TP1 leg has left is closed at market (`Reduce TP1_SYNC`, only while the session is OPEN and the TP1 leg rests - a vanished one may already have filled; until then both legs stay). A signal without TP2 is skipped (strategy A always sets one). A smaller live position counts as a bracket fill only when our resting legs still cover exactly the position: the TP1 leg used up is the live TP1 (break-even); a partial TP1 keeps the TP1 leg for the rest; any other reduction is unexplained (`UNEXPLAINED_REDUCTION`: alert, the stop stays, the rest is protected). More contracts than the trade holds (a manual order, a reduction that did not fill) are reduced at market while the session is OPEN (`Reduce EXCESS`, spec §4.4) - until then, or while another reduction is pending, the legs cover the whole position (brackets only reduce); a position taken over is capped at the stage maximum (SHADOW/CANARY 1, FULL 3 in its first 30 days) and the rest reduced. Legs never exceed the position, and a close waiting for the session keeps missing legs placed at the stop in force. A TP1 leg emptied by its own stop (both legs share it) reads as the live TP1: the rest's break-even stop is then through the market and fills at once, with the watchdog as the backstop if the venue refuses it (runbook).
-6. **Stop moves.** Replace first (new bracket, then cancel the old one; brackets only reduce, spec §4.2); if the venue refuses the overlap, cancel first and track the gap as unprotected time. `orders/edit` on a bracket is used only with `EWBOT_LIVE_EDIT_STOPS=1`, after CANARY confirms it (spec §6.2). With no resting stop and the price through the stop, the watchdog closes at once; with a resting stop gapped past its 5% limit (`STOP_LIMIT_OFFSET`, the Create Order reference; spec §4.2 assumed 1%) for 10 s, it closes at market (spec §4.2).
-7. **Idempotency and retries** (spec §4.2, §5.1). Intent before send; a PENDING intent (ambiguous error, killed process) is looked up by `client_order_id` (orders created up to 5 min before it) before the same id is sent again; a duplicate-id answer resolves to the existing order; a PENDING intent not on the exchange after 10 min is ABANDONED (checked every minute). Reads are retried 3 times in the adapter; an ambiguous entry is looked up and re-sent with the same id on the next polls only until 5 minutes after its bar's close, then skipped (`진입이 실패하면 건너뛰고`); a failed close is retried on every poll with a new id, with an alert each time (`청산이 실패하면 계속 재시도하면서 경보`); `close_position` can only reduce, so a late duplicate close cannot open a position. Restart recovery also rebuilds a trade whose entry was accepted but not yet recorded and records a close accepted right before a crash; an accepted entry whose fill could not be read in time is rebuilt from its intent on the next pass (not treated as a foreign position). A reduction is recorded on the trade before it is sent (`pending_reduce`: id, size, reason, the position it was sent against, the trade once done): while its outcome is unknown no other reduction is planned and it is resolved by its id first (looked up; re-sent under the same id only when the venue does not have it and the position shows no reduction); the position showing it settles it as ours (`TP1_SYNC` → the live TP1) - never an unexplained reduction or a second sale. Protection planned together with a reduction waits until the reduction is known to have filled.
+5. **Protection and TP1** (spec §4.2, §4.4). Legs: 1 contract → one bracket (TP1 + stop); more → TP1 size (`engine.position_mgr._tp1_split`) + stop, and the rest + TP2 + stop; after the live TP1 one bracket (rest + TP2) with the stop tightened to at least the live entry price (break-even). A 1-contract CANARY trade therefore exits whole at TP1 while the engine keeps its remainder. When the engine's TP1 has filled but the live TP1 has not, what the resting TP1 leg has left is closed at market (`Reduce TP1_SYNC`, only while the session is OPEN and the TP1 leg rests - a vanished one may already have filled; until then both legs stay). A signal without TP2 is skipped (strategy A always sets one). A smaller live position counts as a bracket fill only when our resting legs still cover exactly the position: the TP1 leg used up is the live TP1 (break-even); a partial TP1 keeps the TP1 leg for the rest; any other reduction is unexplained (`UNEXPLAINED_REDUCTION`: alert, the stop stays, the rest is protected). More contracts than the trade holds (a manual order, a reduction that did not fill) are reduced at market while the session is OPEN (`Reduce EXCESS`, spec §4.4) - until then, or while another reduction is pending, the legs cover the whole position (brackets only reduce); a position taken over is capped at the stage maximum (SHADOW/CANARY 1, FULL 3 in its first 30 days) and the rest reduced. Legs never exceed the position, and a close waiting for the session keeps missing legs placed at the stop in force. A TP1 leg emptied by its own stop (both legs share it) reads as the live TP1: the rest's break-even stop is then through the market and fills at once; if the venue refuses it, the old leg (its stop triggered already) stays, with the watchdog as the backstop (runbook).
+6. **Stop moves.** Working protection is never removed before its replacement rests. Replace first (new bracket, then cancel the old one; brackets only reduce, spec §4.2); only when the venue refuses the replacement (REJECTED, not for its prices: it refuses the overlap) is the old one cancelled first - the gap is tracked as unprotected time (`LEG_GAP`, the designed path on such a venue, not an order failure) and a replacement that then fails puts the old terms back at once (`LEG_RESTORED`). A replacement whose outcome is unknown (429, 5xx, timeout) or that is refused for its prices keeps the old leg (`BRACKET_FAILED`) and the move is tried again on the next pass. A resting bracket of ours the trade does not list (accepted right before a crash, an unconfirmed replacement that reached the venue) is taken over by its client order id and terms (`LEG_ADOPTED`); other brackets of ours are cancelled only once every wanted leg rests; the trade records the new stop only once every leg rests at it. `orders/edit` on a bracket (the order's total size: filled + left) is used only with `EWBOT_LIVE_EDIT_STOPS=1`, after CANARY confirms it (spec §6.2). With no resting stop and the price through the stop, the watchdog closes at once; with a resting stop gapped past its 5% limit (`STOP_LIMIT_OFFSET`, the Create Order reference; spec §4.2 assumed 1%) for 10 s, it closes at market (spec §4.2).
+7. **Idempotency and retries** (spec §4.2, §5.1). Intent before send; a PENDING intent (ambiguous error, killed process) is looked up by `client_order_id` (orders created up to 5 min before it) before the same id is sent again; a duplicate-id answer resolves to the existing order; a PENDING intent not on the exchange after 10 min is ABANDONED (checked every minute). Reads are retried 3 times in the adapter; an ambiguous entry is looked up and re-sent with the same id on the next polls only until 5 minutes after its bar's close, then skipped (`진입이 실패하면 건너뛰고`); a failed close is retried on every poll with a new id, with an alert each time (`청산이 실패하면 계속 재시도하면서 경보`) - the close cancels the brackets first, so a failed or unconfirmed close puts them back at the stop in force at once and a close that keeps failing never leaves the position unprotected; `close_position` can only reduce, so a late duplicate close cannot open a position. Restart recovery also rebuilds a trade whose entry was accepted but not yet recorded (only when no trade with that id was recorded: a position appearing after our trade closed is a foreign one, adopted at its own entry price) and records a close accepted right before a crash with its reason; a failed read during recovery is recorded and counted unresolved, never raised. An accepted entry whose fill could not be read in time (or one still PENDING: looked up first) is rebuilt from its intent on the next pass (not treated as a foreign position); a rebuilt trade opens at its entry order's creation time, so the protection latency (`PROTECTED_FIRST`, `PROTECT_SLOW`) includes an outage. A reduction is recorded on the trade before it is sent (`pending_reduce`: id, size, reason, the position it was sent against, the trade once done): while its outcome is unknown no other reduction is planned and it is resolved by its id first (looked up; re-sent under the same id only when the venue does not have it and the position shows no reduction); the position showing it settles it as ours (`TP1_SYNC` → the live TP1) - never an unexplained reduction or a second sale. Protection planned together with a reduction waits until the reduction is known to have filled.
 8. **Exchange state vs. prices.** Positions and orders are read over REST (every 10 s while a trade is open or an intent is pending): one source of truth for reconcile, read as one state - the position is read again after the orders and the pair is used only when both reads agree (3 tries, else the poll is skipped), so a fill between the reads never pairs a stale position with a vanished leg. Because Coinbase may show a fill in the orders before the position, a leg that left the book is looked up before it is placed again: one with fills is not placed again for 30 s (the next read folds the fill). Prices for the watchdog come from the WebSocket `ticker` + `heartbeats` channels (SDK `WSClient`), with the spec's fallback: silent for 60 s → REST every 10 s; a reconnect or a `sequence_num` gap forces an immediate REST poll. The WebSocket `user` channel is not used.
 9. **SHADOW** runs the complete runtime against `ShadowExchange`: reads (product, session, quotes, balance, key permissions) are real; every order is first checked with the real `POST /orders/preview` (journaled for gate ③) and then executed on a virtual book (`SimExchange`) that follows the real futures price. Sizing is CANARY's, on the real balance (so the account must be funded during SHADOW). After a restart the open virtual position is restored from the journal (`ShadowExchange.restore`) and its brackets are re-placed, so the SHADOW restart test exercises the real recovery path.
 10. **Stages** change only through `ewbot live stage <to> --confirm` with a flat book (journal and Coinbase); promotions need every gate (one stage at a time). A running runtime notices the new stage within a minute and exits once flat; Docker (`restart: unless-stopped`) starts it in the new stage. Incidents: in CANARY the CANARY failure events (unprotected > 60 s, audit mismatch, breaker, transfer key, protection slower than 30 s, a foreign order or position, more contracts than the trade holds or fewer than its legs explain) pause entries (spec §6.2 `자동으로 일시 정지`); in FULL the major incidents pause and demote to CANARY. Pause never stops protection or exits.
-11. **Gates operationalised.** SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED` or `REDUCE_FAILED` event; CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
+11. **Gates operationalised.** SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED` or `REDUCE_FAILED` event (the cancel-first fallback on a venue that refuses overlapping brackets writes `LEG_GAP` only: the designed path, not a failure); CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
 12. **Audit** (spec §3.5): the journal stores the engine decisions in the paper ledger's format; hourly (from minute 50) they are compared with the paper ledger's current epoch (known_at in (epoch start, epoch through_ts]); any mismatch is alerted once and, in CANARY/FULL, is a major incident.
 13. **Costs in the daily summary**: entry slippage against the engine's reference (spot `entry_ref` × ratio), stop slippage of bracket stop fills against the stop price (every filled leg is read back with `get_order` and journaled as `BRACKET_FILL`), measured fees vs. the paper cost model (`execution.costs.fee`); funding is not measured separately (Coinbase books it into the balance) — the summary says so.
 14. **Deployment**: only tags on `origin/master`, only with a flat book; the new image's offline preflight runs before anything else; the running image is `ewbot-live:current` (rollback = deploy the previous tag).
@@ -93,18 +93,18 @@
 | 4 | Target state from the engine replay (+ allowlist line) | 12 |
 | 5 | Price mapping, stage sizing, margin projection | 22 |
 | 6 | Reconcile planner | 29 |
-| 7 | Executor: intent-before-send, protection, closes, recovery | 28 |
+| 7 | Executor: intent-before-send, protection, closes, recovery | 46 |
 | 8 | Watchdog and WebSocket feed | 7 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 6 |
 | 10 | Paper audit, stages and gates | 9 |
 | 11 | Settings and preflight | 7 |
 | 12 | `ShadowExchange` and the runtime loop | 21 |
 | 13 | CLI `ewbot live …` and production wiring | 7 |
-| 14 | Parity and chaos integration tests | 21 |
+| 14 | Parity and chaos integration tests | 23 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 285 more tests, `905 passed, 1 skipped` (`906 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 305 more tests, `925 passed, 1 skipped` (`926 passed` with the cache), about 80 s.
 
 ---
 
@@ -4851,7 +4851,7 @@ EOF
 
 **Interfaces:**
 - Consumes: Tasks 1, 2, 5, 6 (`Exchange`, `ExchangeError`, `Order`, `PlaceResult`, `SimExchange`, `SimCrash`, `Journal`, `map_levels`, every `reconcile` name), `ewbot.live.target.TargetPosition`, `ewbot.engine.position_mgr._tp1_split` (read-only import of the engine's TP1 split).
-- Produces (`ewbot.live.executor`): `FILL_TIMEOUT_S = 10.0`, `FLAT_TIMEOUT_S = 30.0`, `POLL_S = 0.5`, `LOOKUP_WINDOW_S = 300.0`, `ABANDON_AFTER_S = 600.0`, `LEG_SETTLE_S = 30.0`, journal keys `TRADE_KEY = "trade"`, `SKIPS_KEY`, `ORPHAN_KEY`; frozen `Sent(status: "ACCEPTED"|"REJECTED"|"PENDING", order_id=None, error=None)`; `class Executor(exchange, journal, *, clock=time.time, sleep=time.sleep, alert=None, tp1_frac=0.5, edit_stops=False, fill_timeout=10.0, flat_timeout=30.0, poll_s=0.5)` with `trade() -> LiveTrade | None`, `save(trade)`, `event(kind, data, text=None)` (journal + alert when `text`), `send(cid, kind, trade_id, payload, call) -> Sent`, `execute(actions, ctx)` (a `Protect` planned with a `Reduce` is skipped when that reduce is not known filled: the resting legs stay), `enter(Enter, ctx) -> LiveTrade | None`, `adopt(TargetPosition, ctx, contracts=None)` (rebuilds our own accepted entry from its intent, else adopts a foreign position: at most `contracts` and `ctx.max_contracts` - the planner's `Reduce EXCESS` closes the rest; a position the engine took TP1 on is adopted as the rest after TP1: `tp1_filled`, `tp1_n = 0`), `protect(Protect, ctx)` (a leg that left the book is looked up first: one with fills is not placed again for `LEG_SETTLE_S` - event `LEG_FILLED` - so the next observe folds it; unreadable or unfilled: placed again; a replaced leg is cancelled once), `close(reason, ctx) -> bool` (flat confirmed; a refused bracket cancel is recorded as `CANCEL_FAILED` and never blocks the close), `reduce(size, reason, ctx) -> bool` (records `pending_reduce` - the fresh position as `before`, `reconcile.after_reduce` as `after` - before sending; while one is pending it resolves that one instead of sending another; True when the venue reported it filled: its `after` is applied at once (`TP1_SYNC` marks the live TP1 done, `EXCESS` leaves the trade unchanged, `MARGIN` makes the trade smaller) and the record stays until the position shows it; refused, abandoned or unfilled: the record is dropped), `resolve_reduce()` (a pending reduce with an unknown outcome: nothing when the position already shows a reduction, else `send` with its id - looked up first, re-sent under the same id only when the venue does not have it), `flatten(reason, ctx) -> bool`, `resolve_pending() -> (counts, CLOSE intents found)` (no event; the runtime calls it every minute while intents are pending), `recover() -> {"accepted", "abandoned", "unknown", "rebuilt"}` (startup; writes `RECOVERY`). Journal events written: `ENTRY` (`trade_id, side, contracts, price, ref, fee, order_id`), `PROTECTED_FIRST` (`after_entry_s`), `STOP_MOVED` (`stop, stop_spot`), `STOP_EDITED`, `LEG_GAP`, `BRACKET_FAILED`, `CLOSED` (`trade_id, reason, price, contracts, side, fee`), `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCED` (`trade_id, size, reason, price, contracts, side, fee`), `REDUCE_FAILED` (`trade_id, reason, status` `PENDING` / `REJECTED` / `UNFILLED`, `error`), `LEG_FILLED` (`trade_id, leg, order_id, filled, status`), `ENTRY_FAILED`, `ENTRY_UNFILLED`, `ENTRY_UNCONFIRMED`, `CANCEL_FAILED`, `SKIP`, `ADOPTED` (`trade_id, contracts, position`), `RECOVERED_ENTRY`, `RECOVERY`, `CANCELLED`, `ACTION_ERROR`, and once-only alert events (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `CLOSE_DEFERRED`).
+- Produces (`ewbot.live.executor`): `FILL_TIMEOUT_S = 10.0`, `FLAT_TIMEOUT_S = 30.0`, `POLL_S = 0.5`, `LOOKUP_WINDOW_S = 300.0`, `ABANDON_AFTER_S = 600.0`, `LEG_SETTLE_S = 30.0`, journal keys `TRADE_KEY = "trade"`, `SKIPS_KEY`, `ORPHAN_KEY`, `SCRATCH_KEY` (one trade's once-alerts and leg-fill marks: a single key, dropped with the trade); frozen `Sent(status: "ACCEPTED"|"REJECTED"|"PENDING", order_id=None, error=None)`; `class Executor(exchange, journal, *, clock=time.time, sleep=time.sleep, alert=None, tp1_frac=0.5, edit_stops=False, fill_timeout=10.0, flat_timeout=30.0, poll_s=0.5)` with `trade() -> LiveTrade | None`, `save(trade)`, `event(kind, data, text=None)` (journal + alert when `text`), `send(cid, kind, trade_id, payload, call) -> Sent`, `execute(actions, ctx)` (a `Protect` planned with a `Reduce` is skipped when that reduce is not known filled: the resting legs stay), `enter(Enter, ctx) -> LiveTrade | None` (never a signal skipped once; a trade opens at its entry order's `created_ts`), `adopt(TargetPosition, ctx, contracts=None)` (rebuilds our own accepted entry from its intent - one still PENDING is looked up first - unless a trade with that id was recorded already; else adopts a foreign position at its own entry price (`ADOPTED`): at most `contracts` and `ctx.max_contracts` - the planner's `Reduce EXCESS` closes the rest; a position the engine took TP1 on is adopted as the rest after TP1: `tp1_filled`, `tp1_n = 0`; without quotes a foreign position waits, alerted once (`ADOPT_NO_QUOTES`) while it is not covered; a rebuilt or adopted trade goes on from the journal's highest bracket generation and close number for its id - client order ids are never reused), `protect(Protect, ctx)` (never removes a working leg before its replacement rests: replace = place first, then cancel; cancel first (`LEG_GAP`, no `BRACKET_FAILED`) only when the venue refused the replacement (REJECTED, not for its prices), and if the replacement then fails the old terms are placed again (`LEG_RESTORED`); an unknown outcome (PENDING) or a price refusal keeps the old leg (`BRACKET_FAILED`); a resting bracket of ours named for the trade and leg but not listed (accepted before a crash, an unconfirmed replacement) is taken over when its terms match (`LEG_ADOPTED`), else replaced; other brackets of ours are cancelled only once every wanted leg is in place; the new stop is recorded (`STOP_MOVED`) only once every leg rests at it; with `edit_stops` the edit sends the order's total size, filled + left; a leg that left the book is looked up first: one with fills is not placed again for `LEG_SETTLE_S` - event `LEG_FILLED` - so the next observe folds it; unreadable or unfilled: placed again; a replaced leg is cancelled once), `close(reason, ctx) -> bool` (flat confirmed; a refused bracket cancel is recorded as `CANCEL_FAILED` and never blocks the close; the reason is on the trade once the close is accepted; the flat wait ends at once when the IOC close ended short; a failed or unconfirmed close puts the legs back at the stop in force for the position left), `reduce(size, reason, ctx) -> bool` (records `pending_reduce` - the fresh position as `before`, `reconcile.after_reduce` as `after` - before sending; while one is pending it resolves that one instead of sending another; True when the venue reported it filled: its `after` is applied at once (`TP1_SYNC` marks the live TP1 done, `EXCESS` leaves the trade unchanged, `MARGIN` makes the trade smaller) and the record stays until the position shows it; refused, abandoned or unfilled: the record is dropped), `resolve_reduce()` (a pending reduce with an unknown outcome: nothing when the position already shows a reduction, else `send` with its id - looked up first, re-sent under the same id only when the venue does not have it), `flatten(reason, ctx) -> bool`, `resolve_pending() -> (counts, CLOSE intents found)` (no event; the runtime calls it every minute while intents are pending), `recover() -> {"accepted", "abandoned", "unknown", "rebuilt"}` (startup; records a close ACCEPTED before a crash with its reason and fill; rebuilds an accepted entry only when no trade with its id was recorded; a failed read is `RECOVERY_ERROR`, counted `unknown`, never raised; writes `RECOVERY`). Journal events written: `ENTRY` (`trade_id, side, contracts, price, ref, fee, order_id`), `PROTECTED_FIRST` (`after_entry_s`), `STOP_MOVED` (`stop, stop_spot`), `STOP_EDITED`, `LEG_GAP`, `BRACKET_FAILED`, `CLOSED` (`trade_id, reason, price, contracts, side, fee`), `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCED` (`trade_id, size, reason, price, contracts, side, fee`), `REDUCE_FAILED` (`trade_id, reason, status` `PENDING` / `REJECTED` / `UNFILLED`, `error`), `LEG_FILLED` (`trade_id, leg, order_id, filled, status`), `ENTRY_FAILED`, `ENTRY_UNFILLED`, `ENTRY_UNCONFIRMED`, `CANCEL_FAILED`, `SKIP`, `ADOPTED` (`trade_id, contracts, position`), `RECOVERED_ENTRY`, `RECOVERY`, `RECOVERY_ERROR`, `LEG_ADOPTED`, `LEG_RESTORED`, `CANCELLED`, `ACTION_ERROR`, and alert events sent once per trade (the planner's `Alert` kinds such as `FOREIGN_ORDERS`, `UNKNOWN_POSITION`; `CLOSE_DEFERRED`, `ADOPT_NO_QUOTES`, `ADOPT_DEFERRED`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4939,6 +4939,7 @@ from ewbot.live.reconcile import (
     Alert,
     Close,
     Enter,
+    Leg,
     Protect,
     Reduce,
     Skip,
@@ -5058,15 +5059,19 @@ def test_stop_moves_replace_place_first_then_cancel(env):
 
 
 def test_a_refused_overlap_falls_back_to_cancel_then_place(tmp_path):
+    """Probe B: on a venue that refuses overlapping brackets the fallback is the designed path - a LEG_GAP each,
+    no BRACKET_FAILED (a CANARY gate 2 failure) and no alert."""
     clock = Clock()
     ex = sim(clock, reject_overlap=True)
     jr = journal(tmp_path)
-    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    alerts = Alerts()
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep, alert=alerts)
     tr = exe.enter(Enter(entry(), 3), ctx(clock))
     legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
     exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
     assert sorted((o.size, o.stop_price) for o in ex.open_orders()) == [(1, 59_500.0), (2, 59_500.0)]
-    assert len(jr.events(kind="LEG_GAP")) == 2
+    assert len(jr.events(kind="LEG_GAP")) == 2 and not jr.events(kind="BRACKET_FAILED")
+    assert alerts.kinds() == ["ENTRY", "STOP_MOVED"]
     jr.close()
 
 
@@ -5327,6 +5332,290 @@ def test_a_vanished_leg_that_filled_is_looked_up_not_placed_again(env):
     clock.now += 10
     poll(exe, ex, clock, tgt)
     assert [(o.size, o.limit_price, o.stop_price) for o in ex.open_orders()] == [(3, 62_000.0, 60_000.0)]
+
+
+def resting(ex) -> list[tuple[int, float, float]]:
+    """(contracts left, take-profit, stop) of every resting order, sorted."""
+    return sorted((o.size - o.filled, o.limit_price, o.stop_price) for o in ex.open_orders())
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_a_stop_move_never_removes_a_leg_whose_replacement_is_unconfirmed(env, failures):
+    """Probe A: a 503 leaves the replacement's outcome unknown (PENDING, not a refusal): the old leg keeps
+    protecting - nothing is cancelled first - and the trade keeps the stop in force until every leg moved."""
+    clock, ex, jr, _, exe = env
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.fail_next("place_bracket", Unavailable("503"), times=failures)
+    legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    moved_tp2 = 59_500.0 if failures == 1 else 59_000.0
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, moved_tp2)]
+    assert not jr.events(kind="LEG_GAP") and len(jr.events(kind="BRACKET_FAILED")) == failures
+    assert exe.trade().stop_spot == 59_000.0 and not jr.events(kind="STOP_MOVED")
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_500.0), (2, 62_000.0, 59_500.0)]
+    assert exe.trade().stop_spot == 59_500.0 and len(jr.events(kind="STOP_MOVED")) == 1
+
+
+def test_an_unconfirmed_replacement_found_resting_is_taken_over(env):
+    clock, ex, jr, _, exe = env
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.crash_after_accept("place_bracket", Unavailable("read timeout"))  # the new TP1 leg rests, the answer is lost
+    ex.fail_next("find_order", Unavailable("503"))  # and the lookup fails: PENDING
+    legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert not jr.events(kind="LEG_GAP") and sum(n for n, _, _ in resting(ex)) == 4  # both TP1 legs rest
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))  # its terms match: taken over, the old one cancelled
+    assert resting(ex) == [(1, 61_000.0, 59_500.0), (2, 62_000.0, 59_500.0)]
+    assert ex.calls.count("place_bracket") == 4 and jr.events(kind="LEG_ADOPTED")[0]["data"]["leg"] == "tp1"
+
+
+def test_a_replacement_that_fails_after_the_cancel_puts_the_old_leg_back(tmp_path):
+    """The venue refuses the overlap, the old leg is cancelled first, then the replacement fails (503): the old
+    terms are placed again at once, and the next pass completes the move."""
+    clock = Clock()
+    ex = sim(clock, reject_overlap=True)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    real, calls = ex.place_bracket, []
+
+    def flaky(*args, **kw):
+        calls.append(args[0])
+        if len(calls) == 2:  # the replacement sent after the cancel
+            raise Unavailable("503")
+        return real(*args, **kw)
+
+    ex.place_bracket = flaky
+    legs, stop = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_500.0)]  # TP1 restored, TP2 moved
+    assert len(jr.events(kind="LEG_RESTORED")) == 1 and exe.trade().stop_spot == 59_000.0
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_500.0), (2, 62_000.0, 59_500.0)] and exe.trade().stop_spot == 59_500.0
+    jr.close()
+
+
+def test_a_replacement_refused_for_its_prices_keeps_the_old_leg(tmp_path):
+    """A refusal that names a price (a stop through the market, an off-grid level) would refuse the replacement
+    again: the old leg - maybe already triggered and filling - is never cancelled first, even on a venue that
+    refuses overlapping brackets."""
+    clock = Clock()
+    ex = sim(clock, reject_overlap=True)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    legs, _ = desired_legs(tr, 3, 59_500.0, 1.0, 5.0)
+    bad = tuple(Leg(leg.name, leg.size, leg.limit_price, 59_501.0) for leg in legs)  # off the $5 grid
+    exe.protect(Protect(bad, 59_500.0, 59_501.0), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert not jr.events(kind="LEG_GAP") and len(jr.events(kind="BRACKET_FAILED")) == 2
+    assert exe.trade().stop_price == 59_000.0
+    jr.close()
+
+
+@pytest.mark.parametrize("reject_overlap", [False, True])
+def test_brackets_accepted_before_a_crash_are_taken_over_after_the_restart(tmp_path, reject_overlap):
+    """Probe C: killed right after the second bracket was accepted - both legs rest, the trade does not know
+    them. After the restart they are taken over by their client order id and terms (on a venue that refuses
+    overlapping brackets, placing new ones first would fail and cancelling them would leave it unprotected)."""
+    clock = Clock()
+    ex = sim(clock, reject_overlap=reject_overlap)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    real, calls = ex.place_bracket, []
+
+    def crash_on_second(*args, **kw):
+        calls.append(args[0])
+        if len(calls) == 2:
+            ex.crash_after_accept("place_bracket")
+        return real(*args, **kw)
+
+    ex.place_bracket = crash_on_second
+    with pytest.raises(SimCrash):
+        exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.place_bracket = real
+    jr.close()
+    jr2 = journal(tmp_path)
+    exe2 = Executor(ex, jr2, clock=clock, sleep=clock.sleep)
+    exe2.recover()
+    assert poll(exe2, ex, clock, target(T0 + 3600, position())) == ["UNPROTECTED"]
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert ex.calls.count("place_bracket") == 2 and not jr2.events(kind="BRACKET_FAILED")
+    assert [leg.client_order_id for leg in exe2.trade().legs] == [f"ewb-b-{T0}-tp1-1", f"ewb-b-{T0}-tp2-2"]
+    assert poll(exe2, ex, clock, target(T0 + 3600, position())) == ["PROTECTED"]
+    jr2.close()
+
+
+def test_a_failed_close_puts_the_protection_back(env):
+    """Probe D: the close cancels the brackets first; when the close then fails, the legs go back at the stop in
+    force for the position, so a close that keeps failing never leaves it unprotected."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.fail_next("close_position", RateLimited("429"))
+    assert exe.close("TIME", ctx(clock)) is False and "CLOSE_FAILED" in alerts.kinds()
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert poll(exe, ex, clock, target(T0 + 3600, position(), exit_reason="TIME")) == []  # never seen unprotected
+    assert ex.position() is None and exe.trade().exit_reason == "TIME"
+
+
+def test_a_partly_filled_close_returns_at_once_and_protects_the_rest(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.market_fill_ratio = 0.5  # the IOC close fills 1 of 3, its rest is cancelled
+    start = clock()
+    assert exe.close("TIME", ctx(clock)) is False and jr.events(kind="CLOSE_UNCONFIRMED")
+    assert clock() - start < 5.0  # the close order ended: no 30 s wait for a flat position that cannot come
+    assert ex.position().contracts == 2 and resting(ex) == [(1, 61_000.0, 59_000.0), (1, 62_000.0, 59_000.0)]
+
+
+def test_an_edit_keeps_what_a_partly_filled_leg_has_left(tmp_path):
+    """Probe E: orders/edit takes the order's total size: a TP1 leg of 2 with 1 filled is edited to 2 (1 left),
+    never to 1 (which would end it and leave a contract unprotected)."""
+    clock = Clock()
+    ex = sim(clock, edit_supported=True)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep, edit_stops=True)
+    exe.enter(Enter(entry(), 5), ctx(clock))  # TP1 leg 2, TP2 leg 3
+    ex.bracket_fill_cap = 1
+    ex.set_prices(61_000.0)
+    ex.set_prices(60_500.0)
+    ex.bracket_fill_cap = None
+    seen, events = observe(exe.trade(), ex.position(), ex.open_orders(), clock())
+    exe.save(seen)
+    assert [k for k, _ in events] == ["PARTIAL_FILL"] and ex.position().contracts == 4
+    legs, stop = desired_legs(exe.trade(), 4, 59_500.0, 1.0, 5.0)
+    exe.protect(Protect(tuple(legs), 59_500.0, stop), ctx(clock))
+    assert resting(ex) == [(1, 61_000.0, 59_500.0), (3, 62_000.0, 59_500.0)]
+    assert ex.calls.count("place_bracket") == 2 and len(jr.events(kind="STOP_EDITED")) == 2
+    jr.close()
+
+
+def test_a_signal_skipped_once_is_never_entered_later(env):
+    """Probe F: the flip's close failed, so the new signal was skipped (alerted); on the next pass the close goes
+    through, and the skipped entry is not sent late (never chase)."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    short = entry(signal_ts=T0 + 3600, direction=-1, stop=61_000.0, tp1=59_000.0, tp2=58_000.0)
+    ex.fail_next("close_position", RateLimited("429"))
+    exe.execute([Close("FLIP"), Enter(short, 1)], ctx(clock))
+    clock.now += 10
+    poll(exe, ex, clock, target(T0 + 3600, position(), exit_reason="FLIP", ent=short))
+    assert ex.position() is None and ex.calls.count("place_market") == 1
+    assert jr.intent(f"ewb-e-{T0 + 3600}-S") is None and alerts.kinds().count("SKIP") == 1
+
+
+def test_recovery_records_a_close_accepted_before_the_crash(tmp_path):
+    """Probe G: killed while waiting for the flat position after the close was accepted: the restart records
+    the close with its reason (not as a bracket exit)."""
+    clock = Clock()
+    ex = sim(clock)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    exe.enter(Enter(entry(), 1), ctx(clock))
+
+    def killed(*_args):
+        raise SimCrash("killed during the flat wait")
+
+    exe._await_flat = killed
+    with pytest.raises(SimCrash):
+        exe.close("TIME", ctx(clock))
+    assert jr.intent(f"ewb-x-{T0}-1")["status"] == "ACCEPTED" and ex.position() is None
+    jr.close()
+    jr2 = journal(tmp_path)
+    exe2 = Executor(ex, jr2, clock=clock, sleep=clock.sleep)
+    exe2.recover()
+    tr = exe2.trade()
+    assert (tr.status, tr.exit_reason) == ("CLOSED", "TIME")
+    closed = jr2.events(kind="CLOSED")[0]["data"]
+    assert closed["recovered"] and closed["reason"] == "TIME" and closed["price"] == 59_997.5
+    jr2.close()
+
+
+def test_a_rebuilt_trade_measures_protection_from_its_fill(tmp_path):
+    """Probe H: an entry rebuilt after a 5-minute outage was unprotected for 5 minutes: PROTECTED_FIRST says so
+    (PROTECT_SLOW, CANARY gate 1), it does not start the clock at the restart."""
+    clock = Clock()
+    ex = sim(clock)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    ex.crash_after_accept("place_market")
+    with pytest.raises(SimCrash):
+        exe.enter(Enter(entry(), 3), ctx(clock))
+    jr.close()
+    clock.now += 300
+    jr2 = journal(tmp_path)
+    exe2 = Executor(ex, jr2, clock=clock, sleep=clock.sleep)
+    exe2.recover()
+    exe2.execute(plan(None, exe2.trade(), ex.position(), ex.open_orders(), ctx(clock)), ctx(clock))
+    assert jr2.events(kind="PROTECTED_FIRST")[0]["data"]["after_entry_s"] == 300.0
+    jr2.close()
+
+
+def test_a_foreign_position_after_our_trade_closed_is_adopted_under_fresh_ids(env):
+    """probe3: our 1-contract trade left at its TP1; a manual position in the engine's direction follows while
+    the engine still holds that trade. It is a foreign position (ADOPTED, its own entry price), not our entry
+    rebuilt from its intent, and its brackets go on from the journal's ids (a reused id would resolve to the
+    filled TP1 leg and leave the position unprotected)."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    ex.set_prices(61_000.0)
+    assert poll(exe, ex, clock, target(T0 + 3600, position())) == ["CLOSED"]
+    ex.set_prices(60_500.0)
+    ex.place_market("manual-1", 1, 1)
+    clock.now += 60
+    poll(exe, ex, clock, target(T0 + 3600, position()))
+    tr = exe.trade()
+    assert (tr.status, tr.entry_price, tr.gen) == ("OPEN", 60_502.5, 2)
+    assert [o.client_order_id for o in ex.open_orders()] == [f"ewb-b-{T0}-tp1-2"]
+    assert "ADOPTED" in alerts.kinds() and "RECOVERED_ENTRY" not in alerts.kinds()
+
+
+def test_an_own_entry_still_pending_is_looked_up_before_a_position_is_called_foreign(env):
+    clock, ex, jr, alerts, exe = env
+    ex.crash_after_accept("place_market", Unavailable("read timeout"))  # filled, the answer lost
+    ex.fail_next("find_order", Unavailable("503"))  # and the lookup failed: PENDING
+    assert exe.enter(Enter(entry(), 1), ctx(clock)) is None and jr.intent(f"ewb-e-{T0}-L")["status"] == "PENDING"
+    poll(exe, ex, clock, target(T0 + 3600, ent=entry()))
+    assert exe.trade().trade_id == T0 and len(ex.open_orders()) == 1
+    assert "RECOVERED_ENTRY" in alerts.kinds() and "ADOPTED" not in alerts.kinds()
+
+
+def test_a_position_that_cannot_be_adopted_without_quotes_is_alerted_once(env):
+    clock, ex, jr, alerts, exe = env
+    ex.place_market("manual-1", 1, 2)
+    for _ in range(2):
+        exe.execute([Adopt(position(), 2)], ctx(clock, ratio=None))
+    assert exe.trade() is None and ex.open_orders() == [] and alerts.kinds() == ["ADOPT_NO_QUOTES"]
+
+
+def test_alerts_are_once_per_trade_and_the_journal_keys_stay_bounded(env):
+    clock, ex, jr, alerts, exe = env
+    for signal in (T0, T0 + 7200):
+        exe.enter(Enter(entry(signal_ts=signal), 1), ctx(clock))
+        for _ in range(2):
+            exe.close("LINEAGE", ctx(clock, session_open=False))
+        assert exe.close("LINEAGE", ctx(clock)) is True
+    assert alerts.kinds().count("CLOSE_DEFERRED") == 2  # once for each trade
+    for k in range(50):
+        exe.execute([Alert("FOREIGN_ORDERS", f"f{k}")], ctx(clock))
+    keys = [r[0] for r in jr._exec("SELECT key FROM kv").fetchall()]
+    assert len(keys) <= 4 and not [k for k in keys if k.startswith(("alerted:", "leg_filled:"))]
+
+
+def test_recovery_survives_an_unreadable_exchange(tmp_path):
+    clock = Clock()
+    ex = sim(clock)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    ex.crash_after_accept("place_market")
+    with pytest.raises(SimCrash):
+        exe.enter(Enter(entry(), 1), ctx(clock))
+    ex.fail_next("get_order", Unavailable("503"))
+    assert exe.recover() == {"accepted": 1, "abandoned": 0, "unknown": 1, "rebuilt": 0}
+    assert jr.events(kind="RECOVERY_ERROR") and exe.trade() is None
+    assert exe.recover()["rebuilt"] == 1 and exe.trade().trade_id == T0
+    jr.close()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -5350,19 +5639,34 @@ failure (429 / 5xx / timeout / process killed) leaves it PENDING, and a PENDING 
 the exchange by client_order_id before it is ever sent again - so a restart never doubles an order.
 
 Entries are market IOC orders; the fill is awaited (10 s) and the trade is protected at once with
-trigger_bracket_gtc legs. Stop moves edit the resting bracket when `edit_stops` is on (unconfirmed for
-CFM brackets: off until CANARY confirms it), otherwise the new bracket is placed first and the old
-one cancelled (brackets only reduce, so a short overlap cannot over-close); if the exchange refuses the
-overlap, the old one is cancelled first and the gap is tracked as unprotected time. A leg that left the
-book is looked up before it is placed again: one with fills is not placed again for LEG_SETTLE_S (the
-position read may not show the fill yet, and a take-profit placed again below the market would sell at
-once what the leg already sold) - the next observe folds the fill. Closes cancel our brackets (a refused
-cancel is recorded, CANCEL_FAILED, and never blocks the close) and call close_position; the flat
-position is awaited (30 s). Reductions (close_position with a size) are recorded on the trade before they
-are sent (`LiveTrade.pending_reduce`): a reduce with an unknown outcome is resolved by its client order
-id (`resolve_reduce`, before every read of the exchange state) and never followed by a second one, and a
-Protect planned with a reduce waits until the reduce is known to have filled. Market orders wait for an
-OPEN session; a deferred close is retried on every pass (spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`).
+trigger_bracket_gtc legs. Working protection is never removed before its replacement is in place. Stop
+moves edit the resting bracket when `edit_stops` is on (unconfirmed for CFM brackets: off until CANARY
+confirms it; the edit sends the order's total size, filled + left), otherwise the new bracket is placed
+first and the old one cancelled (brackets only reduce, so a short overlap cannot over-close). Only when
+the venue refuses the replacement (REJECTED: it refuses the overlap) is the old one cancelled first -
+LEG_GAP, the designed path on such a venue and not an order failure - and when the replacement then fails
+as well, the old terms are placed again at once (LEG_RESTORED). A replacement whose outcome is unknown
+(PENDING: 429 / 5xx / timeout) or that is refused for its prices (a stop through the market, an off-grid
+level: it would be refused again) keeps the old leg. A resting bracket of ours the trade does not list
+(accepted right before a crash, or a PENDING replacement that reached the venue) is taken over when its
+client order id names the trade and leg and its terms are the wanted ones (LEG_ADOPTED), else replaced
+like a leg of the trade; other brackets of ours are cancelled only once every wanted leg is in place,
+and the trade records a new stop only once every leg rests at it (STOP_MOVED). A leg that left the book is
+looked up before it is placed again: one with fills is not placed again for LEG_SETTLE_S (the position
+read may not show the fill yet, and a take-profit placed again below the market would sell at once what
+the leg already sold) - the next observe folds the fill.
+
+Closes cancel our brackets (a refused cancel is recorded, CANCEL_FAILED, and never blocks the close) and
+call close_position; the flat position is awaited (30 s; at once over when the IOC close ended without
+closing everything). A close that fails or is not confirmed puts the legs back at the stop in force for
+the position left, so a close that keeps failing never leaves it unprotected. Reductions (close_position
+with a size) are recorded on the trade before they are sent (`LiveTrade.pending_reduce`): a reduce with
+an unknown outcome is resolved by its client order id (`resolve_reduce`, before every read of the exchange
+state) and never followed by a second one, and a Protect planned with a reduce waits until the reduce is
+known to have filled. Market orders wait for an OPEN session; a deferred close is retried on every pass
+(spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`). An entry skipped once is never sent later (never chase).
+Client order ids are never reused: a trade rebuilt or taken over under the id of an earlier one goes on
+from the journal's highest bracket generation and close number.
 
 The same code runs every stage: in SHADOW the exchange is a ShadowExchange (virtual fills, real
 previews)."""
@@ -5378,6 +5682,7 @@ from ewbot.live.exchange import Exchange, ExchangeError, Order, PlaceResult
 from ewbot.live.journal import Journal
 from ewbot.live.pricing import map_levels
 from ewbot.live.reconcile import (
+    PREFIX,
     Action,
     Adopt,
     Alert,
@@ -5410,6 +5715,7 @@ LEG_SETTLE_S = 30.0  # a leg that left the book with fills is not placed again f
 TRADE_KEY = "trade"
 SKIPS_KEY = "skipped_signals"
 ORPHAN_KEY = "orphan_closes"
+SCRATCH_KEY = "trade_scratch"  # one trade's bookkeeping (alerts sent once, legs seen filled): replaced with the trade
 
 Alerter = Callable[[str, str], None]
 
@@ -5423,6 +5729,23 @@ class Sent:
 
 def _side(d: int) -> str:
     return "롱" if d > 0 else "숏"
+
+
+def _terms(o: Order) -> tuple[int, float | None, float | None]:
+    """What a resting bracket still covers, at which take-profit and stop."""
+    return o.size - o.filled, o.limit_price, o.stop_price
+
+
+def _refuses_prices(sent: Sent) -> bool:
+    """A refusal of the order's prices (a stop through the market, an off-grid level): a replacement refused so
+    is refused again after a cancel - not the overlap refusal the cancel-first fallback answers."""
+    return sent.status == "REJECTED" and "PRICE" in str(sent.error or "").upper()
+
+
+def _leg_of(name: str, o: Order) -> Leg:
+    """The trade's record of a resting bracket of ours, with the order's own terms."""
+    return Leg(name, o.size - o.filled, float(o.limit_price or 0.0), float(o.stop_price or 0.0), o.client_order_id,
+               o.order_id)
 
 
 class Executor:
@@ -5458,11 +5781,43 @@ class Executor:
 
     def save(self, trade: LiveTrade | None) -> None:
         self.journal.put(TRADE_KEY, None if trade is None else trade.to_json())
+        if trade is None or trade.status != "OPEN":
+            self.journal.put(SCRATCH_KEY, None)  # the trade's bookkeeping ends with it
 
     def event(self, kind: str, data: dict[str, Any], text: str | None = None) -> None:
         self.journal.add_event(self.clock(), kind, data)
         if text is not None:
             self.alert(kind, text)
+
+    def _scratch(self, trade_id: int) -> dict[str, Any]:
+        """The bookkeeping of one trade (0: no open trade): `alerted` (alerts sent once) and `leg_filled` (order id
+        -> when a leg was first found gone with fills). One journal key, replaced when the trade changes."""
+        data = self.journal.get(SCRATCH_KEY)
+        if not isinstance(data, dict) or data.get("trade_id") != trade_id:
+            data = {"trade_id": trade_id, "alerted": [], "leg_filled": {}}
+        return data
+
+    def _counters(self, trade_id: int) -> tuple[int, int]:
+        """The highest bracket generation and close / reduce number the journal holds for `trade_id`: a trade
+        rebuilt or taken over under the id of an earlier one goes on from there (a reused client order id would
+        resolve to the earlier, filled order)."""
+        gen = closes = 0
+        for row in self.journal.intents(trade_id=trade_id):
+            tail = str(row["client_order_id"]).rsplit("-", 1)[-1]
+            if not tail.isdigit():
+                continue
+            if row["kind"] == "BRACKET":
+                gen = max(gen, int(tail))
+            elif row["kind"] in ("CLOSE", "REDUCE"):
+                closes = max(closes, int(tail))
+        return gen, closes
+
+    def _recorded(self, trade_id: int) -> bool:
+        """A trade with this id was recorded once: it is the journal's trade, or it sent orders of its own."""
+        t = self.trade()
+        if t is not None and t.trade_id == trade_id:
+            return True
+        return any(row["kind"] != "ENTRY" for row in self.journal.intents(trade_id=trade_id))
 
     # ------------------------------------------------------------------ sending
     def _lookup(self, client_order_id: str, created_ts: float) -> tuple[Order | None, bool]:
@@ -5531,11 +5886,20 @@ class Executor:
         except ExchangeError as exc:
             self.event("CANCEL_FAILED", {"trade_id": trade_id, "order_ids": order_ids, "error": str(exc)[:200]})
 
-    def _await_flat(self) -> bool:
+    def _await_flat(self, order_id: str | None) -> bool:
+        """True once the position is flat. False at the deadline - or at once when the IOC close ended without
+        filling all it was sent for (the venue cancelled the rest: the position stays). Read errors are retried
+        until the deadline."""
         deadline = self.clock() + self.flat_timeout
         while True:
-            if self.ex.position() is None:
-                return True
+            try:
+                if self.ex.position() is None:
+                    return True
+                o = self.ex.get_order(order_id) if order_id else None
+                if o is not None and o.is_terminal and o.filled < o.size:
+                    return False
+            except ExchangeError:
+                pass
             if self.clock() >= deadline:
                 return False
             self.sleep(self.poll_s)
@@ -5576,10 +5940,15 @@ class Executor:
                     reduced = False
 
     def _alert_once(self, kind: str, detail: str) -> None:
-        key = f"alerted:{kind}:{detail}"
-        if not self.journal.get(key, False):
-            self.journal.put(key, True)
-            self.event(kind, {"detail": detail}, f"[경고] {kind}: {detail}")
+        """Once per open trade (or once while there is none): the record goes with the trade."""
+        t = self.trade()
+        scratch = self._scratch(t.trade_id if t is not None and t.status == "OPEN" else 0)
+        key = f"{kind}:{detail}"
+        if key in scratch["alerted"]:
+            return
+        scratch["alerted"] = (scratch["alerted"] + [key])[-100:]
+        self.journal.put(SCRATCH_KEY, scratch)
+        self.event(kind, {"detail": detail}, f"[경고] {kind}: {detail}")
 
     def _skip(self, a: Skip) -> None:
         done = self.journal.get(SKIPS_KEY, [])
@@ -5595,6 +5964,8 @@ class Executor:
         row = self.journal.intent(cid)
         if row is not None and row["status"] != "PENDING":
             return None  # already entered or refused once: an entry is never sent twice
+        if e.signal_ts in self.journal.get(SKIPS_KEY, []):
+            return None  # skipped once (paused, a flip's close not confirmed, no quotes...): never sent later
         if ctx.ratio is None:
             self._skip(Skip(e.signal_ts, "no futures/spot quotes"))
             return None
@@ -5627,25 +5998,43 @@ class Executor:
         return self.trade()
 
     def _trade_from(self, payload: dict[str, Any], order: Order) -> LiveTrade:
+        """The trade of our filled entry. It opened when the order was created (a trade rebuilt after an outage
+        was unprotected since then: PROTECTED_FIRST measures it); its ids go on from the journal's."""
         n = int(order.filled)
+        trade_id = int(payload["signal_ts"])
+        gen, closes = self._counters(trade_id)
         return LiveTrade(
-            trade_id=int(payload["signal_ts"]), setup=str(payload["setup"]), direction=int(payload["direction"]),
+            trade_id=trade_id, setup=str(payload["setup"]), direction=int(payload["direction"]),
             contracts=n, tp1_n=_tp1_split(n, self.tp1_frac), entry_price=float(order.avg_fill_price or 0.0),
             tp1_price=float(payload["tp1"]), tp2_price=None if payload["tp2"] is None else float(payload["tp2"]),
-            stop_spot=float(payload["stop_spot"]), stop_price=float(payload["stop"]), opened_ts=self.clock(),
+            stop_spot=float(payload["stop_spot"]), stop_price=float(payload["stop"]),
+            opened_ts=float(order.created_ts or self.clock()), gen=gen, closes=closes,
         )
 
     def adopt(self, tp: TargetPosition, ctx: PlanContext, contracts: int | None = None) -> None:
         """Take over a position the trade state does not know: at most `contracts` (default: the whole
         position) and never above the stage maximum `ctx.max_contracts`; the planner reduces the rest
-        (Reduce EXCESS). Our own accepted entry for that signal (its fill could not be read in time) is
-        rebuilt from its intent; anything else is a foreign position (event ADOPTED: manual intervention).
-        A position the engine already took TP1 on is the rest after TP1 (break-even, no TP1 portion)."""
+        (Reduce EXCESS). Our own entry for that signal (its fill could not be read in time; one still PENDING
+        is looked up first) is rebuilt from its intent - unless a trade with that id was recorded already: a
+        position after our trade closed is a foreign one. A foreign position (event ADOPTED: manual
+        intervention) is taken over at its own entry price, its ids going on from the journal's; without quotes
+        the engine's levels cannot be mapped (alerted once while it is not covered). A position the engine
+        already took TP1 on is the rest after TP1 (break-even, no TP1 portion)."""
         pos = self.ex.position()
-        if pos is None or ctx.ratio is None:
+        if pos is None:
             return
-        own = self.journal.intent(entry_cid(tp.signal_ts, tp.direction))
-        if own is not None and own["status"] == "ACCEPTED" and own["order_id"]:
+        cid = entry_cid(tp.signal_ts, tp.direction)
+        own = self.journal.intent(cid)
+        if own is not None and own["status"] == "PENDING":  # our entry's outcome is unknown: look it up first
+            found, known = self._lookup(cid, float(own["created_ts"]))
+            if not known:
+                self._alert_once("ADOPT_DEFERRED", f"{cid}: the entry's outcome is unknown (lookup failed)")
+                return
+            if found is not None:
+                self.journal.update_intent(cid, "ACCEPTED", self.clock(), order_id=found.order_id, note="found by lookup")
+                own = self.journal.intent(cid)
+        if (own is not None and own["status"] == "ACCEPTED" and own["order_id"]
+                and not self._recorded(tp.signal_ts)):
             order = self.ex.get_order(str(own["order_id"]))
             if order.filled > 0:
                 trade = self._trade_from(own["payload"], order)
@@ -5656,15 +6045,24 @@ class Executor:
                 legs, stop = desired_legs(trade, size, trade.stop_spot, ctx.ratio, ctx.tick)
                 self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
                 return
+        if ctx.ratio is None:
+            covered = sum(o.size - o.filled for o in self.ex.open_orders()
+                          if o.kind == "BRACKET" and o.side == -pos.side and o.stop_price is not None)
+            if covered < pos.contracts:
+                self._alert_once("ADOPT_NO_QUOTES", f"position {pos.side:+d} x{pos.contracts}: no quotes to map the "
+                                                    f"engine levels, unprotected until they are back")
+            return
         n = pos.contracts if contracts is None else min(contracts, pos.contracts)
         if ctx.max_contracts is not None:
             n = min(n, ctx.max_contracts)
         after_tp1 = tp.tp1_done and n > 1
         lv = map_levels(tp.direction, tp.stop, tp.tp1, tp.tp2, ctx.ratio, ctx.tick)
+        gen, closes = self._counters(tp.signal_ts)
         trade = LiveTrade(
             trade_id=tp.signal_ts, setup=tp.setup, direction=tp.direction, contracts=n,
             tp1_n=0 if after_tp1 else _tp1_split(n, self.tp1_frac), entry_price=pos.avg_entry, tp1_price=lv.tp1,
             tp2_price=lv.tp2, stop_spot=tp.stop, stop_price=lv.stop, opened_ts=self.clock(), tp1_filled=after_tp1,
+            gen=gen, closes=closes,
         )
         self.save(trade)
         self.event("ADOPTED", {"trade_id": trade.trade_id, "contracts": n, "position": pos.contracts},
@@ -5674,81 +6072,153 @@ class Executor:
         self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
 
     # protection --------------------------------------------------------------
-    def _place_leg(self, trade: LiveTrade, want: Leg) -> Leg | None:
+    def _place_leg(self, trade: LiveTrade, want: Leg) -> tuple[Leg | None, Sent]:
         trade.gen += 1
         cid = bracket_cid(trade.trade_id, want.name, trade.gen)
-        leg = Leg(want.name, want.size, want.limit_price, want.stop_price, cid, None)
         self.save(trade)  # the generation is persisted before the request
         sent = self.send(cid, "BRACKET", trade.trade_id,
                          {"leg": want.name, "size": want.size, "limit": want.limit_price, "stop": want.stop_price},
                          lambda: self.ex.place_bracket(cid, -trade.direction, want.size, want.limit_price, want.stop_price))
-        if sent.status == "ACCEPTED":
-            leg.order_id = sent.order_id
-            return leg
+        if sent.status != "ACCEPTED":
+            return None, sent
+        return Leg(want.name, want.size, want.limit_price, want.stop_price, cid, sent.order_id), sent
+
+    def _bracket_failed(self, trade: LiveTrade, want: Leg, sent: Sent) -> None:
         self.event("BRACKET_FAILED", {"trade_id": trade.trade_id, "leg": want.name, "status": sent.status,
                                       "error": sent.error},
                    f"[보호 주문 실패] {want.name} {want.size}계약 손절 {want.stop_price:,.0f}: {sent.status} {sent.error}")
-        return None
+
+    def _edit(self, o: Order, want: Leg) -> bool:
+        """orders/edit takes the order's total size: what already filled plus what is to rest. A failed edit
+        (refused or unanswered) is replaced like any other leg."""
+        try:
+            return self.ex.edit_bracket(o.order_id, o.filled + want.size, want.limit_price, want.stop_price)
+        except ExchangeError:
+            return False
+
+    @staticmethod
+    def _orphan(trade: LiveTrade, want: Leg, orders: dict[str, Order], claimed: set[str]) -> Order | None:
+        """A resting bracket of ours for this trade's `want.name` leg that the trade does not list (accepted right
+        before a crash, or a replacement whose answer was lost) - one with the wanted terms first."""
+        prefix = f"{PREFIX}b-{trade.trade_id}-{want.name}-"
+        found = [o for oid, o in orders.items() if oid not in claimed and o.kind == "BRACKET"
+                 and o.client_order_id.startswith(prefix) and o.side == -trade.direction]
+        wanted = (want.size, want.limit_price, want.stop_price)
+        return next((o for o in found if _terms(o) == wanted), found[0] if found else None)
 
     def protect(self, a: Protect, ctx: PlanContext) -> None:
+        """Make the resting brackets the wanted legs without ever removing a working leg before its replacement
+        rests (module docstring): kept, taken over, edited or replaced (place first, then cancel; cancel first
+        only when the venue refuses the overlap)."""
         trade = self.trade()
         if trade is None or trade.status != "OPEN":
             return
         orders = {o.order_id: o for o in self.ex.open_orders()}
+        claimed = {str(leg.order_id) for leg in trade.legs if leg.order_id in orders}
         kept: list[Leg] = []
+        exact = 0  # wanted legs resting with exactly the wanted terms
         replaced: set[str] = set()  # cancelled below already: not cancelled again as stale
         for want in a.legs:
+            terms = (want.size, want.limit_price, want.stop_price)
             cur = next((leg for leg in trade.legs if leg.name == want.name and leg.order_id in orders), None)
-            gone = next((leg for leg in trade.legs if leg.name == want.name and leg.order_id), None)
-            if cur is None and gone is not None and self._left_with_fills(trade, gone):
-                kept.append(gone)  # not placed again: the next observe folds its fill (or it is placed later)
-                continue
-            if cur is not None:
-                o = orders[str(cur.order_id)]
-                if (o.size - o.filled, o.limit_price, o.stop_price) == (want.size, want.limit_price, want.stop_price):
-                    kept.append(cur)
+            if cur is None:
+                gone = next((leg for leg in trade.legs if leg.name == want.name and leg.order_id), None)
+                if gone is not None and self._left_with_fills(trade, gone):
+                    kept.append(gone)  # not placed again: the next observe folds its fill (or it is placed later)
                     continue
-                if (self.edit_stops and (o.size - o.filled, o.limit_price) == (want.size, want.limit_price)
-                        and self.ex.edit_bracket(str(cur.order_id), want.size, want.limit_price, want.stop_price)):
-                    kept.append(Leg(cur.name, want.size, want.limit_price, want.stop_price, cur.client_order_id, cur.order_id))
+            if cur is not None and _terms(orders[str(cur.order_id)]) == terms:
+                kept.append(cur)
+                exact += 1
+                continue
+            orphan = self._orphan(trade, want, orders, claimed)
+            if orphan is not None:
+                claimed.add(orphan.order_id)
+                if _terms(orphan) == terms:  # ours for this leg, its answer lost: taken over, not placed again
+                    kept.append(_leg_of(want.name, orphan))
+                    exact += 1
+                    self.event("LEG_ADOPTED", {"trade_id": trade.trade_id, "leg": want.name, "order_id": orphan.order_id,
+                                               "client_order_id": orphan.client_order_id})
+                    if cur is not None:
+                        self._cancel_quietly([str(cur.order_id)], trade.trade_id)
+                        replaced.add(str(cur.order_id))
+                    continue
+                if cur is None:
+                    cur = _leg_of(want.name, orphan)  # replaced like a leg of the trade
+            if cur is not None and self.edit_stops:
+                o = orders[str(cur.order_id)]
+                if (o.size - o.filled, o.limit_price) == (want.size, want.limit_price) and self._edit(o, want):
+                    kept.append(Leg(cur.name, want.size, want.limit_price, want.stop_price, cur.client_order_id,
+                                    cur.order_id))
+                    exact += 1
                     self.event("STOP_EDITED", {"trade_id": trade.trade_id, "leg": want.name, "stop": want.stop_price})
                     continue
-            placed = self._place_leg(trade, want)
-            if placed is None and cur is not None:  # the venue refused the overlap: cancel first, then place
-                self.ex.cancel([str(cur.order_id)])
-                replaced.add(str(cur.order_id))
-                self.event("LEG_GAP", {"trade_id": trade.trade_id, "leg": want.name})
-                cur = None
-                placed = self._place_leg(trade, want)
+            placed, sent = self._place_leg(trade, want)
+            moved = placed is not None
+            if placed is None and cur is not None and sent.status == "REJECTED" and not _refuses_prices(sent):
+                placed, moved = self._swap(trade, cur, orders[str(cur.order_id)], want, replaced)  # overlap refused
+            elif placed is None:  # unknown (PENDING), refused for its prices or nothing to replace: the old leg stays
+                self._bracket_failed(trade, want, sent)
             if placed is not None:
-                if cur is not None:
+                if cur is not None and str(cur.order_id) not in replaced:
                     self._cancel_quietly([str(cur.order_id)], trade.trade_id)
                     replaced.add(str(cur.order_id))
                 kept.append(placed)
-            elif cur is not None:
-                kept.append(cur)
+                exact += int(moved)
+            elif cur is not None and str(cur.order_id) not in replaced:
+                kept.append(cur)  # its replacement is not in place: the old leg keeps protecting
+        complete = len(kept) == len(a.legs)
         keep = {leg.order_id for leg in kept}
         stale = [oid for oid, o in orders.items()
                  if is_ours(o) and o.kind == "BRACKET" and oid not in keep and oid not in replaced]
-        if stale:
+        if stale and complete:  # extra brackets only reduce: removed once every wanted leg is in place
             self._cancel_quietly(stale, trade.trade_id)
-        moved = a.stop_price != trade.stop_price
-        trade.legs, trade.stop_spot, trade.stop_price = kept, a.stop_spot, a.stop_price
-        if trade.protected_ts is None and kept and len(kept) == len(a.legs):
+        trade.legs = kept
+        in_place = exact == len(a.legs)  # every leg rests at the new terms: their stop is the stop in force
+        moved_stop = in_place and a.stop_price != trade.stop_price
+        if in_place:
+            trade.stop_spot, trade.stop_price = a.stop_spot, a.stop_price
+        if trade.protected_ts is None and kept and complete:
             trade.protected_ts = self.clock()
             self.event("PROTECTED_FIRST", {"trade_id": trade.trade_id,
                                            "after_entry_s": round(trade.protected_ts - trade.opened_ts, 3)})
-        elif moved:
+        elif moved_stop:
             self.event("STOP_MOVED", {"trade_id": trade.trade_id, "stop": a.stop_price, "stop_spot": a.stop_spot},
                        f"[손절 이동] {trade.setup} {_side(trade.direction)} → {a.stop_price:,.0f}")
         self.save(trade)
+
+    def _swap(self, trade: LiveTrade, cur: Leg, o: Order, want: Leg, replaced: set[str]) -> tuple[Leg | None, bool]:
+        """The venue refused `want` while `cur` rests (it refuses overlapping brackets): cancel `cur` first (LEG_GAP:
+        the designed path on such a venue, not an order failure), then place `want`; when that fails as well,
+        `cur`'s terms are placed again at once (LEG_RESTORED). Returns the leg now resting (None: none) and whether
+        it has the wanted terms."""
+        oid = str(cur.order_id)
+        try:
+            self.ex.cancel([oid])
+        except ExchangeError as exc:  # it may still rest: kept, the move is tried again on the next pass
+            self.event("CANCEL_FAILED", {"trade_id": trade.trade_id, "order_ids": [oid], "error": str(exc)[:200]})
+            self._bracket_failed(trade, want, Sent("REJECTED", None, "overlap refused, the old leg not cancelled"))
+            return None, False
+        replaced.add(oid)
+        self.event("LEG_GAP", {"trade_id": trade.trade_id, "leg": want.name})
+        placed, sent = self._place_leg(trade, want)
+        if placed is not None:
+            return placed, True
+        self._bracket_failed(trade, want, sent)
+        back = Leg(cur.name, o.size - o.filled, float(o.limit_price or cur.limit_price),
+                   float(o.stop_price or cur.stop_price))
+        restored, sent = self._place_leg(trade, back)
+        if restored is None:
+            self._bracket_failed(trade, back, sent)
+            return None, False
+        self.event("LEG_RESTORED", {"trade_id": trade.trade_id, "leg": cur.name, "stop": back.stop_price})
+        return restored, False
 
     def _left_with_fills(self, trade: LiveTrade, leg: Leg) -> bool:
         """A leg of ours that left the book: True while it has fills the position read may not show yet - for
         LEG_SETTLE_S from when it was first found so (then it is placed again if still wanted). A leg that cannot
         be read is placed again (protection first)."""
-        key = f"leg_filled:{leg.order_id}"
-        first = self.journal.get(key)
+        scratch = self._scratch(trade.trade_id)
+        first = scratch["leg_filled"].get(str(leg.order_id))
         if first is not None:
             return self.clock() - float(first) < LEG_SETTLE_S
         try:
@@ -5757,10 +6227,30 @@ class Executor:
             return False
         if o.filled <= 0:
             return False
-        self.journal.put(key, self.clock())
+        scratch["leg_filled"][str(leg.order_id)] = self.clock()
+        self.journal.put(SCRATCH_KEY, scratch)
         self.event("LEG_FILLED", {"trade_id": trade.trade_id, "leg": leg.name, "order_id": leg.order_id,
                                   "filled": o.filled, "status": o.status})
         return True
+
+    def _protect_rest(self, ctx: PlanContext) -> None:
+        """A close that did not go flat cancelled the brackets: they go back at the stop in force for the position
+        left (brackets only reduce: an excess is covered as well), so a close that keeps failing never leaves the
+        position unprotected. A leg the cancel left resting is taken back by its terms."""
+        trade = self.trade()
+        if trade is None or trade.status != "OPEN":
+            return
+        try:
+            pos = self.ex.position()
+            if pos is None or pos.side != trade.direction:
+                return
+            trade.legs = []  # cancelled for the close: nothing to look up
+            self.save(trade)
+            legs, stop = desired_legs(trade, pos.contracts, trade.stop_spot, ctx.ratio, ctx.tick)
+            self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
+        except ExchangeError as exc:  # observe sees the gap (UNPROTECTED); the next pass places them
+            self.event("ACTION_ERROR", {"action": "Protect", "error": str(exc)[:200]},
+                       f"[주문 오류] Protect: {str(exc)[:200]}")
 
     # exits -------------------------------------------------------------------
     def close(self, reason: str, ctx: PlanContext) -> bool:
@@ -5789,9 +6279,14 @@ class Executor:
         if sent.status != "ACCEPTED":
             self.event("CLOSE_FAILED", {"trade_id": tid, "reason": reason, "status": sent.status, "error": sent.error},
                        f"[청산 실패 - 재시도 중] {reason}: {sent.status} {sent.error}")
+            self._protect_rest(ctx)
             return False
-        if not self._await_flat():
+        if open_trade is not None:  # the position going flat from now on is this close (also after a crash)
+            open_trade.exit_reason = reason
+            self.save(open_trade)
+        if not self._await_flat(sent.order_id):
             self.event("CLOSE_UNCONFIRMED", {"trade_id": tid, "reason": reason}, f"[청산 미확인 - 재시도 중] {reason}")
+            self._protect_rest(ctx)
             return False
         if open_trade is not None:
             open_trade.status, open_trade.exit_reason = "CLOSED", reason
@@ -5918,29 +6413,50 @@ class Executor:
                 out["abandoned"] += 1
         return out, closes
 
+    def _recovery_error(self, out: dict[str, int], what: str, exc: ExchangeError) -> None:
+        """A read the recovery needs failed: unresolved (counted unknown), the regular passes pick it up."""
+        out["unknown"] += 1
+        self.event("RECOVERY_ERROR", {"what": what, "error": str(exc)[:200]})
+
     def recover(self) -> dict[str, int]:
-        """At startup: resolve PENDING intents, rebuild the trade from an accepted entry the journal did not
-        get to record, record a close accepted right before a crash. A bracket accepted right before a crash
-        is not in the trade's legs: the next protect() cancels it as a stale order of ours."""
-        out, closes = self.resolve_pending()
+        """At startup: resolve PENDING intents, record a close accepted right before a crash (the journal's open
+        trade, a flat position and an ACCEPTED close of that trade - its reason, not a bracket exit), rebuild the
+        trade from an accepted entry the journal did not get to record (only when no trade with that id was
+        recorded). A bracket accepted right before a crash is not in the trade's legs: protect() takes it over
+        by its client order id and terms. A read that fails is recorded (RECOVERY_ERROR, counted unknown) and
+        the recovery goes on."""
+        out, _ = self.resolve_pending()
         trade = self.trade()
-        if trade is not None and trade.status == "OPEN" and self.ex.position() is None:
-            mine = [r for r in closes if r["trade_id"] == trade.trade_id]
-            if mine:  # killed after our close was accepted: record it with its reason
-                trade.status, trade.exit_reason = "CLOSED", str(mine[-1]["payload"].get("reason"))
+        if trade is not None and trade.status == "OPEN":
+            try:
+                flat = self.ex.position() is None
+            except ExchangeError as exc:
+                flat = False
+                self._recovery_error(out, "position", exc)
+            mine = self.journal.intents(status="ACCEPTED", kind="CLOSE", trade_id=trade.trade_id)
+            if flat and mine:  # killed after our close was accepted: record it with its reason
+                row = mine[-1]
+                trade.status, trade.exit_reason = "CLOSED", str(row["payload"].get("reason"))
                 self.save(trade)
-                self.event("CLOSED", {"trade_id": trade.trade_id, "reason": trade.exit_reason, "recovered": True})
-        entries = [r for r in self.journal.intents(status="ACCEPTED", kind="ENTRY")]
-        if entries and (trade is None or trade.trade_id != entries[-1]["trade_id"]):
+                self.event("CLOSED", {"trade_id": trade.trade_id, "reason": trade.exit_reason, "recovered": True,
+                                      "order_id": row["order_id"], **self._fill_of(row["order_id"])})
+        trade = self.trade()
+        entries = self.journal.intents(status="ACCEPTED", kind="ENTRY")
+        if entries and (trade is None or trade.status != "OPEN"):
             row = entries[-1]
-            order = self.ex.get_order(str(row["order_id"]))
-            pos = self.ex.position()
-            if order.filled > 0 and pos is not None and pos.side == int(row["payload"]["direction"]):
-                trade = self._trade_from(row["payload"], order)
-                self.save(trade)
-                out["rebuilt"] += 1
-                self.event("RECOVERED_ENTRY", {"trade_id": trade.trade_id},
-                           f"[재시작 복구] 진입 {trade.trade_id} {_side(trade.direction)} {trade.contracts}계약 복원")
+            if row["order_id"] and not self._recorded(int(row["trade_id"])):
+                try:
+                    order = self.ex.get_order(str(row["order_id"]))
+                    pos = self.ex.position()
+                except ExchangeError as exc:
+                    self._recovery_error(out, str(row["client_order_id"]), exc)
+                else:
+                    if order.filled > 0 and pos is not None and pos.side == int(row["payload"]["direction"]):
+                        trade = self._trade_from(row["payload"], order)
+                        self.save(trade)
+                        out["rebuilt"] += 1
+                        self.event("RECOVERED_ENTRY", {"trade_id": trade.trade_id},
+                                   f"[재시작 복구] 진입 {trade.trade_id} {_side(trade.direction)} {trade.contracts}계약 복원")
         self.event("RECOVERY", out)
         return out
 ```
@@ -5951,7 +6467,7 @@ class Executor:
 uv run --group live pytest tests/live/test_executor.py -q
 ```
 
-Expected: `28 passed`.
+Expected: `46 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -6838,7 +7354,7 @@ EOF
 **Interfaces:**
 - Consumes: `ewbot.paper.decisions` (`known_at`, `same_decision`), `ewbot.live.exchange.KeyPermissions`, `ewbot.live.journal.Journal`, `ewbot.live.pricing` (`FULL_CAP_CONTRACTS`, `FULL_CAP_DAYS`), `ewbot.types.H1`, `requests`.
 - Produces (`ewbot.live.audit`): `CONTENTS_API`, `class AuditError(RuntimeError)`, `fetch_paper_ledger(repo, token, session=None, ref="paper") -> dict`, frozen `AuditResult(window: (lo, hi), compared, matched, mismatches: tuple[dict, ...])` with `.ok` (something compared, nothing mismatched), `audit(live_decisions, ledger, baseline_fingerprint=None, since=None) -> AuditResult` (mismatch types `MISSING_IN_LIVE`, `MISSING_IN_PAPER`, `DIFFERENT`, `PAPER_FINGERPRINT`).
-- Produces (`ewbot.live.stage`): `STAGES = ("SHADOW", "CANARY", "FULL")`, `SHADOW_MIN_DAYS = 14`, `CYCLE_DEADLINE_S = 120`, `CANARY_MIN_TRADES = 3`, `CANARY_MAX_DAYS = 90`, `PROTECT_MAX_S = 30.0`, `PAUSE_KEY = "paused"`, `MAJOR`, `MANUAL` (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `ADOPTED`, `EXCESS_POSITION`, `UNEXPLAINED_REDUCTION`: the position changed outside our orders), `CANARY_FAIL` (`MAJOR` + `PROTECT_SLOW` + `MANUAL`), `ORDER_FAILURES`; `class StageError(RuntimeError)`, frozen `Gate(name, met, detail)`, `gate_lines(gates) -> list[str]`, `paused(journal) -> dict | None`, `pause(journal, reason, now)`, `resume(journal, now)`, `full_cap(journal, now) -> int | None`, `on_incident(journal, kind, now) -> list[str]` (`"paused"`, `"demoted to CANARY"`), `shadow_gates(journal, now, audit_result)`, `canary_entry_gates(journal, now, audit_result, paper_status, perms)`, `canary_gates(journal, now)`, `full_entry_gates(journal, now, paper_status, perms)` (all `-> list[Gate]`), `transition(journal, to, now, gates, *, confirm, flat)` (raises `StageError`). `paper_status` is the dict of `paper.criteria.golive_status`.
+- Produces (`ewbot.live.stage`): `STAGES = ("SHADOW", "CANARY", "FULL")`, `SHADOW_MIN_DAYS = 14`, `CYCLE_DEADLINE_S = 120`, `CANARY_MIN_TRADES = 3`, `CANARY_MAX_DAYS = 90`, `PROTECT_MAX_S = 30.0`, `PAUSE_KEY = "paused"`, `MAJOR`, `MANUAL` (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `ADOPTED`, `EXCESS_POSITION`, `UNEXPLAINED_REDUCTION`: the position changed outside our orders), `CANARY_FAIL` (`MAJOR` + `PROTECT_SLOW` + `MANUAL`), `ORDER_FAILURES` (CANARY gate ②: `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` - not `LEG_GAP`, the executor's designed cancel-first fallback on a venue that refuses overlapping brackets); `class StageError(RuntimeError)`, frozen `Gate(name, met, detail)`, `gate_lines(gates) -> list[str]`, `paused(journal) -> dict | None`, `pause(journal, reason, now)`, `resume(journal, now)`, `full_cap(journal, now) -> int | None`, `on_incident(journal, kind, now) -> list[str]` (`"paused"`, `"demoted to CANARY"`), `shadow_gates(journal, now, audit_result)`, `canary_entry_gates(journal, now, audit_result, paper_status, perms)`, `canary_gates(journal, now)`, `full_entry_gates(journal, now, paper_status, perms)` (all `-> list[Gate]`), `transition(journal, to, now, gates, *, confirm, flat)` (raises `StageError`). `paper_status` is the dict of `paper.criteria.golive_status`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -7193,6 +7709,8 @@ MAJOR = ("UNPROTECTED_60S", "AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY")  # spec
 # fewer than its legs explain (reconcile.observe)
 MANUAL = ("FOREIGN_ORDERS", "UNKNOWN_POSITION", "ADOPTED", "EXCESS_POSITION", "UNEXPLAINED_REDUCTION")
 CANARY_FAIL = MAJOR + ("PROTECT_SLOW",) + MANUAL
+# CANARY gate 2: an order that did not do what was targeted. Not LEG_GAP: on a venue that refuses overlapping
+# brackets the executor cancels the old leg first by design (a replacement that then fails is BRACKET_FAILED)
 ORDER_FAILURES = ("BRACKET_FAILED", "CLOSE_FAILED", "CLOSE_UNCONFIRMED", "REDUCE_FAILED")
 
 
@@ -7806,7 +8324,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`FakeFetch`, `make_lock`, `synth_frame`, `ts`), `tests.live.helpers`.
 - Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position (`reconcile.expected_contracts`) back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
-- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict`, `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`), `poll(now)`, `watch(now)`, `minute(now)`, `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply`, `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
+- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`), `poll(now)`, `watch(now)`, `minute(now)`, `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply`, `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9599,7 +10117,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `tests.live.harness.Harness` (Task 12), `LiveRuntime`, `SimExchange` / `SimCrash`, `TickerFeed`, `Journal`, `traced_with_exits`, `compute_target`, `build_decisions`, `same_decision`, `map_level`, `tests.paper.helpers.make_lock`, `ewbot.engine.loop._Run` (swapped by one test to queue an exit on a chosen bar).
-- Produces: no production code. This task is the spec §7 `일치 테스트` and `장애 주입` coverage over Tasks 1–13: three hour-by-hour walks of the synthetic series in the first 30 days of FULL (3 contracts, basis ratio 1.0005) — a TIME exit, a trailed stop-out and TP1 → break-even → TP2 — must record the paper replay's decisions exactly, enter on the engine's signals, place the mapped engine levels, move the stop with the engine and exit in the engine's exit hour; and a process killed right after an accepted entry, bracket or close, a WebSocket drop and sequence gap, 429s and outages, a stop move while the quotes cannot be read (sent at the first poll with quotes, never lost), an exit waiting for the session to reopen, an exit queued before the weekly CFM halt (still the target at the halt bar's cycle) and a stop the spot price crossed during the halt must all end protected, flat or reconciled without a duplicate order — the last two closed by the first poll that sees the session OPEN, not an hour later.
+- Produces: no production code. This task is the spec §7 `일치 테스트` and `장애 주입` coverage over Tasks 1–13: three hour-by-hour walks of the synthetic series in the first 30 days of FULL (3 contracts, basis ratio 1.0005) — a TIME exit, a trailed stop-out and TP1 → break-even → TP2 — must record the paper replay's decisions exactly, enter on the engine's signals, place the mapped engine levels, move the stop with the engine and exit in the engine's exit hour; and a process killed right after an accepted entry, bracket or close, a WebSocket drop and sequence gap, 429s and outages, a stop move while the quotes cannot be read (sent at the first poll with quotes, never lost), a 429 storm during a stop move and a close that keeps failing (the resting legs protect the position at every poll: never cancelled before the replacement rests, put back after each failed close), an exit waiting for the session to reopen, an exit queued before the weekly CFM halt (still the target at the halt bar's cycle) and a stop the spot price crossed during the halt must all end protected, flat or reconciled without a duplicate order — the last two closed by the first poll that sees the session OPEN, not an hour later.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9843,6 +10361,54 @@ def test_a_stop_move_during_a_quote_outage_goes_out_with_the_quotes(tmp_path):
     assert h.journal.events(kind="STOP_MOVED")[-1]["data"]["stop_spot"] == tr.stop_spot
 
 
+def covered(h: Harness) -> bool:
+    """Our resting brackets cover the whole position."""
+    pos = h.ex.position()
+    return pos is not None and sum(o.size - o.filled for o in h.ex.open_orders() if o.stop_price) >= pos.contracts
+
+
+def test_a_429_storm_during_a_stop_move_keeps_the_position_protected(tmp_path):
+    """Every bracket request is rate-limited while the engine trails the stop: the replacement's outcome is
+    unknown (never a refusal), so the resting leg keeps protecting - it is never cancelled first - and the stop in
+    force stays recorded; the move goes out at the first poll the venue answers."""
+    trail = ts("2024-03-14 07:00")  # the engine trails the long's stop at this close
+    h = started(tmp_path)
+    h.walk(ENTRY_BAR, trail + 3600)
+    before = h.rt.executor.trade().stop_spot
+    h.price(float(h.bar(trail + 3600)["open"]))
+    h.ex.fail_next("place_bracket", RateLimited("429"), times=50)
+    t0 = trail + 3600 + 30
+    for k in range(4):  # the cycle sees the new engine stop, then three polls into the storm
+        h.at(t0 + 10 * k)
+        assert covered(h) and h.rt.executor.trade().stop_spot == before
+    assert h.journal.events(kind="BRACKET_FAILED", since=t0) and not h.journal.events(kind="LEG_GAP")
+    h.ex._faults.clear()
+    h.at(t0 + 40)
+    tr = h.rt.executor.trade()
+    assert tr.stop_spot == h.rt.target.position.stop != before
+    assert [o.stop_price for o in h.ex.open_orders()] == [tr.stop_price] and covered(h)
+    assert not h.journal.events(kind="UNPROTECTED", since=t0)
+
+
+def test_a_close_that_keeps_failing_keeps_the_position_protected(tmp_path):
+    """The engine queues the TIME exit and the venue rate-limits the close three times. Each close cancelled the
+    brackets first; each failure puts them back at the stop in force, so no poll ever finds the position
+    unprotected, and the fourth close goes through with the engine's reason."""
+    exit_bar = ts("2024-01-04 15:00")  # the engine queues the TIME exit at this close
+    h = started(tmp_path, start=TIME_SIGNAL + 3600 + 30)
+    h.at(TIME_SIGNAL + 3600 + 30)
+    assert h.ex.position().side == -1
+    h.price(float(h.bar(exit_bar + 3600)["open"]))
+    h.ex.fail_next("close_position", RateLimited("429"), times=3)
+    t0 = exit_bar + 3600 + 30
+    for k in range(3):
+        h.at(t0 + 10 * k)
+        assert covered(h)
+    h.at(t0 + 30)
+    assert h.ex.position() is None and h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "TIME"
+    assert len(h.journal.events(kind="CLOSE_FAILED")) == 3 and not h.journal.events(kind="UNPROTECTED", since=t0)
+
+
 def test_an_exit_waits_for_the_reopen(tmp_path):
     exit_bar = ts("2024-01-04 15:00")  # the engine queues the TIME exit at this close
     h = started(tmp_path, start=TIME_SIGNAL + 3600 + 30)
@@ -9919,7 +10485,7 @@ def test_a_stop_crossed_during_the_cfm_halt_closes_at_the_reopen(tmp_path):
 uv run --group live pytest tests/live/test_parity.py tests/live/test_chaos.py -q
 ```
 
-Expected: `21 passed` already — this task only adds integration coverage of code written in Tasks 1–13, so there is no red phase. If anything fails here, the bug is in Tasks 1–13: fix the component (and its unit test), never relax this test.
+Expected: `23 passed` already — this task only adds integration coverage of code written in Tasks 1–13, so there is no red phase. If anything fails here, the bug is in Tasks 1–13: fix the component (and its unit test), never relax this test.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -9931,7 +10497,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `274 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `294 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -10432,7 +10998,8 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - Telegram commands (only from `TELEGRAM_CHAT_ID`): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` within 60 s (cancel the brackets, close at market, pause), `/help`.
 - Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes).
 - The daily summary (09:00 New York) shows the stage, the position, the cycle, the paper comparison, the fills of the last 24 h (entry slippage vs. the engine's reference, stop slippage vs. the stop price, measured fees vs. the paper cost model; funding is part of the balance change) and the margin.
-- **A stop that empties the TP1 leg first** (FULL only: a 1-contract CANARY trade has one bracket). Both legs share the stop. When the price falls through it, the TP1 leg's stop can fill a poll before the TP2 leg's: the runtime then reads the smaller position as the live TP1 (`TP1_FILLED`, Telegram `[TP1 체결]`) and re-places the rest with a break-even stop that is already through the market, so it fills at once - or, if Coinbase refuses a stop through the market (`BRACKET_FAILED`), the watchdog closes the unprotected rest at market (`STOP_UNPROTECTED`). Either way the rest leaves at about the stop; for that trade `TP1_FILLED` is not a take-profit (its `BRACKET_FILL` events show the stop prices).
+- **A stop that empties the TP1 leg first** (FULL only: a 1-contract CANARY trade has one bracket). Both legs share the stop. When the price falls through it, the TP1 leg's stop can fill a poll before the TP2 leg's: the runtime then reads the smaller position as the live TP1 (`TP1_FILLED`, Telegram `[TP1 체결]`) and re-places the rest with a break-even stop that is already through the market, so it fills at once - or, if Coinbase refuses a stop through the market (`BRACKET_FAILED`), the old leg stays: its stop has triggered already and fills, and if the price gapped past its 5% limit the watchdog closes at market (`STOP_GAP`). Either way the rest leaves at about the stop; for that trade `TP1_FILLED` is not a take-profit (its `BRACKET_FILL` events show the stop prices).
+- **A close or a stop move that keeps failing.** A failed close (`CLOSE_FAILED`, Telegram `[청산 실패 - 재시도 중]`) is retried on every poll with a new id; it cancelled the brackets first, so they are put back at the stop in force right after each failure (`ewbot live status` shows them resting). A stop move whose answer was lost (429, 5xx, timeout: `BRACKET_FAILED`, `[보호 주문 실패]`) keeps the old leg until a later poll moves it; a bracket of ours that Coinbase accepted while the answer was lost is taken over by its client order id (`LEG_ADOPTED`). If Coinbase refuses overlapping brackets, a stop move cancels the old leg first (`LEG_GAP`, no alert: not an order failure) and puts it back at once if the new one fails (`LEG_RESTORED`).
 - **A reduction whose answer was lost** (`REDUCE_FAILED` with status `PENDING`, Telegram `[수량 축소 미확인]`): it was recorded before it was sent, so it is never sent under a new id. It is looked up by its client order id (sent again under the same id only if Coinbase does not have it), and the smaller position is read as that reduction (`REDUCE_SETTLED`), not as a manual one. Nothing to do unless `[경고] … 1분 넘게 포지션에 반영되지 않음` follows.
 
 ## Stage transitions
@@ -10497,7 +11064,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `905 passed, 1 skipped` without a candle cache (`906 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `925 passed, 1 skipped` without a candle cache (`926 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -10532,7 +11099,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `906 passed` with the real cache (`905 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `926 passed` with the real cache (`925 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
