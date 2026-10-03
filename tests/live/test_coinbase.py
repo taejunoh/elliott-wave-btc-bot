@@ -9,8 +9,17 @@ from pathlib import Path
 import pytest
 import requests
 
-from ewbot.live.coinbase import API, CoinbaseExchange, fmt_decimal, map_error, parse_order
-from ewbot.live.exchange import ExchangeError, Position, RateLimited, Unavailable
+from ewbot.live.coinbase import (
+    API,
+    RETRY_AFTER_MAX_S,
+    CoinbaseExchange,
+    fmt_decimal,
+    map_error,
+    parse_order,
+    parse_place,
+    retry_after_s,
+)
+from ewbot.live.exchange import OPEN_STATUSES, ExchangeError, Position, RateLimited, Unavailable
 
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "coinbase.json").read_text(encoding="utf-8"))
 FUT = "BIP-20DEC30-CDE"
@@ -95,10 +104,12 @@ def test_open_orders_follow_the_cursor_and_parse_brackets():
     orders = ex.open_orders()
     assert [(o.client_order_id, o.kind, o.size, o.limit_price, o.stop_price, o.status) for o in orders] == [
         ("ewb-b-1790942400-tp1-1", "BRACKET", 1, 83500.0, 85900.0, "OPEN"),
-        ("ewb-b-1790942400-tp2-1", "BRACKET", 2, 82000.0, 85900.0, "OPEN"),  # CANCEL_QUEUED may still fill
+        ("ewb-b-1790942400-tp2-1", "BRACKET", 2, 82000.0, 85900.0, "CANCEL_QUEUED"),  # may still fill
     ]
+    assert all(o.is_open for o in orders)
     assert orders[0].side == 1 and orders[0].created_ts == 1791028841
-    assert client.calls[0][2]["product_ids"] == [FUT] and client.calls[0][2]["order_status"] == ["OPEN"]
+    assert client.calls[0][2]["product_ids"] == [FUT]
+    assert client.calls[0][2]["order_status"] == ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"]
     assert client.calls[1][2]["cursor"] == "c-2"
 
 
@@ -246,3 +257,227 @@ def test_whole_number_float_sizes_are_still_sent():
     assert ex.close_position("c", size=2.0).ok
     assert client.calls[0][2]["order_configuration"] == {"market_market_ioc": {"base_size": "3"}}
     assert client.calls[1][2]["size"] == "2"
+
+
+# ---------------------------------------------------------------------------- Fix round 1
+SECRET = "Bearer eyJhbGciOiJFUzI1NiJ9.secret"
+
+
+@pytest.mark.parametrize("exc", [
+    requests.exceptions.ChunkedEncodingError(SECRET),
+    requests.exceptions.ContentDecodingError(SECRET),
+    requests.exceptions.JSONDecodeError("Expecting value", SECRET, 0),
+    requests.exceptions.InvalidHeader(f"Invalid return character or leading space in header: Authorization: {SECRET}"),
+    requests.exceptions.ReadTimeout(SECRET),
+    requests.exceptions.SSLError(SECRET),
+    requests.exceptions.HTTPError(SECRET),  # no response attached
+    requests.exceptions.RequestException(SECRET),
+])
+def test_ambiguous_post_send_failures_are_unavailable_and_sent_once(exc):
+    """The order may exist: any requests failure is ambiguous (Unavailable -> lookup by client_order_id),
+    never a final rejection; the message is the type name only (an exception text may carry the JWT)."""
+    ex, client, _ = make({("POST", "/orders"): [exc, "create_ok"]})
+    with pytest.raises(Unavailable) as err:
+        ex.place_market("ewb-e-1-L", 1, 1)
+    assert str(err.value) == type(exc).__name__ and "secret" not in str(err.value)
+    assert len(client.calls) == 1
+
+
+def test_unknown_exceptions_keep_only_their_type_name():
+    err = map_error(ValueError(SECRET))
+    assert type(err) is ExchangeError and not err.retryable and str(err) == "ValueError"
+
+
+def test_failure_reason_prefers_new_order_failure_reason():
+    ex, _, _ = make({("POST", "/orders"): ["create_failed_new_reason", "create_duplicate_new_reason"]})
+    r = ex.place_bracket("b", -1, 1, 86000.0, 83500.0)
+    assert not r.ok and r.error.startswith("INVALID_BRACKET_PRICES") and not r.duplicate
+    d = ex.place_market("a", 1, 1)  # error and failure_reason say UNKNOWN_*; new_order_failure_reason decides
+    assert not d.ok and d.duplicate and d.error.startswith("DUPLICATE_CLIENT_ORDER_ID")
+    assert parse_place({"success": False, "error_response": {"preview_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"}},
+                       "c").duplicate
+    assert parse_place({"success": False, "failure_reason": "UNKNOWN_FAILURE_REASON"}, "c").error == "UNKNOWN_FAILURE_REASON"
+    assert not parse_place(FIXTURES["create_insufficient"], "c").duplicate
+
+
+@pytest.mark.parametrize("body", ["http400_duplicate_order_body", "http400_duplicate_gateway_body"])
+def test_an_http_4xx_naming_the_duplicate_id_takes_the_duplicate_path(body):
+    text = json.dumps(FIXTURES[body])
+    ex, client, _ = make({("POST", "/orders"): [http_error(400, text)],
+                          ("POST", "/orders/close_position"): [http_error(409, text)]})
+    for r in (ex.place_market("ewb-e-1-L", 1, 1), ex.close_position("ewb-x-1-1")):
+        assert not r.ok and r.duplicate and r.order_id is None
+    assert len(client.calls) == 2
+    ex2, _, _ = make({("POST", "/orders"): [http_error(400, json.dumps(FIXTURES["create_insufficient"]))]})
+    with pytest.raises(ExchangeError) as err:
+        ex2.place_market("a", 1, 1)
+    assert not err.value.retryable
+
+
+def test_position_sides_are_mapped_explicitly():
+    ex, _, _ = make({("GET", "/cfm/positions"): ["positions_bip_long", {"positions": [
+        {"product_id": FUT, "side": "SHORT", "number_of_contracts": "-3", "avg_entry_price": "85100"}]},
+        {"positions": [{"product_id": FUT, "side": "UNKNOWN", "number_of_contracts": "2", "avg_entry_price": "1"}]},
+        {"positions": [{"product_id": FUT, "side": "FUTURES_POSITION_SIDE_LONG", "number_of_contracts": "2"}]}]})
+    assert ex.position() == Position(1, 2, 84000.0)
+    assert ex.position() == Position(-1, 3, 85100.0)  # abs() of a signed count
+    for _ in range(2):
+        with pytest.raises(ExchangeError) as err:
+            ex.position()
+        assert not err.value.retryable
+
+
+def test_order_sides_are_mapped_explicitly():
+    base = {"order_id": "x", "status": "OPEN", "order_configuration": {}}
+    assert parse_order({**base, "side": "BUY"}).side == 1 and parse_order({**base, "side": "SELL"}).side == -1
+    for side in ("", "UNKNOWN_ORDER_SIDE", None, "buy"):
+        with pytest.raises(ExchangeError):
+            parse_order({**base, "side": side})
+
+
+def test_sell_bracket_protects_a_long():
+    ex, client, _ = make({("POST", "/orders"): "create_ok"})
+    assert ex.place_bracket("ewb-b-1790942400-tp1-1", -1, 2, 86000.0, 83500.0).ok
+    assert client.calls[0][2] == {
+        "client_order_id": "ewb-b-1790942400-tp1-1", "product_id": FUT, "side": "SELL",
+        "order_configuration": {"trigger_bracket_gtc": {"base_size": "2", "limit_price": "86000",
+                                                        "stop_trigger_price": "83500"}}}
+
+
+@pytest.mark.parametrize("status", ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"])
+def test_resting_statuses_are_open(status):
+    o = parse_order({"order_id": "x", "side": "BUY", "status": status, "order_configuration": {}})
+    assert o.status == status and o.is_open and not o.is_terminal
+    assert status in OPEN_STATUSES
+
+
+def test_unknown_order_status_is_neither_open_nor_terminal():
+    o = parse_order({"order_id": "x", "side": "BUY", "status": "UNKNOWN_ORDER_STATUS", "order_configuration": {}})
+    assert o.status == "UNKNOWN" and not o.is_open and not o.is_terminal
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (None, 1.0), ("2", 2.0), ("0.5", 0.5), ("120", RETRY_AFTER_MAX_S), ("-5", 0.0), ("soon", 1.0), ("nan", 1.0),
+    ("inf", 1.0), ("Wed, 21 Oct 2015 07:28:00 GMT", 0.0), ("Fri, 31 Dec 2099 23:59:59 GMT", RETRY_AFTER_MAX_S),
+])
+def test_retry_after_is_parsed_leniently_and_capped(value, expected):
+    assert retry_after_s(value) == pytest.approx(expected)
+    headers = {} if value is None else {"Retry-After": value}
+    err = map_error(http_error(429, "slow down", headers))
+    assert isinstance(err, RateLimited) and err.retry_after == pytest.approx(expected)
+
+
+def test_a_long_retry_after_waits_at_most_the_cap():
+    ex, _, slept = make({("GET", "/cfm/positions"): [http_error(429, "", {"Retry-After": "3600"}), "positions"]})
+    assert ex.position().contracts == 3 and slept == [RETRY_AFTER_MAX_S]
+    resp = dict(FIXTURES["positions"], **{"x-ratelimit-remaining": "lots", "x-ratelimit-reset": "soon"})
+    ex2, _, slept2 = make({("GET", "/cfm/positions"): [resp, "positions"]})
+    ex2.position()
+    ex2.position()
+    assert slept2 == []  # unreadable pacing headers are ignored
+
+
+@pytest.mark.parametrize(("route", "reply", "call"), [
+    (("GET", f"/products/{FUT}"), {"price_increment": "5"}, lambda ex: ex.product()),
+    (("GET", f"/products/{FUT}"), {"fcm_trading_session_details": {"maintenance": {"start_time": "soon"}}},
+     lambda ex: ex.session()),
+    (("GET", "/market/product_book"), {"pricebook": {"bids": [{"px": "1"}], "asks": [{"px": "2"}]}},
+     lambda ex: ex.quote(FUT)),
+    (("GET", "/cfm/positions"), {"positions": [{"product_id": FUT, "side": "LONG", "number_of_contracts": "two"}]},
+     lambda ex: ex.position()),
+    (("GET", "/orders/historical/batch"), {"orders": [{"side": "BUY", "status": "OPEN"}]}, lambda ex: ex.open_orders()),
+    (("GET", "/orders/historical/o1"), {"not_order": {}}, lambda ex: ex.get_order("o1")),
+    (("GET", "/cfm/balance_summary"), {"balance_summary": {"total_usd_balance": {"value": "n/a"}}},
+     lambda ex: ex.balance()),
+    (("POST", "/orders/preview"), {"errs": 5}, lambda ex: ex.preview_market(1, 1)),
+    (("POST", "/orders/batch_cancel"), {"results": [7]}, lambda ex: ex.cancel(["o1"])),
+])
+def test_malformed_replies_raise_exchange_errors_only(route, reply, call):
+    ex, _, _ = make({route: reply})
+    with pytest.raises(ExchangeError) as err:
+        call(ex)
+    assert not err.value.retryable
+
+
+def test_a_reply_that_is_not_an_object_or_an_accepted_order_without_id_is_ambiguous():
+    ex, client, _ = make({("POST", "/orders"): [["not", "an", "object"], {"success": True, "success_response": {}}]})
+    for _ in range(2):
+        with pytest.raises(Unavailable):
+            ex.place_market("ewb-e-1-L", 1, 1)
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("bad", [0.0, -5.0, float("nan"), float("inf")])
+def test_non_finite_or_non_positive_prices_are_refused_locally(bad):
+    ex, client, _ = make({})
+    r = ex.place_bracket("b", -1, 1, bad, 83500.0)
+    assert not r.ok and r.error == "INVALID_PRICE_PRECISION"
+    r = ex.place_bracket("b", -1, 1, 86000.0, bad)
+    assert not r.ok and r.error == "INVALID_STOP_PRICE_PRECISION"
+    assert ex.edit_bracket("o1", 1, bad, 83500.0) is False and ex.edit_bracket("o1", 1, 86000.0, bad) is False
+    assert ex.preview_bracket(-1, 1, bad, 83500.0).errors == ("PREVIEW_INVALID_PRICE_PRECISION",)
+    assert ex.preview_bracket(-1, 1, 86000.0, bad).errors == ("PREVIEW_INVALID_STOP_PRICE_PRECISION",)
+    assert client.calls == []
+
+
+def test_key_permissions_fail_closed():
+    ex, _, _ = make({("GET", "/key_permissions"): [{"can_view": True, "can_trade": True},
+                                                    {"can_view": True, "can_trade": True, "can_transfer": None}, {}]})
+    k = ex.key_permissions()
+    assert (k.can_view, k.can_trade, k.can_transfer) == (True, True, True)  # can_transfer missing: assume it can
+    assert ex.key_permissions().can_transfer is True  # null: the same
+    k = ex.key_permissions()
+    assert (k.can_view, k.can_trade, k.can_transfer) == (False, False, True)
+
+
+@pytest.mark.parametrize("summary", [
+    {"balance_summary": {"unrealized_pnl": {"value": "13.05", "currency": "USD"}}},
+    {"balance_summary": {"total_usd_balance": {"currency": "USD"}, "unrealized_pnl": {"value": "13.05"}}},
+    {"balance_summary": {"total_usd_balance": {"value": "", "currency": "USD"}}},
+    {"balance_summary": {"total_usd_balance": {"value": "inf", "currency": "USD"}}},
+    {},
+])
+def test_balance_without_a_cash_total_is_an_error(summary):
+    ex, _, _ = make({("GET", "/cfm/balance_summary"): summary})
+    with pytest.raises(ExchangeError):
+        ex.balance()
+
+
+def test_cancel_honours_each_result():
+    ex, client, _ = make({("POST", "/orders/batch_cancel"): ["cancel_done_or_refused", "cancel_done_or_refused",
+                                                             "cancel_ok"]})
+    ex.cancel(["o-ok", "o-queued", "o-filled"])  # cancelled, already queued, already filled: nothing rests
+    with pytest.raises(ExchangeError) as err:
+        ex.cancel(["o-ok", "o-refused"])
+    assert "o-refused: UNKNOWN_CANCEL_ORDER" in str(err.value) and "o-ok" not in str(err.value)
+    assert not err.value.retryable
+    with pytest.raises(ExchangeError, match="o-missing: NO_RESULT"):
+        ex.cancel(["11111111-aaaa-4000-8000-000000000001", "o-missing"])
+    assert len(client.calls) == 3
+
+
+def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypatch):
+    """List Orders takes order_status as an exploded array; SDK 1.8.4 passes the list to requests unchanged
+    (list_orders(order_status: Optional[List[str]])), which repeats the key. Needs the `live` group."""
+    rest = pytest.importorskip("coinbase.rest")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    assert "List" in str(inspect.signature(rest.RESTClient.list_orders).parameters["order_status"].annotation)
+    pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()
+    ).decode()
+    client = rest.RESTClient(api_key="organizations/x/apiKeys/y", api_secret=pem)
+    urls: list[str] = []
+
+    def fake_request(method, url, params=None, json=None, headers=None, timeout=None):
+        urls.append(requests.Request(method, url, params=params).prepare().url)
+        r = requests.Response()
+        r.status_code = 200
+        r._content = b'{"orders": [], "has_next": false, "cursor": ""}'
+        return r
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    assert CoinbaseExchange(client, FUT).open_orders() == []
+    query = urls[0].split("?", 1)[1]
+    assert [p.split("=")[1] for p in query.split("&") if p.startswith("order_status=")] == list(OPEN_STATUSES)

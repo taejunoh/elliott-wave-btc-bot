@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from ewbot.live.exchange import Position, RateLimited, Unavailable
+from ewbot.live.exchange import (
+    STOP_LIMIT_OFFSET,
+    ExchangeError,
+    PlaceResult,
+    Position,
+    RateLimited,
+    Unavailable,
+)
 from ewbot.live.sim import BIP_SPEC, SimCrash, SimExchange
 
 
@@ -51,20 +58,33 @@ def test_brackets_only_reduce_and_take_profit_at_the_limit(ex):
     assert not r.ok and r.error == "NO_POSITION_TO_REDUCE"
 
 
-def test_stop_fills_inside_the_one_percent_limit(ex):
-    ex.place_market("e1", 1, 1)
+def test_a_triggered_stop_rests_five_percent_beyond_the_stop():
+    """Coinbase create-order reference, trigger_bracket_gtc.stop_trigger_price: a stop limit order is placed
+    "with a limit price 5% higher for BUYS and 5% lower for SELLS"."""
+    assert STOP_LIMIT_OFFSET == 0.05
+
+
+def test_stop_fills_inside_the_five_percent_limit(ex):
+    ex.place_market("e1", 1, 2)
     ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
+    ex.place_bracket("b2", -1, 1, 62_000.0, 59_500.0)
+    ex.bracket_fill_cap = 1
     fills = ex.set_prices(59_400.0)
-    assert [(f["size"], f["price"]) for f in fills] == [(1, 59_400.0)] and ex.position() is None
+    assert [(f["size"], f["price"]) for f in fills] == [(1, 59_400.0), (1, 59_400.0)] and ex.position() is None
+    ex.set_prices(60_000.0)
+    ex.place_market("e2", 1, 1)
+    ex.place_bracket("b3", -1, 1, 62_000.0, 59_500.0)
+    fills = ex.set_prices(56_600.0)  # 4.9% through the stop: still inside its 56_525 limit
+    assert [f["price"] for f in fills] == [56_600.0] and ex.position() is None
 
 
 def test_stop_gap_beyond_the_limit_rests_until_the_price_comes_back(ex):
     ex.place_market("e1", 1, 1)
     ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
-    assert ex.set_prices(58_000.0) == []  # limit 58_905: gapped through, nothing fills
+    assert ex.set_prices(56_000.0) == []  # limit 56_525: gapped through, nothing fills
     assert ex.position() is not None and ex.open_orders()[0].client_order_id == "b1"
-    fills = ex.set_prices(58_950.0)
-    assert [f["price"] for f in fills] == [58_950.0] and ex.position() is None
+    fills = ex.set_prices(56_550.0)
+    assert [f["price"] for f in fills] == [56_550.0] and ex.position() is None
 
 
 def test_short_bracket_mirrors_the_long(ex):
@@ -72,6 +92,11 @@ def test_short_bracket_mirrors_the_long(ex):
     ex.place_bracket("b1", 1, 2, 59_000.0, 60_500.0)
     fills = ex.set_prices(60_600.0)
     assert [(f["side"], f["size"], f["price"]) for f in fills] == [(1, 2, 60_600.0)] and ex.position() is None
+    ex.set_prices(60_000.0)
+    ex.place_market("s2", -1, 1)
+    ex.place_bracket("b2", 1, 1, 59_000.0, 60_500.0)  # buy limit 5% above the stop: 63_525
+    assert ex.set_prices(64_000.0) == [] and ex.position() is not None
+    assert [f["price"] for f in ex.set_prices(63_500.0)] == [63_500.0] and ex.position() is None
 
 
 def test_partial_fills(ex):
@@ -91,7 +116,7 @@ def test_nothing_fills_while_the_session_is_closed(ex):
     ex.place_market("e1", 1, 1)
     ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
     ex.set_session("CLOSE")
-    assert ex.set_prices(57_000.0) == []
+    assert ex.set_prices(56_000.0) == []
     assert not ex.place_market("e2", 1, 1).ok and not ex.close_position("x1").ok
     assert ex.session().state == "CLOSE" and not ex.session().is_open
     fills = ex.set_session("OPEN")  # reopens far below the stop limit: the stop rests
@@ -232,3 +257,30 @@ def test_fault_injection_only_accepts_methods_that_honour_it(ex):
     ex.crash_after_accept("close_position")
     with pytest.raises(Unavailable):
         ex.cancel([])
+
+
+def test_cancel_reports_orders_it_could_not_cancel(ex):
+    """Like the adapter honouring batch_cancel's results[].success: an unknown or no longer cancellable
+    order raises after the others were cancelled; an order that already filled no longer rests (the venue's
+    ORDER_IS_FULLY_FILLED) and is not an error."""
+    ex.place_market("e1", 1, 2)
+    b1 = ex.place_bracket("b1", -1, 1, 62_000.0, 59_000.0)
+    b2 = ex.place_bracket("b2", -1, 1, 61_000.0, 59_000.0)
+    ex.cancel([b1.order_id])
+    with pytest.raises(ExchangeError) as err:
+        ex.cancel(["nope", b1.order_id, b2.order_id])
+    assert not err.value.retryable and "nope" in str(err.value) and b1.order_id in str(err.value)
+    assert b2.order_id not in str(err.value) and ex.get_order(b2.order_id).status == "CANCELLED"
+    b3 = ex.place_bracket("b3", -1, 2, 60_500.0, 59_000.0)
+    ex.set_prices(60_600.0)
+    assert ex.get_order(b3.order_id).status == "FILLED"
+    ex.cancel([b3.order_id])
+
+
+def test_a_duplicate_result_is_flagged_explicitly():
+    strict = SimExchange(clock=Clock(), duplicate="error")
+    strict.set_prices(60_000.0)
+    strict.place_market("e1", 1, 1)
+    dup = strict.place_market("e1", 1, 1)
+    assert dup == PlaceResult("e1", None, False, "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)
+    assert not PlaceResult("x", None, False, "INVALID_REQUEST: duplicate field").duplicate

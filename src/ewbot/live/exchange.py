@@ -13,9 +13,16 @@ from typing import Protocol, Sequence
 FUTURES_PRODUCT = "BIP-20DEC30-CDE"  # nano Bitcoin perp-style future, 0.01 BTC per contract
 SPOT_PRODUCT = "BTC-USD"  # the signal source (same candles as the paper runtime)
 SESSION_OPEN = "OPEN"
-OPEN_STATUSES = ("OPEN", "PENDING", "QUEUED")
+# Statuses of an order that still rests and can fill. EDIT_QUEUED and CANCEL_QUEUED are open until the
+# venue confirms the edit / cancel: a queued cancel can still fill, so it still counts as protection and as
+# an order of ours (List Orders reference, OrderExecutionStatus).
+OPEN_STATUSES = ("OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED")
 TERMINAL_STATUSES = ("FILLED", "CANCELLED", "EXPIRED", "FAILED")
-STOP_LIMIT_OFFSET = 0.01  # a triggered bracket stop rests as a limit 1% beyond the stop (spec 4.2)
+# A triggered trigger_bracket stop rests as a limit this far beyond the stop. Coinbase Advanced Trade API
+# reference, Create Order, trigger_bracket_gtc.stop_trigger_price (checked 2026-10-03): "When triggered, a
+# stop limit order is automatically placed with a limit price 5% higher for BUYS and 5% lower for SELLS."
+# (Spec 4.2 assumed 1%; the reference wins. Confirm on the first stop fill in CANARY.)
+STOP_LIMIT_OFFSET = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +77,7 @@ class Order:
     kind: str  # "MARKET" | "BRACKET" | "OTHER"
     size: int
     filled: int
-    status: str  # OPEN, PENDING, FILLED, CANCELLED, EXPIRED, FAILED, UNKNOWN
+    status: str  # OPEN_STATUSES, TERMINAL_STATUSES or UNKNOWN
     limit_price: float | None = None  # bracket take-profit
     stop_price: float | None = None  # bracket stop trigger
     avg_fill_price: float | None = None
@@ -106,10 +113,7 @@ class PlaceResult:
     order_id: str | None
     ok: bool
     error: str | None = None
-
-    @property
-    def duplicate(self) -> bool:
-        return bool(self.error) and "DUPLICATE" in str(self.error).upper()
+    duplicate: bool = False  # refused because the client_order_id exists: look the order up, never re-send blind
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +162,10 @@ class Exchange(Protocol):
         self, client_order_id: str, side: int, size: int, limit_price: float, stop_price: float
     ) -> PlaceResult: ...
     def edit_bracket(self, order_id: str, size: int, limit_price: float, stop_price: float) -> bool: ...
-    def cancel(self, order_ids: Sequence[str]) -> None: ...
+    def cancel(self, order_ids: Sequence[str]) -> None:
+        """Cancel resting orders. Raises ExchangeError naming every order that may still rest (refused or
+        unknown); an order that already filled, or whose cancel is already queued, is not an error."""
+        ...
     def close_position(self, client_order_id: str, size: int | None = None) -> PlaceResult: ...
     def preview_market(self, side: int, size: int) -> PreviewResult: ...
     def preview_bracket(self, side: int, size: int, limit_price: float, stop_price: float) -> PreviewResult: ...

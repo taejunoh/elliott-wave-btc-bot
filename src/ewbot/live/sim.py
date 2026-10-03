@@ -13,9 +13,12 @@ book of the SHADOW stage. It models what the runtime relies on:
     reduce_only field): a bracket whose position is gone, or would be increased, is cancelled; a fill
     never exceeds the contracts left; `bracket_fill_cap` makes fills partial;
   - a bracket's take-profit fills at its limit when the futures price reaches it; its stop triggers when
-    the price reaches the stop and then rests as a limit STOP_LIMIT_OFFSET (1%) beyond the stop: it fills
-    at the market while the price is inside that limit and does not fill while the price has gapped
-    past it (the case the stop-gap watchdog closes);
+    the price reaches the stop and then rests as a limit STOP_LIMIT_OFFSET (5%, the Create Order
+    reference) beyond the stop: it fills at the market while the price is inside that limit and does not
+    fill while the price has gapped past it (the case the stop-gap watchdog closes);
+  - cancel() cancels every OPEN order it is given and then raises ExchangeError naming each order it could
+    not cancel (unknown, or already cancelled / expired: the venue's batch_cancel results[].success is
+    false); an order that already FILLED no longer rests and is not an error (ORDER_IS_FULLY_FILLED);
   - nothing fills while the session is not OPEN; market orders are rejected then;
   - fault injection: `fail_next(method, exc)` raises on the next call(s) of a method (429 / 5xx /
     outages) and `crash_after_accept(method)` raises SimCrash right AFTER the order was accepted (a
@@ -246,7 +249,7 @@ class SimExchange:
             if o.client_order_id == client_order_id:
                 if self.duplicate == "existing":
                     return PlaceResult(client_order_id, o.order_id, True)
-                return PlaceResult(client_order_id, None, False, "DUPLICATE_CLIENT_ORDER_ID")
+                return PlaceResult(client_order_id, None, False, "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)
         return None
 
     def _new(self, client_order_id: str, side: int, kind: str, size: int, limit: float | None = None,
@@ -308,10 +311,15 @@ class SimExchange:
 
     def cancel(self, order_ids: Sequence[str]) -> None:
         self._fault("cancel")
+        refused: list[str] = []
         for oid in order_ids:
             o = self.orders.get(oid)
             if o is not None and o.status == "OPEN":
                 o.status = "CANCELLED"
+            elif o is None or o.status != "FILLED":
+                refused.append(f"{oid}: UNKNOWN_CANCEL_ORDER")
+        if refused:
+            raise ExchangeError("cancel refused: " + ", ".join(refused))
 
     def close_position(self, client_order_id: str, size: int | None = None) -> PlaceResult:
         self._fault("close_position")

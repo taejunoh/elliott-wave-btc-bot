@@ -1,5 +1,5 @@
 {
- "_comment": "product_bip, book_bip and book_btc are trimmed real public responses recorded 2026-10-03 (GET /market/products/BIP-20DEC30-CDE, /market/product_book?limit=1). The private-endpoint entries follow the Advanced Trade API reference shapes; re-record them in SHADOW (docs/live-trading.md).",
+ "_comment": "product_bip, book_bip and book_btc are trimmed real public responses recorded 2026-10-03 (GET /market/products/BIP-20DEC30-CDE, /market/product_book?limit=1). The private-endpoint entries follow the Advanced Trade API reference shapes; re-record them in SHADOW (docs/live-trading.md). positions_bip_long, create_failed_new_reason, create_duplicate_new_reason, http400_duplicate_*_body and cancel_done_or_refused (Fix round 1) follow the reference's enums: FCMPositionSide LONG/SHORT, NewOrderErrorResponse.new_order_failure_reason (error and preview_failure_reason are deprecated), CancelOrderFailureReason.",
  "product_bip": {
   "product_id": "BIP-20DEC30-CDE",
   "price": "84675",
@@ -118,6 +118,20 @@
  },
  "positions_flat": {
   "positions": []
+ },
+ "positions_bip_long": {
+  "positions": [
+   {
+    "product_id": "BIP-20DEC30-CDE",
+    "expiration_time": "2030-12-20T16:00:00Z",
+    "side": "LONG",
+    "number_of_contracts": "2",
+    "current_price": "84665",
+    "avg_entry_price": "84000",
+    "unrealized_pnl": "13.30",
+    "daily_realized_pnl": "0"
+   }
+  ]
  },
  "balance_summary": {
   "balance_summary": {
@@ -308,6 +322,43 @@
    "error_details": ""
   }
  },
+ "create_failed_new_reason": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "Invalid bracket prices",
+   "error_details": "stop_trigger_price must be below limit_price for a sell bracket",
+   "preview_failure_reason": "UNKNOWN_PREVIEW_FAILURE_REASON",
+   "new_order_failure_reason": "INVALID_BRACKET_PRICES"
+  }
+ },
+ "create_duplicate_new_reason": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "client_order_id has already been used",
+   "error_details": "",
+   "preview_failure_reason": "UNKNOWN_PREVIEW_FAILURE_REASON",
+   "new_order_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"
+  }
+ },
+ "http400_duplicate_order_body": {
+  "success": false,
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "client_order_id has already been used",
+   "error_details": "",
+   "new_order_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"
+  }
+ },
+ "http400_duplicate_gateway_body": {
+  "error": "INVALID_ARGUMENT",
+  "code": 3,
+  "message": "DUPLICATE_CLIENT_ORDER_ID",
+  "details": []
+ },
  "close_ok": {
   "success": true,
   "success_response": {
@@ -345,6 +396,30 @@
     "success": true,
     "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON",
     "order_id": "11111111-aaaa-4000-8000-000000000001"
+   }
+  ]
+ },
+ "cancel_done_or_refused": {
+  "results": [
+   {
+    "success": true,
+    "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON",
+    "order_id": "o-ok"
+   },
+   {
+    "success": false,
+    "failure_reason": "DUPLICATE_CANCEL_REQUEST",
+    "order_id": "o-queued"
+   },
+   {
+    "success": false,
+    "failure_reason": "ORDER_IS_FULLY_FILLED",
+    "order_id": "o-filled"
+   },
+   {
+    "success": false,
+    "failure_reason": "UNKNOWN_CANCEL_ORDER",
+    "order_id": "o-refused"
    }
   ]
  },
