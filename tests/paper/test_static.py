@@ -168,7 +168,7 @@ def test_the_repository_has_exactly_the_paper_and_ci_workflows():
 def test_workflow_triggers_concurrency_and_permissions():
     wf, _ = _workflow()
     on = wf[True]  # YAML 1.1 reads the bare key `on` as boolean True
-    assert on["schedule"] == [{"cron": "7 * * * *"}] and "workflow_dispatch" in on
+    assert on["schedule"] == [{"cron": "52 */3 * * *"}] and "workflow_dispatch" in on
     assert wf["concurrency"] == {"group": "paper", "cancel-in-progress": False}
     assert wf["permissions"] == {"contents": "write"}
     assert "permissions" not in wf["jobs"]["paper"]

@@ -4,8 +4,8 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
 ## What runs
 
-- `.github/workflows/paper.yml` runs `uv run ewbot paper run --ledger-dir <paper worktree>` every hour at minute 7 (and on demand) on `ubuntu-24.04`. `scripts/paper_sync.sh` does the git side: the `paper` worktree, the commit, the push and its retries.
-- GitHub can start a scheduled run late (minutes, sometimes much more when Actions is busy), so a run can slip into the next hour and leave an hour without a successful run. Criterion 4's 95% coverage target tolerates up to 33 missed hours in 28 days (5% of 672 hours is 33.6).
+- `.github/workflows/paper.yml` runs `uv run ewbot paper run --ledger-dir <paper worktree>` every hour on `ubuntu-24.04`. The primary trigger is an external Cloudflare Workers cron that calls `workflow_dispatch` at minute 37 of every hour (see Reliable hourly trigger); the workflow's own `schedule` (`52 */3 * * *`: minute 52, every 3 hours) is a sparse backup, and you can also start it by hand. `scripts/paper_sync.sh` does the git side: the `paper` worktree, the commit, the push and its retries.
+- GitHub's own `schedule` is unreliable under load: it can start a run late (minutes, sometimes much more) or drop it (as of 2026-10-03 only 2 of about 13 hourly `7 * * * *` runs had fired), which leaves hours without a successful run. That is why the hourly trigger is external. Criterion 4's 95% coverage target tolerates up to 33 missed hours in 28 days (5% of 672 hours is 33.6). Coverage counts the hours with a successful run, whatever triggered it (`workflow_dispatch` or `schedule`).
 - `.github/workflows/ci.yml` runs the strategy-fingerprint and static guards on every pull request to `master` and every push to `master` (see Strict fingerprint policy).
 - Each run recomputes the whole engine deterministically from 2017 with the params in the committed `holdout.lock` (K4 = 2.0, Q_MIN = 0.7, S_MIN = 0.5), conservative risk, breakers on and Plan 1 costs. Trading starts at the holdout start (2024-01-01), so the run reproduces the holdout's A run and continues it.
 - Paper trades are the trades that **enter after the holdout's last bar** (`entry_ts > 1790938800`, 2026-10-02 11:00 UTC). A position already open at that bar belongs to the holdout and is never counted twice.
@@ -44,12 +44,35 @@ Spec: `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
    Without these secrets the runtime still runs and records everything; it only skips Telegram.
 4. Set a small Actions budget, for example $5, at <https://github.com/settings/billing> (budgets and alerts, product Actions). With the default $0 budget GitHub stops running the workflow once the month's free minutes are used up, and every missed hour counts against criterion 4; a small budget keeps the runs going and caps what they can cost (see Cost).
-5. Start the first run by hand and watch it:
+5. Start the first run by hand and watch it (then set up the hourly trigger below):
 
    ```bash
    gh workflow run paper.yml
    gh run watch "$(gh run list --workflow paper.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
    ```
+
+## Reliable hourly trigger (Cloudflare Workers)
+
+GitHub drops many scheduled runs when Actions is busy, so the hourly run is started from outside: a Cloudflare Workers cron calls the GitHub API (`workflow_dispatch` on `paper.yml`, ref `master`) at minute 37 of every hour (UTC). The workflow's `schedule: "52 */3 * * *"` stays as a backup (8 runs a day); the `paper` concurrency group keeps overlapping runs from running together. The worker is `ops/cloudflare-trigger/worker.js` (no dependencies). One-time setup (you):
+
+1. Create a fine-grained personal access token at <https://github.com/settings/personal-access-tokens/new>:
+   - Resource owner: `taejunoh`.
+   - Repository access: **Only select repositories** → `elliott-wave-btc-bot`.
+   - Permissions → Repository permissions → **Actions: Read and write**. Nothing else.
+   - Expiration: for example 1 year. Put the renewal date in your calendar: once the token expires the primary trigger stops (the worker's runs fail with HTTP 401) and only the 3-hourly backup schedule keeps running, which leaves most hours uncovered.
+   - Generate it and copy the token; GitHub shows it once.
+2. In the Cloudflare dashboard open **Workers & Pages** → **Create** → **Create Worker**. Name it (for example `ewbot-paper-trigger`), **Deploy** the hello-world stub, then **Edit code**, replace everything with the contents of `ops/cloudflare-trigger/worker.js`, and **Deploy** again.
+3. Worker → **Settings** → **Variables and Secrets** → **Add** → type **Secret**, name `GITHUB_TOKEN`, value: the token from step 1 → **Deploy**.
+4. Worker → **Settings** → **Trigger Events** → **Cron Triggers** → **Add** → `37 * * * *` (Cloudflare cron runs in UTC).
+5. Verify, either way:
+   - In the Worker's **Settings** → **Trigger Events** (or the editor's **Schedule** test panel) run the cron trigger by hand, or just wait for the next :37.
+   - Then check that a `workflow_dispatch` run was created:
+
+     ```bash
+     gh run list --workflow paper.yml --limit 5
+     ```
+
+     The `EVENT` column shows `workflow_dispatch` for the worker's runs and `schedule` for the backup. If nothing appears, open the Worker's **Observability** / **Logs**: the worker logs the HTTP status and GitHub's reply (never the token). 401 = wrong or expired token, 403 or 404 = the token lacks Actions: Read and write on this repository.
 
 ## Reading the results
 
@@ -115,13 +138,13 @@ GitHub updates the `ubuntu-24.04` image itself (a new `ImageVersion`, often week
 
 ## Cost
 
-Inputs: about 1–2 minutes per hourly run, plus the daily criteria 1–2 recompute (103 engine runs, roughly 10–20 minutes on a 2-vCPU runner) inside one run a day. GitHub rounds every job up to a whole minute (each run here is one job), so an hourly run of 1 min 10 s costs 2 minutes.
+Inputs: about 1–2 minutes per run, plus the daily criteria 1–2 recompute (103 engine runs, roughly 10–20 minutes on a 2-vCPU runner) inside one run a day. There are 24 hourly `workflow_dispatch` runs plus 8 backup `schedule` runs a day, 32 runs in all (the backup run at :52 re-runs the engine on the same data, so it costs the same as an hourly run). GitHub rounds every job up to a whole minute (each run here is one job), so a run of 1 min 10 s costs 2 minutes.
 
 | Estimate | Per day | 30-day month | 31-day month |
 |---|---|---|---|
-| low: 23 × 1 + 1 × (1 + 10) | 34 min | 1,020 min | 1,054 min |
-| high: 23 × 2 + 1 × (2 + 20) | 68 min | 2,040 min | 2,108 min |
+| low: 31 × 1 + 1 × (1 + 10) | 42 min | 1,260 min | 1,302 min |
+| high: 31 × 2 + 1 × (2 + 20) | 84 min | 2,520 min | 2,604 min |
 
 The high end is above the 2,000 free minutes a month of a private repository on GitHub Free, and it is the likely end once an hourly run takes just over a minute. Check the real usage in your GitHub billing settings after the first week.
 
-Do not lower the cost by changing what runs: the 100 RANDOM runs are part of criteria 1–2 (fewer runs change the criteria), and the hourly schedule is what criterion 4 counts. If a month would go over the free minutes, either allow paid Actions minutes (the small budget of One-time setup step 4: with the default $0, GitHub stops running the workflow once the free minutes are used up, and every missed hour counts against criterion 4), or move the job to a self-hosted runner (`runs-on: self-hosted`: no Actions minutes, but that machine has to be online every hour, and its own image becomes the recorded environment).
+Do not lower the cost by changing what runs: the 100 RANDOM runs are part of criteria 1–2 (fewer runs change the criteria), and the hourly trigger is what criterion 4 counts (do not drop the Cloudflare trigger to save minutes; the backup alone covers only every third hour). If a month would go over the free minutes, either allow paid Actions minutes (the small budget of One-time setup step 4: with the default $0, GitHub stops running the workflow once the free minutes are used up, and every missed hour counts against criterion 4), or move the job to a self-hosted runner (`runs-on: self-hosted`: no Actions minutes, but that machine has to be online every hour, and its own image becomes the recorded environment).
