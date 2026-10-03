@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import threading
+import time
 
 import pytest
 
-from ewbot.live.exchange import SessionInfo, Unavailable
-from ewbot.live.feed import TickerFeed
+from ewbot.live.exchange import Quote, SessionInfo, Unavailable
+from ewbot.live.feed import HEALTHY_S, SILENT_S, Tick, TickerFeed, sdk_ws_factory
 from ewbot.live.sim import BIP_SPEC
-from ewbot.live.watchdog import AccountGuard, PriceSource, SessionWatch, StopGapWatch, margin_status
+from ewbot.live.watchdog import AccountGuard, BadEquity, PriceSource, SessionWatch, StopGapWatch, margin_status
 from tests.live.helpers import Clock, journal, sim
 
 NY_NOON = 1_791_043_200  # 2026-10-03 12:00 New York (16:00 UTC)
+FUT = "BIP-20DEC30-CDE"
 
 
 def test_stop_gap_closes_only_after_ten_seconds_beyond_the_limit():
@@ -26,6 +31,14 @@ def test_stop_gap_closes_only_after_ten_seconds_beyond_the_limit():
     assert w.check(-1, 60_000.0, 63_100.0, now=36.0)
 
 
+def test_stop_gap_fires_at_most_one_grace_period_late_when_the_clock_steps_back():
+    w = StopGapWatch()
+    assert not w.check(1, 60_000.0, 56_900.0, now=10_000.0)
+    assert not w.check(1, 60_000.0, 56_900.0, now=6_405.0)  # the wall clock stepped back an hour: re-armed
+    assert not w.check(1, 60_000.0, 56_900.0, now=6_414.0)
+    assert w.check(1, 60_000.0, 56_900.0, now=6_415.0)  # 10 s after the step, not an hour
+
+
 def test_margin_levels_use_the_overnight_rate():
     assert margin_status(1, 84_000.0, 1, BIP_SPEC, 1_000.0).level == "OK"  # 17.7%
     assert margin_status(5, 84_000.0, 1, BIP_SPEC, 1_000.0).level == "WARN"  # 88.3%
@@ -34,20 +47,60 @@ def test_margin_levels_use_the_overnight_rate():
     assert margin_status(1, 84_000.0, 1, BIP_SPEC, 100.0).reduce_by == 1  # nothing fits: close it all
 
 
-def test_account_guard_trips_daily_and_total_once_and_survives_a_restart(tmp_path):
+def test_account_guard_trips_on_two_breaching_reads_once_a_day_and_survives_a_restart(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)
     assert g.update(10_000.0, NY_NOON) is None
     assert g.update(9_701.0, NY_NOON + 60) is None
-    assert g.update(9_700.0, NY_NOON + 120) == "DAILY_LOSS"
-    assert g.update(9_600.0, NY_NOON + 180) is None  # once per New York day
+    assert g.update(9_700.0, NY_NOON + 120) is None  # -3%: one breaching read is not enough
+    assert g.update(9_700.0, NY_NOON + 180) == "DAILY_LOSS"  # the second in a row trips (one poll later)
+    assert g.update(9_600.0, NY_NOON + 240) is None  # once per New York day
     g2 = AccountGuard(jr)  # restart
     assert g2.state()["daily_tripped"] and g2.state()["peak"] == 10_000.0
     assert g2.update(9_600.0, NY_NOON + 86_400) is None  # next day: new reference 9_600
-    assert g2.update(8_500.0, NY_NOON + 86_460) == "TOTAL_DD"  # 15% below the 10_000 peak
-    assert g2.update(8_000.0, NY_NOON + 86_520) is None
-    g2.reset(8_000.0, NY_NOON + 86_580)
-    assert g2.state()["peak"] == 8_000.0 and not g2.state()["total_tripped"]
+    assert g2.update(8_500.0, NY_NOON + 86_460) is None
+    assert g2.update(8_500.0, NY_NOON + 86_520) == "TOTAL_DD"  # 15% below the 10_000 peak, twice
+    assert g2.update(8_000.0, NY_NOON + 86_580) is None
+    jr.close()
+
+
+def test_one_bad_balance_read_never_trips_a_breaker_nor_raises_the_peak(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr)
+    assert g.update(10_000.0, NY_NOON) is None
+    assert g.update(9_000.0, NY_NOON + 60) is None  # one low read (-10%) between normal ones
+    assert g.update(10_000.0, NY_NOON + 120) is None
+    assert g.update(20_000.0, NY_NOON + 180) is None  # one high read
+    assert [g.update(10_000.0, NY_NOON + 240 + 60 * k) for k in range(3)] == [None, None, None]
+    assert g.state()["peak"] == 10_000.0  # the peak only rises to what two reads in a row reached
+    assert g.update(10_400.0, NY_NOON + 480) is None and g.state()["peak"] == 10_000.0
+    assert g.update(10_500.0, NY_NOON + 540) is None and g.state()["peak"] == 10_400.0
+    for bad in (math.nan, math.inf, 0.0, -5.0):
+        with pytest.raises(BadEquity):
+            g.update(bad, NY_NOON + 600)  # a read failure, not an observation
+    assert g.state()["equity"] == 10_500.0 and g.update(10_500.0, NY_NOON + 660) is None
+    jr.close()
+
+
+def test_resume_rebases_only_the_breaker_that_tripped(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr)
+    g.update(10_000.0, NY_NOON)
+    g.update(9_800.0, NY_NOON + 60)
+    before = g.state()
+    assert g.reset(9_800.0, NY_NOON + 120) == [] and g.state() == before  # /pause then /resume: nothing changes
+    g.update(9_700.0, NY_NOON + 180)
+    assert g.update(9_650.0, NY_NOON + 240) == "DAILY_LOSS"
+    assert g.reset(9_650.0, NY_NOON + 300) == ["DAILY_LOSS"]
+    st = g.state()
+    assert (st["day_ref"], st["peak"], st["daily_tripped"]) == (9_650.0, 10_000.0, False)  # the peak stays
+    g.update(8_400.0, NY_NOON + 360)
+    assert g.update(8_400.0, NY_NOON + 420) == "TOTAL_DD"  # 16% below the peak (it marks the day too)
+    assert g.reset(8_400.0, NY_NOON + 480) == ["TOTAL_DD", "DAILY_LOSS"]
+    st = g.state()
+    assert (st["peak"], st["day_ref"], st["total_tripped"], st["daily_tripped"]) == (8_400.0, 8_400.0, False, False)
+    with pytest.raises(BadEquity):
+        g.reset(math.nan, NY_NOON + 540)
     jr.close()
 
 
@@ -61,9 +114,19 @@ def test_session_watch_reports_changes_and_maintenance_once():
     assert w.update(SessionInfo("OPEN", NY_NOON + 3 * 86_400), NY_NOON + 180)[0][0] == "SESSION"  # too far ahead
 
 
-def ticker(product: str, price: float, seq: int) -> str:
-    return json.dumps({"channel": "ticker", "sequence_num": seq,
-                       "events": [{"type": "update", "tickers": [{"type": "ticker", "product_id": product, "price": str(price)}]}]})
+def test_session_watch_announces_a_window_in_progress_and_an_open_end():
+    w = SessionWatch()  # a (re)start during maintenance
+    assert w.update(SessionInfo("OPEN", NY_NOON - 600, NY_NOON + 3_000), NY_NOON) == [
+        ("MAINTENANCE", "정기 점검 진행 중 2026-10-03 11:50 ~ 12:50 (뉴욕)")]
+    assert w.update(SessionInfo("OPEN", NY_NOON - 600, NY_NOON + 3_000), NY_NOON + 60) == []
+    assert SessionWatch().update(SessionInfo("OPEN", NY_NOON + 3_600, None), NY_NOON) == [
+        ("MAINTENANCE", "정기 점검 예정 2026-10-03 13:00 ~ 미정 (뉴욕)")]
+    assert SessionWatch().update(SessionInfo("OPEN", NY_NOON - 7_200, NY_NOON - 3_600), NY_NOON) == []  # over
+
+
+def ticker(product: str, price: float | str, seq: int, **book: str) -> str:
+    return json.dumps({"channel": "ticker", "sequence_num": seq, "events": [
+        {"type": "update", "tickers": [{"type": "ticker", "product_id": product, "price": str(price), **book}]}]})
 
 
 def test_price_source_uses_a_fresh_feed_then_rest_every_ten_seconds():
@@ -84,51 +147,204 @@ def test_price_source_uses_a_fresh_feed_then_rest_every_ten_seconds():
     assert PriceSource(ex, None, clock=clock).futures_price() == 60_000.0
 
 
+class Book:
+    """A futures quote source whose book can break (a price read as 0, NaN, ...) or fail."""
+
+    futures_id = FUT
+
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self.bid: float | None = 60_000.0
+        self.ask = 60_010.0
+        self.calls = 0
+
+    def quote(self, product_id: str) -> Quote:
+        self.calls += 1
+        if self.bid is None:
+            raise Unavailable("503")
+        return Quote(product_id, self.bid, self.ask, self.clock())
+
+
+class StuckFeed:
+    def __init__(self, tick: Tick) -> None:
+        self.tick = tick
+
+    def latest(self, product_id: str) -> Tick:
+        return self.tick
+
+
+def test_price_source_never_returns_an_unusable_or_stale_price():
+    clock = Clock(1_000.0)
+    book = Book(clock)
+    src = PriceSource(book, StuckFeed(Tick(math.nan, 1_000.0)), clock=clock)  # type: ignore[arg-type]
+    assert src.futures_price() == 60_005.0 and src.mode == "rest"  # a NaN tick is never fresh
+    for bid, ask in ((0.0, 60_010.0), (math.nan, 60_010.0), (-1.0, -1.0), (math.inf, math.inf)):
+        clock.now += 10.0
+        book.bid, book.ask = bid, ask
+        assert src.futures_price() == 60_005.0  # a broken book is a failed read: the last good price (<= 40 s old)
+    clock.now += 10.0
+    book.bid = None  # outage
+    assert src.futures_price() == 60_005.0 and book.calls == 6  # 50 s old
+    clock.now += 5.0
+    assert src.futures_price() == 60_005.0 and book.calls == 6  # one attempt per 10 s, failed or not
+    clock.now += 6.0
+    assert src.futures_price() is None and book.calls == 7  # the last good price is 61 s old: no price
+    clock.now += 10.0
+    book.bid, book.ask = 60_100.0, 60_110.0
+    assert src.futures_price() == 60_105.0
+
+
 def test_feed_parses_ticks_and_flags_sequence_gaps():
     clock = Clock(5.0)
-    feed = TickerFeed(["BIP-20DEC30-CDE"], ws_factory=lambda **kw: None, clock=clock)
-    feed.on_message(ticker("BIP-20DEC30-CDE", 60_000.0, 7))
+    feed = TickerFeed([FUT], ws_factory=lambda **kw: None, clock=clock)
+    feed.on_message(ticker(FUT, 60_000.0, 7))
     feed.on_message(json.dumps({"channel": "heartbeats", "sequence_num": 8}))
-    assert feed.latest("BIP-20DEC30-CDE").price == 60_000.0 and not feed.take_resync()
-    feed.on_message(ticker("BIP-20DEC30-CDE", 60_010.0, 11))  # 9 and 10 missing
+    assert feed.latest(FUT).price == 60_000.0 and not feed.take_resync()
+    feed.on_message(ticker(FUT, 60_010.0, 11))  # 9 and 10 missing
     assert feed.gaps == 1 and feed.take_resync() and not feed.take_resync()
     feed.on_message("not json")
     clock.now = 9.0
     assert feed.age() == pytest.approx(4.0)
 
 
-class FakeWS:
-    def __init__(self, feed: TickerFeed, plan: list[int], log: list[str], **kw) -> None:
+def test_feed_takes_the_bid_ask_mid_and_ignores_unusable_prices():
+    clock = Clock(5.0)
+    feed = TickerFeed([FUT], ws_factory=lambda **kw: None, clock=clock)
+    feed.on_message(ticker(FUT, 60_100.0, 1, best_bid="60000", best_ask="60010"))
+    assert feed.latest(FUT).price == 60_005.0  # the REST quote's measure, not the last trade
+    feed.on_message(ticker(FUT, 60_020.0, 2, best_bid="", best_ask="60030"))
+    assert feed.latest(FUT).price == 60_020.0  # no usable bid: the last trade price
+    clock.now = 6.0
+    for seq, bad in enumerate(("NaN", "inf", "0", "-5", "", "abc"), start=3):
+        feed.on_message(ticker(FUT, bad, seq, best_bid=bad, best_ask="60030"))
+    assert feed.latest(FUT) == Tick(60_020.0, 5.0) and feed.bad_messages == 6
+
+
+def test_a_message_the_feed_cannot_read_never_reaches_the_sdk():
+    feed = TickerFeed([FUT], ws_factory=lambda **kw: None, clock=Clock(5.0))
+    for raw in ("not json", "[]", "5", json.dumps({"channel": "ticker", "events": [None]}),
+                json.dumps({"channel": "ticker", "events": [{"tickers": "x"}]})):
+        feed.on_message(raw)  # an exception here would end the SDK's message handler for good
+    assert feed.bad_messages == 5 and feed.latest(FUT) is None
+    feed.on_message(json.dumps({"type": "error", "message": "failure to subscribe"}))
+    assert feed.last_error == "server error: failure to subscribe"
+    feed.on_message(ticker(FUT, 60_000.0, 1))
+    assert feed.latest(FUT).price == 60_000.0
+
+
+class ScriptedWS:
+    """One connection. `script` is "refuse" (open fails) or steps consumed one per sleep_with_exception_check:
+    "msg" delivers a heartbeat, "quiet" returns without one (an SDK whose handler ended), "drop" raises like
+    the SDK on a lost connection, "stop" stops the feed. An exhausted script stays quiet; after 500 steps in
+    all the feed is stopped (a feed that never notices silence must not hang the test)."""
+
+    steps = 0
+
+    def __init__(self, feed: TickerFeed, scripts: list, log: list[str], **kw) -> None:
         self.feed, self.log = feed, log
         self.on_message = kw["on_message"]
-        self.beats = plan.pop(0) if plan else 0
+        self.script = scripts.pop(0) if scripts else ["stop"]
+        self.used = 0
 
     def open(self):
         self.log.append("open")
+        if self.script == "refuse":
+            raise ConnectionRefusedError("refused")
 
     def subscribe(self, products, channels):
         self.log.append(f"subscribe {','.join(products)} {','.join(channels)}")
 
     def sleep_with_exception_check(self, s):
-        if self.beats <= 0:
-            if not self.feed.connects < 3:
-                self.feed.stop()
-                return
+        ScriptedWS.steps += 1
+        self.used += 1
+        step = self.script.pop(0) if self.script else "quiet"
+        if ScriptedWS.steps > 500:
+            step = "stop"
+        if step == "msg":
+            self.on_message(json.dumps({"channel": "heartbeats", "sequence_num": self.used}))
+        elif step == "drop":
             raise ConnectionError("dropped")
-        self.beats -= 1
-        self.on_message(ticker("BIP-20DEC30-CDE", 60_000.0, 0))
+        elif step == "stop":
+            self.feed.stop()
 
     def close(self):
-        self.log.append("close")
+        self.log.append(f"close {self.used}")
+
+
+def scripted(scripts: list, **kw) -> tuple[TickerFeed, list[str], list[float]]:
+    ScriptedWS.steps = 0
+    log: list[str] = []
+    waits: list[float] = []
+    feed = TickerFeed([FUT, "BTC-USD"], ws_factory=None, sleep=waits.append, **kw)  # type: ignore[arg-type]
+    feed.ws_factory = lambda **k: ScriptedWS(feed, scripts, log, **k)
+    return feed, log, waits
 
 
 def test_feed_reconnects_with_backoff_and_requests_a_resync():
-    log: list[str] = []
-    waits: list[float] = []
-    plan = [2, 0, 1]
-    feed = TickerFeed(["BIP-20DEC30-CDE", "BTC-USD"], ws_factory=None, sleep=waits.append)  # type: ignore[arg-type]
-    feed.ws_factory = lambda **kw: FakeWS(feed, plan, log, **kw)
+    feed, log, waits = scripted([["msg", "msg", "drop"], ["drop"], ["msg", "stop"]])
     feed.run()
-    assert feed.connects == 3 and waits == [1.0, 1.0]  # reset to 1 s after each successful connect
-    assert log.count("subscribe BIP-20DEC30-CDE,BTC-USD ticker,heartbeats") == 3 and log.count("close") == 3
-    assert feed.take_resync()
+    assert feed.connects == 3 and waits == [1.0, 2.0]  # a short-lived connection does not reset the backoff
+    assert log.count("subscribe BIP-20DEC30-CDE,BTC-USD ticker,heartbeats") == 3
+    assert [x for x in log if x.startswith("close")] == ["close 3", "close 1", "close 2"]
+    assert feed.failures == 2 and feed.last_error == "ConnectionError" and feed.take_resync()
+
+
+def test_a_silent_connection_is_torn_down_and_opened_again():
+    """A server close (1000/1001) ends the SDK's handler without an error: sleep_with_exception_check keeps
+    returning and no message comes. The heartbeats channel sends one every second, so SILENT_S without one
+    means the connection is gone."""
+    feed, log, waits = scripted([["msg"], ["msg", "stop"]])
+    feed.run()
+    assert feed.connects == 2 and waits == [1.0]
+    assert [x for x in log if x.startswith("close")] == [f"close {1 + int(SILENT_S)}", "close 2"]
+    assert feed.failures == 1 and feed.last_error == f"silent for {SILENT_S:.0f} s"
+
+
+def test_backoff_doubles_to_the_cap_and_resets_only_after_a_healthy_minute():
+    healthy = ["msg"] * int(HEALTHY_S) + ["drop"]
+    feed, log, waits = scripted(["refuse"] * 8 + [["msg"] * 5 + ["drop"], "refuse", healthy, "refuse", ["stop"]])
+    feed.run()
+    assert waits == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0, 60.0, 1.0, 2.0]
+    assert feed.connects == 3 and feed.failures == 12 and feed.last_error == "ConnectionRefusedError"
+
+
+class Refused:
+    def __init__(self, **kw) -> None:
+        pass
+
+    def open(self):
+        raise ConnectionRefusedError("refused")
+
+    def close(self):
+        pass
+
+
+def test_stop_ends_a_backoff_wait_at_once():
+    feed = TickerFeed([FUT], ws_factory=lambda **kw: Refused(**kw))
+    th = feed.start()
+    deadline = time.monotonic() + 2.0
+    while feed.failures == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    feed.stop()  # the feed is waiting 1 s before the next attempt
+    th.join(0.5)
+    assert feed.failures >= 1 and not th.is_alive()
+
+
+def test_the_sdk_client_releases_its_loop_thread_after_a_failed_open(tmp_path, monkeypatch):
+    sdk = pytest.importorskip("coinbase.websocket")  # dependency group `live`
+
+    async def refused(*args, **kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(sdk.websocket_base.websockets, "connect", refused)  # no network
+    key = tmp_path / "key.json"
+    key.write_text(json.dumps({"name": "organizations/o/apiKeys/k", "privateKey": "unused"}))
+    make = sdk_ws_factory(key)
+    threads, fds = threading.active_count(), len(os.listdir("/dev/fd"))
+    for _ in range(5):
+        ws = make(on_message=lambda raw: None)
+        assert (ws.client.timeout, ws.client.retry) == (10, False)  # bounded handshake; TickerFeed reconnects
+        with pytest.raises(sdk.WSClientException):
+            ws.open()
+        ws.close()  # the SDK's own close() raises here and leaves its event-loop thread running
+    assert (threading.active_count(), len(os.listdir("/dev/fd"))) == (threads, fds)

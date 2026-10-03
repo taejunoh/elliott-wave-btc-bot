@@ -85,6 +85,15 @@ def test_quotes_come_from_the_public_order_book():
     assert client.calls[0] == ("GET", API + "/market/product_book", {"product_id": FUT, "limit": 1}, True)
 
 
+@pytest.mark.parametrize(("bid", "ask"), [("", "84680"), ("0", "84680"), ("-5", "84680"), ("NaN", "84680"),
+                                          ("84655", "inf")])
+def test_an_unusable_top_of_book_is_unavailable_not_a_price(bid, ask):
+    book = {"pricebook": {"bids": [{"price": bid, "size": "1"}], "asks": [{"price": ask, "size": "1"}]}}
+    ex, _, _ = make({("GET", "/market/product_book"): book})
+    with pytest.raises(Unavailable):  # a bid read as 0 would make a mid of half the price (and a basis ratio of 0.5)
+        ex.quote(FUT)
+
+
 def test_position_picks_the_bip_product():
     ex, _, _ = make({("GET", "/cfm/positions"): ["positions", "positions_flat"]})
     assert ex.position() == Position(-1, 3, 85100.0)

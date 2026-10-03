@@ -347,7 +347,10 @@ class CoinbaseExchange:
             bids, asks = pb.get("bids") or [], pb.get("asks") or []
             if not bids or not asks:
                 raise Unavailable(f"empty order book for {product_id}")
-            return Quote(product_id, _num(bids[0]["price"]), _num(asks[0]["price"]), self.clock())
+            bid, ask = _num(bids[0]["price"], math.nan), _num(asks[0]["price"], math.nan)
+            if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0):
+                raise Unavailable(f"unusable top of book for {product_id}")  # never a price of 0, NaN or inf
+            return Quote(product_id, bid, ask, self.clock())
 
     def position(self) -> Position | None:
         reply = self._call("GET", "/cfm/positions")
