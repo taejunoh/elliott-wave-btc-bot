@@ -35,7 +35,7 @@
 
 ## Spec Interpretations (decided here, binding for the tasks)
 
-1. **Target at the latest bar.** The engine never evaluates entries on a run's last bar, so the replay gets one placeholder bar T+1h (flat at T's close, volume 0, synthetic). Everything decided at or before T's close is computed before the engine reaches T+1h, so it equals a replay with the real next bar; Task 4's test proves it at every event bar of the synthetic series. Queued exits are recorded by swapping the engine's per-run class `_Run` (looked up at run time, like the paper trace swaps `PaperBroker` / `WaveEngine`) for a subclass that logs each fresh `_request_exit(reason)` with its bar. Nothing at T+1h is used.
+1. **Target at the latest bar.** The engine never evaluates entries on a run's last bar, so the replay gets one placeholder bar T+1h (flat at T's close, volume 0, synthetic). Everything decided at or before T's close is computed before the engine reaches T+1h, so it equals a replay with the real next bar; Task 4's tests prove it at every event bar of the synthetic series and on a sampled sweep of the other holdout bars (every 23rd, every CFM halt bar and the bar before it). Queued exits are recorded by swapping the engine's per-run class `_Run` (looked up at run time, like the paper trace swaps `PaperBroker` / `WaveEngine`) for a subclass that logs each fresh `_request_exit(reason)` with its bar. Nothing fills during the CFM halt (Fri 17–18 New York), so the target reports the exit still pending for the open position, not only one queued at T: an exit queued at the Fri 16:00 close is still `exit_reason` at the halt bar T = 17:00 (`exit_queued_ts` = 16:00 tells a carried exit from a new one), and a stop the halt bar's spot range crossed is flagged (`stop_pending_reopen`: the paper broker stops the position out at the next tradable open). Reconcile closes on both (`STOP_HALT` for the second) at the first poll that sees the session OPEN. The configuration is not a parameter: `compute_target(lock, df, T)` builds `holdout_config(BotConfig(), params)` from the holdout lock (checked like the paper precheck, without its git checks) and always replays from `HOLDOUT_START`. Nothing at T+1h is used.
 2. **Trade identity.** A live trade is identified by its signal bar (`trade_id = signal ts`; the paper trade key is `trade_id + 1h`). Client order ids: entry `ewb-e-<signal ts>-<L|S>`, brackets `ewb-b-<trade>-<tp1|tp2>-<generation>`, closes `ewb-x-<trade>-<n>` (`ewb-x-0-<n>` for a position the journal does not know), reductions `ewb-r-<trade>-<n>`. Within the hour after an entry the replay still shows it as queued (`target.entry`): that queued entry is the engine position of the live trade (`reconcile.pending_position`), never a reason to close.
 3. **Never chase.** Only an entry queued at the latest bar can open a trade, and only within 5 minutes of that bar's close; an entry that was skipped (pause, session, size, margin, breaker, missing TP2), refused or unfilled is recorded once and never sent again; a live trade closed early by its bracket is not re-entered. A position the journal does not know is adopted when the engine holds the same direction, else closed (spec §4.4: the actual position follows the target).
 4. **Levels.** Futures level = `to_tick(spot level × futures mid / spot mid, $5)`, rounded down for a long and up for a short — for every level: the spec's stop rule, and for a TP it moves the limit toward the entry so the live TP fills no later than the engine's strict-cross TP. The ratio is taken when the order is sent; resting legs are re-placed only when the engine's stop (spot) changes, never for basis drift.
@@ -59,7 +59,7 @@
 | `src/ewbot/live/sim.py` | 1 | `SimExchange`: in-memory CFM venue (venue intake checks, reduce-only brackets, partial fills, gaps, sessions, faults, crashes) |
 | `src/ewbot/live/journal.py` | 2 | SQLite journal: intents, events, decisions, cycles, stages, key/value |
 | `src/ewbot/live/coinbase.py` | 3 | `CoinbaseExchange` over the SDK's `RESTClient` (raw JSON parsers, retries, pacing) |
-| `src/ewbot/live/target.py` | 4 | engine replay → `Target` (position, queued exit / entry, decisions) |
+| `src/ewbot/live/target.py` | 4 | engine replay of the holdout lock's config → `Target` (position, pending exit, halt stop, queued entry, decisions) |
 | `src/ewbot/live/pricing.py` | 5 | basis mapping, tick rounding, stage sizing, margin projection |
 | `src/ewbot/live/reconcile.py` | 6 | `LiveTrade` state, `observe`, `desired_legs`, `plan` (pure) |
 | `src/ewbot/live/executor.py` | 7 | intent-before-send, entries, brackets, closes, reductions, restart recovery |
@@ -90,9 +90,9 @@
 | 1 | Exchange boundary and `SimExchange` | 23 |
 | 2 | SQLite journal | 6 |
 | 3 | Coinbase adapter, `live` dependency group, recorded fixtures | 76 |
-| 4 | Target state from the engine replay (+ allowlist line) | 5 |
+| 4 | Target state from the engine replay (+ allowlist line) | 12 |
 | 5 | Price mapping, stage sizing, margin projection | 15 |
-| 6 | Reconcile planner | 15 |
+| 6 | Reconcile planner | 16 |
 | 7 | Executor: intent-before-send, protection, closes, recovery | 20 |
 | 8 | Watchdog and WebSocket feed | 7 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 6 |
@@ -100,11 +100,11 @@
 | 11 | Settings and preflight | 7 |
 | 12 | `ShadowExchange` and the runtime loop | 17 |
 | 13 | CLI `ewbot live …` and production wiring | 7 |
-| 14 | Parity and chaos integration tests | 18 |
+| 14 | Parity and chaos integration tests | 20 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 242 more tests, `862 passed, 1 skipped` (`863 passed` with the cache), about 70 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 252 more tests, `872 passed, 1 skipped` (`873 passed` with the cache), about 80 s.
 
 ---
 
@@ -2900,8 +2900,8 @@ EOF
 - Test: `tests/live/test_target.py`
 
 **Interfaces:**
-- Consumes: `ewbot.backtest.runner.run_backtest`, `ewbot.backtest.walkforward.HOLDOUT_START`, `ewbot.paper.trace.traced_engine` / `EngineTrace`, `ewbot.paper.decisions.build_decisions`, the engine module `ewbot.engine.loop` (its `_Run` name, read-only swap), `tests.paper.helpers` (`PARAMS`, `synth_frame`, `ts`).
-- Produces (`ewbot.live.target`): `class TargetError(RuntimeError)`; frozen dataclasses `TargetPosition(trade_key, signal_ts, setup, direction, entry_price, stop, stop0, tp1, tp2, tp1_done, contracts, remaining)`, `TargetEntry(signal_ts, setup, direction, entry_ref, stop, tp1, tp2, risk_mult, contracts, reason)`, `Target(bar_ts, close, position, exit_reason, entry, decisions: tuple[dict, ...])` with `to_json() -> dict`; `with_placeholder(df1h, bar_ts) -> DataFrame`; context manager `traced_with_exits() -> (EngineTrace, list[(bar ts, reason)])`; `compute_target(cfg, df1h, bar_ts, start_ts=HOLDOUT_START) -> Target`. All prices are spot prices; `contracts` are the engine's own sizes (informational).
+- Consumes: `ewbot.backtest.runner.run_backtest`, `ewbot.backtest.holdout` (`holdout_config`, `lock_digest`), `ewbot.backtest.walkforward` (`HOLDOUT_START`, `grid_combos`), `ewbot.config` (`BotConfig`, `CONSERVATIVE`), `ewbot.paper.trace.traced_engine` / `EngineTrace`, `ewbot.paper.decisions.build_decisions`, the engine module `ewbot.engine.loop` (its `_Run` name, read-only swap; the paper broker's `_stop_triggered_while_closed` flag, read only), `tests.paper.helpers` (`PARAMS`, `make_lock`, `synth_frame`, `ts`).
+- Produces (`ewbot.live.target`): `class TargetError(RuntimeError)`; frozen dataclasses `TargetPosition(trade_key, signal_ts, setup, direction, entry_price, stop, stop0, tp1, tp2, tp1_done, contracts, remaining)`, `TargetEntry(signal_ts, setup, direction, entry_ref, stop, tp1, tp2, risk_mult, contracts, reason)`, `Target(bar_ts, close, position, exit_reason, entry, decisions: tuple[dict, ...], exit_queued_ts=None, stop_pending_reopen=False)` with `to_json() -> dict` — `exit_reason` is the exit queued for the open position and not executed by T (queued at T, or before T and carried across the CFM halt; `exit_queued_ts` is the bar whose close queued it), `stop_pending_reopen` means the halt bar T crossed the open position's stop (the engine stops it out at the reopen); `lock_params(lock) -> tuple[float, ...]` and `frozen_config(lock) -> BotConfig` (the paper precheck's lock checks without its git checks: a grid combo, `HOLDOUT_START`, `sha256 == lock_digest(BotConfig(), params, random_runs, code_sha256)`; then `holdout_config(BotConfig(), params)`, conservative with the breakers on; `TargetError` otherwise); `with_placeholder(df1h, bar_ts) -> DataFrame`; context manager `traced_with_exits() -> (EngineTrace, exits: list[(bar ts, reason)], halt_stops: list[bar ts])`; `compute_target(lock, df1h, bar_ts) -> Target` (no configuration or start parameter; `TargetError` for a lock that is not the holdout's, a missing bar or an inconsistent replay). All prices are spot prices; `contracts` are the engine's own sizes (informational).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2910,41 +2910,124 @@ EOF
 ```python
 from __future__ import annotations
 
+import dataclasses
+import inspect
+from dataclasses import dataclass
+from typing import Any
+
+import pandas as pd
 import pytest
 
 import ewbot.engine.loop as loop_mod
+import ewbot.live.target as target_mod
 from ewbot.backtest.holdout import holdout_config
 from ewbot.backtest.runner import run_backtest
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.config import BotConfig
-from ewbot.live.target import TargetError, compute_target, traced_with_exits, with_placeholder
+from ewbot.data.candles import futures_closed
+from ewbot.engine.position_mgr import EngineResult
+from ewbot.live.target import TargetError, compute_target, frozen_config, traced_with_exits, with_placeholder
 from ewbot.paper.decisions import build_decisions
+from ewbot.paper.trace import EngineTrace
+from ewbot.strategy.base import Signal
 from ewbot.types import H1
-from tests.paper.helpers import PARAMS, synth_frame, ts
+from tests.paper.helpers import PARAMS, make_lock, synth_frame, ts
+
+SWEEP_EVERY = 23  # coprime with 24: the sampled sweep visits every hour of the day and every weekday
+LONG_ENTRY = ts("2024-01-12 15:00")  # the synthetic long open across two CFM halts (trade key)
+HALT = ts("2024-01-12 22:00")  # Fri 17:00 New York (EST): the CFM halt bar while that long is open
+FLIP_AT = ts("2024-01-16 10:00")  # a Tuesday bar while that long is open, with no exit queued
+
+
+@dataclass
+class Ref:
+    df: pd.DataFrame
+    lock: dict[str, Any]
+    res: EngineResult
+    trace: EngineTrace
+    exits: list[tuple[int, str]]
+    halt_stops: list[int]
+    decisions: list[dict[str, Any]]
+
+
+def replay(df: pd.DataFrame) -> tuple[EngineResult, EngineTrace, list[tuple[int, str]], list[int]]:
+    with traced_with_exits() as (trace, exits, halt_stops):
+        res = run_backtest(holdout_config(BotConfig(), PARAMS), df, HOLDOUT_START, None, allow_holdout=True)
+    return res, trace, exits, halt_stops
 
 
 @pytest.fixture(scope="module")
-def ref():
+def lock() -> dict[str, Any]:
+    return make_lock(synth_frame())
+
+
+@pytest.fixture(scope="module")
+def ref(lock) -> Ref:
     """One replay over every synthetic bar: the reference the hourly targets must agree with."""
     df = synth_frame()
-    cfg = holdout_config(BotConfig(), PARAMS)
-    with traced_with_exits() as (trace, exits):
-        res = run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)
-    decisions = build_decisions(res, trace, list(res.trades))
-    return df, cfg, res, trace, exits, decisions
+    res, trace, exits, halt_stops = replay(df)
+    return Ref(df, lock, res, trace, exits, halt_stops, build_decisions(res, trace, list(res.trades)))
 
 
-def _event_bars(res, trace) -> list[int]:
+def _event_bars(ref: Ref) -> list[int]:
     """Every bar where something happens in the reference, with its neighbours."""
-    marks = {o.ts for o in trace.orders} | {f.ts for f in trace.fills} | {s.ts for s in trace.stops}
-    marks |= {t.exit_ts - H1 for t in res.trades}
-    last = int(res.equity[-1].ts)
-    return sorted({m + k * H1 for m in marks for k in (-1, 0, 1)
-                   if HOLDOUT_START <= m + k * H1 < last})
+    marks = {o.ts for o in ref.trace.orders} | {f.ts for f in ref.trace.fills} | {s.ts for s in ref.trace.stops}
+    marks |= {t.exit_ts - H1 for t in ref.res.trades}
+    last = int(ref.res.equity[-1].ts)
+    return sorted({m + k * H1 for m in marks for k in (-1, 0, 1) if HOLDOUT_START <= m + k * H1 < last})
+
+
+def _assert_matches(ref: Ref, t: int) -> None:
+    """compute_target at bar t (frame cut at t + the placeholder) equals the full replay's state after t."""
+    tg = compute_target(ref.lock, ref.df, t)
+    # entry queued at T's close
+    queued = [o for o in ref.trace.orders if o.ts == t]
+    if queued:
+        o = queued[0]
+        assert tg.entry is not None, t
+        assert (tg.entry.direction, tg.entry.stop, tg.entry.tp1, tg.entry.tp2, tg.entry.contracts) == (
+            o.direction, o.stop, o.tp1, o.tp2, o.contracts)
+    else:
+        assert tg.entry is None, t
+    # position still open after T (a trade exiting at T + 1h's open is still open after T)
+    live = [x for x in ref.res.trades if x.entry_ts <= t < x.exit_ts]
+    if live:
+        x = live[0]
+        stops = [s.new for s in ref.trace.stops if s.trade_key == x.entry_ts and s.ts <= t]
+        tp1 = any(f.kind == "TP1" and f.trade_key == x.entry_ts and f.ts <= t for f in ref.trace.fills)
+        p = tg.position
+        assert p is not None, t
+        assert (p.trade_key, p.direction, p.setup, p.entry_price, p.tp1, p.tp2) == (
+            x.entry_ts, x.direction, x.setup, x.entry_price, x.tp1, x.tp2)
+        assert p.stop == (stops[-1] if stops else x.stop0) and p.tp1_done == tp1, t
+        assert p.signal_ts == x.entry_ts - H1
+        # the exit queued for this trade and not executed by T (queued at T, or before T across the halt)
+        pending = [(e, r) for e, r in ref.exits if x.entry_ts <= e <= t]
+        assert (tg.exit_queued_ts, tg.exit_reason) == (pending[-1] if pending else (None, None)), t
+        assert tg.stop_pending_reopen == (t in ref.halt_stops), t
+    else:
+        assert tg.position is None, t
+        assert (tg.exit_reason, tg.exit_queued_ts, tg.stop_pending_reopen) == (None, None, False), t
+    # decisions up to T
+    assert list(tg.decisions) == [d for d in ref.decisions if d["ts"] <= t], t
+
+
+def _force_exit(monkeypatch, at: int, reason: str) -> None:
+    """The engine requests `reason` at the close of bar `at` and again at the next close (BREAKER and LINEAGE
+    repeat while their condition holds; only a trade's first request counts): a constructed breaker or
+    broken lineage on a chosen bar."""
+
+    class Forced(loop_mod._Run):  # type: ignore[misc, valid-type]
+        def _may_enter(self, bar, t_close):  # type: ignore[no-untyped-def]
+            if bar.ts in (at, at + H1):
+                self._request_exit(reason)
+            return super()._may_enter(bar, t_close)
+
+    monkeypatch.setattr(loop_mod, "_Run", Forced)
 
 
 def test_the_placeholder_bar_is_flat_and_refuses_a_missing_bar(ref):
-    df = ref[0]
+    df = ref.df
     t = ts("2024-03-13 22:00")
     out = with_placeholder(df, t)
     assert int(out["ts"].iloc[-1]) == t + H1 and int(out["ts"].iloc[-2]) == t
@@ -2956,59 +3039,45 @@ def test_the_placeholder_bar_is_flat_and_refuses_a_missing_bar(ref):
 
 
 def test_the_hourly_target_equals_the_full_replay_at_every_event_bar(ref):
-    df, cfg, res, trace, exits, decisions = ref
-    bars = _event_bars(res, trace)
+    bars = _event_bars(ref)
     assert len(bars) > 60
     for t in bars:
-        tg = compute_target(cfg, df, t)
-        # entry queued at T's close
-        queued = [o for o in trace.orders if o.ts == t]
-        if queued:
-            o = queued[0]
-            assert tg.entry is not None, t
-            assert (tg.entry.direction, tg.entry.stop, tg.entry.tp1, tg.entry.tp2, tg.entry.contracts) == (
-                o.direction, o.stop, o.tp1, o.tp2, o.contracts)
-        else:
-            assert tg.entry is None, t
-        # position still open after T (a trade exiting at T + 1h's open is still open after T)
-        live = [x for x in res.trades if x.entry_ts <= t < x.exit_ts]
-        if live:
-            x = live[0]
-            stops = [s.new for s in trace.stops if s.trade_key == x.entry_ts and s.ts <= t]
-            tp1 = any(f.kind == "TP1" and f.trade_key == x.entry_ts and f.ts <= t for f in trace.fills)
-            p = tg.position
-            assert p is not None, t
-            assert (p.trade_key, p.direction, p.setup, p.entry_price, p.tp1, p.tp2) == (
-                x.entry_ts, x.direction, x.setup, x.entry_price, x.tp1, x.tp2)
-            assert p.stop == (stops[-1] if stops else x.stop0) and p.tp1_done == tp1, t
-            assert p.signal_ts == x.entry_ts - H1
-        else:
-            assert tg.position is None, t
-        # exit queued at T's close
-        assert tg.exit_reason == next((r for e, r in exits if e == t), None), t
-        # decisions up to T
-        assert list(tg.decisions) == [d for d in decisions if d["ts"] <= t], t
+        _assert_matches(ref, t)
+
+
+def test_a_sampled_sweep_of_the_holdout_bars_equals_the_full_replay(ref):
+    """Bar by bar beyond the event bars: every SWEEP_EVERY-th holdout bar, every CFM halt bar and the bar
+    before it (the event bars are covered above)."""
+    last = int(ref.res.equity[-1].ts)
+    hours = [int(x) for x in ref.df["ts"] if HOLDOUT_START <= int(x) < last]
+    halts = [h for h in hours if futures_closed(h)]
+    bars = sorted((set(hours[::SWEEP_EVERY]) | set(halts) | {h - H1 for h in halts}) - set(_event_bars(ref)))
+    assert len(bars) >= 80 and len(halts) >= 10
+    assert any(x.entry_ts <= h < x.exit_ts for h in halts for x in ref.res.trades)  # a position across a halt
+    for t in bars:
+        _assert_matches(ref, t)
 
 
 def test_queued_exits_carry_the_engine_reason(ref):
-    df, cfg, res, trace, exits, _ = ref
-    timed = [x for x in res.trades if x.exit_reason == "TIME"]
+    timed = [x for x in ref.res.trades if x.exit_reason == "TIME"]
     assert timed
     for x in timed:
-        tg = compute_target(cfg, df, x.exit_ts - H1)
-        assert tg.exit_reason == "TIME" and tg.position is not None and tg.position.trade_key == x.entry_ts
+        tg = compute_target(ref.lock, ref.df, x.exit_ts - H1)
+        assert tg.exit_reason == "TIME" and tg.exit_queued_ts == x.exit_ts - H1
+        assert tg.position is not None and tg.position.trade_key == x.entry_ts
 
 
 def test_a_signal_bar_gives_an_entry_with_the_engine_levels(ref):
-    df, cfg, res, trace, _, _ = ref
     t = ts("2024-03-13 22:00")
-    tg = compute_target(cfg, df, t)
-    sig = next(s for s in res.signals if s.ts == t)
+    tg = compute_target(ref.lock, ref.df, t)
+    sig = next(s for s in ref.res.signals if s.ts == t)
     assert tg.entry is not None and tg.position is None
     assert (tg.entry.setup, tg.entry.direction, tg.entry.entry_ref, tg.entry.risk_mult, tg.entry.reason) == (
         sig.setup, sig.direction, sig.entry_ref, sig.risk_mult, sig.reason)
     assert tg.decisions[-1]["id"] == f"SIGNAL:{t}:{t}"
-    assert tg.to_json()["entry"]["signal_ts"] == t and tg.to_json()["position"] is None
+    js = tg.to_json()
+    assert js["entry"]["signal_ts"] == t and js["position"] is None
+    assert (js["exit_reason"], js["exit_queued_ts"], js["stop_pending_reopen"]) == (None, None, False)
 
 
 def test_the_engine_class_is_restored_after_an_error():
@@ -3018,6 +3087,113 @@ def test_the_engine_class_is_restored_after_an_error():
             assert loop_mod._Run is not original
             raise RuntimeError("boom")
     assert loop_mod._Run is original
+
+
+def test_the_target_is_bound_to_the_holdout_lock(lock, ref):
+    """No caller passes a config or a start: both come from the lock, checked like the paper precheck."""
+    assert list(inspect.signature(compute_target).parameters) == ["lock", "df1h", "bar_ts"]
+    assert frozen_config(lock) == holdout_config(BotConfig(), PARAMS)
+    bad = {
+        "sha256": dict(lock, sha256="0" * 64),  # not lock_digest(BotConfig(), params, ...): another configuration
+        "code": dict(lock, code_sha256="f" * 64),  # bound through lock_digest as well
+        "start": dict(lock, holdout_start=HOLDOUT_START + H1),
+        "grid": make_lock(ref.df, params=(9.0, 9.0, 9.0)),  # self-consistent digest, but not a grid combo
+        "missing": {k: v for k, v in lock.items() if k != "random_runs"},
+        "garbage": dict(lock, params="2.0,0.5,0.0x"),
+    }
+    for b in bad.values():
+        with pytest.raises(TargetError):
+            frozen_config(b)
+        with pytest.raises(TargetError):
+            compute_target(b, ref.df, ts("2024-03-13 22:00"))
+
+
+@pytest.mark.parametrize("reason", ["BREAKER", "LINEAGE"])
+def test_an_exit_queued_before_the_cfm_halt_is_still_pending_at_the_halt_bar(lock, monkeypatch, reason):
+    fri16 = HALT - H1  # Fri 16:00 New York
+    assert futures_closed(HALT) and not futures_closed(fri16) and not futures_closed(HALT + H1)
+    _force_exit(monkeypatch, fri16, reason)
+    df = synth_frame()
+    before = compute_target(lock, df, fri16)
+    assert before.position is not None and before.position.trade_key == LONG_ENTRY
+    assert (before.exit_reason, before.exit_queued_ts) == (reason, fri16)
+    halt = compute_target(lock, df, HALT)  # nothing fills while the futures are closed: the exit is still queued
+    assert halt.position is not None and halt.position.trade_key == LONG_ENTRY
+    assert (halt.exit_reason, halt.exit_queued_ts, halt.stop_pending_reopen) == (reason, fri16, False)
+    assert halt.to_json()["exit_queued_ts"] == fri16
+    after = compute_target(lock, df, HALT + H1)  # the engine closed it at the reopen's open
+    assert after.position is None and (after.exit_reason, after.exit_queued_ts) == (None, None)
+    res, _, exits, _ = replay(df)
+    x = next(t for t in res.trades if t.entry_ts == LONG_ENTRY)
+    assert (x.exit_ts, x.exit_reason) == (HALT + H1, reason) and (fri16, reason) in exits
+
+
+def test_a_stop_touched_during_the_halt_bar_is_flagged(lock, ref):
+    x = next(t for t in ref.res.trades if t.entry_ts == LONG_ENTRY)
+    assert x.direction == 1 and x.exit_ts > HALT + H1
+    stops = [s.new for s in ref.trace.stops if s.trade_key == LONG_ENTRY and s.ts < HALT]
+    stop = stops[-1] if stops else x.stop0  # the stop in force during the halt bar
+    df = ref.df.copy()
+    i = df.index[df["ts"] == HALT][0]
+    assert df.loc[i, "low"] > stop
+    df.loc[i, "low"] = stop - 10.0  # the halt bar's range crosses the stop (spot trades through the CFM halt)
+    tg = compute_target(lock, df, HALT)
+    assert tg.position is not None and tg.position.trade_key == LONG_ENTRY
+    assert tg.stop_pending_reopen and tg.exit_reason is None and tg.to_json()["stop_pending_reopen"] is True
+    assert not compute_target(lock, df, HALT - H1).stop_pending_reopen
+    after = compute_target(lock, df, HALT + H1)
+    assert after.position is None or after.position.trade_key != LONG_ENTRY
+    assert not after.stop_pending_reopen
+    res, _, _, halt_stops = replay(df)
+    y = next(t for t in res.trades if t.entry_ts == LONG_ENTRY)
+    assert (y.exit_ts, y.exit_reason) == (HALT + H1, "STOP") and halt_stops == [HALT]
+
+
+def test_a_flip_target_holds_the_position_its_queued_exit_and_the_opposite_entry(lock, monkeypatch):
+    """The engine flips at FLIP_AT: the long is still open after that bar, its FLIP exit and the short entry are
+    both queued at the close; one hour later the short is the position."""
+
+    class Flipping(loop_mod._Run):  # type: ignore[misc, valid-type]
+        def __init__(self, cfg, strategy, wave, choch, start_ts) -> None:  # type: ignore[no-untyped-def]
+            super().__init__(cfg, strategy, wave, choch, start_ts)
+            inner = self.strategy
+
+            class Opposite:
+                def on_bar(self, cbar, ws, ch):  # type: ignore[no-untyped-def]
+                    sig = inner.on_bar(cbar, ws, ch)
+                    if cbar.ts != FLIP_AT:
+                        return sig
+                    c = cbar.close
+                    return Signal(FLIP_AT, "C_END", -1, c, c + 300.0, c - 600.0, c - 1200.0, 1.0, None, None, None,
+                                  "constructed flip")
+
+            self.strategy = Opposite()
+
+    monkeypatch.setattr(loop_mod, "_Run", Flipping)
+    df = synth_frame()
+    tg = compute_target(lock, df, FLIP_AT)
+    assert tg.position is not None and (tg.position.trade_key, tg.position.direction) == (LONG_ENTRY, 1)
+    assert (tg.exit_reason, tg.exit_queued_ts) == ("FLIP", FLIP_AT)
+    assert tg.entry is not None and (tg.entry.signal_ts, tg.entry.direction, tg.entry.reason) == (
+        FLIP_AT, -1, "constructed flip")
+    assert tg.decisions[-1]["id"] == f"SIGNAL:{FLIP_AT}:{FLIP_AT}"
+    nxt = compute_target(lock, df, FLIP_AT + H1)
+    assert nxt.position is not None and (nxt.position.trade_key, nxt.position.signal_ts, nxt.position.direction) == (
+        FLIP_AT + H1, FLIP_AT, -1)
+    assert (nxt.exit_reason, nxt.exit_queued_ts, nxt.entry) == (None, None, None)
+    res, _, _, _ = replay(df)
+    assert next(t for t in res.trades if t.entry_ts == LONG_ENTRY).exit_reason == "FLIP"
+
+
+def test_an_inconsistent_replay_raises_a_target_error(lock, ref, monkeypatch):
+    real = target_mod.run_backtest
+    signal_bar = ts("2024-03-13 22:00")
+    monkeypatch.setattr(target_mod, "run_backtest", lambda *a, **k: dataclasses.replace(real(*a, **k), signals=()))
+    with pytest.raises(TargetError, match="signal"):
+        compute_target(lock, ref.df, signal_bar)
+    monkeypatch.setattr(target_mod, "run_backtest", lambda *a, **k: dataclasses.replace(real(*a, **k), trades=()))
+    with pytest.raises(TargetError, match="trade"):
+        compute_target(lock, ref.df, signal_bar + 5 * H1)  # the long entered at signal_bar + 1h is open
 ```
 
 Then add the live target to the static allowlist (Decision D2):
@@ -3053,25 +3229,36 @@ Every cycle replays the whole engine - `run_backtest(cfg, df, HOLDOUT_START, Non
 over every cached bar, exactly like the paper runtime - and reads what the engine wants after the
 latest closed bar T:
   - `position`: the engine position still open after bar T (its current stop, TPs, TP1 state);
-  - `exit_reason`: an exit the engine queued at T's close (TIME, LINEAGE, BREAKER, FLIP);
+  - `exit_reason` / `exit_queued_ts`: the exit the engine has queued for that position and not executed
+    yet (TIME, LINEAGE, BREAKER, FLIP) and the bar at whose close it was queued. Usually that bar is T
+    (the engine fills the exit at T+1's open). Nothing fills during the CFM halt (Fri 17-18 New York,
+    `futures_closed`), so an exit queued at the Fri 16:00 close is still pending after the halt bar
+    T = 17:00 (exit_queued_ts = 16:00 < T) and fills at the 18:00 open;
+  - `stop_pending_reopen`: the halt bar T crossed the position's stop - the paper broker marks the stop
+    triggered while closed and the engine stops the position out at the next tradable open;
   - `entry`: an entry the engine queued at T's close (it fills at T+1's open in the engine);
   - `decisions`: the engine's decisions with ts <= T in the paper ledger's format (audit, spec 3.5).
+
+Frozen inputs (Plan 3 global constraints): the configuration is built here from the holdout lock -
+`holdout_config(BotConfig(), params)` with the lock checked like the paper precheck (`lock_params`) -
+and the replay starts at HOLDOUT_START. No caller passes a configuration or a start.
 
 The engine never evaluates entries on the LAST bar of a run (it has no next bar to fill on), so the
 frame gets one placeholder bar T+1 (flat at T's close, volume 0, synthetic). Everything decided at or
 before T's close is computed before the engine reaches T+1, so it is identical to a replay that has
 the real bar T+1 (tests/live/test_target.py proves it bar by bar); nothing at T+1 is used.
 
-Queued exits are not in EngineResult or in the paper trace, so the engine's per-run `_Run` class is
-swapped (the paper trace's technique: the name is looked up at run time, no file is edited) for a
-subclass that records each fresh `_request_exit(reason)` with the bar it happened on. The swap is
-process-global inside the `with` block: never run two replays concurrently.
+Queued exits and halt stops are not in EngineResult or in the paper trace, so the engine's per-run
+`_Run` class is swapped (the paper trace's technique: the name is looked up at run time, no file is
+edited) for a subclass that records each fresh `_request_exit(reason)` with the bar it happened on and
+every bar after which the broker holds a stop triggered during the halt. The swap is process-global
+inside the `with` block: never run two replays concurrently.
 
 This module is the live runtime's only caller of allow_holdout=True (tests/paper/test_static.py)."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -3079,16 +3266,19 @@ from typing import Any
 import pandas as pd
 
 import ewbot.engine.loop as loop_mod
+from ewbot.backtest.holdout import holdout_config, lock_digest
 from ewbot.backtest.runner import run_backtest
-from ewbot.backtest.walkforward import HOLDOUT_START
-from ewbot.config import BotConfig
+from ewbot.backtest.walkforward import HOLDOUT_START, grid_combos
+from ewbot.config import CONSERVATIVE, BotConfig
 from ewbot.paper.decisions import build_decisions
 from ewbot.paper.trace import EngineTrace, traced_engine
 from ewbot.types import H1
+from ewbot.waves.engine import WaveState
 
 
 class TargetError(RuntimeError):
-    """The candles do not end at the requested bar (or the replay is inconsistent)."""
+    """The lock is not the holdout's, the candles do not end at the requested bar, or the replay is
+    inconsistent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -3126,16 +3316,53 @@ class Target:
     bar_ts: int
     close: float
     position: TargetPosition | None
-    exit_reason: str | None
+    exit_reason: str | None  # exit queued for `position`, not executed by T (None when flat)
     entry: TargetEntry | None
     decisions: tuple[dict[str, Any], ...]
+    exit_queued_ts: int | None = None  # bar whose close queued `exit_reason` (< bar_ts: carried across the halt)
+    stop_pending_reopen: bool = False  # the halt bar crossed the stop: the engine stops out at the reopen
 
     def to_json(self) -> dict[str, Any]:
         def pos(p: Any) -> dict[str, Any] | None:
             return None if p is None else {f: getattr(p, f) for f in p.__slots__}
 
         return {"bar_ts": self.bar_ts, "close": self.close, "position": pos(self.position),
-                "exit_reason": self.exit_reason, "entry": pos(self.entry)}
+                "exit_reason": self.exit_reason, "exit_queued_ts": self.exit_queued_ts,
+                "stop_pending_reopen": self.stop_pending_reopen, "entry": pos(self.entry)}
+
+
+def lock_params(lock: Mapping[str, Any]) -> tuple[float, ...]:
+    """The params of a completed holdout lock, checked with the paper precheck's semantics
+    (paper.runner.precheck_lock) minus its git checks - the image has no git history; preflight pins the
+    committed lock's sha256 instead: the params are a walk-forward grid combo, the holdout start is
+    HOLDOUT_START and sha256 == lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. the
+    configuration built from them is the one the holdout ran with (conservative, breakers on)."""
+    try:
+        params = tuple(float(x) for x in lock["params"])
+        random_runs = int(lock["random_runs"])
+        code_sha = str(lock["code_sha256"])
+        holdout_start = int(lock["holdout_start"])
+        sha = str(lock["sha256"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TargetError(f"not a completed holdout lock: {exc!r}") from exc
+    if params not in grid_combos():
+        raise TargetError(f"lock params {list(params)} are not a walk-forward grid combo")
+    if holdout_start != HOLDOUT_START:
+        raise TargetError(f"lock holdout_start {holdout_start} != {HOLDOUT_START}")
+    digest = lock_digest(BotConfig(), params, random_runs, code_sha)
+    if digest != sha:
+        raise TargetError(f"lock sha256 {sha[:12]} != lock_digest(BotConfig(), params, random_runs, code_sha256) "
+                          f"{digest[:12]}: not the configuration the holdout ran with")
+    return params
+
+
+def frozen_config(lock: Mapping[str, Any]) -> BotConfig:
+    """The holdout's configuration: BotConfig defaults with the lock's params (strategy A, conservative risk,
+    circuit breakers on)."""
+    cfg = holdout_config(BotConfig(), lock_params(lock))
+    if cfg.risk != CONSERVATIVE or not cfg.breakers.enabled:
+        raise TargetError("the frozen configuration must be conservative with the circuit breakers on")
+    return cfg
 
 
 def with_placeholder(df1h: pd.DataFrame, bar_ts: int) -> pd.DataFrame:
@@ -3153,13 +3380,23 @@ def with_placeholder(df1h: pd.DataFrame, bar_ts: int) -> pd.DataFrame:
 
 
 @contextmanager
-def traced_with_exits() -> Iterator[tuple[EngineTrace, list[tuple[int, str]]]]:
-    """paper.trace.traced_engine() plus the exits the engine queues: [(bar ts, reason)]."""
+def traced_with_exits() -> Iterator[tuple[EngineTrace, list[tuple[int, str]], list[int]]]:
+    """paper.trace.traced_engine() plus what the engine queues: (trace, exits [(bar ts, reason)] - each
+    fresh exit request with the bar whose close made it -, halt_stops [bar ts] - every bar after which
+    the open position's stop has been triggered during the futures halt, PaperBroker's
+    `_stop_triggered_while_closed`: it stops out at the next tradable open)."""
     exits: list[tuple[int, str]] = []
+    halt_stops: list[int] = []
     with traced_engine() as trace:
         original = loop_mod._Run
 
         class _ExitRecordingRun(original):  # type: ignore[misc, valid-type]
+            def _manage(self, ws: WaveState, closed_4h: bool) -> None:
+                b = self.broker  # step 5 runs right after this bar's fills (process_bar)
+                if b.position is not None and b._stop_triggered_while_closed and trace.last_ts is not None:
+                    halt_stops.append(int(trace.last_ts))
+                super()._manage(ws, closed_4h)
+
             def _request_exit(self, reason: str) -> None:
                 ot = self.open
                 fresh = ot is not None and self.broker.position is not None and ot.exit_reason is None
@@ -3169,58 +3406,78 @@ def traced_with_exits() -> Iterator[tuple[EngineTrace, list[tuple[int, str]]]]:
 
         loop_mod._Run = _ExitRecordingRun  # type: ignore[misc]
         try:
-            yield trace, exits
+            yield trace, exits, halt_stops
         finally:
             loop_mod._Run = original  # type: ignore[misc]
 
 
-def compute_target(cfg: BotConfig, df1h: pd.DataFrame, bar_ts: int, start_ts: int = HOLDOUT_START) -> Target:
+def compute_target(lock: Mapping[str, Any], df1h: pd.DataFrame, bar_ts: int) -> Target:
+    """The engine's target after bar `bar_ts` (module docstring) for the holdout `lock`. Raises TargetError
+    when the lock is not the holdout's, the candles do not end at bar_ts or the replay is inconsistent."""
+    cfg = frozen_config(lock)
+    bar_ts = int(bar_ts)
     frame = with_placeholder(df1h, bar_ts)
-    with traced_with_exits() as (trace, exits):
-        res = run_backtest(cfg, frame, start_ts, None, allow_holdout=True)
-    trades = {t.entry_ts: t for t in res.trades}
-    fills = [f for f in trace.fills if f.ts <= bar_ts]
+    with traced_with_exits() as (trace, exits, halt_stops):
+        res = run_backtest(cfg, frame, HOLDOUT_START, None, allow_holdout=True)
 
+    def inconsistent(what: str) -> TargetError:
+        return TargetError(f"inconsistent replay at bar {bar_ts}: {what}")
+
+    fills = [f for f in trace.fills if f.ts <= bar_ts]
     left: dict[int, int] = {}
     open_key: int | None = None
     for f in fills:
         if f.kind == "ENTRY":
             left[f.trade_key] = f.contracts
             open_key = f.trade_key
+        elif f.trade_key not in left:
+            raise inconsistent(f"a {f.kind} fill at {f.ts} for the unknown position {f.trade_key}")
         else:
             left[f.trade_key] -= f.contracts
             if left[f.trade_key] == 0 and f.trade_key == open_key:
                 open_key = None
 
     position: TargetPosition | None = None
+    exit_reason: str | None = None
+    exit_queued_ts: int | None = None
     if open_key is not None:
-        t = trades[open_key]
-        stops = [s for s in trace.stops if s.trade_key == open_key and s.ts <= bar_ts]
+        t = next((x for x in res.trades if x.entry_ts == open_key), None)
+        if t is None:
+            raise inconsistent(f"no engine trade for the position entered at {open_key}")
         orders = [o for o in trace.orders if o.ts < open_key]
         if not orders:
-            raise TargetError(f"no queued entry before the position entered at {open_key}")
+            raise inconsistent(f"no queued entry before the position entered at {open_key}")
+        stops = [s for s in trace.stops if s.trade_key == open_key and s.ts <= bar_ts]
         tp1 = sum(f.contracts for f in fills if f.trade_key == open_key and f.kind == "TP1")
         position = TargetPosition(
             trade_key=open_key, signal_ts=orders[-1].ts, setup=t.setup, direction=t.direction,
             entry_price=t.entry_price, stop=stops[-1].new if stops else t.stop0, stop0=t.stop0, tp1=t.tp1,
             tp2=t.tp2, tp1_done=tp1 > 0, contracts=t.contracts, remaining=t.contracts - tp1,
         )
-
-    exit_reason = next((r for ts, r in exits if ts == bar_ts), None) if position is not None else None
+        # the position is still open after T, so an exit queued for it since its entry has not filled yet
+        pending = [(ts, r) for ts, r in exits if open_key <= ts <= bar_ts]
+        if pending:
+            exit_queued_ts, exit_reason = pending[-1]
+    stop_pending_reopen = position is not None and bar_ts in halt_stops
 
     entry: TargetEntry | None = None
     queued = [o for o in trace.orders if o.ts == bar_ts]
     if queued:
-        sig = next(s for s in res.signals if s.ts == bar_ts)
+        sig = next((s for s in res.signals if s.ts == bar_ts), None)
+        if sig is None:
+            raise inconsistent(f"an entry queued at {bar_ts} without its engine signal")
         o = queued[-1]
         entry = TargetEntry(
             signal_ts=bar_ts, setup=sig.setup, direction=sig.direction, entry_ref=sig.entry_ref, stop=o.stop,
             tp1=o.tp1, tp2=o.tp2, risk_mult=sig.risk_mult, contracts=o.contracts, reason=sig.reason,
         )
 
-    decisions = tuple(d for d in build_decisions(res, trace, list(res.trades)) if d["ts"] <= bar_ts)
+    try:
+        decisions = tuple(d for d in build_decisions(res, trace, list(res.trades)) if d["ts"] <= bar_ts)
+    except (KeyError, StopIteration) as exc:
+        raise inconsistent(f"the decisions cannot be built: {exc!r}") from exc
     close = float(frame["close"].iloc[-1])
-    return Target(int(bar_ts), close, position, exit_reason, entry, decisions)
+    return Target(bar_ts, close, position, exit_reason, entry, decisions, exit_queued_ts, stop_pending_reopen)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -3229,7 +3486,7 @@ def compute_target(cfg: BotConfig, df1h: pd.DataFrame, bar_ts: int, start_ts: in
 uv run --group live pytest tests/live/test_target.py tests/paper/test_static.py -q
 ```
 
-Expected: `30 passed` (5 target tests, about 4 s: the equivalence test replays the synthetic series at every event bar; 25 static tests).
+Expected: `37 passed` (12 target tests, about 10 s: the equivalence tests replay the synthetic series at every event bar and at a sampled sweep of the other holdout bars; 25 static tests).
 
 - [ ] **Step 5: Commit**
 
@@ -3526,7 +3783,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.live.exchange` (`Order`, `Position`), `ewbot.live.pricing` (`map_level`, `to_tick`), `ewbot.live.target` (`Target`, `TargetEntry`, `TargetPosition`).
-- Produces (`ewbot.live.reconcile`): `PREFIX = "ewb-"`, `UNPROTECTED_MAX_S = 60.0`; ids `entry_cid(signal_ts, direction)`, `bracket_cid(trade_id, leg, gen)`, `close_cid(trade_id, n)`, `reduce_cid(trade_id, n)`, `is_ours(order) -> bool`; dataclasses `Leg(name, size, limit_price, stop_price, client_order_id="", order_id=None)` and `LiveTrade(trade_id, setup, direction, contracts, tp1_n, entry_price, tp1_price, tp2_price, stop_spot, stop_price, opened_ts, tp1_filled=False, legs=[], gen=0, closes=0, protected_ts=None, unprotected_since=None, incident_unprotected=False, status="OPEN", exit_reason=None)` with `to_json()` / `from_json(dict)`; frozen actions `Close(reason)`, `Reduce(size, reason)`, `Protect(legs: tuple[Leg, ...], stop_spot, stop_price)`, `Enter(entry: TargetEntry, contracts)`, `Skip(signal_ts, reason)`, `Cancel(order_ids: tuple, reason)`, `Adopt(target: TargetPosition)`, `Alert(kind, detail)` and `Action` (their union); frozen `PlanContext(now, ratio, tick, session_open=True, entry_contracts=0, entry_block=None)`; `observe(trade, position, orders, now) -> (LiveTrade | None, list[(event kind, data)])` (events `CLOSED`, `TP1_FILLED`, `UNPROTECTED`, `UNPROTECTED_60S`, `PROTECTED`), `desired_legs(trade, contracts, stop_spot, ratio, tick) -> (list[Leg], futures stop)`, `legs_match(trade, orders, desired) -> bool`, `pending_position(entry) -> TargetPosition`, `engine_position(target) -> TargetPosition | None`, `plan(target, trade, position, orders, ctx) -> list[Action]` (pure; never mutates its inputs).
+- Produces (`ewbot.live.reconcile`): `PREFIX = "ewb-"`, `UNPROTECTED_MAX_S = 60.0`; ids `entry_cid(signal_ts, direction)`, `bracket_cid(trade_id, leg, gen)`, `close_cid(trade_id, n)`, `reduce_cid(trade_id, n)`, `is_ours(order) -> bool`; dataclasses `Leg(name, size, limit_price, stop_price, client_order_id="", order_id=None)` and `LiveTrade(trade_id, setup, direction, contracts, tp1_n, entry_price, tp1_price, tp2_price, stop_spot, stop_price, opened_ts, tp1_filled=False, legs=[], gen=0, closes=0, protected_ts=None, unprotected_since=None, incident_unprotected=False, status="OPEN", exit_reason=None)` with `to_json()` / `from_json(dict)`; frozen actions `Close(reason)`, `Reduce(size, reason)`, `Protect(legs: tuple[Leg, ...], stop_spot, stop_price)`, `Enter(entry: TargetEntry, contracts)`, `Skip(signal_ts, reason)`, `Cancel(order_ids: tuple, reason)`, `Adopt(target: TargetPosition)`, `Alert(kind, detail)` and `Action` (their union); frozen `PlanContext(now, ratio, tick, session_open=True, entry_contracts=0, entry_block=None)`; `observe(trade, position, orders, now) -> (LiveTrade | None, list[(event kind, data)])` (events `CLOSED`, `TP1_FILLED`, `UNPROTECTED`, `UNPROTECTED_60S`, `PROTECTED`), `desired_legs(trade, contracts, stop_spot, ratio, tick) -> (list[Leg], futures stop)`, `legs_match(trade, orders, desired) -> bool`, `pending_position(entry) -> TargetPosition`, `engine_position(target) -> TargetPosition | None` (none while an exit is queued or the halt bar crossed the stop), `plan(target, trade, position, orders, ctx) -> list[Action]` (pure; never mutates its inputs; an exit carried across the CFM halt closes like one queued at the last close, `stop_pending_reopen` closes with reason `STOP_HALT`; the executor sends a close only while the session is OPEN).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3553,6 +3810,7 @@ from ewbot.live.reconcile import (
     bracket_cid,
     close_cid,
     desired_legs,
+    engine_position,
     entry_cid,
     observe,
     plan,
@@ -3576,8 +3834,8 @@ def tentry(**kw) -> TargetEntry:
     return TargetEntry(**{**base, **kw})
 
 
-def target(position=None, entry=None, exit_reason=None, bar=T + 3600) -> Target:
-    return Target(bar, 60_000.0, position, exit_reason, entry, ())
+def target(position=None, entry=None, exit_reason=None, bar=T + 3600, **kw) -> Target:
+    return Target(bar, 60_000.0, position, exit_reason, entry, (), **kw)
 
 
 def trade(**kw) -> LiveTrade:
@@ -3680,6 +3938,27 @@ def test_engine_exit_closes_and_a_flip_enters_after_the_close():
     assert plan(target(position=tpos()), tr, Position(-1, 3, 60_020.0), [], CTX) == [Close("DIRECTION_MISMATCH")]
 
 
+def test_an_exit_carried_across_the_halt_or_a_stop_crossed_in_it_closes():
+    """At the CFM halt bar the engine still holds the position: an exit queued at the bar before the halt
+    is still queued (exit_queued_ts < bar), and a stop the halt bar crossed stops it out at the reopen. Both
+    close the live trade (the executor waits for an OPEN session); neither position is adopted."""
+    tr = trade()
+    pos = Position(1, 3, 60_020.0)
+    halt = T + 7200
+    carried = target(position=tpos(), exit_reason="LINEAGE", bar=halt, exit_queued_ts=halt - 3600)
+    assert plan(carried, tr, pos, resting(tr), CTX) == [Close("LINEAGE")]
+    assert plan(carried, tr, pos, resting(tr), dataclasses.replace(CTX, session_open=False)) == [Close("LINEAGE")]
+    stopped = target(position=tpos(), bar=halt, stop_pending_reopen=True)
+    assert plan(stopped, tr, pos, resting(tr), CTX) == [Close("STOP_HALT")]
+    both = target(position=tpos(), exit_reason="BREAKER", bar=halt, exit_queued_ts=halt - 3600, stop_pending_reopen=True)
+    assert plan(both, tr, pos, resting(tr), CTX) == [Close("BREAKER")]  # the queued exit fills first in the engine
+    assert engine_position(carried) is None and engine_position(stopped) is None
+    assert plan(stopped, None, pos, [], CTX) == [Close("UNKNOWN_POSITION")]
+    other = tpos(signal_ts=T + 7200, trade_key=T + 10800)
+    assert plan(target(position=other, bar=halt, stop_pending_reopen=True), tr, pos, resting(tr), CTX) == [
+        Close("ENGINE_OTHER_TRADE")]
+
+
 def test_engine_tp1_without_the_live_tp1_reduces_at_market_then_protects_the_rest_at_break_even():
     tr = trade()
     acts = plan(target(position=tpos(tp1_done=True, stop=60_010.0)), tr, Position(1, 3, 60_020.0), resting(tr), CTX)
@@ -3758,7 +4037,10 @@ the engine's target (live/target.py) and the exchange's position and open orders
        - flat: cancel our leftover orders; enter when the engine queued an entry at the last close;
        - engine flat / another trade / exit queued (TIME, LINEAGE, BREAKER, FLIP, ...): close, then
          enter if the engine also queued an entry (the executor enters only after the close is
-         confirmed, spec 4.2 `반대 신호 전환`);
+         confirmed, spec 4.2 `반대 신호 전환`). An exit queued before the CFM halt is still queued at
+         the halt bar (`exit_queued_ts` < bar) and a stop the halt bar crossed stops the engine out at
+         the reopen (`stop_pending_reopen`, reason STOP_HALT): both close as well - the executor sends
+         the close at the first poll that sees the session OPEN, whichever target is current then;
        - engine TP1 done but the live TP1 leg not filled: reduce by the TP1 size at market (spec 4.4);
        - protection: the brackets must equal the desired legs (spec 4.2): two legs (TP1 size + stop,
          rest + TP2 + stop) before TP1, one leg (rest + TP2 + stop) after it, one leg (TP1 + stop) for
@@ -4002,9 +4284,9 @@ def pending_position(e: TargetEntry) -> TargetPosition:
 
 
 def engine_position(target: Target) -> TargetPosition | None:
-    """The engine's position for the hour after the target bar: the open one, unless an exit is queued,
-    else the one a queued entry opens."""
-    if target.position is not None and target.exit_reason is None:
+    """The engine's position for the hour after the target bar: the open one, unless an exit is queued or
+    the halt bar crossed its stop, else the one a queued entry opens."""
+    if target.position is not None and target.exit_reason is None and not target.stop_pending_reopen:
         return target.position
     if target.entry is not None:
         return pending_position(target.entry)
@@ -4054,8 +4336,16 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
         queued = target.entry is not None and target.entry.signal_ts == open_trade.trade_id
         if queued:  # entered at this hour's open; the replay still shows the queued entry
             tp = pending_position(target.entry)  # type: ignore[arg-type]
-        elif tp is None or tp.signal_ts != open_trade.trade_id or target.exit_reason is not None:
-            reason = target.exit_reason or ("ENGINE_FLAT" if tp is None else "ENGINE_OTHER_TRADE")
+        elif (tp is None or tp.signal_ts != open_trade.trade_id or target.exit_reason is not None
+              or target.stop_pending_reopen):
+            if target.exit_reason is not None:  # queued at the last close, or before the halt (carried)
+                reason = target.exit_reason
+            elif tp is None:
+                reason = "ENGINE_FLAT"
+            elif tp.signal_ts != open_trade.trade_id:
+                reason = "ENGINE_OTHER_TRADE"
+            else:
+                reason = "STOP_HALT"
             return acts + [Close(reason)] + entry_actions()
         assert tp is not None
         if (tp.tp1_done and not open_trade.tp1_filled and open_trade.contracts > 1
@@ -4077,7 +4367,7 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
 uv run --group live pytest tests/live/test_reconcile.py -q
 ```
 
-Expected: `15 passed`.
+Expected: `16 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -6795,9 +7085,9 @@ EOF
 - Test: `tests/live/test_runtime.py`
 
 **Interfaces:**
-- Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`PARAMS`, `FakeFetch`, `synth_frame`, `ts`), `tests.live.helpers`.
+- Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`FakeFetch`, `make_lock`, `synth_frame`, `ts`), `tests.live.helpers`.
 - Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
-- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, cfg, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={}, start_ts=HOLDOUT_START)`; `class LiveRuntime(deps)` with `startup() -> recovery dict`, `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)`, `poll(now)`, `watch(now)`, `minute(now)`, `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply`, `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
+- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict`, `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)`, `poll(now)`, `watch(now)`, `minute(now)`, `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply`, `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6819,14 +7109,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from ewbot.backtest.holdout import holdout_config
-from ewbot.config import BotConfig
 from ewbot.live.journal import Journal
 from ewbot.live.runtime import LiveDeps, LiveRuntime
 from ewbot.live.sim import SimExchange
 from ewbot.types import H1
 from tests.live.helpers import Alerts, Clock
-from tests.paper.helpers import PARAMS, FakeFetch, synth_frame
+from tests.paper.helpers import FakeFetch, make_lock, synth_frame
 
 
 class Harness:
@@ -6835,7 +7123,7 @@ class Harness:
                  exchange: SimExchange | None = None, journal_name: str = "journal.sqlite", **sim_kw) -> None:
         self.tmp = tmp_path
         self.df = synth_frame() if df is None else df
-        self.cfg = holdout_config(BotConfig(), PARAMS)
+        self.lock = make_lock(self.df)  # a temp holdout lock (PARAMS) for these candles
         self.ratio = ratio
         self.clock = Clock(start)
         self.ex = exchange if exchange is not None else SimExchange(clock=self.clock, equity=equity, **sim_kw)
@@ -6849,7 +7137,7 @@ class Harness:
         self.rt = self.make_runtime()
 
     def make_runtime(self, **kw) -> LiveRuntime:
-        deps = LiveDeps(journal=self.journal, exchange=self.ex, cfg=self.cfg, fetch=self.fetch,
+        deps = LiveDeps(journal=self.journal, exchange=self.ex, lock=self.lock, fetch=self.fetch,
                         cache_dir=self.tmp / "cache", notify=self.alerts, clock=self.clock, sleep=self.clock.sleep,
                         commands=self.commands, **kw)
         return LiveRuntime(deps)
@@ -7317,8 +7605,6 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.walkforward import HOLDOUT_START
-from ewbot.config import BotConfig
 from ewbot.data.candles import fill_gaps, load_1h
 from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
@@ -7337,7 +7623,7 @@ from ewbot.live.stage import (
     paused,
     resume,
 )
-from ewbot.live.target import Target, TargetError, compute_target
+from ewbot.live.target import Target, TargetError, compute_target, frozen_config
 from ewbot.live.watchdog import NY, AccountGuard, PriceSource, SessionWatch, StopGapWatch, margin_status, ny_date
 from ewbot.types import H1
 
@@ -7360,7 +7646,7 @@ AUDIT_KEY = "audit"
 class LiveDeps:
     journal: Journal
     exchange: Exchange
-    cfg: BotConfig  # holdout_config(BotConfig(), lock params): the frozen strategy
+    lock: dict[str, Any]  # the preflight-checked holdout lock: the only source of the strategy configuration
     fetch: Callable[[Path], Path]  # candle cache update -> parquet path (data.coinbase_history.update_cache)
     cache_dir: Path
     notify: Callable[[str, str], Any] = lambda kind, text: None
@@ -7372,7 +7658,6 @@ class LiveDeps:
     paper_ledger: Callable[[], dict[str, Any]] | None = None
     edit_stops: bool = False
     expiry: dict[str, str] = field(default_factory=dict)
-    start_ts: int = HOLDOUT_START
 
 
 def _utc(ts: float) -> str:
@@ -7389,12 +7674,13 @@ class LiveRuntime:
         self.journal = deps.journal
         self.ex = deps.exchange
         self.clock = deps.clock
+        self.cfg = frozen_config(deps.lock)  # holdout_config(BotConfig(), lock params), checked
         self.stage, _ = self.journal.stage()
         self.executor = Executor(self.ex, self.journal, clock=deps.clock, sleep=deps.sleep, alert=self.alert,
-                                 tp1_frac=deps.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops)
+                                 tp1_frac=self.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops)
         self.prices = PriceSource(self.ex, deps.feed, clock=deps.clock)
         self.gap = StopGapWatch()
-        self.guard = AccountGuard(self.journal, deps.cfg.breakers)
+        self.guard = AccountGuard(self.journal, self.cfg.breakers)
         self.sessions = SessionWatch()
         self.target: Target | None = None
         self.product: ProductSpec | None = None
@@ -7461,7 +7747,7 @@ class LiveRuntime:
         entry = e.entry_ref * ratio
         stop = map_level(e.stop, ratio, tick, e.direction)
         n, why = stage_contracts(self.stage, equity=equity, entry=entry, stop=stop, direction=e.direction,
-                                 risk_mult=e.risk_mult, cfg=self.d.cfg, full_cap=full_cap(self.journal, now))
+                                 risk_mult=e.risk_mult, cfg=self.cfg, full_cap=full_cap(self.journal, now))
         if n == 0:
             return 0, why
         projected = margin_ratio(n, entry, e.direction, self.product, equity)
@@ -7511,7 +7797,7 @@ class LiveRuntime:
             df = self._frame()
             if int(df["ts"].iloc[-1]) < bar_ts:
                 return "LATE"
-            target = compute_target(self.d.cfg, df, bar_ts, self.d.start_ts)
+            target = compute_target(self.d.lock, df, bar_ts)
         except Exception as exc:  # noqa: BLE001 - the cycle fails, protection goes on
             self.journal.finish_cycle(bar_ts, self.clock(), "ERROR", f"{type(exc).__name__}: {exc}"[:300])
             self.alert("CYCLE_ERROR", f"[사이클 오류] {_utc(bar_ts)} 봉: {type(exc).__name__}: {str(exc)[:200]}")
@@ -7730,7 +8016,7 @@ class LiveRuntime:
                  if abs(d["price"] - d["stop"]) < abs(d["price"] - d["limit"])]
         stop_bps = [d["side"] * (d["price"] - d["stop"]) / d["stop"] * 1e4 for d in stops]
         fees = sum(float(f.get("fee") or 0.0) for f in fills)
-        model = sum(model_fee(float(f["price"]), int(f.get("contracts") or 0), self.d.cfg.costs) for f in fills)
+        model = sum(model_fee(float(f["price"]), int(f.get("contracts") or 0), self.cfg.costs) for f in fills)
         return {"fills": len(fills), "slippage_bps": (sum(entry_bps) / len(entry_bps)) if entry_bps else None,
                 "stop_slippage_bps": (sum(stop_bps) / len(stop_bps)) if stop_bps else None, "fees": fees,
                 "model_fees": model}
@@ -7904,8 +8190,8 @@ EOF
 - Test: `tests/live/test_cli_live.py`
 
 **Interfaces:**
-- Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.backtest.holdout.holdout_config`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
-- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier`, `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `frozen_config(lock) -> BotConfig`, dataclass `Wired(runtime, feed, control, heartbeat, notify)`, `build(settings, lock, real, journal) -> Wired` (starts the feed and the Telegram threads). Tests replace `real_exchange` and the module-level `update_cache`.
+- Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
+- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier`, `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, dataclass `Wired(runtime, feed, control, heartbeat, notify)`, `build(settings, lock, real, journal) -> Wired` (hands the preflight-checked lock to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange` and the module-level `update_cache`.
 - Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm]`, `backup --out PATH`; `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`. Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
 
 - [ ] **Step 1: Write the failing test**
@@ -8075,8 +8361,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ewbot.backtest.holdout import holdout_config
-from ewbot.config import BotConfig
 from ewbot.data.coinbase_history import update_cache
 from ewbot.live.audit import AuditError, fetch_paper_ledger
 from ewbot.live.coinbase import CoinbaseExchange
@@ -8129,11 +8413,6 @@ def paper_status(s: LiveSettings, now: float) -> dict[str, Any] | None:
         return None
 
 
-def frozen_config(lock: dict[str, Any]) -> BotConfig:
-    """The holdout's configuration: BotConfig defaults with the lock's params (strategy A, conservative)."""
-    return holdout_config(BotConfig(), tuple(float(p) for p in lock["params"]))
-
-
 @dataclass
 class Wired:
     runtime: LiveRuntime
@@ -8153,7 +8432,7 @@ def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journa
                if s.telegram_token and s.telegram_chat else None)
     heartbeat = Heartbeat(s.healthcheck_url)
     deps = LiveDeps(
-        journal=journal, exchange=ex, cfg=frozen_config(lock),
+        journal=journal, exchange=ex, lock=lock,
         fetch=lambda cache_dir: update_cache(s.spot_id, Path(cache_dir)), cache_dir=s.cache_dir, notify=notify,
         clock=time.time, sleep=time.sleep, feed=feed, heartbeat=heartbeat, commands=commands,
         paper_ledger=paper_fetcher(s), edit_stops=s.edit_stops, expiry=s.expiry,
@@ -8489,8 +8768,8 @@ EOF
 - Test: `tests/live/test_parity.py`, `tests/live/test_chaos.py`
 
 **Interfaces:**
-- Consumes: `tests.live.harness.Harness` (Task 12), `LiveRuntime`, `SimExchange` / `SimCrash`, `TickerFeed`, `Journal`, `traced_with_exits`, `build_decisions`, `same_decision`, `map_level`.
-- Produces: no production code. This task is the spec §7 `일치 테스트` and `장애 주입` coverage over Tasks 1–13: three hour-by-hour walks of the synthetic series in the first 30 days of FULL (3 contracts, basis ratio 1.0005) — a TIME exit, a trailed stop-out and TP1 → break-even → TP2 — must record the paper replay's decisions exactly, enter on the engine's signals, place the mapped engine levels, move the stop with the engine and exit in the engine's exit hour; and a process killed right after an accepted entry, bracket or close, a WebSocket drop and sequence gap, 429s and outages, and an exit waiting for the session to reopen must all end protected, flat or reconciled without a duplicate order.
+- Consumes: `tests.live.harness.Harness` (Task 12), `LiveRuntime`, `SimExchange` / `SimCrash`, `TickerFeed`, `Journal`, `traced_with_exits`, `compute_target`, `build_decisions`, `same_decision`, `map_level`, `tests.paper.helpers.make_lock`, `ewbot.engine.loop._Run` (swapped by one test to queue an exit on a chosen bar).
+- Produces: no production code. This task is the spec §7 `일치 테스트` and `장애 주입` coverage over Tasks 1–13: three hour-by-hour walks of the synthetic series in the first 30 days of FULL (3 contracts, basis ratio 1.0005) — a TIME exit, a trailed stop-out and TP1 → break-even → TP2 — must record the paper replay's decisions exactly, enter on the engine's signals, place the mapped engine levels, move the stop with the engine and exit in the engine's exit hour; and a process killed right after an accepted entry, bracket or close, a WebSocket drop and sequence gap, 429s and outages, an exit waiting for the session to reopen, an exit queued before the weekly CFM halt (still the target at the halt bar's cycle) and a stop the spot price crossed during the halt must all end protected, flat or reconciled without a duplicate order — the last two closed by the first poll that sees the session OPEN, not an hour later.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -8535,7 +8814,7 @@ def reference():
     """The paper runtime's view: one replay over every synthetic bar."""
     df = synth_frame()
     cfg = holdout_config(BotConfig(), PARAMS)
-    with traced_with_exits() as (trace, _):
+    with traced_with_exits() as (trace, _, _):
         res = run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)
     return res, trace, build_decisions(res, trace, list(res.trades))
 
@@ -8603,10 +8882,11 @@ def test_exits_happen_in_the_engine_exit_hour(walked):
 
 ```python
 """Plan 3 spec 7 `장애 주입`: a process killed in the middle of an order, restart reconciliation, WebSocket
-drop and sequence gaps (REST fallback and resync), 429s and outages, and a session closure with an exit
-waiting for the reopen. The process is "killed" by SimCrash (a BaseException nothing in the runtime
-catches) right after the venue accepted an order; the restart is a new LiveRuntime on the same journal
-file and the same exchange."""
+drop and sequence gaps (REST fallback and resync), 429s and outages, a session closure with an exit
+waiting for the reopen, and the weekly CFM halt (an exit queued before it and a stop the spot price
+crossed during it close at the reopen, not an hour later). The process is "killed" by SimCrash (a
+BaseException nothing in the runtime catches) right after the venue accepted an order; the restart is a
+new LiveRuntime on the same journal file and the same exchange."""
 
 from __future__ import annotations
 
@@ -8614,16 +8894,20 @@ import json
 
 import pytest
 
+import ewbot.engine.loop as loop_mod
 from ewbot.live.exchange import RateLimited, Unavailable
 from ewbot.live.feed import TickerFeed
 from ewbot.live.journal import Journal
 from ewbot.live.sim import SimCrash
+from ewbot.live.target import compute_target
 from tests.live.harness import Harness
-from tests.paper.helpers import ts
+from tests.paper.helpers import make_lock, synth_frame, ts
 
 SIGNAL = ts("2024-03-13 22:00")
 ENTRY_BAR = SIGNAL + 3600
 TIME_SIGNAL = ts("2024-01-01 19:00")  # W5_REV short whose TIME exit is queued at 2024-01-04 15:00
+LONG_ENTRY = ts("2024-01-12 15:00")  # a W3 long still open at the CFM halt below
+HALT = ts("2024-01-12 22:00")  # Fri 17:00 New York (EST): the weekly CFM halt bar
 
 
 def started(tmp_path, start: float = ENTRY_BAR + 30, **kw) -> Harness:
@@ -8724,6 +9008,61 @@ def test_an_exit_waits_for_the_reopen(tmp_path):
     h.at(exit_bar + 3600 + 100)  # the minute job sees OPEN and polls at once
     assert h.ex.position() is None
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "TIME"
+
+
+def test_an_exit_queued_before_the_cfm_halt_closes_at_the_first_open_poll(tmp_path, monkeypatch):
+    """The engine queues LINEAGE at the Fri 16:00 New York close; the venue halts, so the close waits. The
+    venue still reports the halt at the 18:00:05 minute check, so the halt bar's cycle (18:00:30) replaces
+    the target before any poll sees OPEN: that target must still carry the exit, and the first poll that
+    sees OPEN closes - not the next cycle an hour later (the engine's exit fills at the 18:00 open)."""
+    fri16 = HALT - 3600
+
+    class Forced(loop_mod._Run):  # type: ignore[misc, valid-type]
+        def _may_enter(self, bar, t_close):  # type: ignore[no-untyped-def]
+            if bar.ts in (fri16, HALT):  # a broken lineage (the engine repeats the request while it holds)
+                self._request_exit("LINEAGE")
+            return super()._may_enter(bar, t_close)
+
+    monkeypatch.setattr(loop_mod, "_Run", Forced)
+    h = started(tmp_path, start=LONG_ENTRY + 30)
+    h.at(LONG_ENTRY + 30)
+    assert h.ex.position().side == 1
+    h.ex.set_session("CLOSE")  # the CFM halt
+    h.price(float(h.bar(HALT)["open"]))
+    h.at(HALT + 30)  # the cycle for the Fri 16:00 bar sees the exit while the venue is halted
+    assert h.rt.target.exit_queued_ts == fri16 and "CLOSE_DEFERRED" in h.alerts.kinds()
+    h.price(float(h.bar(HALT + 3600)["open"]))
+    h.at(HALT + 3600 + 5)  # still halted at this minute check
+    assert h.ex.position() is not None
+    h.ex.set_session("OPEN")
+    h.at(HALT + 3600 + 30)  # the halt bar's cycle: the exit queued at 16:00 is still the target
+    assert (h.rt.target.bar_ts, h.rt.target.exit_reason, h.rt.target.exit_queued_ts) == (HALT, "LINEAGE", fri16)
+    h.at(HALT + 3600 + 65)  # the minute job sees OPEN and polls at once
+    assert h.ex.position() is None
+    assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "LINEAGE"
+
+
+def test_a_stop_crossed_during_the_cfm_halt_closes_at_the_reopen(tmp_path):
+    """Spot trades through the long's stop during the halt hour while the futures venue is closed: the engine
+    stops out at the 18:00 open; the live futures reopen above the resting stop, so the bracket does not
+    trigger - the halt bar's cycle closes the trade (STOP_HALT) instead of an hour later (ENGINE_FLAT)."""
+    df = synth_frame()
+    stop = compute_target(make_lock(df), df, HALT - 3600).position.stop  # the stop in force during the halt bar
+    df.loc[df["ts"] == HALT, "low"] = stop - 10.0
+    h = started(tmp_path, start=LONG_ENTRY + 30, df=df)
+    h.at(LONG_ENTRY + 30)
+    assert h.ex.position().side == 1
+    h.ex.set_session("CLOSE")
+    h.price(float(h.bar(HALT)["open"]))
+    h.at(HALT + 30)
+    h.price(stop - 10.0)  # nothing fills while the venue is halted
+    h.at(HALT + 1800)
+    assert h.ex.position() is not None and h.rt.executor.trade().status == "OPEN"
+    h.price(float(h.bar(HALT + 3600)["open"]))  # the reopen, above the stop: the bracket stays
+    h.ex.set_session("OPEN")
+    h.at(HALT + 3600 + 30)  # minute (OPEN, nothing to close yet), then the halt bar's cycle
+    assert h.rt.target.stop_pending_reopen and h.ex.position() is None
+    assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_HALT"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -8732,7 +9071,7 @@ def test_an_exit_waits_for_the_reopen(tmp_path):
 uv run --group live pytest tests/live/test_parity.py tests/live/test_chaos.py -q
 ```
 
-Expected: `18 passed` already — this task only adds integration coverage of code written in Tasks 1–13, so there is no red phase. If anything fails here, the bug is in Tasks 1–13: fix the component (and its unit test), never relax this test.
+Expected: `20 passed` already — this task only adds integration coverage of code written in Tasks 1–13, so there is no red phase. If anything fails here, the bug is in Tasks 1–13: fix the component (and its unit test), never relax this test.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -8744,14 +9083,14 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `165 passed` (all live tests so far, about 25 s; the three parity walks take about 14 s).
+Expected: `241 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add tests/live/test_parity.py tests/live/test_chaos.py
 git commit -m "$(cat <<'EOF'
-test(live): parity with the paper replay and chaos (crash mid-order, WebSocket drop, 429, session close)
+test(live): parity with the paper replay and chaos (crash mid-order, WebSocket drop, 429, session close, CFM halt)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -9308,7 +9647,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `796 passed, 1 skipped` without a candle cache (`797 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `872 passed, 1 skipped` without a candle cache (`873 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -9343,7 +9682,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `797 passed` with the real cache (`796 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `873 passed` with the real cache (`872 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
