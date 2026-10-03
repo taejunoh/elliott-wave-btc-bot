@@ -99,7 +99,8 @@ def test_stage_contracts_fails_closed_on_bad_sizing_inputs():
     good = dict(equity=1_000.0, entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=CFG)
     nan, inf = math.nan, math.inf
     bad = [dict(direction=2), dict(direction=0), dict(entry=nan), dict(entry=inf), dict(stop=nan), dict(stop=-inf),
-           dict(equity=nan), dict(equity=inf), dict(equity=0.0), dict(equity=-5.0)]
+           dict(equity=nan), dict(equity=inf), dict(equity=0.0), dict(equity=-5.0),
+           dict(risk_mult=nan), dict(risk_mult=inf)]
     for stage in ("SHADOW", "CANARY", "FULL"):
         for override in bad:
             assert stage_contracts(stage, **{**good, **override}) == (0, "bad sizing inputs"), (stage, override)
@@ -127,7 +128,11 @@ def test_margin_projection_uses_the_overnight_rate():
     assert margin_ratio(1, 84_000.0, -1, BIP_SPEC, 1_000.0) == pytest.approx(840.0 * 0.256625 / 1_000.0)
     assert margin_ratio(1, 84_000.0, 1, BIP_SPEC, 1_000.0, overnight=False) < margin_ratio(1, 84_000.0, 1, BIP_SPEC, 1_000.0)
     assert margin_ratio(0, 84_000.0, 1, BIP_SPEC, 0.0) == 0.0 and math.isinf(margin_ratio(1, 1.0, 1, BIP_SPEC, 0.0))
-    for price, equity in [(math.nan, 1_000.0), (math.inf, 1_000.0), (84_000.0, math.nan), (84_000.0, math.inf)]:
+    for price, equity in [(math.nan, 1_000.0), (math.inf, 1_000.0), (84_000.0, math.nan), (84_000.0, math.inf),
+                          (0.0, 1_000.0), (-84_000.0, 1_000.0)]:
         assert math.isinf(margin_ratio(1, price, 1, BIP_SPEC, equity)), (price, equity)
+    for price, equity in [(math.nan, 1_000.0), (84_000.0, math.nan), (84_000.0, math.inf), (math.inf, 1_000.0),
+                          (0.0, 1_000.0), (-84_000.0, 1_000.0), (84_000.0, 0.0), (84_000.0, -1.0)]:
+        assert max_contracts_for_margin(price, 1, BIP_SPEC, equity) == 0, (price, equity)
     n = max_contracts_for_margin(84_000.0, 1, BIP_SPEC, 1_000.0)
     assert n == 3 and margin_ratio(n, 84_000.0, 1, BIP_SPEC, 1_000.0) <= 0.70 < margin_ratio(n + 1, 84_000.0, 1, BIP_SPEC, 1_000.0)

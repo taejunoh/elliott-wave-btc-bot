@@ -83,7 +83,7 @@ def margin_ratio(contracts: int, price: float, side: int, product: ProductSpec, 
                  overnight: bool = True) -> float:
     if contracts <= 0:
         return 0.0
-    if not (math.isfinite(price) and math.isfinite(equity)) or equity <= 0:
+    if not (math.isfinite(price) and math.isfinite(equity)) or price <= 0 or equity <= 0:
         return math.inf
     return contracts * product.contract_size * price * product.margin_rate(side, overnight) / equity
 
@@ -91,7 +91,7 @@ def margin_ratio(contracts: int, price: float, side: int, product: ProductSpec, 
 def max_contracts_for_margin(price: float, side: int, product: ProductSpec, equity: float,
                              limit: float = MARGIN_ENTRY_MAX) -> int:
     per = product.contract_size * price * product.margin_rate(side, True)
-    if per <= 0 or equity <= 0:
+    if not (math.isfinite(per) and math.isfinite(equity)) or per <= 0 or equity <= 0:
         return 0
     return max(0, math.floor(limit * equity / per + _EPS))
 
@@ -108,10 +108,10 @@ def stage_contracts(
     full_cap: int | None = None,
 ) -> tuple[int, str]:
     """(contracts, reason). 0 contracts = skip the signal (recorded, not traded). Fails closed on a
-    non-finite price or equity, a bad direction, or a negative `full_cap`."""
+    non-finite price, equity or `risk_mult`, a bad direction, or a negative `full_cap`."""
     if full_cap is not None and full_cap < 0:
         raise ValueError(f"bad full_cap {full_cap}")
-    if direction not in (1, -1) or not all(map(math.isfinite, (entry, stop, equity))) or equity <= 0:
+    if direction not in (1, -1) or not all(map(math.isfinite, (entry, stop, equity, risk_mult))) or equity <= 0:
         return 0, "bad sizing inputs"
     if direction * (entry - stop) <= 0:
         return 0, "stop on the wrong side of the entry"
