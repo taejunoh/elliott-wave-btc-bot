@@ -21,7 +21,7 @@ export default {
       },
       body: JSON.stringify({ ref: "master" }),
     });
-    if (response.status !== 204) {
+    if (!response.ok) { // 204 (classic) or 200 (newer API versions)
       const text = await response.text();
       // never log the token or the request headers
       console.error(`workflow_dispatch failed: HTTP ${response.status} ${text}`);
