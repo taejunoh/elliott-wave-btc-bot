@@ -40,7 +40,7 @@ def to_tick(price: float, tick: float, direction: int) -> float:
 
 
 def basis_ratio(fut_mid: float, spot_mid: float) -> float:
-    if fut_mid <= 0 or spot_mid <= 0:
+    if not (math.isfinite(fut_mid) and math.isfinite(spot_mid)) or fut_mid <= 0 or spot_mid <= 0:
         raise ValueError(f"bad mids {fut_mid} / {spot_mid}")
     return fut_mid / spot_mid
 
@@ -83,7 +83,7 @@ def margin_ratio(contracts: int, price: float, side: int, product: ProductSpec, 
                  overnight: bool = True) -> float:
     if contracts <= 0:
         return 0.0
-    if equity <= 0:
+    if not (math.isfinite(price) and math.isfinite(equity)) or equity <= 0:
         return math.inf
     return contracts * product.contract_size * price * product.margin_rate(side, overnight) / equity
 
@@ -107,14 +107,19 @@ def stage_contracts(
     cfg: BotConfig,
     full_cap: int | None = None,
 ) -> tuple[int, str]:
-    """(contracts, reason). 0 contracts = skip the signal (recorded, not traded)."""
+    """(contracts, reason). 0 contracts = skip the signal (recorded, not traded). Fails closed on a
+    non-finite price or equity, a bad direction, or a negative `full_cap`."""
+    if full_cap is not None and full_cap < 0:
+        raise ValueError(f"bad full_cap {full_cap}")
+    if direction not in (1, -1) or not all(map(math.isfinite, (entry, stop, equity))) or equity <= 0:
+        return 0, "bad sizing inputs"
     if direction * (entry - stop) <= 0:
         return 0, "stop on the wrong side of the entry"
     if stage in ("SHADOW", "CANARY"):
         risk = risk_per_contract(entry, stop, cfg.costs)
         if risk > CANARY_MAX_RISK * equity:
             return 0, f"1-contract risk {risk:.2f} USD > {CANARY_MAX_RISK:.0%} of equity {equity:.2f}"
-        return 1, "canary: 1 contract"
+        return 1, f"{stage.lower()}: 1 contract"
     if stage == "FULL":
         n = size_contracts(equity, entry, stop, direction, CONSERVATIVE, risk_mult, cfg.costs)
         if n == 0:
