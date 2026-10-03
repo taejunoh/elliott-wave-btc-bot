@@ -3,25 +3,37 @@
 State of the one live trade (`LiveTrade`, persisted by the executor in the journal) is compared with
 the engine's target (live/target.py) and the exchange's position and open orders:
 
-  1. `observe` folds exchange facts into the trade: flat -> CLOSED; fewer contracts than entered ->
-     the TP1 leg (or our TP1 sync) has filled; open legs that do not cover the position -> unprotected
-     since now (a major incident after 60 s, spec 6.2).
+  1. `observe` folds exchange facts into the trade: flat -> CLOSED; fewer contracts than expected
+     (`expected_contracts`: all before the live TP1, the rest after it) are explained only by our resting
+     legs - a reduction is a bracket fill when the legs still cover exactly the position: the TP1 leg used
+     up -> TP1_FILLED (break-even), else PARTIAL_FILL (the legs keep their remainders); any other
+     reduction is UNEXPLAINED_REDUCTION (the trade shrinks to the position, the stop stays where it is,
+     no break-even). Open legs that do not cover the position -> unprotected since now (a major incident
+     after 60 s, spec 6.2; PROTECTED ends it, a later gap is a new incident).
   2. `plan` returns the actions, in order:
-       - a position the journal does not know: adopt it when the engine holds the same direction,
-         else close it (spec 4.4: the actual position always follows the target);
+       - a position the journal does not know: adopt it when the engine holds the same direction (at
+         most the stage maximum `ctx.max_contracts`, the rest is reduced: EXCESS), else close it
+         (spec 4.4: the actual position always follows the target);
        - within the hour after an entry the replay still shows it as queued (`target.entry`): the live
          trade of that signal is the engine position (`pending_position`), never a reason to close;
-       - flat: cancel our leftover orders; enter when the engine queued an entry at the last close;
+       - flat: cancel our leftover orders; enter when the engine queued an entry at the last close
+         (never a signal the live trade already traded: closed early by its bracket, it is not
+         re-entered);
        - engine flat / another trade / exit queued (TIME, LINEAGE, BREAKER, FLIP, ...): close, then
          enter if the engine also queued an entry (the executor enters only after the close is
          confirmed, spec 4.2 `반대 신호 전환`). An exit queued before the CFM halt is still queued at
          the halt bar (`exit_queued_ts` < bar) and a stop the halt bar crossed stops the engine out at
          the reopen (`stop_pending_reopen`, reason STOP_HALT): both close as well - the executor sends
-         the close at the first poll that sees the session OPEN, whichever target is current then;
+         the close at the first poll that sees the session OPEN, whichever target is current then -
+         until then the position stays protected (missing legs are placed at the stop in force);
+       - more contracts than expected (a manual order, a reduction that did not fill): reduce the excess
+         at market while the session is OPEN (spec 4.4) and alert; the legs cover the expected size only;
        - engine TP1 done but the live TP1 leg not filled: reduce by the TP1 size at market (spec 4.4);
        - protection: the brackets must equal the desired legs (spec 4.2): two legs (TP1 size + stop,
          rest + TP2 + stop) before TP1, one leg (rest + TP2 + stop) after it, one leg (TP1 + stop) for
-         1 contract; after the live TP1 the stop is at least break-even (live entry price).
+         1 contract; after the live TP1 the stop is at least break-even (live entry price). Legs never
+         exceed the position. A moved engine stop is mapped with the basis ratio at the time; without
+         quotes the stop in force is kept and the move is planned again once quotes are back.
      Without a target (data late, spec 4.1 step 1) only protection is maintained.
 
 Client order ids are deterministic (spec 4.2): entry `ewb-e-<signal ts>-<L|S>`, brackets
@@ -146,6 +158,7 @@ class Cancel:
 @dataclass(frozen=True)
 class Adopt:
     target: TargetPosition
+    contracts: int  # contracts to take over (at most the stage maximum); the rest is reduced (EXCESS)
 
 
 @dataclass(frozen=True)
@@ -165,6 +178,11 @@ class PlanContext:
     session_open: bool = True  # market orders (entry, close, reduce) only while the session is OPEN
     entry_contracts: int = 0  # stage size for target.entry (0: skip)
     entry_block: str | None = None  # why no entry may be sent now (paused, session, margin, stale, size)
+    max_contracts: int | None = None  # stage maximum for a position taken over (None: no cap)
+
+    def __post_init__(self) -> None:
+        if self.max_contracts is not None and self.max_contracts < 1:
+            raise ValueError(f"bad max_contracts {self.max_contracts}")
 
 
 # ----------------------------------------------------------------------------- observe
@@ -173,6 +191,46 @@ class PlanContext:
 def _open_legs(trade: LiveTrade, orders: list[Order]) -> list[tuple[Leg, Order]]:
     by_id = {o.order_id: o for o in orders if o.is_open}
     return [(leg, by_id[leg.order_id]) for leg in trade.legs if leg.order_id in by_id]
+
+
+def expected_contracts(trade: LiveTrade) -> int:
+    """Contracts the live trade holds: all of them before the live TP1, the rest after it."""
+    return trade.contracts - trade.tp1_n if trade.tp1_filled else trade.contracts
+
+
+def _leg_rest(trade: LiveTrade, orders: list[Order], name: str) -> int | None:
+    """Contracts our `name` leg still has resting (0 once it left the book); None: the trade has no such leg."""
+    leg = next((x for x in trade.legs if x.name == name), None)
+    if leg is None:
+        return None
+    o = next((o for x, o in _open_legs(trade, orders) if x is leg), None)
+    return 0 if o is None else max(o.size - o.filled, 0)
+
+
+def _fold_reduction(t: LiveTrade, n: int, orders: list[Order]) -> tuple[str, dict[str, Any]]:
+    """`t` (a copy) holds fewer contracts (`n`) than expected: fold the reduction into it and name it.
+
+    A bracket fill reduces its leg and the position alike, so a reduction is ours when the legs still
+    cover exactly the position. Before the live TP1 (two legs): the TP1 leg used up -> TP1_FILLED (a TP2
+    fill in the same interval is folded in), else PARTIAL_FILL (the TP1 leg keeps its remainder). After it
+    (one leg): PARTIAL_FILL. Anything else is UNEXPLAINED_REDUCTION: the trade shrinks to the position,
+    the TP1 portion kept as far as possible, the stop unchanged (no break-even)."""
+    expected = expected_contracts(t)
+    if t.tp1_filled:
+        rest2 = _leg_rest(t, orders, "tp2")
+        t.contracts = n + t.tp1_n
+        if rest2 == n:
+            return "PARTIAL_FILL", {"trade_id": t.trade_id, "contracts": n}
+    else:
+        rest1, rest2 = _leg_rest(t, orders, "tp1"), _leg_rest(t, orders, "tp2")
+        if t.contracts > 1 and rest1 is not None and rest2 is not None and rest1 + rest2 == n:
+            if rest1 == 0:
+                t.tp1_filled, t.contracts = True, n + t.tp1_n
+                return "TP1_FILLED", {"trade_id": t.trade_id, "contracts": n}
+            t.contracts, t.tp1_n = n, rest1
+            return "PARTIAL_FILL", {"trade_id": t.trade_id, "contracts": n}
+        t.contracts, t.tp1_n = n, max(1, min(t.tp1_n, n - 1))
+    return "UNEXPLAINED_REDUCTION", {"trade_id": t.trade_id, "expected": expected, "position": n}
 
 
 def observe(trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float
@@ -190,14 +248,14 @@ def observe(trade: LiveTrade | None, position: Position | None, orders: list[Ord
         return t, events
     if position.side != t.direction:
         return t, events  # plan() closes a position on the wrong side
-    if not t.tp1_filled and t.contracts > 1 and position.contracts < t.contracts:
-        t.tp1_filled = True
-        events.append(("TP1_FILLED", {"trade_id": t.trade_id, "contracts": position.contracts}))
+    if position.contracts < expected_contracts(t):
+        events.append(_fold_reduction(t, position.contracts, orders))
     covered = sum(o.size - o.filled for leg, o in _open_legs(t, orders) if o.stop_price is not None)
     if covered >= position.contracts:
         if t.unprotected_since is not None:
             events.append(("PROTECTED", {"trade_id": t.trade_id, "after_s": round(now - t.unprotected_since, 3)}))
         t.unprotected_since = None
+        t.incident_unprotected = False  # the incident ends here: a later gap is a new one
     else:
         if t.unprotected_since is None:
             t.unprotected_since = now
@@ -211,10 +269,23 @@ def observe(trade: LiveTrade | None, position: Position | None, orders: list[Ord
 # ----------------------------------------------------------------------------- desired legs
 
 
+def _leg_sizes(trade: LiveTrade, contracts: int) -> list[tuple[str, int]]:
+    """Leg names and sizes covering `contracts` (normally `expected_contracts`; never more than held)."""
+    if contracts <= 0:
+        return []
+    if trade.tp1_filled:
+        return [("tp2", contracts)]
+    if trade.contracts == 1 or contracts == 1:
+        return [("tp1", contracts)]
+    k = min(trade.tp1_n, contracts - 1)
+    return [("tp1", k), ("tp2", contracts - k)]
+
+
 def desired_legs(trade: LiveTrade, contracts: int, stop_spot: float, ratio: float | None, tick: float
                  ) -> tuple[list[Leg], float]:
     """The brackets that must rest for `contracts` contracts, and their futures stop. The stored futures
-    stop is kept while the engine stop is unchanged (no churn when only the basis moves)."""
+    stop is kept while the engine stop is unchanged (no churn when only the basis moves) or without
+    quotes. Raises ValueError when a TP2 leg is needed and the trade has no TP2."""
     d = trade.direction
     if stop_spot == trade.stop_spot or ratio is None:
         stop = trade.stop_price
@@ -223,14 +294,15 @@ def desired_legs(trade: LiveTrade, contracts: int, stop_spot: float, ratio: floa
     if trade.tp1_filled:
         be = to_tick(trade.entry_price, tick, d)
         stop = max(stop, be) if d > 0 else min(stop, be)
-    if trade.contracts == 1:
-        return [Leg("tp1", contracts, trade.tp1_price, stop)], stop
-    if not trade.tp1_filled and contracts == trade.contracts:
-        assert trade.tp2_price is not None
-        return [Leg("tp1", trade.tp1_n, trade.tp1_price, stop),
-                Leg("tp2", contracts - trade.tp1_n, trade.tp2_price, stop)], stop
-    assert trade.tp2_price is not None
-    return [Leg("tp2", contracts, trade.tp2_price, stop)], stop
+    legs: list[Leg] = []
+    for name, size in _leg_sizes(trade, contracts):
+        if name == "tp1":
+            legs.append(Leg("tp1", size, trade.tp1_price, stop))
+        elif trade.tp2_price is None:
+            raise ValueError(f"trade {trade.trade_id}: a TP2 leg of {size} needs a TP2 price")
+        else:
+            legs.append(Leg("tp2", size, trade.tp2_price, stop))
+    return legs, stop
 
 
 def legs_match(trade: LiveTrade, orders: list[Order], desired: list[Leg]) -> bool:
@@ -270,6 +342,31 @@ def engine_position(target: Target) -> TargetPosition | None:
     return None
 
 
+def _engine_view(target: Target, trade: LiveTrade) -> TargetPosition | str:
+    """The engine position of the live trade, or the reason the live trade must close."""
+    e = target.entry
+    if e is not None and e.signal_ts == trade.trade_id:
+        return pending_position(e)  # entered at this hour's open; the replay still shows the queued entry
+    if target.exit_reason is not None:  # queued at the last close, or before the halt (carried)
+        return target.exit_reason
+    tp = target.position
+    if tp is None:
+        return "ENGINE_FLAT"
+    if tp.signal_ts != trade.trade_id:
+        return "ENGINE_OTHER_TRADE"
+    if target.stop_pending_reopen:
+        return "STOP_HALT"
+    return tp
+
+
+def _protection(trade: LiveTrade, orders: list[Order], contracts: int, stop_spot: float,
+                ctx: PlanContext) -> list[Action]:
+    desired, stop = desired_legs(trade, contracts, stop_spot, ctx.ratio, ctx.tick)
+    if not legs_match(trade, orders, desired) or stop_spot != trade.stop_spot:
+        return [Protect(tuple(desired), stop_spot, stop)]
+    return []
+
+
 def plan(target: Target | None, trade: LiveTrade | None, position: Position | None, orders: list[Order],
          ctx: PlanContext) -> list[Action]:
     acts: list[Action] = []
@@ -283,56 +380,62 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
         if target is None or target.entry is None:
             return []
         e = target.entry
+        if trade is not None and trade.trade_id == e.signal_ts:
+            return []  # this signal was traded (open, or closed early by its bracket): never entered twice
         if ctx.entry_block is not None:
             return [Skip(e.signal_ts, ctx.entry_block)]
         if e.tp2 is None:
             return [Skip(e.signal_ts, "the engine signal has no TP2 (a second bracket needs one)")]
         return [Enter(e, ctx.entry_contracts)]
 
-    if position is not None and open_trade is None:  # a position the journal does not know
-        if target is None:
-            return acts + [Alert("UNKNOWN_POSITION", f"{position.side:+d} x{position.contracts}: waiting for a target")]
-        tp = engine_position(target)
-        if tp is not None and tp.direction == position.side:
-            return acts + [Adopt(tp)]
-        return acts + [Close("UNKNOWN_POSITION")]
-
     if position is None:
         if ours:
             acts.append(Cancel(tuple(o.order_id for o in ours), "FLAT"))
         return acts + entry_actions()
 
-    assert open_trade is not None
+    n = position.contracts
+    if open_trade is None:  # a position the journal does not know
+        if target is None:
+            return acts + [Alert("UNKNOWN_POSITION", f"{position.side:+d} x{n}: waiting for a target")]
+        held = engine_position(target)
+        if held is None or held.direction != position.side:
+            return acts + [Close("UNKNOWN_POSITION")]
+        take = n if ctx.max_contracts is None else min(n, ctx.max_contracts)
+        if take == n:
+            return acts + [Adopt(held, n)]
+        acts += [Alert("EXCESS_POSITION", f"position {n} > stage maximum {ctx.max_contracts}: adopting {take}"),
+                 Adopt(held, take)]
+        return acts + ([Reduce(n - take, "EXCESS")] if ctx.session_open else [])
+
     if position.side != open_trade.direction:
-        return acts + [Close("DIRECTION_MISMATCH")]
+        acts.append(Close("DIRECTION_MISMATCH"))
+        if not ctx.session_open:  # the trade's legs only reduce its own side: nothing can protect this
+            acts.append(Alert("DIRECTION_MISMATCH", f"trade {open_trade.trade_id} {open_trade.direction:+d}: "
+                                                    f"position {position.side:+d} x{n} unprotected until the reopen"))
+        return acts
 
-    contracts = position.contracts
+    expected = expected_contracts(open_trade)
+    size = min(n, expected)  # the legs cover the expected size, never more than the position
     stop_spot = open_trade.stop_spot
+    tp: TargetPosition | None = None
     if target is not None:
-        tp = target.position
-        queued = target.entry is not None and target.entry.signal_ts == open_trade.trade_id
-        if queued:  # entered at this hour's open; the replay still shows the queued entry
-            tp = pending_position(target.entry)  # type: ignore[arg-type]
-        elif (tp is None or tp.signal_ts != open_trade.trade_id or target.exit_reason is not None
-              or target.stop_pending_reopen):
-            if target.exit_reason is not None:  # queued at the last close, or before the halt (carried)
-                reason = target.exit_reason
-            elif tp is None:
-                reason = "ENGINE_FLAT"
-            elif tp.signal_ts != open_trade.trade_id:
-                reason = "ENGINE_OTHER_TRADE"
-            else:
-                reason = "STOP_HALT"
-            return acts + [Close(reason)] + entry_actions()
-        assert tp is not None
-        if (tp.tp1_done and not open_trade.tp1_filled and open_trade.contracts > 1
-                and contracts == open_trade.contracts and ctx.session_open):  # market orders need an OPEN session
-            acts.append(Reduce(open_trade.tp1_n, "TP1_SYNC"))
-            contracts -= open_trade.tp1_n
-            open_trade = LiveTrade.from_json({**open_trade.to_json(), "tp1_filled": True})
-        stop_spot = tp.stop
+        view = _engine_view(target, open_trade)
+        if isinstance(view, str):
+            acts.append(Close(view))
+            if not ctx.session_open:  # the close waits for the reopen: keep the position protected meanwhile
+                acts += _protection(open_trade, orders, size, stop_spot, ctx)
+            return acts + entry_actions()
+        tp = view
+        if ctx.ratio is not None:  # without quotes the stop in force stays; the move is planned again later
+            stop_spot = tp.stop
 
-    desired, stop = desired_legs(open_trade, contracts, stop_spot, ctx.ratio, ctx.tick)
-    if not legs_match(open_trade, orders, desired) or stop_spot != open_trade.stop_spot:
-        acts.append(Protect(tuple(desired), stop_spot, stop))
-    return acts
+    if n > expected:  # spec 4.4: the excess is closed at market (a manual order, an unfilled reduction)
+        acts.append(Alert("EXCESS_POSITION", f"trade {open_trade.trade_id}: position {n} > {expected} expected"))
+        if ctx.session_open:
+            acts.append(Reduce(n - expected, "EXCESS"))
+    if (tp is not None and tp.tp1_done and not open_trade.tp1_filled and open_trade.contracts > 1
+            and n >= expected and ctx.session_open):  # market orders need an OPEN session
+        acts.append(Reduce(open_trade.tp1_n, "TP1_SYNC"))
+        open_trade = LiveTrade.from_json({**open_trade.to_json(), "tp1_filled": True})
+        size = expected_contracts(open_trade)
+    return acts + _protection(open_trade, orders, size, stop_spot, ctx)

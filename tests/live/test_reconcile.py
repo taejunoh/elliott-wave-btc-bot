@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from ewbot.live.exchange import Order, Position
 from ewbot.live.reconcile import (
     Adopt,
@@ -20,6 +22,7 @@ from ewbot.live.reconcile import (
     desired_legs,
     engine_position,
     entry_cid,
+    expected_contracts,
     observe,
     plan,
     reduce_cid,
@@ -93,7 +96,7 @@ def test_an_unknown_position_is_adopted_or_closed():
     pos = Position(1, 2, 60_000.0)
     assert isinstance(plan(None, None, pos, [], CTX)[0], Alert)
     p = tpos()
-    assert plan(target(position=p), None, pos, [], CTX) == [Adopt(p)]
+    assert plan(target(position=p), None, pos, [], CTX) == [Adopt(p, 2)]
     assert plan(target(position=tpos(direction=-1)), None, pos, [], CTX) == [Close("UNKNOWN_POSITION")]
     assert plan(target(), None, pos, [], CTX) == [Close("UNKNOWN_POSITION")]
 
@@ -212,5 +215,138 @@ def test_observe_detects_close_tp1_and_protection_gaps():
     assert t5.incident_unprotected and [k for k, _ in ev] == ["UNPROTECTED_60S"]
     t6, ev = observe(t5, Position(1, 3, 60_020.0), resting(tr), now=170.0)
     assert t6.unprotected_since is None and ev == [("PROTECTED", {"trade_id": T, "after_s": 70.0})]
+    assert not t6.incident_unprotected  # PROTECTED ends the incident: a later gap is a new one
+    t7, _ = observe(t6, Position(1, 3, 60_020.0), resting(tr)[1:], now=200.0)
+    t8, ev = observe(t7, Position(1, 3, 60_020.0), resting(tr)[1:], now=261.0)
+    assert t8.incident_unprotected and [k for k, _ in ev] == ["UNPROTECTED_60S"]
     assert observe(None, None, [], 1.0) == (None, [])
     assert tr.status == "OPEN" and not tr.tp1_filled  # the input is not modified
+
+
+def five() -> LiveTrade:
+    """A 5-contract trade: a 2-contract TP1 leg (o1) and a 3-contract TP2 leg (o2)."""
+    return trade(contracts=5, tp1_n=2, legs=[Leg("tp1", 2, 61_000.0, 59_000.0, bracket_cid(T, "tp1", 1), "o1"),
+                                             Leg("tp2", 3, 62_000.0, 59_000.0, bracket_cid(T, "tp2", 2), "o2")])
+
+
+def after_tp1() -> LiveTrade:
+    """trade() after its live TP1: the 2-contract TP2 leg (o3) at break-even."""
+    return trade(tp1_filled=True, stop_price=60_020.0,
+                 legs=[Leg("tp2", 2, 62_000.0, 60_020.0, bracket_cid(T, "tp2", 3), "o3")])
+
+
+def test_tp1_is_filled_only_when_the_tp1_leg_explains_the_reduction():
+    tr = trade()
+    done, ev = observe(tr, Position(1, 2, 60_020.0), resting(tr, tp1={"filled": 1}), now=100.0)  # filled, not yet gone
+    assert done.tp1_filled and [k for k, _ in ev] == ["TP1_FILLED"] and expected_contracts(done) == 2
+    # one contract less while the TP1 leg still rests unfilled: not the TP1 (no break-even)
+    t2, ev = observe(tr, Position(1, 2, 60_020.0), resting(tr), now=100.0)
+    assert not t2.tp1_filled and ev == [("UNEXPLAINED_REDUCTION", {"trade_id": T, "expected": 3, "position": 2})]
+    assert (t2.contracts, t2.tp1_n, t2.stop_price) == (2, 1, 59_000.0) and expected_contracts(t2) == 2
+    acts = plan(target(position=tpos()), t2, Position(1, 2, 60_020.0), resting(tr), CTX)  # protect what is left
+    assert len(acts) == 1 and isinstance(acts[0], Protect)
+    assert [(leg.name, leg.size, leg.stop_price) for leg in acts[0].legs] == [
+        ("tp1", 1, 59_000.0), ("tp2", 1, 59_000.0)]
+    assert observe(t2, Position(1, 2, 60_020.0), resting(tr), now=110.0)[1] == []  # reported once
+    # down to one contract: a one-contract trade (TP1 + stop)
+    t3, ev = observe(tr, Position(1, 1, 60_020.0), resting(tr), now=100.0)
+    assert (t3.contracts, t3.tp1_n) == (1, 1) and ev[0][0] == "UNEXPLAINED_REDUCTION"
+    assert [(leg.name, leg.size) for leg in desired_legs(t3, 1, 59_000.0, 1.0, 5.0)[0]] == [("tp1", 1)]
+
+
+def test_a_partial_tp1_keeps_the_tp1_leg_for_the_rest():
+    tr = five()
+    part = resting(tr, tp1={"filled": 1})
+    t2, ev = observe(tr, Position(1, 4, 60_020.0), part, now=100.0)
+    assert not t2.tp1_filled and (t2.contracts, t2.tp1_n) == (4, 1)
+    assert ev == [("PARTIAL_FILL", {"trade_id": T, "contracts": 4})]
+    assert plan(target(position=tpos()), t2, Position(1, 4, 60_020.0), part, CTX) == []  # the TP1 leg keeps 1
+    moved = plan(target(position=tpos(stop=59_500.0)), t2, Position(1, 4, 60_020.0), part, CTX)
+    assert [(leg.name, leg.size) for leg in moved[0].legs] == [("tp1", 1), ("tp2", 3)]  # replaced for the rest only
+    t3, ev = observe(t2, Position(1, 3, 60_020.0), part[1:], now=110.0)  # the rest of the TP1 leg filled
+    assert t3.tp1_filled and [k for k, _ in ev] == ["TP1_FILLED"] and expected_contracts(t3) == 3
+    sync = plan(target(position=tpos(tp1_done=True, stop=60_010.0)), t2, Position(1, 4, 60_020.0), part, CTX)
+    assert sync[0] == Reduce(1, "TP1_SYNC")  # the engine's TP1: only what is left of the live TP1 leg
+
+
+def test_tp1_and_a_tp2_fill_in_one_interval_and_reductions_after_tp1():
+    tr = five()
+    t2, ev = observe(tr, Position(1, 2, 60_020.0), resting(tr, tp2={"filled": 1})[1:], now=100.0)
+    assert t2.tp1_filled and [k for k, _ in ev] == ["TP1_FILLED"] and expected_contracts(t2) == 2
+    after = after_tp1()
+    t3, ev = observe(after, Position(1, 1, 60_020.0), resting(after, tp2={"filled": 1}), now=100.0)
+    assert ev == [("PARTIAL_FILL", {"trade_id": T, "contracts": 1})] and expected_contracts(t3) == 1
+    t4, ev = observe(after, Position(1, 1, 60_020.0), resting(after), now=100.0)
+    assert ev[0] == ("UNEXPLAINED_REDUCTION", {"trade_id": T, "expected": 2, "position": 1})
+    assert t4.tp1_filled and expected_contracts(t4) == 1 and t4.stop_price == 60_020.0
+
+
+def test_excess_contracts_are_reduced_and_the_legs_cover_only_the_expected_size():
+    tr = trade()  # 3 contracts
+    pos = Position(1, 5, 60_020.0)
+    alert = Alert("EXCESS_POSITION", f"trade {T}: position 5 > 3 expected")
+    assert plan(target(position=tpos()), tr, pos, resting(tr), CTX) == [alert, Reduce(2, "EXCESS")]
+    closed = dataclasses.replace(CTX, session_open=False)  # no market order now: the legs stay at 3
+    assert plan(target(position=tpos()), tr, pos, resting(tr), closed) == [alert]
+    acts = plan(None, tr, pos, [], CTX)  # without a target too; the missing legs are placed for 3, never 5
+    assert acts[:2] == [alert, Reduce(2, "EXCESS")] and isinstance(acts[2], Protect)
+    assert [(leg.name, leg.size) for leg in acts[2].legs] == [("tp1", 1), ("tp2", 2)]
+    after = after_tp1()
+    acts = plan(target(position=tpos(tp1_done=True)), after, Position(1, 3, 60_020.0), resting(after), CTX)
+    assert acts == [Alert("EXCESS_POSITION", f"trade {T}: position 3 > 2 expected"), Reduce(1, "EXCESS")]
+
+
+def test_an_adopted_position_is_capped_at_the_stage_maximum():
+    pos = Position(1, 3, 60_000.0)
+    p = tpos()
+    canary = dataclasses.replace(CTX, max_contracts=1)
+    alert = Alert("EXCESS_POSITION", "position 3 > stage maximum 1: adopting 1")
+    assert plan(target(position=p), None, pos, [], canary) == [alert, Adopt(p, 1), Reduce(2, "EXCESS")]
+    closed = dataclasses.replace(canary, session_open=False)
+    assert plan(target(position=p), None, pos, [], closed) == [alert, Adopt(p, 1)]
+    assert plan(target(position=p), None, pos, [], dataclasses.replace(CTX, max_contracts=3)) == [Adopt(p, 3)]
+    with pytest.raises(ValueError):
+        dataclasses.replace(CTX, max_contracts=0)
+
+
+def test_a_stop_move_without_quotes_waits_for_them():
+    tr = trade()
+    pos = Position(1, 3, 60_020.0)
+    noq = dataclasses.replace(CTX, ratio=None)
+    moved = target(position=tpos(stop=59_500.0))
+    assert plan(moved, tr, pos, resting(tr), noq) == []  # the engine stop (spot) is not recorded as moved
+    acts = plan(moved, tr, pos, resting(tr)[1:], noq)  # a missing leg is re-placed at the stop in force
+    assert len(acts) == 1 and (acts[0].stop_spot, acts[0].stop_price) == (59_000.0, 59_000.0)
+    acts = plan(moved, tr, pos, resting(tr), dataclasses.replace(CTX, ratio=1.0005))  # quotes are back: the move
+    assert len(acts) == 1 and (acts[0].stop_spot, acts[0].stop_price) == (59_500.0, 59_525.0)
+
+
+def test_a_signal_already_traded_is_never_entered_again():
+    e = tentry(signal_ts=T, direction=1, stop=59_000.0, tp1=61_000.0, tp2=62_000.0)
+    closed_early = trade(status="CLOSED", exit_reason="BRACKET")  # stopped out within its entry hour
+    assert plan(target(entry=e), closed_early, None, [], CTX) == []
+    assert plan(target(entry=e), trade(), None, [], CTX) == []
+    assert plan(target(entry=tentry()), closed_early, None, [], CTX) == [Enter(tentry(), 1)]  # another signal
+
+
+def test_a_close_waiting_for_the_session_keeps_the_position_protected():
+    tr = trade()
+    pos = Position(1, 3, 60_020.0)
+    closed = dataclasses.replace(CTX, session_open=False)
+    halt = T + 7200
+    carried = target(position=tpos(stop=59_500.0), exit_reason="LINEAGE", bar=halt, exit_queued_ts=halt - 3600)
+    assert plan(carried, tr, pos, resting(tr), closed) == [Close("LINEAGE")]  # the legs rest: kept
+    acts = plan(carried, tr, pos, resting(tr)[1:], closed)
+    assert acts[0] == Close("LINEAGE") and isinstance(acts[1], Protect) and len(acts) == 2
+    assert (acts[1].stop_spot, acts[1].stop_price) == (59_000.0, 59_000.0)  # the stop in force, not moved
+    assert [(leg.name, leg.size) for leg in acts[1].legs] == [("tp1", 1), ("tp2", 2)]
+    assert plan(carried, tr, pos, resting(tr)[1:], CTX) == [Close("LINEAGE")]  # open: the close goes out now
+    assert plan(target(), tr, pos, [], closed)[1:] == [acts[1]]  # ENGINE_FLAT as well
+    wrong = plan(target(position=tpos()), tr, Position(-1, 3, 60_020.0), [], closed)
+    assert wrong[0] == Close("DIRECTION_MISMATCH") and isinstance(wrong[1], Alert) and len(wrong) == 2
+
+
+def test_a_tp2_leg_without_a_tp2_price_is_refused():
+    with pytest.raises(ValueError, match="TP2"):
+        desired_legs(trade(tp2_price=None), 3, 59_000.0, 1.0, 5.0)
+    assert desired_legs(trade(tp2_price=None, contracts=1, tp1_n=1), 1, 59_000.0, 1.0, 5.0)[0][0].name == "tp1"
