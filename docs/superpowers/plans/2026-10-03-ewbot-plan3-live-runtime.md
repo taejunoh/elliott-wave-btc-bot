@@ -56,7 +56,7 @@
 |---|---|---|
 | `src/ewbot/live/__init__.py` | 1 | package marker |
 | `src/ewbot/live/exchange.py` | 1 | value types, errors, the `Exchange` protocol |
-| `src/ewbot/live/sim.py` | 1 | `SimExchange`: in-memory CFM venue (reduce-only brackets, partial fills, gaps, sessions, faults, crashes) |
+| `src/ewbot/live/sim.py` | 1 | `SimExchange`: in-memory CFM venue (venue intake checks, reduce-only brackets, partial fills, gaps, sessions, faults, crashes) |
 | `src/ewbot/live/journal.py` | 2 | SQLite journal: intents, events, decisions, cycles, stages, key/value |
 | `src/ewbot/live/coinbase.py` | 3 | `CoinbaseExchange` over the SDK's `RESTClient` (raw JSON parsers, retries, pacing) |
 | `src/ewbot/live/target.py` | 4 | engine replay → `Target` (position, queued exit / entry, decisions) |
@@ -87,7 +87,7 @@
 
 | Task | Component | New tests |
 |---|---|---|
-| 1 | Exchange boundary and `SimExchange` | 14 |
+| 1 | Exchange boundary and `SimExchange` | 20 |
 | 2 | SQLite journal | 6 |
 | 3 | Coinbase adapter, `live` dependency group, recorded fixtures | 14 |
 | 4 | Target state from the engine replay (+ allowlist line) | 5 |
@@ -104,7 +104,7 @@
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 170 more tests, `790 passed, 1 skipped` (`791 passed` with the cache), about 70 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 176 more tests, `796 passed, 1 skipped` (`797 passed` with the cache), about 70 s.
 
 ---
 
@@ -118,7 +118,7 @@ Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a
 **Interfaces:**
 - Consumes: nothing from earlier tasks (stdlib only).
 - Produces (`ewbot.live.exchange`): constants `FUTURES_PRODUCT = "BIP-20DEC30-CDE"`, `SPOT_PRODUCT = "BTC-USD"`, `SESSION_OPEN = "OPEN"`, `OPEN_STATUSES`, `TERMINAL_STATUSES`, `STOP_LIMIT_OFFSET = 0.01`; frozen dataclasses `ProductSpec(product_id, contract_size, price_increment, base_increment, intraday_margin: tuple[float, float], overnight_margin: tuple[float, float])` with `margin_rate(side, overnight=True) -> float`, `SessionInfo(state, maintenance_start=None, maintenance_end=None)` with `.is_open`, `Quote(product_id, bid, ask, ts)` with `.mid`, `Position(side, contracts, avg_entry)`, `Order(order_id, client_order_id, side, kind, size, filled, status, limit_price=None, stop_price=None, avg_fill_price=None, created_ts=None, fee=None)` with `.is_open` / `.is_terminal`, `Balance(equity, available_margin=None)`, `KeyPermissions(can_view, can_trade, can_transfer, portfolio_type=None)`, `PlaceResult(client_order_id, order_id, ok, error=None)` with `.duplicate`, `PreviewResult(ok, errors=(), warnings=())`; errors `ExchangeError` (`.retryable = False`), `RateLimited(message, retry_after=1.0)` and `Unavailable` (both retryable); `class Exchange(Protocol)` with attributes `futures_id`, `spot_id` and methods `product()`, `session()`, `quote(product_id)`, `position()`, `open_orders()`, `get_order(order_id)`, `find_order(client_order_id, since_ts)`, `balance()`, `key_permissions()`, `place_market(client_order_id, side, size)`, `place_bracket(client_order_id, side, size, limit_price, stop_price)`, `edit_bracket(order_id, size, limit_price, stop_price) -> bool`, `cancel(order_ids)`, `close_position(client_order_id, size=None)`, `preview_market(side, size)`, `preview_bracket(side, size, limit_price, stop_price)`.
-- Produces (`ewbot.live.sim`): `BIP_SPEC`, `VIEW_TRADE`, `class SimCrash(BaseException)`, `class SimExchange(product=BIP_SPEC, *, equity=10_000.0, clock=time.time, spot_id="BTC-USD", spread=5.0, duplicate="existing"|"error", reject_overlap=False, edit_supported=False, fee_per_contract=0.0, permissions=VIEW_TRADE)` implementing `Exchange`, plus the test/shadow drivers `set_prices(fut, spot=None) -> list[dict]` (fills it caused), `set_session(state)`, `fail_next(method, exc, times=1)`, `crash_after_accept(method, exc=None)`, and the public attributes `pos`, `orders`, `fills`, `calls`, `cash`, `spread`, `session_state`, `market_fill_ratio`, `bracket_fill_cap`, `preview_errors`, `reject_overlap`, `edit_supported`.
+- Produces (`ewbot.live.sim`): `BIP_SPEC`, `VIEW_TRADE`, `class SimCrash(BaseException)`, `class SimExchange(product=BIP_SPEC, *, equity=10_000.0, clock=time.time, spot_id="BTC-USD", spread=5.0, duplicate="existing"|"error", reject_overlap=False, edit_supported=False, fee_per_contract=0.0, permissions=VIEW_TRADE)` implementing `Exchange`, plus the test/shadow drivers `set_prices(fut, spot=None) -> list[dict]` (fills it caused), `set_session(state)`, `fail_next(method, exc, times=1)`, `crash_after_accept(method, exc=None)` (both raise `ValueError` for a method outside the class attributes `FAULT_METHODS` / `CRASH_METHODS`, the methods that honour them), and the public attributes `pos`, `orders`, `fills`, `calls`, `cash`, `spread`, `session_state`, `market_fill_ratio`, `bracket_fill_cap`, `preview_errors`, `reject_overlap`, `edit_supported`. Order intake is never more forgiving than the venue: a size that is not a whole number of contracts (at least 1), a limit or stop price off the $5 grid, or a bracket whose take-profit is not beyond its stop in the profit direction is refused — `PlaceResult(ok=False, error="INVALID_SIZE_PRECISION" | "INVALID_PRICE_PRECISION" | "INVALID_STOP_PRICE_PRECISION" | "INVALID_BRACKET_PRICES")`, `edit_bracket` → `False`, previews → `PREVIEW_<reason>`. `close_position` is IOC like `place_market` (`market_fill_ratio`), and both re-match the book, so a bracket left with nothing to reduce is cancelled at once.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -184,7 +184,7 @@ def test_brackets_only_reduce_and_take_profit_at_the_limit(ex):
     assert ex.position() is None
     assert [o.client_order_id for o in ex.open_orders()] == []
     ex.place_market("e2", -1, 1)  # a later bracket for a long cannot increase the new short
-    r = ex.place_bracket("b3", -1, 1, 59_000.0, 61_000.0)
+    r = ex.place_bracket("b3", -1, 1, 61_000.0, 59_000.0)
     assert not r.ok and r.error == "NO_POSITION_TO_REDUCE"
 
 
@@ -299,8 +299,76 @@ def test_edit_and_close(ex):
     assert ex.close_position("x1", size=1).ok and ex.position().contracts == 1
     assert ex.close_position("x2").ok and ex.position() is None
     assert ex.close_position("x3").error == "NO_OPEN_POSITION"
-    ex.set_prices(60_000.0)
-    assert ex.open_orders() == []  # the orphaned bracket is cancelled on the next match
+    assert ex.open_orders() == []  # the orphaned bracket is cancelled by the close itself
+
+
+def test_prices_off_the_tick_grid_are_rejected(ex):
+    ex.place_market("e1", 1, 1)
+    r = ex.place_bracket("b1", -1, 1, 60_502.5, 59_000.0)  # $5 tick
+    assert not r.ok and r.error == "INVALID_PRICE_PRECISION"
+    r = ex.place_bracket("b2", -1, 1, 60_500.0, 59_001.0)
+    assert not r.ok and r.error == "INVALID_STOP_PRICE_PRECISION"
+    assert not ex.place_bracket("b3", -1, 1, float("nan"), 59_000.0).ok
+    assert ex.open_orders() == [] and not ex.preview_bracket(-1, 1, 60_500.0, 59_001.0).ok
+    b = ex.place_bracket("b4", -1, 1, 60_500.0, 59_000.0)
+    ex.edit_supported = True
+    assert not ex.edit_bracket(b.order_id, 1, 60_500.0, 59_002.5)
+    assert ex.get_order(b.order_id).stop_price == 59_000.0
+
+
+def test_sizes_must_be_whole_contracts(ex):
+    for size in (1.5, 0, -1):
+        r = ex.place_market(f"e{size}", 1, size)
+        assert not r.ok and r.error == "INVALID_SIZE_PRECISION"
+    assert ex.orders == {} and ex.position() is None and not ex.preview_market(1, 1.5).ok
+    assert ex.place_market("e2", 1, 2.0).ok and ex.position().contracts == 2  # a whole number is fine
+    assert ex.place_bracket("b1", -1, 0.5, 61_000.0, 59_000.0).error == "INVALID_SIZE_PRECISION"
+    assert ex.close_position("x1", size=1.5).error == "INVALID_SIZE_PRECISION"
+    assert ex.position().contracts == 2 and ex.open_orders() == []
+
+
+def test_bracket_take_profit_and_stop_must_be_on_their_sides(ex):
+    ex.place_market("e1", 1, 1)  # long: the sell bracket's take-profit must be above its stop
+    for tp, stop in ((59_000.0, 61_000.0), (60_000.0, 60_000.0)):
+        r = ex.place_bracket(f"b{tp}", -1, 1, tp, stop)
+        assert not r.ok and r.error == "INVALID_BRACKET_PRICES"
+    b = ex.place_bracket("b1", -1, 1, 61_000.0, 59_000.0)
+    ex.edit_supported = True
+    assert not ex.edit_bracket(b.order_id, 1, 59_000.0, 61_000.0)
+    ex.close_position("x1")
+    ex.place_market("s1", -1, 1)  # short: the buy bracket's take-profit must be below its stop
+    assert ex.place_bracket("b2", 1, 1, 61_000.0, 59_000.0).error == "INVALID_BRACKET_PRICES"
+    assert ex.place_bracket("b3", 1, 1, 59_000.0, 61_000.0).ok
+
+
+def test_close_position_honours_the_market_fill_ratio(ex):
+    ex.place_market("e1", 1, 3)
+    ex.market_fill_ratio = 0.5
+    r = ex.close_position("x1")
+    o = ex.get_order(r.order_id)
+    assert r.ok and (o.size, o.filled, o.status) == (3, 1, "CANCELLED") and ex.position().contracts == 2
+    r = ex.close_position("x2", size=1)  # floor(0.5): nothing fills, the IOC rest is cancelled
+    assert r.ok and ex.get_order(r.order_id).status == "CANCELLED" and ex.position().contracts == 2
+
+
+def test_a_market_order_cancels_orphaned_brackets_at_once(ex):
+    ex.place_market("e1", 1, 1)
+    b = ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
+    assert ex.place_market("x1", -1, 1).ok and ex.position() is None
+    assert ex.open_orders() == [] and ex.get_order(b.order_id).status == "CANCELLED"
+
+
+def test_fault_injection_only_accepts_methods_that_honour_it(ex):
+    for bad in ("place_order", "set_prices"):
+        with pytest.raises(ValueError):
+            ex.fail_next(bad, RateLimited("429"))
+    for bad in ("cancel", "edit_bracket", "quote", "place_order"):
+        with pytest.raises(ValueError):
+            ex.crash_after_accept(bad)
+    ex.fail_next("cancel", Unavailable("503"))
+    ex.crash_after_accept("close_position")
+    with pytest.raises(Unavailable):
+        ex.cancel([])
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -495,8 +563,13 @@ class Exchange(Protocol):
 
 Used by every live test (no network) and, wrapped by ShadowExchange (live/shadow.py), as the virtual
 book of the SHADOW stage. It models what the runtime relies on:
-  - market orders are IOC: they fill at the ask (buy) / bid (sell) while the session is OPEN, possibly
-    only partly (`market_fill_ratio`), the rest is cancelled;
+  - order intake is never more forgiving than the venue: a size that is not a whole number of
+    base_increment (min one contract), a price off the price_increment grid ($5) or a bracket whose
+    take-profit is not beyond its stop in the profit direction is rejected (PlaceResult not ok,
+    edit_bracket False, a preview with errors);
+  - market orders and close_position are IOC: they fill at the ask (buy) / bid (sell) while the session
+    is OPEN, possibly only partly (`market_fill_ratio`), the rest is cancelled; a bracket left with
+    nothing to reduce is cancelled at once;
   - trigger_bracket_gtc orders only ever REDUCE the position (help-center behaviour; the API has no
     reduce_only field): a bracket whose position is gone, or would be increased, is cancelled; a fill
     never exceeds the contracts left; `bracket_fill_cap` makes fills partial;
@@ -507,7 +580,8 @@ book of the SHADOW stage. It models what the runtime relies on:
   - nothing fills while the session is not OPEN; market orders are rejected then;
   - fault injection: `fail_next(method, exc)` raises on the next call(s) of a method (429 / 5xx /
     outages) and `crash_after_accept(method)` raises SimCrash right AFTER the order was accepted (a
-    process killed between send and journal update);
+    process killed between send and journal update); a method that does not honour them (FAULT_METHODS,
+    CRASH_METHODS) is refused with ValueError instead of being silently ignored;
   - a repeated client_order_id returns the existing order (`duplicate="existing"`) or an error
     (`duplicate="error"`): Coinbase documents both, the real behaviour is confirmed in CANARY."""
 
@@ -567,6 +641,15 @@ class SimOrder:
 
 
 class SimExchange:
+    # fail_next() works on every method that calls _fault(); crash_after_accept() on those that call
+    # _accepted() after accepting an order. A subclass overriding one without that call narrows these.
+    FAULT_METHODS: frozenset[str] = frozenset({
+        "product", "session", "quote", "position", "open_orders", "get_order", "find_order", "balance",
+        "key_permissions", "place_market", "place_bracket", "edit_bracket", "cancel", "close_position",
+        "preview_market", "preview_bracket",
+    })
+    CRASH_METHODS: frozenset[str] = frozenset({"place_market", "place_bracket", "close_position"})
+
     def __init__(
         self,
         product: ProductSpec = BIP_SPEC,
@@ -622,11 +705,15 @@ class SimExchange:
         return self._match()
 
     def fail_next(self, method: str, exc: BaseException, times: int = 1) -> None:
+        if method not in self.FAULT_METHODS:
+            raise ValueError(f"fail_next: {method!r} never raises injected faults")
         self._faults.setdefault(method, []).extend([exc] * times)
 
     def crash_after_accept(self, method: str, exc: BaseException | None = None) -> None:
         """The next `method` call is accepted, then raises `exc` (default SimCrash: the process dies;
         an Unavailable: the reply was lost, e.g. a timeout after the venue created the order)."""
+        if method not in self.CRASH_METHODS:
+            raise ValueError(f"crash_after_accept: {method!r} does not accept orders")
         self._crash_after[method] = exc if exc is not None else SimCrash(method)
 
     def _fault(self, method: str) -> None:
@@ -690,6 +777,30 @@ class SimExchange:
         self._fault("key_permissions")
         return self.permissions
 
+    # ------------------------------------------------------------------ order intake (the venue's checks)
+    @staticmethod
+    def _on_grid(x: float, step: float) -> bool:
+        """x is a positive whole multiple of step."""
+        x = float(x)
+        if not math.isfinite(x) or x <= 0:
+            return False
+        n = x / step
+        return abs(n - round(n)) < 1e-6
+
+    def _rejected(self, size: float, side: int = 0, limit: float | None = None,
+                  stop: float | None = None) -> str | None:
+        """The venue's failure reason for this order, or None: the size in whole base increments (at least
+        one), prices on the tick grid, a bracket's take-profit beyond its stop in the profit direction."""
+        if not self._on_grid(size, self.spec.base_increment):
+            return "INVALID_SIZE_PRECISION"
+        if limit is not None and not self._on_grid(limit, self.spec.price_increment):
+            return "INVALID_PRICE_PRECISION"
+        if stop is not None and not self._on_grid(stop, self.spec.price_increment):
+            return "INVALID_STOP_PRICE_PRECISION"
+        if limit is not None and stop is not None and side * (stop - limit) <= 0:
+            return "INVALID_BRACKET_PRICES"
+        return None
+
     # ------------------------------------------------------------------ writes
     def _duplicate(self, client_order_id: str) -> PlaceResult | None:
         for o in self.orders.values():
@@ -713,14 +824,13 @@ class SimExchange:
         dup = self._duplicate(client_order_id)
         if dup is not None:
             return dup
+        reason = self._rejected(size)
+        if reason is not None:
+            return PlaceResult(client_order_id, None, False, reason)
         if self.session_state != SESSION_OPEN:
             return PlaceResult(client_order_id, None, False, "SESSION_NOT_OPEN")
         o = self._new(client_order_id, side, "MARKET", size)
-        qty = int(math.floor(size * self.market_fill_ratio + 1e-9))
-        if qty > 0:
-            half = self.spread / 2.0
-            self._fill(o, qty, self.fut_price + side * half)
-        o.status = "FILLED" if o.filled == o.size else "CANCELLED"  # IOC: the unfilled rest is cancelled
+        self._execute_market(o)
         self._accepted("place_market")
         return PlaceResult(client_order_id, o.order_id, True)
 
@@ -731,6 +841,9 @@ class SimExchange:
         dup = self._duplicate(client_order_id)
         if dup is not None:
             return dup
+        reason = self._rejected(size, side, limit_price, stop_price)
+        if reason is not None:
+            return PlaceResult(client_order_id, None, False, reason)
         if self.pos is None or self.pos.side != -side:
             return PlaceResult(client_order_id, None, False, "NO_POSITION_TO_REDUCE")
         if self.reject_overlap:
@@ -748,6 +861,8 @@ class SimExchange:
         o = self.orders.get(order_id)
         if not self.edit_supported or o is None or o.status != "OPEN" or o.triggered:
             return False
+        if self._rejected(size, o.side, limit_price, stop_price) is not None:
+            return False
         o.size, o.limit_price, o.stop_price = int(size), float(limit_price), float(stop_price)
         self._match()
         return True
@@ -764,28 +879,41 @@ class SimExchange:
         dup = self._duplicate(client_order_id)
         if dup is not None:
             return dup
+        reason = None if size is None else self._rejected(size)
+        if reason is not None:
+            return PlaceResult(client_order_id, None, False, reason)
         if self.session_state != SESSION_OPEN:
             return PlaceResult(client_order_id, None, False, "SESSION_NOT_OPEN")
         if self.pos is None:
             return PlaceResult(client_order_id, None, False, "NO_OPEN_POSITION")
         qty = self.pos.contracts if size is None else min(int(size), self.pos.contracts)
-        side = -self.pos.side
-        o = self._new(client_order_id, side, "MARKET", qty)
-        self._fill(o, qty, self.fut_price + side * self.spread / 2.0)
-        o.status = "FILLED"
-        self._match()
+        o = self._new(client_order_id, -self.pos.side, "MARKET", qty)
+        self._execute_market(o)
         self._accepted("close_position")
         return PlaceResult(client_order_id, o.order_id, True)
 
     def preview_market(self, side: int, size: int) -> PreviewResult:
         self._fault("preview_market")
-        return PreviewResult(not self.preview_errors, self.preview_errors)
+        return self._preview_result(self._rejected(size))
 
     def preview_bracket(self, side: int, size: int, limit_price: float, stop_price: float) -> PreviewResult:
         self._fault("preview_bracket")
-        return PreviewResult(not self.preview_errors, self.preview_errors)
+        return self._preview_result(self._rejected(size, side, limit_price, stop_price))
+
+    def _preview_result(self, reason: str | None) -> PreviewResult:
+        errors = self.preview_errors + ((f"PREVIEW_{reason}",) if reason else ())
+        return PreviewResult(not errors, errors)
 
     # ------------------------------------------------------------------ matching
+    def _execute_market(self, o: SimOrder) -> None:
+        """IOC at the touch: market_fill_ratio of the size fills, the unfilled rest is cancelled; a bracket
+        left with nothing to reduce is cancelled at once."""
+        qty = int(math.floor(o.size * self.market_fill_ratio + 1e-9))
+        if qty > 0:
+            self._fill(o, qty, self.fut_price + o.side * self.spread / 2.0)
+        o.status = "FILLED" if o.filled == o.size else "CANCELLED"
+        self._match()
+
     def _fill(self, o: SimOrder, qty: int, price: float) -> None:
         cs = self.spec.contract_size
         pos = self.pos
@@ -849,7 +977,7 @@ class SimExchange:
 uv run pytest tests/live/test_sim.py -q
 ```
 
-Expected: `14 passed`.
+Expected: `20 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -6074,7 +6202,7 @@ EOF
 
 **Interfaces:**
 - Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`PARAMS`, `FakeFetch`, `synth_frame`, `ts`), `tests.live.helpers`.
-- Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions`; `restore(trade)` puts an open virtual position back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
+- Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
 - Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, cfg, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={}, start_ts=HOLDOUT_START)`; `class LiveRuntime(deps)` with `startup() -> recovery dict`, `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)`, `poll(now)`, `watch(now)`, `minute(now)`, `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply`, `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
 
 - [ ] **Step 1: Write the failing test**
@@ -6382,6 +6510,8 @@ def test_the_shadow_exchange_previews_every_order_and_trades_virtually(tmp_path)
     jr = journal(tmp_path)
     alerts = []
     sh = ShadowExchange(real, jr, clock=clock, alert=lambda k, t: alerts.append(k))
+    with pytest.raises(ValueError):
+        sh.fail_next("quote", RateLimited("429"))  # a real read: inject it on `real`
     assert sh.place_market("ewb-e-1-L", 1, 1).ok
     assert sh.place_bracket("ewb-b-1-tp1-1", -1, 1, 61_000.0, 59_000.0).ok
     real.preview_errors = ("PREVIEW_INSUFFICIENT_FUND",)
@@ -6478,6 +6608,9 @@ from ewbot.live.sim import SimExchange
 
 
 class ShadowExchange(SimExchange):
+    # these reads go to the real exchange (no _fault): inject their faults there, `real.fail_next(...)`
+    FAULT_METHODS = SimExchange.FAULT_METHODS - {"product", "session", "quote", "balance", "key_permissions"}
+
     def __init__(self, real: Exchange, journal: Journal, *, clock: Callable[[], float] = time.time,
                  alert: Callable[[str, str], Any] | None = None) -> None:
         super().__init__(real.product(), equity=0.0, clock=clock, spot_id=real.spot_id)
@@ -8017,7 +8150,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `159 passed` (all live tests so far, about 25 s; the three parity walks take about 14 s).
+Expected: `165 passed` (all live tests so far, about 25 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -8580,7 +8713,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `790 passed, 1 skipped` without a candle cache (`791 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `796 passed, 1 skipped` without a candle cache (`797 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -8615,7 +8748,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `791 passed` with the real cache (`790 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `797 passed` with the real cache (`796 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
