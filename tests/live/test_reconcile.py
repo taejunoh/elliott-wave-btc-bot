@@ -6,6 +6,7 @@ import pytest
 
 from ewbot.live.exchange import Order, Position
 from ewbot.live.reconcile import (
+    REDUCE_SETTLE_S,
     Adopt,
     Alert,
     Cancel,
@@ -17,6 +18,7 @@ from ewbot.live.reconcile import (
     Protect,
     Reduce,
     Skip,
+    after_reduce,
     bracket_cid,
     close_cid,
     desired_legs,
@@ -281,13 +283,15 @@ def test_tp1_and_a_tp2_fill_in_one_interval_and_reductions_after_tp1():
     assert t4.tp1_filled and expected_contracts(t4) == 1 and t4.stop_price == 60_020.0
 
 
-def test_excess_contracts_are_reduced_and_the_legs_cover_only_the_expected_size():
+def test_excess_contracts_are_reduced_or_protected_until_they_can_be():
     tr = trade()  # 3 contracts
     pos = Position(1, 5, 60_020.0)
     alert = Alert("EXCESS_POSITION", f"trade {T}: position 5 > 3 expected")
     assert plan(target(position=tpos()), tr, pos, resting(tr), CTX) == [alert, Reduce(2, "EXCESS")]
-    closed = dataclasses.replace(CTX, session_open=False)  # no market order now: the legs stay at 3
-    assert plan(target(position=tpos()), tr, pos, resting(tr), closed) == [alert]
+    closed = dataclasses.replace(CTX, session_open=False)  # no market order now: the legs cover all 5 until then
+    acts = plan(target(position=tpos()), tr, pos, resting(tr), closed)
+    assert acts[0] == alert and len(acts) == 2 and isinstance(acts[1], Protect)
+    assert [(leg.name, leg.size, leg.stop_price) for leg in acts[1].legs] == [("tp1", 1, 59_000.0), ("tp2", 4, 59_000.0)]
     acts = plan(None, tr, pos, [], CTX)  # without a target too; the missing legs are placed for 3, never 5
     assert acts[:2] == [alert, Reduce(2, "EXCESS")] and isinstance(acts[2], Protect)
     assert [(leg.name, leg.size) for leg in acts[2].legs] == [("tp1", 1), ("tp2", 2)]
@@ -350,3 +354,101 @@ def test_a_tp2_leg_without_a_tp2_price_is_refused():
     with pytest.raises(ValueError, match="TP2"):
         desired_legs(trade(tp2_price=None), 3, 59_000.0, 1.0, 5.0)
     assert desired_legs(trade(tp2_price=None, contracts=1, tp1_n=1), 1, 59_000.0, 1.0, 5.0)[0][0].name == "tp1"
+
+
+def short(**kw) -> LiveTrade:
+    """trade() mirrored: a 3-contract short at 60_002, stop 61_000, TP1 59_000 (o1, 1) and TP2 58_000 (o2, 2)."""
+    base = dict(direction=-1, entry_price=60_002.0, tp1_price=59_000.0, tp2_price=58_000.0, stop_spot=61_000.0,
+                stop_price=61_000.0, legs=[Leg("tp1", 1, 59_000.0, 61_000.0, bracket_cid(T, "tp1", 1), "o1"),
+                                          Leg("tp2", 2, 58_000.0, 61_000.0, bracket_cid(T, "tp2", 2), "o2")])
+    return trade(**{**base, **kw})
+
+
+def spos(**kw) -> TargetPosition:
+    base = dict(direction=-1, entry_price=60_000.0, stop=61_000.0, stop0=61_000.0, tp1=59_000.0, tp2=58_000.0)
+    return tpos(**{**base, **kw})
+
+
+def test_short_trades_protect_reduce_and_fold_like_longs():
+    tr = short()
+    pos = Position(-1, 3, 60_002.0)
+    assert plan(target(position=spos()), tr, pos, resting(tr), CTX) == []  # buy-side brackets above / below
+    moved = plan(target(position=spos(stop=60_500.0)), tr, pos, resting(tr), dataclasses.replace(CTX, ratio=1.0005))
+    assert [(leg.name, leg.size, leg.limit_price, leg.stop_price) for leg in moved[0].legs] == [
+        ("tp1", 1, 59_000.0, 60_535.0), ("tp2", 2, 58_000.0, 60_535.0)]  # 60_530.25 rounded up for a short
+    big = Position(-1, 5, 60_002.0)
+    alert = Alert("EXCESS_POSITION", f"trade {T}: position 5 > 3 expected")
+    assert plan(target(position=spos()), tr, big, resting(tr), CTX) == [alert, Reduce(2, "EXCESS")]
+    closed = plan(target(position=spos()), tr, big, resting(tr), dataclasses.replace(CTX, session_open=False))
+    assert closed[0] == alert and [(leg.name, leg.size, leg.stop_price) for leg in closed[1].legs] == [
+        ("tp1", 1, 61_000.0), ("tp2", 4, 61_000.0)]
+    sync = plan(target(position=spos(tp1_done=True)), tr, pos, resting(tr), CTX)
+    assert sync[0] == Reduce(1, "TP1_SYNC") and sync[1].stop_price == 60_005.0  # break-even rounds up for a short
+    t2, ev = observe(tr, Position(-1, 2, 60_002.0), resting(tr)[1:], now=100.0)  # the TP1 leg bought back 1
+    assert t2.tp1_filled and [k for k, _ in ev] == ["TP1_FILLED"]
+    acts = plan(target(position=spos(tp1_done=True)), t2, Position(-1, 2, 60_002.0), resting(tr)[1:], CTX)
+    assert [(leg.name, leg.size, leg.limit_price, leg.stop_price) for leg in acts[0].legs] == [
+        ("tp2", 2, 58_000.0, 60_005.0)]
+    t3, ev = observe(tr, Position(-1, 2, 60_002.0), resting(tr), now=100.0)  # bought back by hand: not ours
+    assert ev[0] == ("UNEXPLAINED_REDUCTION", {"trade_id": T, "expected": 3, "position": 2})
+    assert not t3.tp1_filled and (t3.contracts, t3.tp1_n, t3.stop_price) == (2, 1, 61_000.0)
+
+
+def tp1_sync_pending(tr: LiveTrade, filled: int | None = None) -> LiveTrade:
+    """`tr` once the executor has recorded Reduce(1, TP1_SYNC) against a 3-contract position (before sending it)."""
+    pr = {"cid": reduce_cid(T, 1), "size": 1, "reason": "TP1_SYNC", "before": 3, "ts": 100.0,
+          "after": after_reduce(tr, 1, "TP1_SYNC"), "filled": filled}
+    return dataclasses.replace(tr, pending_reduce=pr)
+
+
+def test_a_reduce_whose_answer_was_lost_is_ours_once_the_position_shows_it():
+    """Probe (a): the TP1_SYNC reduce came back ambiguous (PENDING) but filled. It is ours - never an unexplained
+    reduction - and no other reduce is planned while it is pending (the executor resolves it by its id first)."""
+    tr = tp1_sync_pending(trade())
+    eng = target(position=tpos(tp1_done=True))
+    assert plan(eng, tr, Position(1, 3, 60_020.0), resting(tr), CTX) == []  # not in the position yet: both legs stay
+    acts = plan(eng, tr, Position(1, 4, 60_020.0), resting(tr), CTX)
+    assert acts[0].kind == "EXCESS_POSITION" and not [a for a in acts if isinstance(a, Reduce)]
+    seen, ev = observe(tr, Position(1, 2, 60_020.0), resting(tr), now=110.0)  # it filled
+    assert ev == [("REDUCE_SETTLED", {"trade_id": T, "reason": "TP1_SYNC", "size": 1, "position": 2})]
+    assert seen.tp1_filled and seen.pending_reduce is None and expected_contracts(seen) == 2
+    acts = plan(eng, seen, Position(1, 2, 60_020.0), resting(tr), CTX)
+    assert len(acts) == 1 and isinstance(acts[0], Protect)  # the rest at break-even, never a second TP1 sale
+    assert [(leg.name, leg.size, leg.stop_price) for leg in acts[0].legs] == [("tp2", 2, 60_020.0)]
+    # the reduce and a TP2 fill in one interval: the reduce first, then the legs explain the rest
+    seen, ev = observe(tr, Position(1, 1, 60_020.0), resting(tr, tp2={"filled": 1}), now=110.0)
+    assert [k for k, _ in ev] == ["REDUCE_SETTLED", "PARTIAL_FILL"] and expected_contracts(seen) == 1
+    assert observe(tr, Position(1, 3, 60_020.0), resting(tr), now=900.0)[0].pending_reduce is not None  # unknown: kept
+
+
+def test_a_filled_reduce_the_position_does_not_show_yet_is_not_an_excess():
+    """The venue reported the reduce filled (the executor applied it) but the position read lags: no EXCESS, no
+    gap in protection. A minute later the position wins (e.g. contracts added by hand meanwhile)."""
+    tr = tp1_sync_pending(trade(tp1_filled=True, stop_price=60_020.0,
+                                legs=[Leg("tp2", 2, 62_000.0, 60_020.0, bracket_cid(T, "tp2", 3), "o3")]), filled=1)
+    lagging = Position(1, 3, 60_020.0)
+    eng = target(position=tpos(tp1_done=True))
+    assert plan(eng, tr, lagging, resting(tr), CTX) == []
+    assert observe(tr, lagging, resting(tr), now=100.0 + REDUCE_SETTLE_S)[1] == []
+    seen, ev = observe(tr, lagging, resting(tr), now=101.0 + REDUCE_SETTLE_S)
+    assert [k for k, _ in ev] == ["REDUCE_NOT_SEEN", "UNPROTECTED"] and seen.pending_reduce is None
+    assert plan(eng, seen, lagging, resting(tr), CTX) == [
+        Alert("EXCESS_POSITION", f"trade {T}: position 3 > 2 expected"), Reduce(1, "EXCESS")]
+    assert [k for k, _ in observe(tr, Position(1, 2, 60_020.0), resting(tr), now=110.0)[1]] == ["REDUCE_SETTLED"]
+
+
+def test_a_vanished_tp1_leg_is_never_synced_at_market():
+    """Probe (b): the TP1 leg filled between the position read and the order read (or the order list is ahead of
+    the position): the position still shows 5 while the TP1 leg is gone. The engine's TP1 must not be synced by a
+    market sale of what the leg already sold (the executor looks a vanished leg up before re-placing it); the next
+    read folds the fill as the live TP1."""
+    tr = five()
+    stale, gone = Position(1, 5, 60_020.0), resting(tr)[1:]
+    seen, ev = observe(tr, stale, gone, now=100.0)
+    assert [k for k, _ in ev] == ["UNPROTECTED"] and not seen.tp1_filled
+    eng = target(position=tpos(tp1_done=True))
+    assert not [a for a in plan(eng, seen, stale, gone, CTX) if isinstance(a, Reduce)]
+    half = resting(tr, tp1={"filled": 1})  # half the TP1 leg filled, the position does not show it yet
+    assert plan(eng, tr, stale, half, CTX)[0] == Reduce(1, "TP1_SYNC")  # only what the leg has left
+    later, ev = observe(seen, Position(1, 3, 60_020.0), gone, now=110.0)  # the fill shows: the live TP1
+    assert [k for k, _ in ev] == ["TP1_FILLED", "PROTECTED"] and expected_contracts(later) == 3
