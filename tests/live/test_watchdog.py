@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import json
 import math
-import os
-import threading
+import ssl
 import time
+from importlib import metadata
 
 import pytest
 
 from ewbot.live.exchange import Quote, SessionInfo, Unavailable
-from ewbot.live.feed import HEALTHY_S, SILENT_S, Tick, TickerFeed, sdk_ws_factory
+from ewbot.live.feed import HEALTHY_S, PUBLIC_WS_URL, SILENT_S, Tick, TickerFeed, public_ws_factory
 from ewbot.live.sim import BIP_SPEC
 from ewbot.live.watchdog import AccountGuard, BadEquity, PriceSource, SessionWatch, StopGapWatch, margin_status
 from tests.live.helpers import Clock, journal, sim
@@ -233,9 +234,9 @@ def test_a_message_the_feed_cannot_read_never_reaches_the_sdk():
 
 
 class ScriptedWS:
-    """One connection. `script` is "refuse" (open fails) or steps consumed one per sleep_with_exception_check:
-    "msg" delivers a heartbeat, "quiet" returns without one (an SDK whose handler ended), "drop" raises like
-    the SDK on a lost connection, "stop" stops the feed. An exhausted script stays quiet; after 500 steps in
+    """One connection. `script` is "refuse" (open fails) or steps consumed one per pump(1): "msg" delivers a
+    heartbeat, "quiet" returns without one (a connection that fell silent), "drop" raises like a lost
+    connection, "stop" stops the feed. An exhausted script stays quiet; after 500 opens and steps in
     all the feed is stopped (a feed that never notices silence must not hang the test)."""
 
     steps = 0
@@ -247,6 +248,9 @@ class ScriptedWS:
         self.used = 0
 
     def open(self):
+        ScriptedWS.steps += 1
+        if ScriptedWS.steps > 500:
+            self.feed.stop()
         self.log.append("open")
         if self.script == "refuse":
             raise ConnectionRefusedError("refused")
@@ -254,7 +258,7 @@ class ScriptedWS:
     def subscribe(self, products, channels):
         self.log.append(f"subscribe {','.join(products)} {','.join(channels)}")
 
-    def sleep_with_exception_check(self, s):
+    def pump(self, s):
         ScriptedWS.steps += 1
         self.used += 1
         step = self.script.pop(0) if self.script else "quiet"
@@ -290,9 +294,9 @@ def test_feed_reconnects_with_backoff_and_requests_a_resync():
 
 
 def test_a_silent_connection_is_torn_down_and_opened_again():
-    """A server close (1000/1001) ends the SDK's handler without an error: sleep_with_exception_check keeps
-    returning and no message comes. The heartbeats channel sends one every second, so SILENT_S without one
-    means the connection is gone."""
+    """A connection can stay open and bring nothing (a half-open TCP connection, a server that stopped
+    sending): pump keeps returning and no message comes. The heartbeats channel sends one every second, so
+    SILENT_S without one means the connection is gone."""
     feed, log, waits = scripted([["msg"], ["msg", "stop"]])
     feed.run()
     assert feed.connects == 2 and waits == [1.0]
@@ -330,21 +334,61 @@ def test_stop_ends_a_backoff_wait_at_once():
     assert feed.failures >= 1 and not th.is_alive()
 
 
-def test_the_sdk_client_releases_its_loop_thread_after_a_failed_open(tmp_path, monkeypatch):
-    sdk = pytest.importorskip("coinbase.websocket")  # dependency group `live`
+class FakeConnection:
+    """Stands in for a websockets ClientConnection: recv() hands out `inbox`, then raises `end`."""
 
-    async def refused(*args, **kwargs):
-        raise OSError("connection refused")
+    def __init__(self, inbox: list[str], end: BaseException) -> None:
+        self.inbox, self.end = inbox, end
+        self.sent: list[dict] = []
+        self.closed = False
 
-    monkeypatch.setattr(sdk.websocket_base.websockets, "connect", refused)  # no network
-    key = tmp_path / "key.json"
-    key.write_text(json.dumps({"name": "organizations/o/apiKeys/k", "privateKey": "unused"}))
-    make = sdk_ws_factory(key)
-    threads, fds = threading.active_count(), len(os.listdir("/dev/fd"))
-    for _ in range(5):
-        ws = make(on_message=lambda raw: None)
-        assert (ws.client.timeout, ws.client.retry) == (10, False)  # bounded handshake; TickerFeed reconnects
-        with pytest.raises(sdk.WSClientException):
-            ws.open()
-        ws.close()  # the SDK's own close() raises here and leaves its event-loop thread running
-    assert (threading.active_count(), len(os.listdir("/dev/fd"))) == (threads, fds)
+    def send(self, text: str) -> None:
+        self.sent.append(json.loads(text))
+
+    def recv(self, timeout: float | None = None) -> str:
+        if self.inbox:
+            return self.inbox.pop(0)
+        raise self.end
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_the_public_socket_subscribes_without_a_key_over_verified_tls():
+    beat = json.dumps({"channel": "heartbeats", "sequence_num": 1})
+    conn = FakeConnection([beat, ticker(FUT, 60_000.0, 2)], ConnectionResetError("lost"))
+    opened: list[tuple[str, dict]] = []
+
+    def connect(url, **kw):  # no network: what the socket asks of websockets.sync.client.connect
+        opened.append((url, kw))
+        return conn
+
+    got: list[str] = []
+    ws = public_ws_factory(connect=connect)(on_message=got.append)
+    ws.open()
+    [(url, kw)] = opened
+    assert url == PUBLIC_WS_URL == "wss://advanced-trade-ws.coinbase.com" and kw["open_timeout"] == 10
+    ctx = kw["ssl"]  # the default context: the certificate chain and the host name are verified
+    assert isinstance(ctx, ssl.SSLContext) and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    ws.subscribe([FUT, "BTC-USD"], ["ticker", "heartbeats"])
+    assert conn.sent == [{"type": "subscribe", "product_ids": [FUT, "BTC-USD"], "channel": "ticker"},
+                         {"type": "subscribe", "product_ids": [FUT, "BTC-USD"], "channel": "heartbeats"}]  # no jwt
+    with pytest.raises(ConnectionResetError):  # a lost connection reaches TickerFeed.run
+        ws.pump(1)
+    assert got == [beat, ticker(FUT, 60_000.0, 2)]
+    quiet = FakeConnection([], TimeoutError())
+    ws2 = public_ws_factory(connect=lambda url, **kw: quiet)(on_message=got.append)
+    ws2.open()
+    ws2.pump(0.01)  # nothing within the time: returns (TickerFeed counts the silence)
+    ws2.close()
+    assert quiet.closed and len(got) == 2
+
+
+def test_the_pinned_websockets_client_takes_the_arguments_the_socket_passes():
+    """Runs only with the `live` dependency group installed (websockets 13.1, declared there)."""
+    client = pytest.importorskip("websockets.sync.client")
+    assert metadata.version("websockets") == "13.1"
+    assert {"ssl", "open_timeout"} <= set(inspect.signature(client.connect).parameters)
+    for name in ("send", "recv", "close"):
+        assert callable(getattr(client.ClientConnection, name))
+    assert "timeout" in inspect.signature(client.ClientConnection.recv).parameters

@@ -213,7 +213,6 @@ def test_helpers():
 def test_the_pinned_sdk_matches_the_calls_this_adapter_makes(monkeypatch):
     """Runs only with the `live` dependency group installed (uv run --group live pytest)."""
     rest = pytest.importorskip("coinbase.rest")
-    ws = pytest.importorskip("coinbase.websocket")
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -222,8 +221,6 @@ def test_the_pinned_sdk_matches_the_calls_this_adapter_makes(monkeypatch):
     assert {"key_file", "timeout", "rate_limit_headers"} <= set(init)
     assert {"url_path", "params", "public"} <= set(inspect.signature(rest.RESTClient.get).parameters)
     assert {"url_path", "data"} <= set(inspect.signature(rest.RESTClient.post).parameters)
-    for name in ("open", "subscribe", "close"):
-        assert callable(getattr(ws.WSClient, name))
 
     pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()

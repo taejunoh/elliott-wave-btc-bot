@@ -1,37 +1,40 @@
 """WebSocket ticker feed (Plan 3 spec 2 `WebSocket`, 5.1).
 
-The SDK's WSClient (coinbase-advanced-py 1.8.4, dependency group `live`) runs the connection in its own
-event-loop thread; this class subscribes to the `ticker` and `heartbeats` channels of the futures and spot
-products, keeps the price per product - the mid of the ticker's best bid and ask (what the REST quote
-measures), its last trade price only when those are missing; only a finite price above 0 - and the time of
-the last message, and watches the per-connection `sequence_num` for gaps.
+Coinbase's public market-data endpoint (PUBLIC_WS_URL: spot and US futures) serves the `ticker` and
+`heartbeats` channels without a key or JWT (WebSocket Endpoints reference, checked 2026-10-03), so the feed
+holds no credential. It connects with the `websockets` sync client (dependency group `live`) and the
+default TLS context, which verifies the certificate chain and the host name; the SDK's WSClient is not used
+(SDK 1.8.4 opens wss:// with an SSLContext that verifies neither). This class subscribes to both channels
+for the futures and spot products, keeps the price per product - the mid of the ticker's best bid and ask
+(what the REST quote measures), its last trade price only when those are missing; only a finite price above
+0 - and the time of the last message, and watches the per-connection `sequence_num` for gaps.
 
-`run` owns every reconnect (the SDK's own retry is off: its backoff would race this one). A connection that
-fails, raises, or brings no message for SILENT_S (the heartbeats channel sends one every second; a server
-close 1000/1001 ends the SDK's handler without any error, so silence is how that shows) is torn down and
-opened again after an exponential backoff: 1 s doubling to 60 s, back to 1 s only once a connection has
-carried messages for HEALTHY_S. `stop()` also ends a backoff wait at once. Every (re)connect and every
-sequence gap sets `resync`, so the runtime re-reads positions and orders over REST. A message that cannot
-be read is counted (`bad_messages`) and never raised into the SDK (that would end its handler for good).
-`failures` and `last_error` (an exception's type name only - its text might carry a token - or "silent for
-15 s", or a server error message) tell the runtime why the feed is down. The runtime reads prices through
-watchdog.PriceSource, which uses REST polling once the feed has been silent for 60 s."""
+`run` owns every reconnect. A connection that fails, closes (a clean 1000/1001 close included), raises, or
+brings no message for SILENT_S (the heartbeats channel sends one every second, so silence means the
+connection is gone) is torn down and opened again after an exponential backoff: 1 s doubling to 60 s, back
+to 1 s only once a connection has carried messages for HEALTHY_S. `stop()` also ends a backoff wait at once.
+Every (re)connect and every sequence gap sets `resync`, so the runtime re-reads positions and orders over
+REST. A message that cannot be read is counted (`bad_messages`) and never raised. `failures` and
+`last_error` (an exception's type name only, "silent for 15 s", or a server error message) tell the runtime
+why the feed is down. The runtime reads prices through watchdog.PriceSource, which uses REST polling once
+the feed has been silent for 60 s."""
 
 from __future__ import annotations
 
 import json
 import math
+import ssl
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Sequence
 
 CHANNELS = ("ticker", "heartbeats")
 MAX_BACKOFF_S = 60.0
 SILENT_S = 15.0  # no message for this long (heartbeats come every second): the connection is gone
 HEALTHY_S = 60.0  # a connection that carried messages this long resets the backoff to 1 s
-OPEN_TIMEOUT_S = 10  # the SDK's opening-handshake timeout (none by default: a stalled handshake hangs)
+OPEN_TIMEOUT_S = 10  # the opening handshake (TCP, TLS, HTTP upgrade) times out after this
+PUBLIC_WS_URL = "wss://advanced-trade-ws.coinbase.com"  # public market data: no key, no JWT
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +160,7 @@ class TickerFeed:
                     seen = self.messages
                 up = silent = 0
                 while not self._stop.is_set():
-                    ws.sleep_with_exception_check(1)  # raises what the SDK's handler hit (a lost connection)
+                    ws.pump(1)  # hands over what arrives within 1 s; raises when the connection is lost
                     up += 1
                     with self._lock:
                         count = self.messages
@@ -187,48 +190,51 @@ class TickerFeed:
         return th
 
 
-class SdkSocket:
-    """The SDK's WSClient as TickerFeed drives it, with a close() that always releases the client's
-    event-loop thread: WSClient.close() (SDK 1.8.4) raises before it stops and joins its loop when the
-    socket is not open - a connection that never opened, or one the server closed - which would leak one
-    thread and three file descriptors per failed connection."""
+class PublicSocket:
+    """One connection to Coinbase's public market-data WebSocket, as TickerFeed drives it. `connect` is
+    `websockets.sync.client.connect` (tests pass a fake); a wss:// URL gets the default TLS context."""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, url: str, on_message: Callable[[str], None], *,
+                 connect: Callable[..., Any] | None = None, open_timeout: float = OPEN_TIMEOUT_S) -> None:
+        self.url = url
+        self.on_message = on_message
+        self.connect = connect
+        self.open_timeout = open_timeout
+        self.conn: Any = None
 
     def open(self) -> None:
-        self.client.open()
+        if self.connect is None:
+            from websockets.sync.client import connect  # dependency group `live`
+
+            self.connect = connect
+        ctx = ssl.create_default_context() if self.url.startswith("wss://") else None
+        self.conn = self.connect(self.url, ssl=ctx, open_timeout=self.open_timeout)
 
     def subscribe(self, products: list[str], channels: list[str]) -> None:
-        self.client.subscribe(products, channels)
+        for channel in channels:  # one subscribe message per channel; public channels take no jwt
+            self.conn.send(json.dumps({"type": "subscribe", "product_ids": list(products), "channel": channel}))
 
-    def sleep_with_exception_check(self, s: int) -> None:
-        self.client.sleep_with_exception_check(s)
+    def pump(self, seconds: float) -> None:
+        """Hand every message that arrives within `seconds` to on_message; a lost or closed connection raises
+        (websockets' ConnectionClosed, a clean close included)."""
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                raw = self.conn.recv(timeout=left)
+            except TimeoutError:
+                return
+            self.on_message(raw if isinstance(raw, str) else bytes(raw).decode("utf-8", "replace"))
 
     def close(self) -> None:
-        try:
-            self.client.close()
-            return
-        except Exception:  # noqa: BLE001 - the socket was not open: stop the client's loop here
-            pass
-        loop, thread = getattr(self.client, "loop", None), getattr(self.client, "thread", None)
-        if loop is None or loop.is_closed():
-            return
-        loop.call_soon_threadsafe(loop.stop)
-        if thread is not None:
-            thread.join(5.0)
-        if thread is None or not thread.is_alive():
-            loop.close()
+        if self.conn is not None:
+            self.conn.close()
 
 
-def sdk_ws_factory(key_file: Path) -> Callable[..., Any]:
-    """WSClient factory for production (the CDP key signs the subscription JWTs). The SDK's retry is off -
-    TickerFeed.run reconnects - and the opening handshake times out after OPEN_TIMEOUT_S."""
+def public_ws_factory(url: str = PUBLIC_WS_URL, *,
+                      connect: Callable[..., Any] | None = None) -> Callable[..., PublicSocket]:
+    """TickerFeed's ws_factory for production: a PublicSocket on Coinbase's public endpoint (no credential)."""
 
-    def make(on_message: Callable[[str], None]) -> SdkSocket:
-        from coinbase.websocket import WSClient  # dependency group `live`
-
-        return SdkSocket(WSClient(key_file=str(key_file), on_message=on_message, retry=False,
-                                  timeout=OPEN_TIMEOUT_S))
+    def make(on_message: Callable[[str], None]) -> PublicSocket:
+        return PublicSocket(url, on_message, connect=connect)
 
     return make

@@ -99,7 +99,8 @@ class AccountGuard:
     raise a reference: a breaker trips on the second observation in a row that breaches it (one poll - a
     minute in the runtime - after the first), and the peak only rises to a level two observations in a row
     reached (the lower of the two), so a single wrong balance read, low or high, cannot flatten the account.
-    The day's reference is the first observation of the New York day."""
+    The day's reference is the first observation of the New York day - a single read (accepted limit: a wrong
+    high read at exactly that moment can trip DAILY_LOSS two reads later; it errs toward flat and paused)."""
 
     KEY = "account_guard"
 

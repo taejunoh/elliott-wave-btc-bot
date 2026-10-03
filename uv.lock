@@ -352,6 +352,7 @@ dev = [
 ]
 live = [
     { name = "coinbase-advanced-py" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -369,7 +370,10 @@ dev = [
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "pytest", specifier = ">=8" },
 ]
-live = [{ name = "coinbase-advanced-py", specifier = "==1.8.4" }]
+live = [
+    { name = "coinbase-advanced-py", specifier = "==1.8.4" },
+    { name = "websockets", specifier = "==13.1" },
+]
 
 [[package]]
 name = "hypothesis"
