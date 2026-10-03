@@ -19,7 +19,7 @@
 - Frozen inputs: params only from `holdout.lock`; config = `holdout_config(BotConfig(), params)`; replay from the first cached bar with `start_ts = HOLDOUT_START`; signals from the spot `BTC-USD` hourly candles of the public Coinbase Exchange API (`data.coinbase_history.update_cache`, as the paper runtime); no CLI option changes any of it.
 - Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short (recorded 2026-10-03). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
 - Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 for the first 30 days of FULL.
-- Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 1% limit for 10 s; unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s; heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min); daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour.
+- Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s; heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min); daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour.
 - Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90%; real-account breakers −3% from the New York day's first equity and −15% from the peak → flatten and pause.
 - Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name.
 - Tests never touch the network, a real account, the real `data/cache` or `<repo>/holdout.lock`: `SimExchange`, recorded JSON fixtures, fake sessions, synthetic candles (`tests.paper.helpers.synth_frame`) and temp-dir locks. Exception: `check_fingerprint()` hashes the working tree's strategy files (read-only), as the paper fingerprint test does.
@@ -40,7 +40,7 @@
 3. **Never chase.** Only an entry queued at the latest bar can open a trade, and only within 5 minutes of that bar's close; an entry that was skipped (pause, session, size, margin, breaker, missing TP2), refused or unfilled is recorded once and never sent again; a live trade closed early by its bracket is not re-entered. A position the journal does not know is adopted when the engine holds the same direction, else closed (spec §4.4: the actual position follows the target).
 4. **Levels.** Futures level = `to_tick(spot level × futures mid / spot mid, $5)`, rounded down for a long and up for a short — for every level: the spec's stop rule, and for a TP it moves the limit toward the entry so the live TP fills no later than the engine's strict-cross TP. The ratio is taken when the order is sent; resting legs are re-placed only when the engine's stop (spot) changes, never for basis drift.
 5. **Protection and TP1** (spec §4.2, §4.4). Legs: 1 contract → one bracket (TP1 + stop); more → TP1 size (`engine.position_mgr._tp1_split`) + stop, and the rest + TP2 + stop; after the live TP1 one bracket (rest + TP2) with the stop tightened to at least the live entry price (break-even). A 1-contract CANARY trade therefore exits whole at TP1 while the engine keeps its remainder. When the engine's TP1 has filled but the live TP1 has not, the TP1 size is closed at market (`Reduce TP1_SYNC`, only while the session is OPEN; until then both legs stay). A signal without TP2 is skipped (strategy A always sets one).
-6. **Stop moves.** Replace first (new bracket, then cancel the old one; brackets only reduce, spec §4.2); if the venue refuses the overlap, cancel first and track the gap as unprotected time. `orders/edit` on a bracket is used only with `EWBOT_LIVE_EDIT_STOPS=1`, after CANARY confirms it (spec §6.2). With no resting stop and the price through the stop, the watchdog closes at once; with a resting stop gapped past its 1% limit for 10 s, it closes at market (spec §4.2).
+6. **Stop moves.** Replace first (new bracket, then cancel the old one; brackets only reduce, spec §4.2); if the venue refuses the overlap, cancel first and track the gap as unprotected time. `orders/edit` on a bracket is used only with `EWBOT_LIVE_EDIT_STOPS=1`, after CANARY confirms it (spec §6.2). With no resting stop and the price through the stop, the watchdog closes at once; with a resting stop gapped past its 5% limit (`STOP_LIMIT_OFFSET`, the Create Order reference; spec §4.2 assumed 1%) for 10 s, it closes at market (spec §4.2).
 7. **Idempotency and retries** (spec §4.2, §5.1). Intent before send; a PENDING intent (ambiguous error, killed process) is looked up by `client_order_id` (orders created up to 5 min before it) before the same id is sent again; a duplicate-id answer resolves to the existing order; a PENDING intent not on the exchange after 10 min is ABANDONED (checked every minute). Reads are retried 3 times in the adapter; an ambiguous entry is looked up and re-sent with the same id on the next polls only until 5 minutes after its bar's close, then skipped (`진입이 실패하면 건너뛰고`); a failed close is retried on every poll with a new id, with an alert each time (`청산이 실패하면 계속 재시도하면서 경보`); `close_position` can only reduce, so a late duplicate close cannot open a position. Restart recovery also rebuilds a trade whose entry was accepted but not yet recorded and records a close accepted right before a crash; an accepted entry whose fill could not be read in time is rebuilt from its intent on the next pass (not treated as a foreign position).
 8. **Exchange state vs. prices.** Positions and orders are read over REST (every 10 s while a trade is open or an intent is pending): one source of truth for reconcile. Prices for the watchdog come from the WebSocket `ticker` + `heartbeats` channels (SDK `WSClient`), with the spec's fallback: silent for 60 s → REST every 10 s; a reconnect or a `sequence_num` gap forces an immediate REST poll. The WebSocket `user` channel is not used.
 9. **SHADOW** runs the complete runtime against `ShadowExchange`: reads (product, session, quotes, balance, key permissions) are real; every order is first checked with the real `POST /orders/preview` (journaled for gate ③) and then executed on a virtual book (`SimExchange`) that follows the real futures price. Sizing is CANARY's, on the real balance (so the account must be funded during SHADOW). After a restart the open virtual position is restored from the journal (`ShadowExchange.restore`) and its brackets are re-placed, so the SHADOW restart test exercises the real recovery path.
@@ -87,13 +87,13 @@
 
 | Task | Component | New tests |
 |---|---|---|
-| 1 | Exchange boundary and `SimExchange` | 20 |
+| 1 | Exchange boundary and `SimExchange` | 23 |
 | 2 | SQLite journal | 6 |
-| 3 | Coinbase adapter, `live` dependency group, recorded fixtures | 14 |
+| 3 | Coinbase adapter, `live` dependency group, recorded fixtures | 76 |
 | 4 | Target state from the engine replay (+ allowlist line) | 5 |
 | 5 | Price mapping, stage sizing, margin projection | 15 |
 | 6 | Reconcile planner | 15 |
-| 7 | Executor: intent-before-send, protection, closes, recovery | 19 |
+| 7 | Executor: intent-before-send, protection, closes, recovery | 20 |
 | 8 | Watchdog and WebSocket feed | 7 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 6 |
 | 10 | Paper audit, stages and gates | 9 |
@@ -104,7 +104,7 @@
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 176 more tests, `796 passed, 1 skipped` (`797 passed` with the cache), about 70 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 242 more tests, `862 passed, 1 skipped` (`863 passed` with the cache), about 70 s.
 
 ---
 
@@ -117,8 +117,8 @@ Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks (stdlib only).
-- Produces (`ewbot.live.exchange`): constants `FUTURES_PRODUCT = "BIP-20DEC30-CDE"`, `SPOT_PRODUCT = "BTC-USD"`, `SESSION_OPEN = "OPEN"`, `OPEN_STATUSES`, `TERMINAL_STATUSES`, `STOP_LIMIT_OFFSET = 0.01`; frozen dataclasses `ProductSpec(product_id, contract_size, price_increment, base_increment, intraday_margin: tuple[float, float], overnight_margin: tuple[float, float])` with `margin_rate(side, overnight=True) -> float`, `SessionInfo(state, maintenance_start=None, maintenance_end=None)` with `.is_open`, `Quote(product_id, bid, ask, ts)` with `.mid`, `Position(side, contracts, avg_entry)`, `Order(order_id, client_order_id, side, kind, size, filled, status, limit_price=None, stop_price=None, avg_fill_price=None, created_ts=None, fee=None)` with `.is_open` / `.is_terminal`, `Balance(equity, available_margin=None)`, `KeyPermissions(can_view, can_trade, can_transfer, portfolio_type=None)`, `PlaceResult(client_order_id, order_id, ok, error=None)` with `.duplicate`, `PreviewResult(ok, errors=(), warnings=())`; errors `ExchangeError` (`.retryable = False`), `RateLimited(message, retry_after=1.0)` and `Unavailable` (both retryable); `class Exchange(Protocol)` with attributes `futures_id`, `spot_id` and methods `product()`, `session()`, `quote(product_id)`, `position()`, `open_orders()`, `get_order(order_id)`, `find_order(client_order_id, since_ts)`, `balance()`, `key_permissions()`, `place_market(client_order_id, side, size)`, `place_bracket(client_order_id, side, size, limit_price, stop_price)`, `edit_bracket(order_id, size, limit_price, stop_price) -> bool`, `cancel(order_ids)`, `close_position(client_order_id, size=None)`, `preview_market(side, size)`, `preview_bracket(side, size, limit_price, stop_price)`.
-- Produces (`ewbot.live.sim`): `BIP_SPEC`, `VIEW_TRADE`, `class SimCrash(BaseException)`, `class SimExchange(product=BIP_SPEC, *, equity=10_000.0, clock=time.time, spot_id="BTC-USD", spread=5.0, duplicate="existing"|"error", reject_overlap=False, edit_supported=False, fee_per_contract=0.0, permissions=VIEW_TRADE)` implementing `Exchange`, plus the test/shadow drivers `set_prices(fut, spot=None) -> list[dict]` (fills it caused), `set_session(state)`, `fail_next(method, exc, times=1)`, `crash_after_accept(method, exc=None)` (both raise `ValueError` for a method outside the class attributes `FAULT_METHODS` / `CRASH_METHODS`, the methods that honour them), and the public attributes `pos`, `orders`, `fills`, `calls`, `cash`, `spread`, `session_state`, `market_fill_ratio`, `bracket_fill_cap`, `preview_errors`, `reject_overlap`, `edit_supported`. Order intake is never more forgiving than the venue: a size that is not a whole number of contracts (at least 1), a limit or stop price off the $5 grid, or a bracket whose take-profit is not beyond its stop in the profit direction is refused — `PlaceResult(ok=False, error="INVALID_SIZE_PRECISION" | "INVALID_PRICE_PRECISION" | "INVALID_STOP_PRICE_PRECISION" | "INVALID_BRACKET_PRICES")`, `edit_bracket` → `False`, previews → `PREVIEW_<reason>`. `close_position` is IOC like `place_market` (`market_fill_ratio`), and both re-match the book, so a bracket left with nothing to reduce is cancelled at once.
+- Produces (`ewbot.live.exchange`): constants `FUTURES_PRODUCT = "BIP-20DEC30-CDE"`, `SPOT_PRODUCT = "BTC-USD"`, `SESSION_OPEN = "OPEN"`, `OPEN_STATUSES` (`OPEN`, `PENDING`, `QUEUED`, `EDIT_QUEUED`, `CANCEL_QUEUED`: an order with a queued edit or cancel still rests and can fill), `TERMINAL_STATUSES`, `STOP_LIMIT_OFFSET = 0.05` (a triggered bracket stop is placed as a limit 5% beyond it, Create Order reference); frozen dataclasses `ProductSpec(product_id, contract_size, price_increment, base_increment, intraday_margin: tuple[float, float], overnight_margin: tuple[float, float])` with `margin_rate(side, overnight=True) -> float`, `SessionInfo(state, maintenance_start=None, maintenance_end=None)` with `.is_open`, `Quote(product_id, bid, ask, ts)` with `.mid`, `Position(side, contracts, avg_entry)`, `Order(order_id, client_order_id, side, kind, size, filled, status, limit_price=None, stop_price=None, avg_fill_price=None, created_ts=None, fee=None)` with `.is_open` / `.is_terminal`, `Balance(equity, available_margin=None)`, `KeyPermissions(can_view, can_trade, can_transfer, portfolio_type=None)`, `PlaceResult(client_order_id, order_id, ok, error=None, duplicate=False)` (`duplicate`: the client_order_id already exists), `PreviewResult(ok, errors=(), warnings=())`; errors `ExchangeError` (`.retryable = False`), `RateLimited(message, retry_after=1.0)` and `Unavailable` (both retryable); `class Exchange(Protocol)` with attributes `futures_id`, `spot_id` and methods `product()`, `session()`, `quote(product_id)`, `position()`, `open_orders()`, `get_order(order_id)`, `find_order(client_order_id, since_ts)`, `balance()`, `key_permissions()`, `place_market(client_order_id, side, size)`, `place_bracket(client_order_id, side, size, limit_price, stop_price)`, `edit_bracket(order_id, size, limit_price, stop_price) -> bool`, `cancel(order_ids)` (raises `ExchangeError` naming each order that may still rest; an order that already filled or whose cancel is already queued is not an error), `close_position(client_order_id, size=None)`, `preview_market(side, size)`, `preview_bracket(side, size, limit_price, stop_price)`.
+- Produces (`ewbot.live.sim`): `BIP_SPEC`, `VIEW_TRADE`, `class SimCrash(BaseException)`, `class SimExchange(product=BIP_SPEC, *, equity=10_000.0, clock=time.time, spot_id="BTC-USD", spread=5.0, duplicate="existing"|"error", reject_overlap=False, edit_supported=False, fee_per_contract=0.0, permissions=VIEW_TRADE)` implementing `Exchange`, plus the test/shadow drivers `set_prices(fut, spot=None) -> list[dict]` (fills it caused), `set_session(state)`, `fail_next(method, exc, times=1)`, `crash_after_accept(method, exc=None)` (both raise `ValueError` for a method outside the class attributes `FAULT_METHODS` / `CRASH_METHODS`, the methods that honour them), and the public attributes `pos`, `orders`, `fills`, `calls`, `cash`, `spread`, `session_state`, `market_fill_ratio`, `bracket_fill_cap`, `preview_errors`, `reject_overlap`, `edit_supported`. Order intake is never more forgiving than the venue: a size that is not a whole number of contracts (at least 1), a limit or stop price off the $5 grid, or a bracket whose take-profit is not beyond its stop in the profit direction is refused — `PlaceResult(ok=False, error="INVALID_SIZE_PRECISION" | "INVALID_PRICE_PRECISION" | "INVALID_STOP_PRICE_PRECISION" | "INVALID_BRACKET_PRICES")`, `edit_bracket` → `False`, previews → `PREVIEW_<reason>`. `close_position` is IOC like `place_market` (`market_fill_ratio`), and both re-match the book, so a bracket left with nothing to reduce is cancelled at once. `cancel` cancels every OPEN order given, then raises `ExchangeError` for the unknown or no longer cancellable ones (a FILLED order is not an error); a duplicate client_order_id in `duplicate="error"` mode answers `PlaceResult(..., "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -139,7 +139,14 @@ from __future__ import annotations
 
 import pytest
 
-from ewbot.live.exchange import Position, RateLimited, Unavailable
+from ewbot.live.exchange import (
+    STOP_LIMIT_OFFSET,
+    ExchangeError,
+    PlaceResult,
+    Position,
+    RateLimited,
+    Unavailable,
+)
 from ewbot.live.sim import BIP_SPEC, SimCrash, SimExchange
 
 
@@ -188,20 +195,33 @@ def test_brackets_only_reduce_and_take_profit_at_the_limit(ex):
     assert not r.ok and r.error == "NO_POSITION_TO_REDUCE"
 
 
-def test_stop_fills_inside_the_one_percent_limit(ex):
-    ex.place_market("e1", 1, 1)
+def test_a_triggered_stop_rests_five_percent_beyond_the_stop():
+    """Coinbase create-order reference, trigger_bracket_gtc.stop_trigger_price: a stop limit order is placed
+    "with a limit price 5% higher for BUYS and 5% lower for SELLS"."""
+    assert STOP_LIMIT_OFFSET == 0.05
+
+
+def test_stop_fills_inside_the_five_percent_limit(ex):
+    ex.place_market("e1", 1, 2)
     ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
+    ex.place_bracket("b2", -1, 1, 62_000.0, 59_500.0)
+    ex.bracket_fill_cap = 1
     fills = ex.set_prices(59_400.0)
-    assert [(f["size"], f["price"]) for f in fills] == [(1, 59_400.0)] and ex.position() is None
+    assert [(f["size"], f["price"]) for f in fills] == [(1, 59_400.0), (1, 59_400.0)] and ex.position() is None
+    ex.set_prices(60_000.0)
+    ex.place_market("e2", 1, 1)
+    ex.place_bracket("b3", -1, 1, 62_000.0, 59_500.0)
+    fills = ex.set_prices(56_600.0)  # 4.9% through the stop: still inside its 56_525 limit
+    assert [f["price"] for f in fills] == [56_600.0] and ex.position() is None
 
 
 def test_stop_gap_beyond_the_limit_rests_until_the_price_comes_back(ex):
     ex.place_market("e1", 1, 1)
     ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
-    assert ex.set_prices(58_000.0) == []  # limit 58_905: gapped through, nothing fills
+    assert ex.set_prices(56_000.0) == []  # limit 56_525: gapped through, nothing fills
     assert ex.position() is not None and ex.open_orders()[0].client_order_id == "b1"
-    fills = ex.set_prices(58_950.0)
-    assert [f["price"] for f in fills] == [58_950.0] and ex.position() is None
+    fills = ex.set_prices(56_550.0)
+    assert [f["price"] for f in fills] == [56_550.0] and ex.position() is None
 
 
 def test_short_bracket_mirrors_the_long(ex):
@@ -209,6 +229,11 @@ def test_short_bracket_mirrors_the_long(ex):
     ex.place_bracket("b1", 1, 2, 59_000.0, 60_500.0)
     fills = ex.set_prices(60_600.0)
     assert [(f["side"], f["size"], f["price"]) for f in fills] == [(1, 2, 60_600.0)] and ex.position() is None
+    ex.set_prices(60_000.0)
+    ex.place_market("s2", -1, 1)
+    ex.place_bracket("b2", 1, 1, 59_000.0, 60_500.0)  # buy limit 5% above the stop: 63_525
+    assert ex.set_prices(64_000.0) == [] and ex.position() is not None
+    assert [f["price"] for f in ex.set_prices(63_500.0)] == [63_500.0] and ex.position() is None
 
 
 def test_partial_fills(ex):
@@ -228,7 +253,7 @@ def test_nothing_fills_while_the_session_is_closed(ex):
     ex.place_market("e1", 1, 1)
     ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
     ex.set_session("CLOSE")
-    assert ex.set_prices(57_000.0) == []
+    assert ex.set_prices(56_000.0) == []
     assert not ex.place_market("e2", 1, 1).ok and not ex.close_position("x1").ok
     assert ex.session().state == "CLOSE" and not ex.session().is_open
     fills = ex.set_session("OPEN")  # reopens far below the stop limit: the stop rests
@@ -369,6 +394,33 @@ def test_fault_injection_only_accepts_methods_that_honour_it(ex):
     ex.crash_after_accept("close_position")
     with pytest.raises(Unavailable):
         ex.cancel([])
+
+
+def test_cancel_reports_orders_it_could_not_cancel(ex):
+    """Like the adapter honouring batch_cancel's results[].success: an unknown or no longer cancellable
+    order raises after the others were cancelled; an order that already filled no longer rests (the venue's
+    ORDER_IS_FULLY_FILLED) and is not an error."""
+    ex.place_market("e1", 1, 2)
+    b1 = ex.place_bracket("b1", -1, 1, 62_000.0, 59_000.0)
+    b2 = ex.place_bracket("b2", -1, 1, 61_000.0, 59_000.0)
+    ex.cancel([b1.order_id])
+    with pytest.raises(ExchangeError) as err:
+        ex.cancel(["nope", b1.order_id, b2.order_id])
+    assert not err.value.retryable and "nope" in str(err.value) and b1.order_id in str(err.value)
+    assert b2.order_id not in str(err.value) and ex.get_order(b2.order_id).status == "CANCELLED"
+    b3 = ex.place_bracket("b3", -1, 2, 60_500.0, 59_000.0)
+    ex.set_prices(60_600.0)
+    assert ex.get_order(b3.order_id).status == "FILLED"
+    ex.cancel([b3.order_id])
+
+
+def test_a_duplicate_result_is_flagged_explicitly():
+    strict = SimExchange(clock=Clock(), duplicate="error")
+    strict.set_prices(60_000.0)
+    strict.place_market("e1", 1, 1)
+    dup = strict.place_market("e1", 1, 1)
+    assert dup == PlaceResult("e1", None, False, "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)
+    assert not PlaceResult("x", None, False, "INVALID_REQUEST: duplicate field").duplicate
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -405,9 +457,16 @@ from typing import Protocol, Sequence
 FUTURES_PRODUCT = "BIP-20DEC30-CDE"  # nano Bitcoin perp-style future, 0.01 BTC per contract
 SPOT_PRODUCT = "BTC-USD"  # the signal source (same candles as the paper runtime)
 SESSION_OPEN = "OPEN"
-OPEN_STATUSES = ("OPEN", "PENDING", "QUEUED")
+# Statuses of an order that still rests and can fill. EDIT_QUEUED and CANCEL_QUEUED are open until the
+# venue confirms the edit / cancel: a queued cancel can still fill, so it still counts as protection and as
+# an order of ours (List Orders reference, OrderExecutionStatus).
+OPEN_STATUSES = ("OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED")
 TERMINAL_STATUSES = ("FILLED", "CANCELLED", "EXPIRED", "FAILED")
-STOP_LIMIT_OFFSET = 0.01  # a triggered bracket stop rests as a limit 1% beyond the stop (spec 4.2)
+# A triggered trigger_bracket stop rests as a limit this far beyond the stop. Coinbase Advanced Trade API
+# reference, Create Order, trigger_bracket_gtc.stop_trigger_price (checked 2026-10-03): "When triggered, a
+# stop limit order is automatically placed with a limit price 5% higher for BUYS and 5% lower for SELLS."
+# (Spec 4.2 assumed 1%; the reference wins. Confirm on the first stop fill in CANARY.)
+STOP_LIMIT_OFFSET = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,7 +521,7 @@ class Order:
     kind: str  # "MARKET" | "BRACKET" | "OTHER"
     size: int
     filled: int
-    status: str  # OPEN, PENDING, FILLED, CANCELLED, EXPIRED, FAILED, UNKNOWN
+    status: str  # OPEN_STATUSES, TERMINAL_STATUSES or UNKNOWN
     limit_price: float | None = None  # bracket take-profit
     stop_price: float | None = None  # bracket stop trigger
     avg_fill_price: float | None = None
@@ -498,10 +557,7 @@ class PlaceResult:
     order_id: str | None
     ok: bool
     error: str | None = None
-
-    @property
-    def duplicate(self) -> bool:
-        return bool(self.error) and "DUPLICATE" in str(self.error).upper()
+    duplicate: bool = False  # refused because the client_order_id exists: look the order up, never re-send blind
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,7 +606,10 @@ class Exchange(Protocol):
         self, client_order_id: str, side: int, size: int, limit_price: float, stop_price: float
     ) -> PlaceResult: ...
     def edit_bracket(self, order_id: str, size: int, limit_price: float, stop_price: float) -> bool: ...
-    def cancel(self, order_ids: Sequence[str]) -> None: ...
+    def cancel(self, order_ids: Sequence[str]) -> None:
+        """Cancel resting orders. Raises ExchangeError naming every order that may still rest (refused or
+        unknown); an order that already filled, or whose cancel is already queued, is not an error."""
+        ...
     def close_position(self, client_order_id: str, size: int | None = None) -> PlaceResult: ...
     def preview_market(self, side: int, size: int) -> PreviewResult: ...
     def preview_bracket(self, side: int, size: int, limit_price: float, stop_price: float) -> PreviewResult: ...
@@ -574,9 +633,12 @@ book of the SHADOW stage. It models what the runtime relies on:
     reduce_only field): a bracket whose position is gone, or would be increased, is cancelled; a fill
     never exceeds the contracts left; `bracket_fill_cap` makes fills partial;
   - a bracket's take-profit fills at its limit when the futures price reaches it; its stop triggers when
-    the price reaches the stop and then rests as a limit STOP_LIMIT_OFFSET (1%) beyond the stop: it fills
-    at the market while the price is inside that limit and does not fill while the price has gapped
-    past it (the case the stop-gap watchdog closes);
+    the price reaches the stop and then rests as a limit STOP_LIMIT_OFFSET (5%, the Create Order
+    reference) beyond the stop: it fills at the market while the price is inside that limit and does not
+    fill while the price has gapped past it (the case the stop-gap watchdog closes);
+  - cancel() cancels every OPEN order it is given and then raises ExchangeError naming each order it could
+    not cancel (unknown, or already cancelled / expired: the venue's batch_cancel results[].success is
+    false); an order that already FILLED no longer rests and is not an error (ORDER_IS_FULLY_FILLED);
   - nothing fills while the session is not OPEN; market orders are rejected then;
   - fault injection: `fail_next(method, exc)` raises on the next call(s) of a method (429 / 5xx /
     outages) and `crash_after_accept(method)` raises SimCrash right AFTER the order was accepted (a
@@ -807,7 +869,7 @@ class SimExchange:
             if o.client_order_id == client_order_id:
                 if self.duplicate == "existing":
                     return PlaceResult(client_order_id, o.order_id, True)
-                return PlaceResult(client_order_id, None, False, "DUPLICATE_CLIENT_ORDER_ID")
+                return PlaceResult(client_order_id, None, False, "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)
         return None
 
     def _new(self, client_order_id: str, side: int, kind: str, size: int, limit: float | None = None,
@@ -869,10 +931,15 @@ class SimExchange:
 
     def cancel(self, order_ids: Sequence[str]) -> None:
         self._fault("cancel")
+        refused: list[str] = []
         for oid in order_ids:
             o = self.orders.get(oid)
             if o is not None and o.status == "OPEN":
                 o.status = "CANCELLED"
+            elif o is None or o.status != "FILLED":
+                refused.append(f"{oid}: UNKNOWN_CANCEL_ORDER")
+        if refused:
+            raise ExchangeError("cancel refused: " + ", ".join(refused))
 
     def close_position(self, client_order_id: str, size: int | None = None) -> PlaceResult:
         self._fault("close_position")
@@ -977,7 +1044,7 @@ class SimExchange:
 uv run pytest tests/live/test_sim.py -q
 ```
 
-Expected: `20 passed`.
+Expected: `23 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1333,7 +1400,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.live.exchange` (Task 1); `requests` (existing dependency); the SDK `coinbase.rest.RESTClient` (only in `CoinbaseExchange.from_key_file` and the SDK test; imported lazily, so `ewbot` still imports without the `live` group).
-- Produces (`ewbot.live.coinbase`): `API = "/api/v3/brokerage"`, `SESSION_PREFIX`, `fmt_decimal(x) -> str`, `iso_ts(text) -> int | None`, `map_error(exc) -> ExchangeError`, `parse_order(dict) -> Order`, `parse_place(dict, client_order_id) -> PlaceResult`, `class CoinbaseExchange(client, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, *, sleep=time.sleep, clock=time.time, attempts=3, backoff_s=1.0, min_remaining=2)` implementing `Exchange` with the SDK's generic `client.get(path, params=..., public=...)` / `client.post(path, data=...)`, and `CoinbaseExchange.from_key_file(key_file, futures_id, spot_id, timeout=10)`. Reads and `cancel` retry 3 times on 429 / 5xx / network errors; `place_market`, `place_bracket`, `close_position` and `edit_bracket` are sent once.
+- Produces (`ewbot.live.coinbase`): `API = "/api/v3/brokerage"`, `SESSION_PREFIX`, `RETRY_AFTER_MAX_S = 10.0`, `CANCEL_DONE`, `class DuplicateClientOrderId(ExchangeError)`, `fmt_decimal(x) -> str`, `bad_size(size) -> bool`, `bad_price(price) -> bool`, `iso_ts(text) -> int | None`, `retry_after_s(value, now=None) -> float` (delta-seconds or HTTP-date, clamped to [0, 10], garbage → 1), `map_error(exc) -> ExchangeError` (429 → `RateLimited`, 5xx and every other `requests` exception → `Unavailable` with the type name only, a 4xx naming `DUPLICATE_CLIENT_ORDER_ID` → `DuplicateClientOrderId`, anything else → `ExchangeError(type name)`), `parse_order(dict) -> Order` (sides `BUY`/`SELL` only), `parse_place(dict, client_order_id) -> PlaceResult` (reason: `new_order_failure_reason`, then the deprecated `error` and `preview_failure_reason`, then `failure_reason`, skipping `UNKNOWN_*`; `duplicate=True` when any of them is `DUPLICATE_CLIENT_ORDER_ID`; accepted without an order id → `Unavailable`), `class CoinbaseExchange(client, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, *, sleep=time.sleep, clock=time.time, attempts=3, backoff_s=1.0, min_remaining=2)` implementing `Exchange` with the SDK's generic `client.get(path, params=..., public=...)` / `client.post(path, data=...)`, and `CoinbaseExchange.from_key_file(key_file, futures_id, spot_id, timeout=10)`. Reads and `cancel` retry 3 times on 429 / 5xx / network errors; `place_market`, `place_bracket`, `close_position` and `edit_bracket` are sent once. Only `ExchangeError` leaves the adapter (or `ValueError` for a side other than ±1): a reply of the wrong shape is an `ExchangeError`, one that is not a JSON object `Unavailable`. Refused locally without a request: sizes that are not whole contracts ≥ 1 (`INVALID_SIZE_PRECISION`), non-finite or ≤ 0 limit / stop prices (`INVALID_PRICE_PRECISION` / `INVALID_STOP_PRICE_PRECISION`). `position()` maps `LONG`/`SHORT` only and takes `abs()` of the contract count; `open_orders()` asks for every resting status (`order_status` repeated); `balance()` requires `total_usd_balance`; a missing `can_transfer` reads `True`; `cancel()` raises `ExchangeError` for every order whose `results[].success` is false (except `DUPLICATE_CANCEL_REQUEST` / `ORDER_IS_FULLY_FILLED`) or that has no result.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1345,7 +1412,7 @@ mkdir -p tests/live/fixtures
 
 ```json
 {
- "_comment": "product_bip, book_bip and book_btc are trimmed real public responses recorded 2026-10-03 (GET /market/products/BIP-20DEC30-CDE, /market/product_book?limit=1). The private-endpoint entries follow the Advanced Trade API reference shapes; re-record them in SHADOW (docs/live-trading.md).",
+ "_comment": "product_bip, book_bip and book_btc are trimmed real public responses recorded 2026-10-03 (GET /market/products/BIP-20DEC30-CDE, /market/product_book?limit=1). The private-endpoint entries follow the Advanced Trade API reference shapes; re-record them in SHADOW (docs/live-trading.md). positions_bip_long, create_failed_new_reason, create_duplicate_new_reason, http400_duplicate_*_body and cancel_done_or_refused (Fix round 1) follow the reference's enums: FCMPositionSide LONG/SHORT, NewOrderErrorResponse.new_order_failure_reason (error and preview_failure_reason are deprecated), CancelOrderFailureReason.",
  "product_bip": {
   "product_id": "BIP-20DEC30-CDE",
   "price": "84675",
@@ -1464,6 +1531,20 @@ mkdir -p tests/live/fixtures
  },
  "positions_flat": {
   "positions": []
+ },
+ "positions_bip_long": {
+  "positions": [
+   {
+    "product_id": "BIP-20DEC30-CDE",
+    "expiration_time": "2030-12-20T16:00:00Z",
+    "side": "LONG",
+    "number_of_contracts": "2",
+    "current_price": "84665",
+    "avg_entry_price": "84000",
+    "unrealized_pnl": "13.30",
+    "daily_realized_pnl": "0"
+   }
+  ]
  },
  "balance_summary": {
   "balance_summary": {
@@ -1654,6 +1735,43 @@ mkdir -p tests/live/fixtures
    "error_details": ""
   }
  },
+ "create_failed_new_reason": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "Invalid bracket prices",
+   "error_details": "stop_trigger_price must be below limit_price for a sell bracket",
+   "preview_failure_reason": "UNKNOWN_PREVIEW_FAILURE_REASON",
+   "new_order_failure_reason": "INVALID_BRACKET_PRICES"
+  }
+ },
+ "create_duplicate_new_reason": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "client_order_id has already been used",
+   "error_details": "",
+   "preview_failure_reason": "UNKNOWN_PREVIEW_FAILURE_REASON",
+   "new_order_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"
+  }
+ },
+ "http400_duplicate_order_body": {
+  "success": false,
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "client_order_id has already been used",
+   "error_details": "",
+   "new_order_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"
+  }
+ },
+ "http400_duplicate_gateway_body": {
+  "error": "INVALID_ARGUMENT",
+  "code": 3,
+  "message": "DUPLICATE_CLIENT_ORDER_ID",
+  "details": []
+ },
  "close_ok": {
   "success": true,
   "success_response": {
@@ -1694,6 +1812,30 @@ mkdir -p tests/live/fixtures
    }
   ]
  },
+ "cancel_done_or_refused": {
+  "results": [
+   {
+    "success": true,
+    "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON",
+    "order_id": "o-ok"
+   },
+   {
+    "success": false,
+    "failure_reason": "DUPLICATE_CANCEL_REQUEST",
+    "order_id": "o-queued"
+   },
+   {
+    "success": false,
+    "failure_reason": "ORDER_IS_FULLY_FILLED",
+    "order_id": "o-filled"
+   },
+   {
+    "success": false,
+    "failure_reason": "UNKNOWN_CANCEL_ORDER",
+    "order_id": "o-refused"
+   }
+  ]
+ },
  "edit_ok": {
   "success": true,
   "errors": []
@@ -1715,8 +1857,17 @@ from pathlib import Path
 import pytest
 import requests
 
-from ewbot.live.coinbase import API, CoinbaseExchange, fmt_decimal, map_error, parse_order
-from ewbot.live.exchange import ExchangeError, Position, RateLimited, Unavailable
+from ewbot.live.coinbase import (
+    API,
+    RETRY_AFTER_MAX_S,
+    CoinbaseExchange,
+    fmt_decimal,
+    map_error,
+    parse_order,
+    parse_place,
+    retry_after_s,
+)
+from ewbot.live.exchange import OPEN_STATUSES, ExchangeError, Position, RateLimited, Unavailable
 
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "coinbase.json").read_text(encoding="utf-8"))
 FUT = "BIP-20DEC30-CDE"
@@ -1801,10 +1952,12 @@ def test_open_orders_follow_the_cursor_and_parse_brackets():
     orders = ex.open_orders()
     assert [(o.client_order_id, o.kind, o.size, o.limit_price, o.stop_price, o.status) for o in orders] == [
         ("ewb-b-1790942400-tp1-1", "BRACKET", 1, 83500.0, 85900.0, "OPEN"),
-        ("ewb-b-1790942400-tp2-1", "BRACKET", 2, 82000.0, 85900.0, "OPEN"),  # CANCEL_QUEUED may still fill
+        ("ewb-b-1790942400-tp2-1", "BRACKET", 2, 82000.0, 85900.0, "CANCEL_QUEUED"),  # may still fill
     ]
+    assert all(o.is_open for o in orders)
     assert orders[0].side == 1 and orders[0].created_ts == 1791028841
-    assert client.calls[0][2]["product_ids"] == [FUT] and client.calls[0][2]["order_status"] == ["OPEN"]
+    assert client.calls[0][2]["product_ids"] == [FUT]
+    assert client.calls[0][2]["order_status"] == ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"]
     assert client.calls[1][2]["cursor"] == "c-2"
 
 
@@ -1930,6 +2083,252 @@ def test_the_pinned_sdk_matches_the_calls_this_adapter_makes(monkeypatch):
     method, url, _, _, headers = seen[0]
     assert (method, url) == ("GET", "https://api.coinbase.com/api/v3/brokerage/cfm/positions")
     assert headers["Authorization"].startswith("Bearer ") and len(headers["Authorization"]) > 100  # SDK-signed JWT
+
+
+@pytest.mark.parametrize("size", [0, 0.5, 1.5, 2.9999, -1, float("nan"), float("inf")])
+def test_non_integer_or_sub_one_sizes_are_rejected_not_truncated(size):
+    """Controller amendment: str(int(size)) would silently send fewer contracts; the adapter refuses like
+    SimExchange (INVALID_SIZE_PRECISION) and never reaches the network."""
+    ex, client, _ = make({})
+    for r in (ex.place_market("a", 1, size), ex.place_bracket("b", 1, size, 83500.0, 85900.0),
+              ex.close_position("c", size=size)):
+        assert not r.ok and r.order_id is None and r.error == "INVALID_SIZE_PRECISION"
+    assert ex.edit_bracket("o1", size, 82000.0, 85000.0) is False
+    for p in (ex.preview_market(1, size), ex.preview_bracket(-1, size, 83000.0, 86000.0)):
+        assert not p.ok and p.errors == ("PREVIEW_INVALID_SIZE_PRECISION",)
+    assert client.calls == []
+
+
+def test_whole_number_float_sizes_are_still_sent():
+    ex, client, _ = make({("POST", "/orders"): "create_ok", ("POST", "/orders/close_position"): "close_ok"})
+    assert ex.place_market("a", 1, 3.0).ok
+    assert ex.close_position("c", size=2.0).ok
+    assert client.calls[0][2]["order_configuration"] == {"market_market_ioc": {"base_size": "3"}}
+    assert client.calls[1][2]["size"] == "2"
+
+
+# ---------------------------------------------------------------------------- Fix round 1
+SECRET = "Bearer eyJhbGciOiJFUzI1NiJ9.secret"
+
+
+@pytest.mark.parametrize("exc", [
+    requests.exceptions.ChunkedEncodingError(SECRET),
+    requests.exceptions.ContentDecodingError(SECRET),
+    requests.exceptions.JSONDecodeError("Expecting value", SECRET, 0),
+    requests.exceptions.InvalidHeader(f"Invalid return character or leading space in header: Authorization: {SECRET}"),
+    requests.exceptions.ReadTimeout(SECRET),
+    requests.exceptions.SSLError(SECRET),
+    requests.exceptions.HTTPError(SECRET),  # no response attached
+    requests.exceptions.RequestException(SECRET),
+])
+def test_ambiguous_post_send_failures_are_unavailable_and_sent_once(exc):
+    """The order may exist: any requests failure is ambiguous (Unavailable -> lookup by client_order_id),
+    never a final rejection; the message is the type name only (an exception text may carry the JWT)."""
+    ex, client, _ = make({("POST", "/orders"): [exc, "create_ok"]})
+    with pytest.raises(Unavailable) as err:
+        ex.place_market("ewb-e-1-L", 1, 1)
+    assert str(err.value) == type(exc).__name__ and "secret" not in str(err.value)
+    assert len(client.calls) == 1
+
+
+def test_unknown_exceptions_keep_only_their_type_name():
+    err = map_error(ValueError(SECRET))
+    assert type(err) is ExchangeError and not err.retryable and str(err) == "ValueError"
+
+
+def test_failure_reason_prefers_new_order_failure_reason():
+    ex, _, _ = make({("POST", "/orders"): ["create_failed_new_reason", "create_duplicate_new_reason"]})
+    r = ex.place_bracket("b", -1, 1, 86000.0, 83500.0)
+    assert not r.ok and r.error.startswith("INVALID_BRACKET_PRICES") and not r.duplicate
+    d = ex.place_market("a", 1, 1)  # error and failure_reason say UNKNOWN_*; new_order_failure_reason decides
+    assert not d.ok and d.duplicate and d.error.startswith("DUPLICATE_CLIENT_ORDER_ID")
+    assert parse_place({"success": False, "error_response": {"preview_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"}},
+                       "c").duplicate
+    assert parse_place({"success": False, "failure_reason": "UNKNOWN_FAILURE_REASON"}, "c").error == "UNKNOWN_FAILURE_REASON"
+    assert not parse_place(FIXTURES["create_insufficient"], "c").duplicate
+
+
+@pytest.mark.parametrize("body", ["http400_duplicate_order_body", "http400_duplicate_gateway_body"])
+def test_an_http_4xx_naming_the_duplicate_id_takes_the_duplicate_path(body):
+    text = json.dumps(FIXTURES[body])
+    ex, client, _ = make({("POST", "/orders"): [http_error(400, text)],
+                          ("POST", "/orders/close_position"): [http_error(409, text)]})
+    for r in (ex.place_market("ewb-e-1-L", 1, 1), ex.close_position("ewb-x-1-1")):
+        assert not r.ok and r.duplicate and r.order_id is None
+    assert len(client.calls) == 2
+    ex2, _, _ = make({("POST", "/orders"): [http_error(400, json.dumps(FIXTURES["create_insufficient"]))]})
+    with pytest.raises(ExchangeError) as err:
+        ex2.place_market("a", 1, 1)
+    assert not err.value.retryable
+
+
+def test_position_sides_are_mapped_explicitly():
+    ex, _, _ = make({("GET", "/cfm/positions"): ["positions_bip_long", {"positions": [
+        {"product_id": FUT, "side": "SHORT", "number_of_contracts": "-3", "avg_entry_price": "85100"}]},
+        {"positions": [{"product_id": FUT, "side": "UNKNOWN", "number_of_contracts": "2", "avg_entry_price": "1"}]},
+        {"positions": [{"product_id": FUT, "side": "FUTURES_POSITION_SIDE_LONG", "number_of_contracts": "2"}]}]})
+    assert ex.position() == Position(1, 2, 84000.0)
+    assert ex.position() == Position(-1, 3, 85100.0)  # abs() of a signed count
+    for _ in range(2):
+        with pytest.raises(ExchangeError) as err:
+            ex.position()
+        assert not err.value.retryable
+
+
+def test_order_sides_are_mapped_explicitly():
+    base = {"order_id": "x", "status": "OPEN", "order_configuration": {}}
+    assert parse_order({**base, "side": "BUY"}).side == 1 and parse_order({**base, "side": "SELL"}).side == -1
+    for side in ("", "UNKNOWN_ORDER_SIDE", None, "buy"):
+        with pytest.raises(ExchangeError):
+            parse_order({**base, "side": side})
+
+
+def test_sell_bracket_protects_a_long():
+    ex, client, _ = make({("POST", "/orders"): "create_ok"})
+    assert ex.place_bracket("ewb-b-1790942400-tp1-1", -1, 2, 86000.0, 83500.0).ok
+    assert client.calls[0][2] == {
+        "client_order_id": "ewb-b-1790942400-tp1-1", "product_id": FUT, "side": "SELL",
+        "order_configuration": {"trigger_bracket_gtc": {"base_size": "2", "limit_price": "86000",
+                                                        "stop_trigger_price": "83500"}}}
+
+
+@pytest.mark.parametrize("status", ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"])
+def test_resting_statuses_are_open(status):
+    o = parse_order({"order_id": "x", "side": "BUY", "status": status, "order_configuration": {}})
+    assert o.status == status and o.is_open and not o.is_terminal
+    assert status in OPEN_STATUSES
+
+
+def test_unknown_order_status_is_neither_open_nor_terminal():
+    o = parse_order({"order_id": "x", "side": "BUY", "status": "UNKNOWN_ORDER_STATUS", "order_configuration": {}})
+    assert o.status == "UNKNOWN" and not o.is_open and not o.is_terminal
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (None, 1.0), ("2", 2.0), ("0.5", 0.5), ("120", RETRY_AFTER_MAX_S), ("-5", 0.0), ("soon", 1.0), ("nan", 1.0),
+    ("inf", 1.0), ("Wed, 21 Oct 2015 07:28:00 GMT", 0.0), ("Fri, 31 Dec 2099 23:59:59 GMT", RETRY_AFTER_MAX_S),
+])
+def test_retry_after_is_parsed_leniently_and_capped(value, expected):
+    assert retry_after_s(value) == pytest.approx(expected)
+    headers = {} if value is None else {"Retry-After": value}
+    err = map_error(http_error(429, "slow down", headers))
+    assert isinstance(err, RateLimited) and err.retry_after == pytest.approx(expected)
+
+
+def test_a_long_retry_after_waits_at_most_the_cap():
+    ex, _, slept = make({("GET", "/cfm/positions"): [http_error(429, "", {"Retry-After": "3600"}), "positions"]})
+    assert ex.position().contracts == 3 and slept == [RETRY_AFTER_MAX_S]
+    resp = dict(FIXTURES["positions"], **{"x-ratelimit-remaining": "lots", "x-ratelimit-reset": "soon"})
+    ex2, _, slept2 = make({("GET", "/cfm/positions"): [resp, "positions"]})
+    ex2.position()
+    ex2.position()
+    assert slept2 == []  # unreadable pacing headers are ignored
+
+
+@pytest.mark.parametrize(("route", "reply", "call"), [
+    (("GET", f"/products/{FUT}"), {"price_increment": "5"}, lambda ex: ex.product()),
+    (("GET", f"/products/{FUT}"), {"fcm_trading_session_details": {"maintenance": {"start_time": "soon"}}},
+     lambda ex: ex.session()),
+    (("GET", "/market/product_book"), {"pricebook": {"bids": [{"px": "1"}], "asks": [{"px": "2"}]}},
+     lambda ex: ex.quote(FUT)),
+    (("GET", "/cfm/positions"), {"positions": [{"product_id": FUT, "side": "LONG", "number_of_contracts": "two"}]},
+     lambda ex: ex.position()),
+    (("GET", "/orders/historical/batch"), {"orders": [{"side": "BUY", "status": "OPEN"}]}, lambda ex: ex.open_orders()),
+    (("GET", "/orders/historical/o1"), {"not_order": {}}, lambda ex: ex.get_order("o1")),
+    (("GET", "/cfm/balance_summary"), {"balance_summary": {"total_usd_balance": {"value": "n/a"}}},
+     lambda ex: ex.balance()),
+    (("POST", "/orders/preview"), {"errs": 5}, lambda ex: ex.preview_market(1, 1)),
+    (("POST", "/orders/batch_cancel"), {"results": [7]}, lambda ex: ex.cancel(["o1"])),
+])
+def test_malformed_replies_raise_exchange_errors_only(route, reply, call):
+    ex, _, _ = make({route: reply})
+    with pytest.raises(ExchangeError) as err:
+        call(ex)
+    assert not err.value.retryable
+
+
+def test_a_reply_that_is_not_an_object_or_an_accepted_order_without_id_is_ambiguous():
+    ex, client, _ = make({("POST", "/orders"): [["not", "an", "object"], {"success": True, "success_response": {}}]})
+    for _ in range(2):
+        with pytest.raises(Unavailable):
+            ex.place_market("ewb-e-1-L", 1, 1)
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("bad", [0.0, -5.0, float("nan"), float("inf")])
+def test_non_finite_or_non_positive_prices_are_refused_locally(bad):
+    ex, client, _ = make({})
+    r = ex.place_bracket("b", -1, 1, bad, 83500.0)
+    assert not r.ok and r.error == "INVALID_PRICE_PRECISION"
+    r = ex.place_bracket("b", -1, 1, 86000.0, bad)
+    assert not r.ok and r.error == "INVALID_STOP_PRICE_PRECISION"
+    assert ex.edit_bracket("o1", 1, bad, 83500.0) is False and ex.edit_bracket("o1", 1, 86000.0, bad) is False
+    assert ex.preview_bracket(-1, 1, bad, 83500.0).errors == ("PREVIEW_INVALID_PRICE_PRECISION",)
+    assert ex.preview_bracket(-1, 1, 86000.0, bad).errors == ("PREVIEW_INVALID_STOP_PRICE_PRECISION",)
+    assert client.calls == []
+
+
+def test_key_permissions_fail_closed():
+    ex, _, _ = make({("GET", "/key_permissions"): [{"can_view": True, "can_trade": True},
+                                                    {"can_view": True, "can_trade": True, "can_transfer": None}, {}]})
+    k = ex.key_permissions()
+    assert (k.can_view, k.can_trade, k.can_transfer) == (True, True, True)  # can_transfer missing: assume it can
+    assert ex.key_permissions().can_transfer is True  # null: the same
+    k = ex.key_permissions()
+    assert (k.can_view, k.can_trade, k.can_transfer) == (False, False, True)
+
+
+@pytest.mark.parametrize("summary", [
+    {"balance_summary": {"unrealized_pnl": {"value": "13.05", "currency": "USD"}}},
+    {"balance_summary": {"total_usd_balance": {"currency": "USD"}, "unrealized_pnl": {"value": "13.05"}}},
+    {"balance_summary": {"total_usd_balance": {"value": "", "currency": "USD"}}},
+    {"balance_summary": {"total_usd_balance": {"value": "inf", "currency": "USD"}}},
+    {},
+])
+def test_balance_without_a_cash_total_is_an_error(summary):
+    ex, _, _ = make({("GET", "/cfm/balance_summary"): summary})
+    with pytest.raises(ExchangeError):
+        ex.balance()
+
+
+def test_cancel_honours_each_result():
+    ex, client, _ = make({("POST", "/orders/batch_cancel"): ["cancel_done_or_refused", "cancel_done_or_refused",
+                                                             "cancel_ok"]})
+    ex.cancel(["o-ok", "o-queued", "o-filled"])  # cancelled, already queued, already filled: nothing rests
+    with pytest.raises(ExchangeError) as err:
+        ex.cancel(["o-ok", "o-refused"])
+    assert "o-refused: UNKNOWN_CANCEL_ORDER" in str(err.value) and "o-ok" not in str(err.value)
+    assert not err.value.retryable
+    with pytest.raises(ExchangeError, match="o-missing: NO_RESULT"):
+        ex.cancel(["11111111-aaaa-4000-8000-000000000001", "o-missing"])
+    assert len(client.calls) == 3
+
+
+def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypatch):
+    """List Orders takes order_status as an exploded array; SDK 1.8.4 passes the list to requests unchanged
+    (list_orders(order_status: Optional[List[str]])), which repeats the key. Needs the `live` group."""
+    rest = pytest.importorskip("coinbase.rest")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    assert "List" in str(inspect.signature(rest.RESTClient.list_orders).parameters["order_status"].annotation)
+    pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()
+    ).decode()
+    client = rest.RESTClient(api_key="organizations/x/apiKeys/y", api_secret=pem)
+    urls: list[str] = []
+
+    def fake_request(method, url, params=None, json=None, headers=None, timeout=None):
+        urls.append(requests.Request(method, url, params=params).prepare().url)
+        r = requests.Response()
+        r.status_code = 200
+        r._content = b'{"orders": [], "has_next": false, "cursor": ""}'
+        return r
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    assert CoinbaseExchange(client, FUT).open_orders() == []
+    query = urls[0].split("?", 1)[1]
+    assert [p.split("=")[1] for p in query.split("&") if p.startswith("order_status=")] == list(OPEN_STATUSES)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1963,22 +2362,33 @@ parsers below read the raw JSON of the API (the recorded fixtures in tests/live/
 and do not depend on the SDK's response classes.
 
 Retries (spec 5.1): reads and cancels are retried up to 3 times on HTTP 429 / 5xx / network errors
-(429 waits for the server's Retry-After); order placements are sent ONCE - their failure is ambiguous
-(the order may exist) and the executor looks the order up by client_order_id before sending it again.
-When `x-ratelimit-remaining` drops to `min_remaining`, the next request waits for the reset."""
+(429 waits for the server's Retry-After, at most RETRY_AFTER_MAX_S); order placements are sent ONCE -
+their failure is ambiguous (the order may exist) and the executor looks the order up by client_order_id
+before sending it again. Every requests failure other than an HTTP status (a broken or undecodable
+reply after the send, a bad header, ...) is ambiguous too: Unavailable, never a final rejection. When
+`x-ratelimit-remaining` drops to `min_remaining`, the next request waits for the reset.
+
+Only ExchangeError (or ValueError for a side that is not +1/-1, a programming error) leaves this module:
+an unexpected reply shape is an ExchangeError, a reply that is not a JSON object is Unavailable. Error
+messages never carry an exception's text (it may hold the JWT): the HTTP status and the start of the
+reply body, or the exception's type name."""
 
 from __future__ import annotations
 
+import math
 import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import requests
 
 from ewbot.live.exchange import (
     FUTURES_PRODUCT,
+    OPEN_STATUSES,
     SPOT_PRODUCT,
     Balance,
     ExchangeError,
@@ -1996,14 +2406,67 @@ from ewbot.live.exchange import (
 
 API = "/api/v3/brokerage"
 SESSION_PREFIX = "FCM_TRADING_SESSION_STATE_"
-_STATUS = {"CANCEL_QUEUED": "OPEN", "UNKNOWN_ORDER_STATUS": "UNKNOWN"}
+_STATUS = {"UNKNOWN_ORDER_STATUS": "UNKNOWN"}  # EDIT_QUEUED / CANCEL_QUEUED keep their name: open (exchange.py)
 _BRACKETS = ("trigger_bracket_gtc", "trigger_bracket_gtd")
+_ORDER_SIDES = {"BUY": 1, "SELL": -1}  # OrderSide
+_POSITION_SIDES = {"LONG": 1, "SHORT": -1}  # FCMPositionSide (UNKNOWN is refused)
+INVALID_SIZE = "INVALID_SIZE_PRECISION"  # the reasons SimExchange gives, too
+INVALID_PRICE = "INVALID_PRICE_PRECISION"
+INVALID_STOP = "INVALID_STOP_PRICE_PRECISION"
+DUPLICATE_ID = "DUPLICATE_CLIENT_ORDER_ID"
+_REASON_FIELDS = ("new_order_failure_reason", "error", "preview_failure_reason")  # most specific first
+CANCEL_DONE = frozenset({"DUPLICATE_CANCEL_REQUEST", "ORDER_IS_FULLY_FILLED"})  # nothing rests any more
+RETRY_AFTER_MAX_S = 10.0  # never wait longer than the pacing cap on one 429
+_PARSE_ERRORS = (KeyError, ValueError, TypeError, AttributeError, IndexError)
+
+
+class DuplicateClientOrderId(ExchangeError):
+    """An HTTP 4xx whose body names DUPLICATE_CLIENT_ORDER_ID: an order with this id exists. The order
+    calls turn it into PlaceResult(duplicate=True), so the executor looks the order up."""
+
+
+@contextmanager
+def _parsing(what: str) -> Iterator[None]:
+    """A reply that does not have the expected shape -> ExchangeError (type name only)."""
+    try:
+        yield
+    except _PARSE_ERRORS as exc:
+        raise ExchangeError(f"unexpected {what} reply ({type(exc).__name__})") from None
 
 
 def fmt_decimal(x: float | int) -> str:
     """84665.0 -> "84665", 0.5 -> "0.5" (the API takes decimal strings)."""
     d = Decimal(repr(float(x))).normalize()
     return format(d, "f")
+
+
+def bad_size(size: float) -> bool:
+    """True unless size is a whole number of contracts, at least 1. The adapter never truncates
+    (str(int(2.9)) would silently send fewer contracts than asked): it refuses, like the venue."""
+    try:
+        x = float(size)
+    except (TypeError, ValueError):
+        return True
+    return not math.isfinite(x) or x != int(x) or x < 1
+
+
+def bad_price(price: float) -> bool:
+    """True unless price is a finite number above zero (fmt_decimal would send "NaN" or "-5")."""
+    try:
+        x = float(price)
+    except (TypeError, ValueError):
+        return True
+    return not math.isfinite(x) or x <= 0
+
+
+def _bracket_problem(size: float, limit_price: float, stop_price: float) -> str | None:
+    if bad_size(size):
+        return INVALID_SIZE
+    if bad_price(limit_price):
+        return INVALID_PRICE
+    if bad_price(stop_price):
+        return INVALID_STOP
+    return None
 
 
 def iso_ts(text: str | None) -> int | None:
@@ -2024,64 +2487,112 @@ def _num(x: Any, default: float = 0.0) -> float:
     return float(x)
 
 
+def retry_after_s(value: Any, now: float | None = None) -> float:
+    """Retry-After in seconds - delta-seconds or an HTTP-date - clamped to [0, RETRY_AFTER_MAX_S];
+    missing or unreadable -> 1 s."""
+    if value is None:
+        return 1.0
+    text = str(value).strip()
+    try:
+        secs = float(text)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return 1.0
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        secs = when.timestamp() - (time.time() if now is None else now)
+    if not math.isfinite(secs):
+        return 1.0
+    return min(max(secs, 0.0), RETRY_AFTER_MAX_S)
+
+
 def map_error(exc: BaseException) -> ExchangeError:
     """SDK / requests exception -> ExchangeError (RateLimited, Unavailable or a final error). Messages
-    keep the status and the start of the reply only (never headers: they carry the JWT)."""
+    keep the status and the start of the reply only, or the exception's type name - never its text or
+    headers (they may carry the JWT)."""
     if isinstance(exc, ExchangeError):
         return exc
     if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
         resp = exc.response
         status = int(resp.status_code)
-        text = str(getattr(resp, "text", ""))[:200]
+        body = str(getattr(resp, "text", "") or "")
+        text = body[:200]
         if status == 429:
-            retry_after = _num(resp.headers.get("Retry-After"), 1.0) if resp.headers else 1.0
-            return RateLimited(f"HTTP 429: {text}", retry_after=retry_after)
+            return RateLimited(f"HTTP 429: {text}", retry_after=retry_after_s((resp.headers or {}).get("Retry-After")))
         if status >= 500:
             return Unavailable(f"HTTP {status}: {text}")
+        if DUPLICATE_ID in body:
+            return DuplicateClientOrderId(f"HTTP {status}: {text}")
         return ExchangeError(f"HTTP {status}: {text}")
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-        return Unavailable(f"{type(exc).__name__}")
-    return ExchangeError(f"{type(exc).__name__}: {str(exc)[:200]}")
+    if isinstance(exc, requests.exceptions.RequestException):
+        # connection, timeout, a reply cut short or undecodable after the send, an invalid header, ...:
+        # the request may have reached the venue -> ambiguous (the executor looks the order up first)
+        return Unavailable(type(exc).__name__)
+    return ExchangeError(type(exc).__name__)
+
+
+def _side_of(text: Any, sides: dict[str, int], what: str) -> int:
+    side = sides.get(str(text)) if text is not None else None
+    if side is None:
+        raise ExchangeError(f"unexpected {what} side {str(text)[:40]!r}")
+    return side
 
 
 def parse_order(o: dict[str, Any]) -> Order:
-    cfg = o.get("order_configuration") or {}
-    kind, limit, stop, size = "OTHER", None, None, None
-    if "market_market_ioc" in cfg:
-        kind, size = "MARKET", cfg["market_market_ioc"].get("base_size")
-    for key in _BRACKETS:
-        if key in cfg:
-            b = cfg[key]
-            kind, size = "BRACKET", b.get("base_size")
-            limit, stop = _num(b.get("limit_price"), 0.0) or None, _num(b.get("stop_trigger_price"), 0.0) or None
-    filled = int(_num(o.get("filled_size")))
-    avg = _num(o.get("average_filled_price")) or None
-    status = str(o.get("status") or "UNKNOWN")
-    return Order(
-        order_id=str(o["order_id"]),
-        client_order_id=str(o.get("client_order_id") or ""),
-        side=1 if o.get("side") == "BUY" else -1,
-        kind=kind,
-        size=int(_num(size, filled)),
-        filled=filled,
-        status=_STATUS.get(status, status),
-        limit_price=limit,
-        stop_price=stop,
-        avg_fill_price=avg,
-        created_ts=iso_ts(o.get("created_time")),
-        fee=None if o.get("total_fees") in (None, "") else _num(o.get("total_fees")),
-    )
+    with _parsing("order"):
+        cfg = o.get("order_configuration") or {}
+        kind, limit, stop, size = "OTHER", None, None, None
+        if "market_market_ioc" in cfg:
+            kind, size = "MARKET", cfg["market_market_ioc"].get("base_size")
+        for key in _BRACKETS:
+            if key in cfg:
+                b = cfg[key]
+                kind, size = "BRACKET", b.get("base_size")
+                limit, stop = _num(b.get("limit_price"), 0.0) or None, _num(b.get("stop_trigger_price"), 0.0) or None
+        filled = int(_num(o.get("filled_size")))
+        avg = _num(o.get("average_filled_price")) or None
+        status = str(o.get("status") or "UNKNOWN")
+        return Order(
+            order_id=str(o["order_id"]),
+            client_order_id=str(o.get("client_order_id") or ""),
+            side=_side_of(o.get("side"), _ORDER_SIDES, "order"),
+            kind=kind,
+            size=int(_num(size, filled)),
+            filled=filled,
+            status=_STATUS.get(status, status),
+            limit_price=limit,
+            stop_price=stop,
+            avg_fill_price=avg,
+            created_ts=iso_ts(o.get("created_time")),
+            fee=None if o.get("total_fees") in (None, "") else _num(o.get("total_fees")),
+        )
+
+
+def _reasons(resp: dict[str, Any]) -> list[str]:
+    """The failure reasons of a create / close reply, most specific first: error_response's
+    new_order_failure_reason, then its deprecated error and preview_failure_reason, then failure_reason."""
+    err = resp.get("error_response") or {}
+    found = [err.get(k) for k in _REASON_FIELDS] + [resp.get("failure_reason")]
+    return [str(r) for r in found if r]
 
 
 def parse_place(resp: dict[str, Any], client_order_id: str) -> PlaceResult:
-    if resp.get("success"):
-        ok = resp.get("success_response") or {}
-        return PlaceResult(client_order_id, str(ok.get("order_id") or "") or None, True)
-    err = resp.get("error_response") or {}
-    reason = (err.get("error") or err.get("new_order_failure_reason") or err.get("preview_failure_reason")
-              or resp.get("failure_reason") or "UNKNOWN_FAILURE_REASON")
-    message = err.get("message") or err.get("error_details") or ""
-    return PlaceResult(client_order_id, None, False, f"{reason}: {message}"[:200] if message else str(reason))
+    """A create / close_position reply -> PlaceResult. Accepted without an order id is ambiguous
+    (Unavailable: the executor looks the order up by client_order_id)."""
+    with _parsing("order placement"):
+        if resp.get("success"):
+            order_id = str((resp.get("success_response") or {}).get("order_id") or "")
+            if not order_id:
+                raise Unavailable("order accepted without an order_id")
+            return PlaceResult(client_order_id, order_id, True)
+        reasons = _reasons(resp)
+        reason = next((r for r in reasons if not r.startswith("UNKNOWN_")), "UNKNOWN_FAILURE_REASON")
+        err = resp.get("error_response") or {}
+        message = str(err.get("message") or err.get("error_details") or "")
+        error = f"{reason}: {message}"[:200] if message else reason
+        return PlaceResult(client_order_id, None, False, error, duplicate=DUPLICATE_ID in reasons)
 
 
 class CoinbaseExchange:
@@ -2117,14 +2628,20 @@ class CoinbaseExchange:
 
     # ------------------------------------------------------------------ transport
     def _pace(self, resp: dict[str, Any]) -> None:
+        """Rate-limit headers (merged into the reply by the SDK); unreadable values are ignored."""
         remaining = resp.pop("x-ratelimit-remaining", None)
         reset = resp.pop("x-ratelimit-reset", None)
         resp.pop("x-ratelimit-limit", None)
-        if remaining is None or int(_num(remaining)) > self.min_remaining:
+        try:
+            if remaining is None or int(_num(remaining)) > self.min_remaining:
+                return
+            r = _num(reset, 1.0)
+        except _PARSE_ERRORS:
             return
-        r = _num(reset, 1.0)
+        if not math.isfinite(r):
+            return
         wait = r - self.clock() if r > 1e9 else r  # epoch seconds or seconds-to-reset
-        self._wait_until = self.clock() + min(max(wait, 0.0), 10.0)
+        self._wait_until = self.clock() + min(max(wait, 0.0), RETRY_AFTER_MAX_S)
 
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               data: dict[str, Any] | None = None, public: bool = False, retry: bool = True) -> dict[str, Any]:
@@ -2138,11 +2655,14 @@ class CoinbaseExchange:
                     resp = self.client.get(API + path, params=params, public=public)
                 else:
                     resp = self.client.post(API + path, data=data)
+                if not isinstance(resp, dict):  # after the send: the request may have been executed
+                    raise Unavailable(f"reply is not a JSON object ({type(resp).__name__})")
             except Exception as exc:  # noqa: BLE001 - mapped below
                 err = map_error(exc)
                 if not err.retryable or attempt == tries - 1:
                     raise err from None
-                self.sleep(err.retry_after if isinstance(err, RateLimited) else self.backoff_s * 2**attempt)
+                wait = min(err.retry_after, RETRY_AFTER_MAX_S) if isinstance(err, RateLimited) else self.backoff_s * 2**attempt
+                self.sleep(wait)
                 continue
             resp = dict(resp)
             self._pace(resp)
@@ -2155,41 +2675,46 @@ class CoinbaseExchange:
 
     def product(self) -> ProductSpec:
         p = self._product_json()
-        fpd = p.get("future_product_details") or {}
-        im, om = fpd.get("intraday_margin_rate") or {}, fpd.get("overnight_margin_rate") or {}
-        return ProductSpec(
-            product_id=str(p["product_id"]),
-            contract_size=_num(fpd.get("contract_size")),
-            price_increment=_num(p.get("price_increment")),
-            base_increment=_num(p.get("base_increment")),
-            intraday_margin=(_num(im.get("long_margin_rate")), _num(im.get("short_margin_rate"))),
-            overnight_margin=(_num(om.get("long_margin_rate")), _num(om.get("short_margin_rate"))),
-        )
+        with _parsing("product"):
+            fpd = p.get("future_product_details") or {}
+            im, om = fpd.get("intraday_margin_rate") or {}, fpd.get("overnight_margin_rate") or {}
+            return ProductSpec(
+                product_id=str(p["product_id"]),
+                contract_size=_num(fpd.get("contract_size")),
+                price_increment=_num(p.get("price_increment")),
+                base_increment=_num(p.get("base_increment")),
+                intraday_margin=(_num(im.get("long_margin_rate")), _num(im.get("short_margin_rate"))),
+                overnight_margin=(_num(om.get("long_margin_rate")), _num(om.get("short_margin_rate"))),
+            )
 
     def session(self) -> SessionInfo:
-        s = self._product_json().get("fcm_trading_session_details") or {}
-        state = str(s.get("session_state") or "UNKNOWN").removeprefix(SESSION_PREFIX)
-        m = s.get("maintenance") or {}
-        return SessionInfo(state, iso_ts(m.get("start_time")), iso_ts(m.get("end_time")))
+        p = self._product_json()
+        with _parsing("session"):
+            s = p.get("fcm_trading_session_details") or {}
+            state = str(s.get("session_state") or "UNKNOWN").removeprefix(SESSION_PREFIX)
+            m = s.get("maintenance") or {}
+            return SessionInfo(state, iso_ts(m.get("start_time")), iso_ts(m.get("end_time")))
 
     def quote(self, product_id: str) -> Quote:
         book = self._call("GET", "/market/product_book", params={"product_id": product_id, "limit": 1}, public=True)
-        pb = book.get("pricebook") or {}
-        bids, asks = pb.get("bids") or [], pb.get("asks") or []
-        if not bids or not asks:
-            raise Unavailable(f"empty order book for {product_id}")
-        return Quote(product_id, _num(bids[0]["price"]), _num(asks[0]["price"]), self.clock())
+        with _parsing("product_book"):
+            pb = book.get("pricebook") or {}
+            bids, asks = pb.get("bids") or [], pb.get("asks") or []
+            if not bids or not asks:
+                raise Unavailable(f"empty order book for {product_id}")
+            return Quote(product_id, _num(bids[0]["price"]), _num(asks[0]["price"]), self.clock())
 
     def position(self) -> Position | None:
-        for p in self._call("GET", "/cfm/positions").get("positions") or []:
-            if p.get("product_id") != self.futures_id:
-                continue
-            n = int(_num(p.get("number_of_contracts")))
-            if n == 0:
-                return None
-            side = 1 if "LONG" in str(p.get("side", "")).upper() else -1
-            return Position(side, n, _num(p.get("avg_entry_price")))
-        return None
+        reply = self._call("GET", "/cfm/positions")
+        with _parsing("positions"):
+            for p in reply.get("positions") or []:
+                if p.get("product_id") != self.futures_id:
+                    continue
+                n = abs(int(_num(p.get("number_of_contracts"))))
+                if n == 0:
+                    return None
+                return Position(_side_of(p.get("side"), _POSITION_SIDES, "position"), n, _num(p.get("avg_entry_price")))
+            return None
 
     def _orders(self, params: dict[str, Any]) -> list[Order]:
         out: list[Order] = []
@@ -2197,16 +2722,22 @@ class CoinbaseExchange:
         while True:
             page = self._call("GET", "/orders/historical/batch",
                               params={**params, "product_ids": [self.futures_id], "limit": 250, "cursor": cursor})
-            out += [parse_order(o) for o in page.get("orders") or []]
-            cursor = page.get("cursor") or None
-            if not page.get("has_next") or not cursor:
+            with _parsing("orders"):
+                out += [parse_order(o) for o in page.get("orders") or []]
+                cursor = page.get("cursor") or None
+                more = bool(page.get("has_next"))
+            if not more or not cursor:
                 return out
 
     def open_orders(self) -> list[Order]:
-        return [o for o in self._orders({"order_status": ["OPEN"]}) if o.is_open]
+        """Every resting order: order_status is a repeated query parameter (List Orders reference,
+        `explode: true`; SDK 1.8.4 list_orders takes `order_status: List[str]`)."""
+        return [o for o in self._orders({"order_status": list(OPEN_STATUSES)}) if o.is_open]
 
     def get_order(self, order_id: str) -> Order:
-        return parse_order(self._call("GET", f"/orders/historical/{order_id}")["order"])
+        reply = self._call("GET", f"/orders/historical/{order_id}")
+        with _parsing("order"):
+            return parse_order(reply["order"])
 
     def find_order(self, client_order_id: str, since_ts: float) -> Order | None:
         for o in self._orders({"start_date": _iso(since_ts)}):
@@ -2215,15 +2746,26 @@ class CoinbaseExchange:
         return None
 
     def balance(self) -> Balance:
-        bs = self._call("GET", "/cfm/balance_summary").get("balance_summary") or {}
-        equity = _num(bs.get("total_usd_balance")) + _num(bs.get("unrealized_pnl"))
-        avail = bs.get("available_margin")
-        return Balance(equity, None if avail is None else _num(avail))
+        """Equity = total_usd_balance (cash) + unrealized PnL. Without a readable, finite cash total there
+        is no equity: an error, never PnL alone (the breakers and sizing read it)."""
+        reply = self._call("GET", "/cfm/balance_summary")
+        with _parsing("balance_summary"):
+            bs = reply.get("balance_summary") or {}
+            cash = _num(bs.get("total_usd_balance"), math.nan)
+            if not math.isfinite(cash):
+                raise ExchangeError("balance_summary without a total_usd_balance")
+            equity = cash + _num(bs.get("unrealized_pnl"))
+            avail = bs.get("available_margin")
+            return Balance(equity, None if avail is None else _num(avail))
 
     def key_permissions(self) -> KeyPermissions:
+        """Fail closed: a missing can_view / can_trade reads False, a missing can_transfer reads True
+        (the preflight refuses a key that can transfer)."""
         k = self._call("GET", "/key_permissions")
-        return KeyPermissions(bool(k.get("can_view")), bool(k.get("can_trade")), bool(k.get("can_transfer")),
-                              k.get("portfolio_type"))
+        with _parsing("key_permissions"):
+            transfer = k.get("can_transfer")
+            return KeyPermissions(bool(k.get("can_view")), bool(k.get("can_trade")),
+                                  True if transfer is None else bool(transfer), k.get("portfolio_type"))
 
     # ------------------------------------------------------------------ writes
     @staticmethod
@@ -2239,22 +2781,39 @@ class CoinbaseExchange:
         return {"trigger_bracket_gtc": {"base_size": str(int(size)), "limit_price": fmt_decimal(limit_price),
                                         "stop_trigger_price": fmt_decimal(stop_price)}}
 
+    def _send_order(self, path: str, data: dict[str, Any], client_order_id: str) -> PlaceResult:
+        """POST once; a 4xx naming DUPLICATE_CLIENT_ORDER_ID is the duplicate path, not a final error."""
+        try:
+            resp = self._call("POST", path, data=data, retry=False)
+        except DuplicateClientOrderId as exc:
+            return PlaceResult(client_order_id, None, False, f"{DUPLICATE_ID}: {exc}"[:200], duplicate=True)
+        return parse_place(resp, client_order_id)
+
     def _create(self, client_order_id: str, side: int, cfg: dict[str, Any]) -> PlaceResult:
         data = {"client_order_id": client_order_id, "product_id": self.futures_id, "side": self._side(side),
                 "order_configuration": cfg}
-        return parse_place(self._call("POST", "/orders", data=data, retry=False), client_order_id)
+        return self._send_order("/orders", data, client_order_id)
 
     def place_market(self, client_order_id: str, side: int, size: int) -> PlaceResult:
+        self._side(side)
+        if bad_size(size):
+            return PlaceResult(client_order_id, None, False, INVALID_SIZE)
         return self._create(client_order_id, side, self._market_cfg(size))
 
     def place_bracket(
         self, client_order_id: str, side: int, size: int, limit_price: float, stop_price: float
     ) -> PlaceResult:
+        self._side(side)
+        problem = _bracket_problem(size, limit_price, stop_price)
+        if problem is not None:
+            return PlaceResult(client_order_id, None, False, problem)
         return self._create(client_order_id, side, self._bracket_cfg(size, limit_price, stop_price))
 
     def edit_bracket(self, order_id: str, size: int, limit_price: float, stop_price: float) -> bool:
         """Edit a resting bracket's stop (spec 4.2). Whether CFM brackets accept stop_price edits is
         confirmed in CANARY; any failure returns False and the executor replaces the order instead."""
+        if _bracket_problem(size, limit_price, stop_price) is not None:
+            return False
         data = {"order_id": order_id, "size": str(int(size)), "price": fmt_decimal(limit_price),
                 "stop_price": fmt_decimal(stop_price)}
         try:
@@ -2263,26 +2822,51 @@ class CoinbaseExchange:
             return False
 
     def cancel(self, order_ids: Sequence[str]) -> None:
-        if order_ids:
-            self._call("POST", "/orders/batch_cancel", data={"order_ids": list(order_ids)})
+        """batch_cancel, retried like a read (a repeated cancel is answered DUPLICATE_CANCEL_REQUEST).
+        Raises ExchangeError naming each order that may still rest: refused, or missing from results."""
+        if not order_ids:
+            return
+        ids = [str(i) for i in order_ids]
+        reply = self._call("POST", "/orders/batch_cancel", data={"order_ids": ids})
+        with _parsing("batch_cancel"):
+            results = {str(r.get("order_id")): r for r in reply.get("results") or []}
+            refused = []
+            for oid in ids:
+                r = results.get(oid)
+                if r is None:
+                    refused.append(f"{oid}: NO_RESULT")
+                elif not r.get("success") and str(r.get("failure_reason")) not in CANCEL_DONE:
+                    refused.append(f"{oid}: {r.get('failure_reason') or 'UNKNOWN_CANCEL_FAILURE_REASON'}")
+        if refused:
+            raise ExchangeError("cancel refused: " + ", ".join(refused))
 
     def close_position(self, client_order_id: str, size: int | None = None) -> PlaceResult:
+        if size is not None and bad_size(size):
+            return PlaceResult(client_order_id, None, False, INVALID_SIZE)
         data: dict[str, Any] = {"client_order_id": client_order_id, "product_id": self.futures_id}
         if size is not None:
             data["size"] = str(int(size))
-        return parse_place(self._call("POST", "/orders/close_position", data=data, retry=False), client_order_id)
+        return self._send_order("/orders/close_position", data, client_order_id)
 
     def _preview(self, side: int, cfg: dict[str, Any]) -> PreviewResult:
         resp = self._call("POST", "/orders/preview",
                           data={"product_id": self.futures_id, "side": self._side(side), "order_configuration": cfg})
-        errs = tuple(str(e) for e in resp.get("errs") or ())
-        warns = tuple(str(w) for w in resp.get("warning") or ())
-        return PreviewResult(not errs, errs, warns)
+        with _parsing("preview"):
+            errs = tuple(str(e) for e in resp.get("errs") or ())
+            warns = tuple(str(w) for w in resp.get("warning") or ())
+            return PreviewResult(not errs, errs, warns)
 
     def preview_market(self, side: int, size: int) -> PreviewResult:
+        self._side(side)
+        if bad_size(size):
+            return PreviewResult(False, (f"PREVIEW_{INVALID_SIZE}",))
         return self._preview(side, self._market_cfg(size))
 
     def preview_bracket(self, side: int, size: int, limit_price: float, stop_price: float) -> PreviewResult:
+        self._side(side)
+        problem = _bracket_problem(size, limit_price, stop_price)
+        if problem is not None:
+            return PreviewResult(False, (f"PREVIEW_{problem}",))
         return self._preview(side, self._bracket_cfg(size, limit_price, stop_price))
 ```
 
@@ -2292,7 +2876,7 @@ class CoinbaseExchange:
 uv run --group live pytest tests/live/test_coinbase.py -q
 ```
 
-Expected: `14 passed` (with `uv run pytest` and without the group the SDK test is skipped: `13 passed, 1 skipped`).
+Expected: `76 passed` (with `uv run pytest` and without the group the two SDK tests are skipped: `74 passed, 2 skipped`).
 
 - [ ] **Step 5: Commit**
 
@@ -2731,10 +3315,10 @@ def test_mapping_uses_the_basis_ratio_conservatively():
 
 
 def test_stop_limit_and_gap():
-    assert stop_limit(80_000.0, 1) == pytest.approx(79_200.0)
-    assert stop_limit(80_000.0, -1) == pytest.approx(80_800.0)
-    assert not stop_gapped(79_300.0, 80_000.0, 1) and stop_gapped(79_100.0, 80_000.0, 1)
-    assert not stop_gapped(80_700.0, 80_000.0, -1) and stop_gapped(80_900.0, 80_000.0, -1)
+    assert stop_limit(80_000.0, 1) == pytest.approx(76_000.0)  # STOP_LIMIT_OFFSET 5%
+    assert stop_limit(80_000.0, -1) == pytest.approx(84_000.0)
+    assert not stop_gapped(76_100.0, 80_000.0, 1) and stop_gapped(75_900.0, 80_000.0, 1)
+    assert not stop_gapped(83_900.0, 80_000.0, -1) and stop_gapped(84_100.0, 80_000.0, -1)
 
 
 def test_risk_per_contract_matches_the_sizing_distance():
@@ -2852,7 +3436,7 @@ def map_levels(direction: int, stop: float, tp1: float, tp2: float | None, ratio
 
 
 def stop_limit(stop: float, direction: int, offset: float = STOP_LIMIT_OFFSET) -> float:
-    """The limit a triggered stop of a `direction` position rests at (a long sells 1% below)."""
+    """The limit a triggered stop of a `direction` position rests at (a long sells 5% below)."""
     return stop * (1.0 - direction * offset)
 
 
@@ -3518,7 +4102,7 @@ EOF
 
 **Interfaces:**
 - Consumes: Tasks 1, 2, 5, 6 (`Exchange`, `ExchangeError`, `Order`, `PlaceResult`, `SimExchange`, `SimCrash`, `Journal`, `map_levels`, every `reconcile` name), `ewbot.live.target.TargetPosition`, `ewbot.engine.position_mgr._tp1_split` (read-only import of the engine's TP1 split).
-- Produces (`ewbot.live.executor`): `FILL_TIMEOUT_S = 10.0`, `FLAT_TIMEOUT_S = 30.0`, `POLL_S = 0.5`, `LOOKUP_WINDOW_S = 300.0`, `ABANDON_AFTER_S = 600.0`, journal keys `TRADE_KEY = "trade"`, `SKIPS_KEY`, `ORPHAN_KEY`; frozen `Sent(status: "ACCEPTED"|"REJECTED"|"PENDING", order_id=None, error=None)`; `class Executor(exchange, journal, *, clock=time.time, sleep=time.sleep, alert=None, tp1_frac=0.5, edit_stops=False, fill_timeout=10.0, flat_timeout=30.0, poll_s=0.5)` with `trade() -> LiveTrade | None`, `save(trade)`, `event(kind, data, text=None)` (journal + alert when `text`), `send(cid, kind, trade_id, payload, call) -> Sent`, `execute(actions, ctx)`, `enter(Enter, ctx) -> LiveTrade | None`, `adopt(TargetPosition, ctx)` (rebuilds our own accepted entry from its intent, else adopts a foreign position), `protect(Protect, ctx)`, `close(reason, ctx) -> bool` (flat confirmed), `reduce(size, reason, ctx)`, `flatten(reason, ctx) -> bool`, `resolve_pending() -> (counts, CLOSE intents found)` (no event; the runtime calls it every minute while intents are pending), `recover() -> {"accepted", "abandoned", "unknown", "rebuilt"}` (startup; writes `RECOVERY`). Journal events written: `ENTRY` (`trade_id, side, contracts, price, ref, fee, order_id`), `PROTECTED_FIRST` (`after_entry_s`), `STOP_MOVED` (`stop, stop_spot`), `STOP_EDITED`, `LEG_GAP`, `BRACKET_FAILED`, `CLOSED` (`trade_id, reason, price, contracts, side, fee`), `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCED`, `REDUCE_FAILED`, `ENTRY_FAILED`, `ENTRY_UNFILLED`, `ENTRY_UNCONFIRMED`, `CANCEL_FAILED`, `SKIP`, `ADOPTED`, `RECOVERED_ENTRY`, `RECOVERY`, `CANCELLED`, `ACTION_ERROR`, and once-only alert events (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `CLOSE_DEFERRED`).
+- Produces (`ewbot.live.executor`): `FILL_TIMEOUT_S = 10.0`, `FLAT_TIMEOUT_S = 30.0`, `POLL_S = 0.5`, `LOOKUP_WINDOW_S = 300.0`, `ABANDON_AFTER_S = 600.0`, journal keys `TRADE_KEY = "trade"`, `SKIPS_KEY`, `ORPHAN_KEY`; frozen `Sent(status: "ACCEPTED"|"REJECTED"|"PENDING", order_id=None, error=None)`; `class Executor(exchange, journal, *, clock=time.time, sleep=time.sleep, alert=None, tp1_frac=0.5, edit_stops=False, fill_timeout=10.0, flat_timeout=30.0, poll_s=0.5)` with `trade() -> LiveTrade | None`, `save(trade)`, `event(kind, data, text=None)` (journal + alert when `text`), `send(cid, kind, trade_id, payload, call) -> Sent`, `execute(actions, ctx)`, `enter(Enter, ctx) -> LiveTrade | None`, `adopt(TargetPosition, ctx)` (rebuilds our own accepted entry from its intent, else adopts a foreign position), `protect(Protect, ctx)`, `close(reason, ctx) -> bool` (flat confirmed; a refused bracket cancel is recorded as `CANCEL_FAILED` and never blocks the close), `reduce(size, reason, ctx)`, `flatten(reason, ctx) -> bool`, `resolve_pending() -> (counts, CLOSE intents found)` (no event; the runtime calls it every minute while intents are pending), `recover() -> {"accepted", "abandoned", "unknown", "rebuilt"}` (startup; writes `RECOVERY`). Journal events written: `ENTRY` (`trade_id, side, contracts, price, ref, fee, order_id`), `PROTECTED_FIRST` (`after_entry_s`), `STOP_MOVED` (`stop, stop_spot`), `STOP_EDITED`, `LEG_GAP`, `BRACKET_FAILED`, `CLOSED` (`trade_id, reason, price, contracts, side, fee`), `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCED`, `REDUCE_FAILED`, `ENTRY_FAILED`, `ENTRY_UNFILLED`, `ENTRY_UNCONFIRMED`, `CANCEL_FAILED`, `SKIP`, `ADOPTED`, `RECOVERED_ENTRY`, `RECOVERY`, `CANCELLED`, `ACTION_ERROR`, and once-only alert events (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `CLOSE_DEFERRED`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3599,7 +4183,7 @@ from __future__ import annotations
 
 import pytest
 
-from ewbot.live.exchange import RateLimited, Unavailable
+from ewbot.live.exchange import ExchangeError, RateLimited, Unavailable
 from ewbot.live.executor import Executor
 from ewbot.live.reconcile import Alert, Close, Enter, Protect, Reduce, Skip, desired_legs, plan
 from ewbot.live.sim import SimCrash
@@ -3737,6 +4321,15 @@ def test_close_cancels_brackets_and_waits_for_flat(env):
     assert jr.intent(f"ewb-x-{T0}-1")["status"] == "ACCEPTED" and "CLOSED" in alerts.kinds()
 
 
+def test_a_refused_bracket_cancel_does_not_block_the_close(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.fail_next("cancel", ExchangeError("cancel refused: sim-2: NOT_ALLOWED_TO_CANCEL"))
+    assert exe.close("TIME", ctx(clock)) is True  # brackets only reduce: the close goes out anyway
+    assert ex.position() is None and ex.open_orders() == []
+    assert jr.events(kind="CANCEL_FAILED")[0]["data"]["error"].startswith("cancel refused")
+
+
 def test_close_waits_for_an_open_session_and_alerts_once(env):
     clock, ex, jr, alerts, exe = env
     exe.enter(Enter(entry(), 1), ctx(clock))
@@ -3857,7 +4450,8 @@ trigger_bracket_gtc legs. Stop moves edit the resting bracket when `edit_stops` 
 CFM brackets: off until CANARY confirms it), otherwise the new bracket is placed first and the old
 one cancelled (brackets only reduce, so a short overlap cannot over-close); if the exchange refuses the
 overlap, the old one is cancelled first and the gap is tracked as unprotected time. Closes cancel our
-brackets and call close_position; the flat position is awaited (30 s). Market orders wait for an OPEN
+brackets (a refused cancel is recorded, CANCEL_FAILED, and never blocks the close) and call
+close_position; the flat position is awaited (30 s). Market orders wait for an OPEN
 session; a deferred close is retried on every pass (spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`).
 
 The same code runs every stage: in SHADOW the exchange is a ShadowExchange (virtual fills, real
@@ -4229,8 +4823,8 @@ class Executor:
             self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
             return False
         ours = [o.order_id for o in self.ex.open_orders() if is_ours(o)]
-        if ours:
-            self.ex.cancel(ours)
+        if ours:  # a refused cancel never blocks the close: brackets only reduce
+            self._cancel_quietly(ours, trade.trade_id if trade is not None else 0)
         open_trade = trade if trade is not None and trade.status == "OPEN" else None
         if open_trade is not None:
             open_trade.closes += 1
@@ -4350,7 +4944,7 @@ class Executor:
 uv run --group live pytest tests/live/test_executor.py -q
 ```
 
-Expected: `19 passed`.
+Expected: `20 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -4399,15 +4993,15 @@ NY_NOON = 1_791_043_200  # 2026-10-03 12:00 New York (16:00 UTC)
 
 def test_stop_gap_closes_only_after_ten_seconds_beyond_the_limit():
     w = StopGapWatch()
-    assert not w.check(1, 60_000.0, 59_500.0, now=0.0)  # inside the 1% limit (59_400)
-    assert not w.check(1, 60_000.0, 59_300.0, now=1.0)
-    assert not w.check(1, 60_000.0, 59_300.0, now=10.9)
-    assert w.check(1, 60_000.0, 59_300.0, now=11.0)
-    assert not w.check(1, 60_000.0, 59_450.0, now=12.0) and w.since is None  # back inside: reset
-    assert not w.check(-1, 60_000.0, 60_700.0, now=20.0)  # a short's limit is 60_600
-    assert not w.check(-1, 60_000.0, 60_500.0, now=25.0) and w.since is None
-    assert not w.check(-1, 60_000.0, 60_700.0, now=26.0)
-    assert w.check(-1, 60_000.0, 60_700.0, now=36.0)
+    assert not w.check(1, 60_000.0, 57_500.0, now=0.0)  # inside the 5% limit (57_000)
+    assert not w.check(1, 60_000.0, 56_900.0, now=1.0)
+    assert not w.check(1, 60_000.0, 56_900.0, now=10.9)
+    assert w.check(1, 60_000.0, 56_900.0, now=11.0)
+    assert not w.check(1, 60_000.0, 57_100.0, now=12.0) and w.since is None  # back inside: reset
+    assert not w.check(-1, 60_000.0, 63_100.0, now=20.0)  # a short's limit is 63_000
+    assert not w.check(-1, 60_000.0, 62_900.0, now=25.0) and w.since is None
+    assert not w.check(-1, 60_000.0, 63_100.0, now=26.0)
+    assert w.check(-1, 60_000.0, 63_100.0, now=36.0)
 
 
 def test_margin_levels_use_the_overnight_rate():
@@ -4533,7 +5127,7 @@ Expected: collection error `ModuleNotFoundError: No module named 'ewbot.live.fee
 ```python
 """Always-on safety checks between decision cycles (Plan 3 spec 3.2 `watchdog`, 4.2, 4.5, 5.1).
 
-  StopGapWatch   a bracket stop fills as a limit 1% beyond the stop; when the futures price has passed
+  StopGapWatch   a bracket stop fills as a limit 5% beyond the stop; when the futures price has passed
                  that limit and the position is still open 10 s later, the runtime closes at market.
   margin_status  overnight-margin projection of the open position: >= 80% warn, >= 90% reduce back to
                  the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
@@ -6399,7 +6993,7 @@ def test_a_failing_command_is_reported_and_the_loop_goes_on(h):
 
 def test_the_stop_gap_watchdog_closes_after_ten_seconds(h):
     entered(h)
-    h.price(26_000.0)  # far below the stop's 1% limit (26_319.15): the bracket cannot fill
+    h.price(25_000.0)  # far below the stop's 5% limit (25_255.75): the bracket cannot fill
     assert h.ex.position() is not None
     for k in range(1, 12):
         h.at(ENTRY_BAR + 40 + k)
@@ -6413,7 +7007,7 @@ def test_an_unprotected_position_through_its_stop_is_closed_at_once(h):
     assert h.ex.position() is not None and h.ex.open_orders() == []
     h.at(ENTRY_BAR + 40)  # the poll observes the gap in protection
     assert h.rt.executor.trade().unprotected_since == ENTRY_BAR + 40
-    h.price(26_580.0)  # through the 26_585 stop, inside its 1% limit: a resting stop would have filled
+    h.price(26_580.0)  # through the 26_585 stop, inside its 5% limit: a resting stop would have filled
     h.at(ENTRY_BAR + 51)  # the next REST price (no WebSocket feed here: polled every 10 s)
     assert h.ex.position() is None and "STOP_UNPROTECTED" in h.alerts.kinds()
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_UNPROTECTED"
@@ -6421,7 +7015,7 @@ def test_an_unprotected_position_through_its_stop_is_closed_at_once(h):
 
 def test_bracket_fills_are_recorded_for_the_cost_report(h):
     entered(h)
-    h.price(26_570.0)  # through the 26_585 stop, inside its 1% limit: the bracket's stop fills at 26_570
+    h.price(26_570.0)  # through the 26_585 stop, inside its 5% limit: the bracket's stop fills at 26_570
     h.at(ENTRY_BAR + 45)
     assert h.ex.position() is None
     fill = h.journal.events(kind="BRACKET_FILL")[0]["data"]
@@ -6728,7 +7322,7 @@ from ewbot.config import BotConfig
 from ewbot.data.candles import fill_gaps, load_1h
 from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
-from ewbot.live.exchange import Exchange, ExchangeError, ProductSpec, SessionInfo
+from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, ProductSpec, SessionInfo
 from ewbot.live.executor import Executor
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
@@ -7023,7 +7617,7 @@ class LiveRuntime:
             return
         if not self.gap.check(t.direction, t.stop_price, price, now):
             return
-        self.alert("STOP_GAP", f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 1% 지정가를 10초 넘게 지남: 시장가 청산")
+        self.alert("STOP_GAP", f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 {STOP_LIMIT_OFFSET:.0%} 지정가를 10초 넘게 지남: 시장가 청산")
         self.journal.add_event(now, "STOP_GAP", {"trade_id": t.trade_id, "price": price, "stop": t.stop_price})
         self.executor.close("STOP_GAP", self._ctx(now))
         self.gap.reset()
@@ -8542,7 +9136,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - One Docker container on a US-East VPS runs `ewbot live run` (`deploy/live/docker-compose.yml`, `restart: unless-stopped`). It trades the frozen strategy (params from the committed `holdout.lock`, conservative risk) on the Coinbase CFM future `BIP-20DEC30-CDE` (0.01 BTC per contract, $5 tick). Signals come from the same spot BTC-USD hourly candles as the paper runtime.
 - Every hour at hh:00:30 it replays the whole engine (as the paper runtime does) and reads the target after the bar that just closed: the position the engine holds, its stop and TPs, an exit or an entry queued at that close. It then makes the Coinbase account match that target (`src/ewbot/live/reconcile.py`): market entries, two `trigger_bracket_gtc` orders as protection (TP1 size + stop, the rest + TP2 + stop; one bracket for 1 contract), stop moves, TP1 break-even, closes. If the bar has not arrived 2 minutes after the close, the decision is held and the resting brackets keep protecting the position.
-- Between cycles: every second the stop-gap watchdog (the bracket's stop fills as a limit 1% beyond the stop; if the price is past that limit for 10 s, the position is closed at market); every 10 s while a trade is open the position and orders are re-read and protection is repaired; every minute the session state, the account breakers (−3% a New York day, −15% from the peak: flatten and pause), the overnight-margin projection (80% warns, 90% reduces to 70%), the heartbeat to healthchecks.io and the stage-change check; at 15:30 New York an overnight-margin report; at 09:00 New York the daily summary; from minute 50 of every hour the comparison of the live engine decisions with the paper ledger.
+- Between cycles: every second the stop-gap watchdog (the bracket's stop fills as a limit 5% beyond the stop, Coinbase's trigger_bracket rule; if the price is past that limit for 10 s, the position is closed at market); every 10 s while a trade is open the position and orders are re-read and protection is repaired; every minute the session state, the account breakers (−3% a New York day, −15% from the peak: flatten and pause), the overnight-margin projection (80% warns, 90% reduces to 70%), the heartbeat to healthchecks.io and the stage-change check; at 15:30 New York an overnight-margin report; at 09:00 New York the daily summary; from minute 50 of every hour the comparison of the live engine decisions with the paper ledger.
 - Everything is recorded in the SQLite journal `/var/lib/ewbot/journal.sqlite`: every order intent before it is sent (deterministic `client_order_id`, so a restart never doubles an order), events, the engine decisions, the cycles and the stage history.
 - The GitHub Actions paper runtime keeps running as the independent audit. Telegram messages of the live runtime start with `[LIVE]`, the paper runtime's with `[ewbot paper]`.
 
@@ -8671,7 +9265,8 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - Whether brackets survive the Friday 17:00–18:00 New York close.
 - Whether `orders/edit` changes a bracket's stop. If it does, set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy; until then stop moves place the new bracket first and cancel the old one.
 - The actual fee tier (`GET /api/v3/brokerage/transaction_summary`).
-- Re-record the private-endpoint fixtures in `tests/live/fixtures/coinbase.json` (positions, balance summary, key permissions, orders, preview) from real responses with personal data removed, and rerun the tests.
+- The limit of the first triggered bracket stop: the Create Order reference says 5% beyond the stop (`STOP_LIMIT_OFFSET`, also the stop-gap watchdog's threshold). If Coinbase uses another offset, change the constant and redeploy with a flat book.
+- Re-record the private-endpoint fixtures in `tests/live/fixtures/coinbase.json` (positions, balance summary, key permissions, orders, the open-orders query with every resting `order_status`, preview) from real responses with personal data removed, and rerun the tests.
 
 ## Emergency procedures
 
@@ -8792,6 +9387,9 @@ out = {
     "balance_summary": c.get(p + "/cfm/balance_summary"),
     "key_permissions": c.get(p + "/key_permissions"),
     "orders_history": c.get(p + "/orders/historical/batch", params={"product_ids": ["BIP-20DEC30-CDE"], "limit": 5}),
+    "orders_open": c.get(p + "/orders/historical/batch", params={
+        "product_ids": ["BIP-20DEC30-CDE"], "limit": 5,
+        "order_status": ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"]}),  # open_orders()' filter
     "preview_ok": c.post(p + "/orders/preview", data={"product_id": "BIP-20DEC30-CDE", "side": "BUY",
                                                       "order_configuration": {"market_market_ioc": {"base_size": "1"}}}),
 }
@@ -8802,7 +9400,7 @@ print(sorted(out))
 EOF
 ```
 
-Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account identifier, and diff its keys and value formats against the fixture entries. A difference in a field the parsers read (`side`, `number_of_contracts`, `avg_entry_price`, `total_usd_balance`, `unrealized_pnl`, `available_margin`, `can_*`, `order_configuration`, `status`, `filled_size`, `average_filled_price`, `total_fees`, `errs`) is a bug: update the fixture with the real shape, adapt `live/coinbase.py`, rerun the tests, redeploy (flat book).
+Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account identifier, and diff its keys and value formats against the fixture entries. A difference in a field the parsers read (`side`, `number_of_contracts`, `avg_entry_price`, `total_usd_balance`, `unrealized_pnl`, `available_margin`, `can_*`, `order_configuration`, `status`, `filled_size`, `average_filled_price`, `total_fees`, `errs`) is a bug: update the fixture with the real shape, adapt `live/coinbase.py`, rerun the tests, redeploy (flat book). If `orders_open` is refused (HTTP 4xx), Coinbase does not combine `order_status` values: make `open_orders()` send one request per resting status before CANARY.
 
 - [ ] **Step 6: Run SHADOW for at least 14 days (controller watches, user restarts once)**
 
@@ -8822,4 +9420,4 @@ Expected: the preflight's key line reads `view=True trade=True transfer=False`; 
 
 - [ ] **Step 8: CANARY confirmations (controller records the answers in the project notes)**
 
-During CANARY, confirm the spec §6.2 unknowns from the journal and the Coinbase order history: duplicate `client_order_id` behaviour; whether the brackets survive the Friday 17:00–18:00 New York close; whether `orders/edit` moves a bracket stop (then set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy with a flat book); the actual fee tier (`GET /api/v3/brokerage/transaction_summary`); the measured costs in the daily summaries vs. the paper cost model. CANARY passes with ≥ 3 closed trades (or 90 days) and every CANARY gate `충족` (`ewbot live status`). FULL is not part of this month's schedule: it needs all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades), the CANARY gates and the user's approval (`ewbot live stage full --confirm`).
+During CANARY, confirm the spec §6.2 unknowns from the journal and the Coinbase order history: duplicate `client_order_id` behaviour; whether the brackets survive the Friday 17:00–18:00 New York close; whether `orders/edit` moves a bracket stop (then set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy with a flat book); the limit of the first triggered bracket stop (the reference says 5% beyond the stop: `STOP_LIMIT_OFFSET`, also the stop-gap threshold); the actual fee tier (`GET /api/v3/brokerage/transaction_summary`); the measured costs in the daily summaries vs. the paper cost model. CANARY passes with ≥ 3 closed trades (or 90 days) and every CANARY gate `충족` (`ewbot live status`). FULL is not part of this month's schedule: it needs all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades), the CANARY gates and the user's approval (`ewbot live stage full --confirm`).
