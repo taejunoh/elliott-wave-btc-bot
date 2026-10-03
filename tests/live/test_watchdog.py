@@ -83,6 +83,32 @@ def test_one_bad_balance_read_never_trips_a_breaker_nor_raises_the_peak(tmp_path
     jr.close()
 
 
+def test_a_low_first_read_of_the_day_does_not_disable_the_daily_breaker(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr)
+    g.update(10_000.0, NY_NOON)
+    g.update(9_000.0, NY_NOON + 86_400)  # the next day's first read is wrong low (a funding settlement, say)
+    g.update(10_000.0, NY_NOON + 86_460)
+    assert g.state()["day_ref"] == 10_000.0  # the higher of the day's first two observations
+    assert g.update(9_650.0, NY_NOON + 86_520) is None
+    assert g.update(9_650.0, NY_NOON + 86_580) == "DAILY_LOSS"
+    jr.close()
+
+
+def test_a_low_read_at_resume_does_not_disable_the_daily_breaker(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr)
+    g.update(10_000.0, NY_NOON)
+    g.update(9_650.0, NY_NOON + 60)
+    assert g.update(9_650.0, NY_NOON + 120) == "DAILY_LOSS"
+    assert g.reset(8_000.0, NY_NOON + 180) == ["DAILY_LOSS"]  # /resume read a wrong low balance
+    g.update(9_650.0, NY_NOON + 240)
+    assert g.state()["day_ref"] == 9_650.0  # the higher of the reset read and the next one
+    assert g.update(9_300.0, NY_NOON + 300) is None
+    assert g.update(9_300.0, NY_NOON + 360) == "DAILY_LOSS"
+    jr.close()
+
+
 def test_resume_rebases_only_the_breaker_that_tripped(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)
@@ -218,19 +244,20 @@ def test_feed_takes_the_bid_ask_mid_and_ignores_unusable_prices():
     clock.now = 6.0
     for seq, bad in enumerate(("NaN", "inf", "0", "-5", "", "abc"), start=3):
         feed.on_message(ticker(FUT, bad, seq, best_bid=bad, best_ask="60030"))
-    assert feed.latest(FUT) == Tick(60_020.0, 5.0) and feed.bad_messages == 6
+    assert feed.latest(FUT) == Tick(60_020.0, 5.0) and (feed.unpriced_tickers, feed.unreadable_messages) == (6, 0)
 
 
-def test_a_message_the_feed_cannot_read_never_reaches_the_sdk():
+def test_a_message_the_feed_cannot_read_is_counted_never_raised():
     feed = TickerFeed([FUT], ws_factory=lambda **kw: None, clock=Clock(5.0))
     for raw in ("not json", "[]", "5", json.dumps({"channel": "ticker", "events": [None]}),
                 json.dumps({"channel": "ticker", "events": [{"tickers": "x"}]})):
-        feed.on_message(raw)  # an exception here would end the SDK's message handler for good
-    assert feed.bad_messages == 5 and feed.latest(FUT) is None
-    feed.on_message(json.dumps({"type": "error", "message": "failure to subscribe"}))
+        feed.on_message(raw)  # an exception here would end the connection's read loop (PublicSocket.pump)
+    assert (feed.unreadable_messages, feed.unpriced_tickers) == (5, 0) and feed.latest(FUT) is None
+    feed.on_message(json.dumps({"type": "error", "message": "failure to subscribe"}))  # a refused subscription
     assert feed.last_error == "server error: failure to subscribe"
+    assert feed.messages == 0 and feed.age() is None  # a server error is no sign of a working feed
     feed.on_message(ticker(FUT, 60_000.0, 1))
-    assert feed.latest(FUT).price == 60_000.0
+    assert feed.latest(FUT).price == 60_000.0 and feed.messages == 1
 
 
 class ScriptedWS:

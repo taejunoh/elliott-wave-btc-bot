@@ -99,8 +99,10 @@ class AccountGuard:
     raise a reference: a breaker trips on the second observation in a row that breaches it (one poll - a
     minute in the runtime - after the first), and the peak only rises to a level two observations in a row
     reached (the lower of the two), so a single wrong balance read, low or high, cannot flatten the account.
-    The day's reference is the first observation of the New York day - a single read (accepted limit: a wrong
-    high read at exactly that moment can trip DAILY_LOSS two reads later; it errs toward flat and paused)."""
+    The day's reference is the higher of the New York day's first two observations (after a reset that
+    re-based it: the reset's read and the next one), so one wrong low read - at the midnight funding
+    settlement, or at /resume - cannot disable DAILY_LOSS for the day (accepted limit: a wrong high read among
+    those two can trip it two reads later; it errs toward flat and paused)."""
 
     KEY = "account_guard"
 
@@ -119,7 +121,9 @@ class AccountGuard:
         prev = st.get("equity")
         day = ny_date(now)
         if st["day"] != day:
-            st.update(day=day, day_ref=e, daily_tripped=False, daily_breach=False)
+            st.update(day=day, day_ref=e, day_ref_check=True, daily_tripped=False, daily_breach=False)
+        elif st.get("day_ref_check"):  # the day's second observation, or the first after a reset
+            st.update(day_ref=max(float(st["day_ref"]), e), day_ref_check=False)
         st["peak"] = max(float(st["peak"]), e if prev is None else min(e, float(prev)))
         total = e <= st["peak"] * (1.0 - self.params.total_dd)
         daily = e <= st["day_ref"] * (1.0 - self.params.daily_loss)
@@ -136,8 +140,8 @@ class AccountGuard:
 
     def reset(self, equity: float, now: float) -> list[str]:
         """After the user resumes: only a breaker that tripped is re-based at this equity - the peak after
-        TOTAL_DD, the day's reference after DAILY_LOSS (a TOTAL_DD trip marks the day too) - and its name is
-        returned. A resume without a trip changes nothing."""
+        TOTAL_DD, the day's reference after DAILY_LOSS (a TOTAL_DD trip marks the day too; the next observation
+        raises it if higher) - and its name is returned. A resume without a trip changes nothing."""
         e = _observed(equity)
         st = self.state()
         done: list[str] = []
@@ -147,7 +151,7 @@ class AccountGuard:
             st.update(peak=e, total_tripped=False, total_breach=False)
             done.append("TOTAL_DD")
         if st.get("daily_tripped"):
-            st.update(day=ny_date(now), day_ref=e, daily_tripped=False, daily_breach=False)
+            st.update(day=ny_date(now), day_ref=e, day_ref_check=True, daily_tripped=False, daily_breach=False)
             done.append("DAILY_LOSS")
         if done:
             st["equity"] = e

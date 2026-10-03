@@ -14,9 +14,11 @@ brings no message for SILENT_S (the heartbeats channel sends one every second, s
 connection is gone) is torn down and opened again after an exponential backoff: 1 s doubling to 60 s, back
 to 1 s only once a connection has carried messages for HEALTHY_S. `stop()` also ends a backoff wait at once.
 Every (re)connect and every sequence gap sets `resync`, so the runtime re-reads positions and orders over
-REST. A message that cannot be read is counted (`bad_messages`) and never raised. `failures` and
-`last_error` (an exception's type name only, "silent for 15 s", or a server error message) tell the runtime
-why the feed is down. The runtime reads prices through watchdog.PriceSource, which uses REST polling once
+REST. A message that cannot be read is counted (`unreadable_messages`), a ticker entry without a usable
+price too (`unpriced_tickers`); neither is ever raised. A server `error` message (a refused subscription,
+say) is kept in `last_error` and is no sign of life: only other messages count as liveness. `failures` and
+`last_error` (an exception's type name only, "silent for 15 s", or the server's error message) tell the
+runtime why the feed is down. The runtime reads prices through watchdog.PriceSource, which uses REST polling once
 the feed has been silent for 60 s."""
 
 from __future__ import annotations
@@ -83,19 +85,20 @@ class TickerFeed:
         self.connects = 0
         self.failures = 0
         self.messages = 0
-        self.bad_messages = 0
+        self.unreadable_messages = 0
+        self.unpriced_tickers = 0
         self.last_error: str | None = None
         self._ticks: dict[str, Tick] = {}
         self._resync = False
         self._lock = threading.Lock()
 
     def on_message(self, raw: str) -> None:
-        """Called on the SDK's event-loop thread: never raises."""
+        """Called from PublicSocket.pump on the feed's thread: never raises (that would end the connection)."""
         try:
             self._read(raw)
-        except Exception:  # noqa: BLE001 - a message we cannot read is counted, never raised into the SDK
+        except Exception:  # noqa: BLE001 - a message we cannot read is counted, never raised
             with self._lock:
-                self.bad_messages += 1
+                self.unreadable_messages += 1
 
     def _read(self, raw: str) -> None:
         msg = json.loads(raw)
@@ -115,11 +118,12 @@ class TickerFeed:
                         ticks[t["product_id"]] = price
         now = self.clock()
         with self._lock:
-            self.last_msg = now
-            self.messages += 1
-            self.bad_messages += unusable
-            if msg.get("type") == "error":
+            self.unpriced_tickers += unusable
+            if msg.get("type") == "error":  # e.g. a refused subscription: recorded, but no sign of life
                 self.last_error = f"server error: {msg.get('message')}"[:160]
+            else:
+                self.last_msg = now
+                self.messages += 1
             seq = msg.get("sequence_num")
             if isinstance(seq, int):
                 if self.last_seq is not None and seq != self.last_seq + 1:
