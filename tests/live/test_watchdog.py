@@ -51,17 +51,19 @@ def test_margin_levels_use_the_overnight_rate():
 def test_account_guard_trips_on_two_breaching_reads_once_a_day_and_survives_a_restart(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)
-    assert g.update(10_000.0, NY_NOON) is None
-    assert g.update(9_701.0, NY_NOON + 60) is None
-    assert g.update(9_700.0, NY_NOON + 120) is None  # -3%: one breaching read is not enough
-    assert g.update(9_700.0, NY_NOON + 180) == "DAILY_LOSS"  # the second in a row trips (one poll later)
-    assert g.update(9_600.0, NY_NOON + 240) is None  # once per New York day
+    for k in range(3):  # the day's first three reads set its reference (their median)
+        assert g.update(10_000.0, NY_NOON + 60 * k) is None
+    assert g.update(9_701.0, NY_NOON + 180) is None
+    assert g.update(9_700.0, NY_NOON + 240) is None  # -3%: one breaching read is not enough
+    assert g.update(9_700.0, NY_NOON + 300) == "DAILY_LOSS"  # the second in a row trips (one poll later)
+    assert g.update(9_600.0, NY_NOON + 360) is None  # once per New York day
     g2 = AccountGuard(jr)  # restart
     assert g2.state()["daily_tripped"] and g2.state()["peak"] == 10_000.0
-    assert g2.update(9_600.0, NY_NOON + 86_400) is None  # next day: new reference 9_600
-    assert g2.update(8_500.0, NY_NOON + 86_460) is None
-    assert g2.update(8_500.0, NY_NOON + 86_520) == "TOTAL_DD"  # 15% below the 10_000 peak, twice
-    assert g2.update(8_000.0, NY_NOON + 86_580) is None
+    for k in range(3):  # next day: new reference 9_600
+        assert g2.update(9_600.0, NY_NOON + 86_400 + 60 * k) is None
+    assert g2.update(8_500.0, NY_NOON + 86_580) is None
+    assert g2.update(8_500.0, NY_NOON + 86_640) == "TOTAL_DD"  # 15% below the 10_000 peak, twice
+    assert g2.update(8_000.0, NY_NOON + 86_700) is None
     jr.close()
 
 
@@ -83,51 +85,63 @@ def test_one_bad_balance_read_never_trips_a_breaker_nor_raises_the_peak(tmp_path
     jr.close()
 
 
-def test_a_low_first_read_of_the_day_does_not_disable_the_daily_breaker(tmp_path):
-    jr = journal(tmp_path)
-    g = AccountGuard(jr)
-    g.update(10_000.0, NY_NOON)
-    g.update(9_000.0, NY_NOON + 86_400)  # the next day's first read is wrong low (a funding settlement, say)
-    g.update(10_000.0, NY_NOON + 86_460)
-    assert g.state()["day_ref"] == 10_000.0  # the higher of the day's first two observations
-    assert g.update(9_650.0, NY_NOON + 86_520) is None
-    assert g.update(9_650.0, NY_NOON + 86_580) == "DAILY_LOSS"
-    jr.close()
+@pytest.mark.parametrize("wrong", [12_000.0, 8_000.0], ids=["high", "low"])
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_one_wrong_basing_read_neither_trips_nor_loosens_a_breaker(tmp_path, wrong, position):
+    """The first reads base both the peak and the day's reference: one of them 20% off, either way, at any of the
+    three positions. Neither breaker trips, both references end at the true 10_000 (looser for at most that one
+    read), and a real -3.5% move afterwards still trips DAILY_LOSS on its second read."""
+    g = AccountGuard(journal(tmp_path))
+    reads = [10_000.0] * 3
+    reads[position] = wrong
+    refs = []
+    for k, equity in enumerate(reads + [10_000.0] * 3):
+        assert g.update(equity, NY_NOON + 60 * k) is None
+        refs.append((g.state()["day_ref"], g.state()["peak"]))
+    assert refs[3:] == [(10_000.0, 10_000.0)] * 3  # the median of three: the wrong read set neither reference
+    assert sum(1 for day_ref, peak in refs if min(day_ref, peak) < 10_000.0) <= 1
+    assert g.update(9_650.0, NY_NOON + 360) is None
+    assert g.update(9_650.0, NY_NOON + 420) == "DAILY_LOSS"
 
 
-def test_a_low_read_at_resume_does_not_disable_the_daily_breaker(tmp_path):
-    jr = journal(tmp_path)
-    g = AccountGuard(jr)
-    g.update(10_000.0, NY_NOON)
-    g.update(9_650.0, NY_NOON + 60)
-    assert g.update(9_650.0, NY_NOON + 120) == "DAILY_LOSS"
-    assert g.reset(8_000.0, NY_NOON + 180) == ["DAILY_LOSS"]  # /resume read a wrong low balance
-    g.update(9_650.0, NY_NOON + 240)
-    assert g.state()["day_ref"] == 9_650.0  # the higher of the reset read and the next one
-    assert g.update(9_300.0, NY_NOON + 300) is None
-    assert g.update(9_300.0, NY_NOON + 360) == "DAILY_LOSS"
-    jr.close()
+@pytest.mark.parametrize("wrong", [12_000.0, 8_000.0], ids=["high", "low"])
+def test_one_wrong_read_at_resume_neither_trips_nor_loosens_a_breaker(tmp_path, wrong):
+    g = AccountGuard(journal(tmp_path))
+    for k in range(3):
+        g.update(10_000.0, NY_NOON + 60 * k)
+    g.update(8_400.0, NY_NOON + 180)
+    assert g.update(8_400.0, NY_NOON + 240) == "TOTAL_DD"  # it marks the day too
+    assert g.reset(wrong, NY_NOON + 300) == ["TOTAL_DD", "DAILY_LOSS"]  # /resume read a wrong balance (truth: 8_400)
+    refs = []
+    for k in range(4):
+        assert g.update(8_400.0, NY_NOON + 360 + 60 * k) is None
+        refs.append((g.state()["day_ref"], g.state()["peak"]))
+    assert refs[1:] == [(8_400.0, 8_400.0)] * 3  # the median of the reset's read and the next two
+    assert min(refs[0]) >= 8_400.0  # after the reset's own read, never looser than a read seen
+    assert g.update(8_100.0, NY_NOON + 600) is None  # a real -3.5% from 8_400
+    assert g.update(8_100.0, NY_NOON + 660) == "DAILY_LOSS"
 
 
 def test_resume_rebases_only_the_breaker_that_tripped(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)
-    g.update(10_000.0, NY_NOON)
-    g.update(9_800.0, NY_NOON + 60)
+    for k in range(3):
+        g.update(10_000.0, NY_NOON + 60 * k)
+    g.update(9_800.0, NY_NOON + 180)
     before = g.state()
-    assert g.reset(9_800.0, NY_NOON + 120) == [] and g.state() == before  # /pause then /resume: nothing changes
-    g.update(9_700.0, NY_NOON + 180)
-    assert g.update(9_650.0, NY_NOON + 240) == "DAILY_LOSS"
-    assert g.reset(9_650.0, NY_NOON + 300) == ["DAILY_LOSS"]
+    assert g.reset(9_800.0, NY_NOON + 240) == [] and g.state() == before  # /pause then /resume: nothing changes
+    g.update(9_700.0, NY_NOON + 300)
+    assert g.update(9_650.0, NY_NOON + 360) == "DAILY_LOSS"
+    assert g.reset(9_650.0, NY_NOON + 420) == ["DAILY_LOSS"]
     st = g.state()
     assert (st["day_ref"], st["peak"], st["daily_tripped"]) == (9_650.0, 10_000.0, False)  # the peak stays
-    g.update(8_400.0, NY_NOON + 360)
-    assert g.update(8_400.0, NY_NOON + 420) == "TOTAL_DD"  # 16% below the peak (it marks the day too)
-    assert g.reset(8_400.0, NY_NOON + 480) == ["TOTAL_DD", "DAILY_LOSS"]
+    g.update(8_400.0, NY_NOON + 480)
+    assert g.update(8_400.0, NY_NOON + 540) == "TOTAL_DD"  # 16% below the peak (it marks the day too)
+    assert g.reset(8_400.0, NY_NOON + 600) == ["TOTAL_DD", "DAILY_LOSS"]
     st = g.state()
     assert (st["peak"], st["day_ref"], st["total_tripped"], st["daily_tripped"]) == (8_400.0, 8_400.0, False, False)
     with pytest.raises(BadEquity):
-        g.reset(math.nan, NY_NOON + 540)
+        g.reset(math.nan, NY_NOON + 660)
     jr.close()
 
 

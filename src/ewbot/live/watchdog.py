@@ -4,7 +4,7 @@
                  that limit and the position is still open 10 s later, the runtime closes at market.
   margin_status  overnight-margin projection of the open position: >= 80% warn, >= 90% reduce back to
                  the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
-  AccountGuard   real-account breakers: equity <= the New York day's first equity x 0.97, or <= the peak
+  AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.97, or <= the peak
                  x 0.85 -> flatten and pause (spec 4.5), on the second observation in a row that breaches.
                  State lives in the journal (survives restarts).
   SessionWatch   session state changes and the next scheduled maintenance (noticed 24 h ahead, or at once
@@ -38,6 +38,7 @@ GAP_GRACE_S = 10.0
 WS_STALE_S = 60.0
 REST_POLL_S = 10.0
 MAINTENANCE_NOTICE_S = 24 * 3600
+BASING_READS = 3  # a reference (the day's, a re-based peak) is the median of its first three valid reads
 
 
 class StopGapWatch:
@@ -93,16 +94,34 @@ def _observed(equity: float) -> float:
     return e
 
 
+def _basing(reads: list[float], e: float) -> tuple[list[float] | None, float]:
+    """A reference being based on its first BASING_READS reads: the highest read so far until the last one
+    arrives (never looser than a read seen), then their median - and basing is over (None)."""
+    reads = [*reads, e]
+    if len(reads) < BASING_READS:
+        return reads, max(reads)
+    return None, sorted(reads)[len(reads) // 2]
+
+
 class AccountGuard:
     """Real-account breakers (spec 4.5). Only a finite equity above 0 is an observation; anything else raises
-    BadEquity and changes nothing (the runtime alerts it). One observation can neither trip a breaker nor
-    raise a reference: a breaker trips on the second observation in a row that breaches it (one poll - a
-    minute in the runtime - after the first), and the peak only rises to a level two observations in a row
-    reached (the lower of the two), so a single wrong balance read, low or high, cannot flatten the account.
-    The day's reference is the higher of the New York day's first two observations (after a reset that
-    re-based it: the reset's read and the next one), so one wrong low read - at the midnight funding
-    settlement, or at /resume - cannot disable DAILY_LOSS for the day (accepted limit: a wrong high read among
-    those two can trip it two reads later; it errs toward flat and paused)."""
+    BadEquity and changes nothing (the runtime alerts it).
+
+    References are based on three reads. The day's reference is the median of the New York day's first three
+    observations; the peak is the median of the first three ever and, after a reset re-based either, the
+    reference is the median of the reset's read and the next two. Until its third read arrives a reference is
+    the highest read so far (never looser than any read seen). After basing, the peak only rises to a level
+    two observations in a row reached (the lower of the two). A breaker trips on the second observation in a
+    row that breaches it, each judged against the reference as it then stands (one poll - a minute in the
+    runtime - after the first). So one wrong balance read, high or low, at any position - a basing read
+    (the midnight funding settlement, say), the /resume read or any later one - neither trips a breaker nor
+    leaves a reference looser than the truth for more than that one read.
+
+    Accepted limits: two wrong reads among a reference's three basing reads set it - two wrong high ones can
+    trip that breaker two reads later; two wrong low ones loosen it, the day's reference until the next New
+    York day, a re-based peak until two true reads in a row lift it - and so does a real move within those
+    reads (the first ~2 minutes of the day); two wrong high reads in a row raise the peak; two wrong low reads
+    in a row trip a breaker."""
 
     KEY = "account_guard"
 
@@ -116,15 +135,18 @@ class AccountGuard:
     def update(self, equity: float, now: float) -> str | None:
         """The breaker newly tripped by this equity observation (DAILY_LOSS / TOTAL_DD), else None."""
         e = _observed(equity)
-        st = self.state() or {"peak": e, "day": None, "day_ref": e, "daily_tripped": False,
+        st = self.state() or {"peak": e, "peak_reads": [], "day": None, "day_ref": e, "daily_tripped": False,
                               "total_tripped": False}
         prev = st.get("equity")
         day = ny_date(now)
         if st["day"] != day:
-            st.update(day=day, day_ref=e, day_ref_check=True, daily_tripped=False, daily_breach=False)
-        elif st.get("day_ref_check"):  # the day's second observation, or the first after a reset
-            st.update(day_ref=max(float(st["day_ref"]), e), day_ref_check=False)
-        st["peak"] = max(float(st["peak"]), e if prev is None else min(e, float(prev)))
+            st.update(day=day, day_reads=[], daily_tripped=False, daily_breach=False)
+        if st.get("day_reads") is not None:
+            st["day_reads"], st["day_ref"] = _basing(st["day_reads"], e)
+        if st.get("peak_reads") is not None:
+            st["peak_reads"], st["peak"] = _basing(st["peak_reads"], e)
+        else:
+            st["peak"] = max(float(st["peak"]), e if prev is None else min(e, float(prev)))
         total = e <= st["peak"] * (1.0 - self.params.total_dd)
         daily = e <= st["day_ref"] * (1.0 - self.params.daily_loss)
         trip = None
@@ -139,19 +161,19 @@ class AccountGuard:
         return trip
 
     def reset(self, equity: float, now: float) -> list[str]:
-        """After the user resumes: only a breaker that tripped is re-based at this equity - the peak after
-        TOTAL_DD, the day's reference after DAILY_LOSS (a TOTAL_DD trip marks the day too; the next observation
-        raises it if higher) - and its name is returned. A resume without a trip changes nothing."""
+        """After the user resumes: only a breaker that tripped is re-based - the peak after TOTAL_DD, the day's
+        reference after DAILY_LOSS (a TOTAL_DD trip marks the day too) - starting from this read as the first of
+        its three basing reads, and its name is returned. A resume without a trip changes nothing."""
         e = _observed(equity)
         st = self.state()
         done: list[str] = []
         if not st:
             return done
         if st.get("total_tripped"):
-            st.update(peak=e, total_tripped=False, total_breach=False)
+            st.update(peak=e, peak_reads=[e], total_tripped=False, total_breach=False)
             done.append("TOTAL_DD")
         if st.get("daily_tripped"):
-            st.update(day=ny_date(now), day_ref=e, day_ref_check=True, daily_tripped=False, daily_breach=False)
+            st.update(day=ny_date(now), day_ref=e, day_reads=[e], daily_tripped=False, daily_breach=False)
             done.append("DAILY_LOSS")
         if done:
             st["equity"] = e
