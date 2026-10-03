@@ -4,7 +4,7 @@ import dataclasses
 
 import pytest
 
-from ewbot.live.exchange import PlaceResult, RateLimited, Unavailable
+from ewbot.live.exchange import Order, PlaceResult, RateLimited, Unavailable
 from ewbot.live.executor import Executor
 from ewbot.live.reconcile import (
     Adopt,
@@ -891,3 +891,141 @@ def test_a_bracket_whose_cancel_is_queued_is_not_taken_over(tmp_path):
     assert [e["data"]["leg"] for e in jr.events(kind="LEG_ADOPTED")] == ["tp2"]
     assert queued not in [leg.client_order_id for leg in exe.trade().legs]
     jr.close()
+
+
+def test_an_accepted_entry_whose_fill_stays_unreadable_is_protected_at_once(env):
+    """Probe R1: get_order is down, so the fill of our accepted entry cannot be read - neither in the fill wait nor on
+    the next passes. The position is protected from the first pass with a provisional trade from the entry's intent
+    (alerted), never left without a trade or treated as foreign."""
+    clock, ex, jr, alerts, exe = env
+    ex.fail_next("get_order", Unavailable("503"), times=200)
+    assert exe.enter(Enter(entry(), 3), ctx(clock)) is None and "ENTRY_UNCONFIRMED" in alerts.kinds()
+    for _ in range(4):
+        clock.now += 10
+        poll(exe, ex, clock, target(T0 + 3600, ent=entry()))
+        assert exe.trade().trade_id == T0
+        assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert "ADOPTED" not in alerts.kinds() and "ACTION_ERROR" not in alerts.kinds()
+    assert "RECOVERED_ENTRY" in alerts.kinds() and ex.calls.count("place_market") == 1
+
+
+def test_a_close_that_fails_after_a_conflict_cancel_is_protected_again_on_later_passes(env):
+    """Probe R2 (Q1): the close is refused while the brackets rest, they are cancelled, the resent close and the
+    re-protection both hit a 429 storm. Every later failed close puts the legs back - not only the one that cancelled."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    real, calls = ex.close_position, []
+
+    def conflict_then_429(cid, size=None):
+        calls.append(cid)
+        ex.calls.append("close_position")
+        if len(calls) == 1:
+            return PlaceResult(cid, None, False, "OPEN_BRACKET_ORDERS")
+        raise RateLimited("429")
+
+    ex.close_position = conflict_then_429
+    ex.fail_next("place_bracket", RateLimited("429"), times=2)
+    tgt = target(T0 + 3600, position(), exit_reason="TIME")
+    clock.now += 10
+    poll(exe, ex, clock, tgt)
+    assert ex.open_orders() == [] and len(jr.events(kind="BRACKET_FAILED")) == 2
+    clock.now += 10
+    poll(exe, ex, clock, tgt)  # the close fails again: the legs go back although this call cancelled nothing
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    ex.close_position = real
+    clock.now += 10
+    poll(exe, ex, clock, tgt)
+    assert ex.position() is None and exe.trade().exit_reason == "TIME"
+
+
+def covered_refusal(ex) -> None:
+    """Coinbase-style: a close or reduce is refused while our brackets already cover what it would close."""
+    real = ex.close_position
+
+    def call(cid, size=None):
+        pos = ex.pos
+        cover = sum(o.size - o.filled for o in ex.orders.values() if o.kind == "BRACKET" and o.status == "OPEN")
+        if pos is not None and cover + (pos.contracts if size is None else size) > pos.contracts:
+            ex.calls.append("close_position")
+            return PlaceResult(cid, None, False, "ORDER_SIZE_EXCEEDS_BRACKETED_POSITION")
+        return real(cid, size)
+
+    ex.close_position = call
+
+
+def test_a_tp1_sync_refused_while_the_brackets_cover_the_position_cancels_the_tp1_leg_first(env):
+    """Probe R3 (Q3): the venue refuses the TP1_SYNC reduce because the legs cover the position. The TP1 leg (the
+    contracts the reduce sells) is cancelled, the reduce resent under a new id, and the rest goes to break-even."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    covered_refusal(ex)
+    ex.set_prices(60_900.0)
+    clock.now += 10
+    poll(exe, ex, clock, target(T0 + 3600, position(tp1_done=True, stop=60_000.0)))
+    assert ex.position().contracts == 2 and exe.trade().tp1_filled
+    assert resting(ex) == [(2, 62_000.0, 60_000.0)]
+    assert not jr.events(kind="REDUCE_FAILED") and jr.events(kind="REDUCE_CONFLICT")
+    assert jr.intent(f"ewb-r-{T0}-1")["status"] == "REJECTED" and jr.intent(f"ewb-r-{T0}-2")["status"] == "ACCEPTED"
+
+
+def test_an_excess_refused_while_the_brackets_cover_it_shrinks_the_legs_first(env):
+    """Probe R3 (Q4): contracts added by hand while the session was closed are covered by the legs; at the reopen the
+    EXCESS reduce is refused for it. The legs shrink to the trade's size (placed first), then the reduce goes out."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    ex.place_market("manual-1", 1, 2)
+    closed = ctx(clock, session_open=False)
+    seen, _ = observe(exe.trade(), ex.position(), ex.open_orders(), clock())
+    exe.save(seen)
+    exe.execute(plan(target(T0 + 3600, position()), seen, ex.position(), ex.open_orders(), closed), closed)
+    assert sum(n for n, _, _ in resting(ex)) == 5
+    covered_refusal(ex)
+    clock.now += 10
+    poll(exe, ex, clock, target(T0 + 3600, position()))
+    assert ex.position().contracts == 3 and resting(ex) == [(1, 61_000.0, 59_000.0), (2, 62_000.0, 59_000.0)]
+    assert not jr.events(kind="REDUCE_FAILED") and exe.trade().contracts == 3
+
+
+def test_a_margin_reduce_refused_while_the_brackets_cover_it_resizes_the_legs_first(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    covered_refusal(ex)
+    assert exe.reduce(1, "MARGIN", ctx(clock)) is True
+    assert ex.position().contracts == 2 and exe.trade().contracts == 2
+    assert resting(ex) == [(1, 61_000.0, 59_000.0), (1, 62_000.0, 59_000.0)] and not jr.events(kind="REDUCE_FAILED")
+
+
+def test_a_resent_reduce_that_fails_puts_the_shrunk_legs_back(env):
+    """Never a gap: the TP1 leg was cancelled to make room, the resent reduce's outcome is unknown (429) - the leg goes
+    back at once so the whole position stays covered (a reduce that did fill only leaves an extra reduce-only leg)."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    covered_refusal(ex)
+    ex.set_prices(60_900.0)
+    refusing = ex.close_position
+
+    def refuse_then_429(cid, size=None):
+        if cid.endswith("-2"):
+            ex.calls.append("close_position")
+            raise RateLimited("429")
+        return refusing(cid, size)
+
+    ex.close_position = refuse_then_429
+    clock.now += 10
+    poll(exe, ex, clock, target(T0 + 3600, position(tp1_done=True, stop=60_000.0)))
+    assert ex.position().contracts == 3 and sum(n for n, _, _ in resting(ex)) == 3
+    assert exe.trade().pending_reduce["cid"] == f"ewb-r-{T0}-2"
+
+
+def test_a_flip_waits_while_a_bracket_of_the_closed_position_still_rests(env):
+    """Probe R4: the close is confirmed but a bracket of ours could not be cancelled (or not read): the opposite entry is
+    skipped (recorded once), never sent next to a bracket of the old side."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    real_open = ex.open_orders
+    stray = Order("sim-x", f"ewb-b-{T0}-tp1-9", -1, "BRACKET", 1, 0, "OPEN", 61_000.0, 59_000.0)
+    ex.open_orders = lambda: real_open() + ([stray] if ex.pos is None else [])
+    short = entry(signal_ts=T0 + 3600, direction=-1, stop=61_000.0, tp1=59_000.0, tp2=58_000.0)
+    exe.execute([Close("FLIP"), Enter(short, 1)], ctx(clock))
+    assert ex.position() is None and jr.intent(f"ewb-e-{T0 + 3600}-S") is None
+    assert jr.events(kind="SKIP")[0]["data"]["signal_ts"] == T0 + 3600 and alerts.kinds().count("SKIP") == 1
