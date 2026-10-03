@@ -3510,7 +3510,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.config` (`CONSERVATIVE`, `BotConfig`, `CostParams`), `ewbot.risk.sizing.size_contracts` (called, not changed), `ewbot.live.exchange` (`STOP_LIMIT_OFFSET`, `ProductSpec`), `ewbot.live.sim.BIP_SPEC` (test).
-- Produces (`ewbot.live.pricing`): `CANARY_MAX_RISK = 0.02`, `FULL_CAP_CONTRACTS = 3`, `FULL_CAP_DAYS = 30`, `MARGIN_ENTRY_MAX = 0.70`, `MARGIN_WARN = 0.80`, `MARGIN_REDUCE = 0.90`; `to_tick(price, tick, direction) -> float` (long floor, short ceil), `basis_ratio(fut_mid, spot_mid) -> float`, `map_level(spot_level, ratio, tick, direction) -> float`, frozen `Levels(stop, tp1, tp2)`, `map_levels(direction, stop, tp1, tp2, ratio, tick) -> Levels`, `stop_limit(stop, direction, offset=0.01) -> float`, `stop_gapped(price, stop, direction, offset=0.01) -> bool`, `risk_per_contract(entry, stop, costs) -> float`, `margin_ratio(contracts, price, side, product, equity, overnight=True) -> float`, `max_contracts_for_margin(price, side, product, equity, limit=0.70) -> int`, `stage_contracts(stage, *, equity, entry, stop, direction, risk_mult, cfg, full_cap=None) -> tuple[int, str]` (0 = skip, with the reason).
+- Produces (`ewbot.live.pricing`): `CANARY_MAX_RISK = 0.02`, `FULL_CAP_CONTRACTS = 3`, `FULL_CAP_DAYS = 30`, `MARGIN_ENTRY_MAX = 0.70`, `MARGIN_WARN = 0.80`, `MARGIN_REDUCE = 0.90`; `to_tick(price, tick, direction) -> float` (long floor, short ceil), `basis_ratio(fut_mid, spot_mid) -> float`, `map_level(spot_level, ratio, tick, direction) -> float`, frozen `Levels(stop, tp1, tp2)`, `map_levels(direction, stop, tp1, tp2, ratio, tick) -> Levels`, `stop_limit(stop, direction, offset=STOP_LIMIT_OFFSET) -> float`, `stop_gapped(price, stop, direction, offset=STOP_LIMIT_OFFSET) -> bool`, `risk_per_contract(entry, stop, costs) -> float`, `margin_ratio(contracts, price, side, product, equity, overnight=True) -> float`, `max_contracts_for_margin(price, side, product, equity, limit=0.70) -> int`, `stage_contracts(stage, *, equity, entry, stop, direction, risk_mult, cfg, full_cap=None) -> tuple[int, str]` (0 = skip, with the reason; `"bad sizing inputs"` for a direction other than ±1, a non-finite entry/stop/equity or equity <= 0; the reason of an accepted SHADOW/CANARY entry is `"<stage>: 1 contract"`). Fail-closed: `basis_ratio` raises `ValueError` for a non-positive or non-finite mid, `margin_ratio` returns `inf` for a non-finite price or equity, `stage_contracts` raises `ValueError` for a negative `full_cap`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3519,11 +3519,12 @@ EOF
 ```python
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import pytest
 
-from ewbot.config import BotConfig
+from ewbot.config import AGGRESSIVE, BotConfig
 from ewbot.live.pricing import (
     basis_ratio,
     map_level,
@@ -3571,6 +3572,12 @@ def test_mapping_uses_the_basis_ratio_conservatively():
         basis_ratio(0.0, 1.0)
 
 
+@pytest.mark.parametrize("fut,spot", [(math.nan, 1.0), (1.0, math.nan), (math.inf, 1.0), (1.0, math.inf), (-math.inf, 1.0)])
+def test_basis_ratio_fails_closed_on_non_finite_mids(fut, spot):
+    with pytest.raises(ValueError):
+        basis_ratio(fut, spot)
+
+
 def test_stop_limit_and_gap():
     assert stop_limit(80_000.0, 1) == pytest.approx(76_000.0)  # STOP_LIMIT_OFFSET 5%
     assert stop_limit(80_000.0, -1) == pytest.approx(84_000.0)
@@ -3586,11 +3593,36 @@ def test_risk_per_contract_matches_the_sizing_distance():
 def test_canary_and_shadow_trade_one_contract_unless_the_risk_exceeds_two_percent():
     kw = dict(entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=CFG)
     assert stage_contracts("CANARY", equity=1_000.0, **kw) == (1, "canary: 1 contract")
-    assert stage_contracts("SHADOW", equity=1_000.0, **kw)[0] == 1
+    assert stage_contracts("SHADOW", equity=1_000.0, **kw) == (1, "shadow: 1 contract")
     n, why = stage_contracts("CANARY", equity=500.0, **kw)  # risk 10.6 > 10.0
     assert n == 0 and "2%" in why
     assert stage_contracts("CANARY", equity=1_000.0, entry=60_000.0, stop=61_000.0, direction=1,
                            risk_mult=1.0, cfg=CFG)[0] == 0
+
+
+def test_canary_short_side_and_the_exact_two_percent_boundary():
+    short = dict(entry=60_000.0, stop=61_000.0, direction=-1, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("CANARY", equity=1_000.0, **short) == (1, "canary: 1 contract")
+    n, why = stage_contracts("CANARY", equity=500.0, **short)  # risk 10.605 > 10.0
+    assert n == 0 and "2%" in why
+    assert stage_contracts("CANARY", equity=1_000.0, entry=60_000.0, stop=59_000.0, direction=-1,
+                           risk_mult=1.0, cfg=CFG)[0] == 0  # stop on the wrong side for a short
+    exact = dataclasses.replace(CFG, costs=dataclasses.replace(CFG.costs, slippage=0.0))
+    kw = dict(entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=exact)
+    assert risk_per_contract(60_000.0, 59_000.0, exact.costs) == 10.0
+    assert stage_contracts("CANARY", equity=500.0, **kw)[0] == 1  # exactly 2%: allowed (strictly greater skips)
+    assert stage_contracts("CANARY", equity=499.99, **kw)[0] == 0
+
+
+def test_stage_contracts_fails_closed_on_bad_sizing_inputs():
+    good = dict(equity=1_000.0, entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=CFG)
+    nan, inf = math.nan, math.inf
+    bad = [dict(direction=2), dict(direction=0), dict(entry=nan), dict(entry=inf), dict(stop=nan), dict(stop=-inf),
+           dict(equity=nan), dict(equity=inf), dict(equity=0.0), dict(equity=-5.0)]
+    for stage in ("SHADOW", "CANARY", "FULL"):
+        for override in bad:
+            assert stage_contracts(stage, **{**good, **override}) == (0, "bad sizing inputs"), (stage, override)
+    assert stage_contracts("CANARY", **good)[0] == 1
 
 
 def test_full_uses_the_frozen_sizing_with_the_conservative_profile_and_the_cap():
@@ -3600,6 +3632,11 @@ def test_full_uses_the_frozen_sizing_with_the_conservative_profile_and_the_cap()
     assert stage_contracts("FULL", equity=20_000.0, **kw) == (expected, f"full: {expected}")
     assert stage_contracts("FULL", equity=20_000.0, full_cap=3, **kw)[0] == 3
     assert stage_contracts("FULL", equity=10.0, **kw)[0] == 0
+    aggressive = dataclasses.replace(CFG, risk=AGGRESSIVE)
+    assert aggressive.risk != CFG.risk
+    assert stage_contracts("FULL", equity=20_000.0, **{**kw, "cfg": aggressive}) == (expected, f"full: {expected}")
+    with pytest.raises(ValueError):
+        stage_contracts("FULL", equity=20_000.0, full_cap=-1, **kw)
     with pytest.raises(ValueError):
         stage_contracts("PAPER", equity=1.0, **kw)
 
@@ -3609,6 +3646,8 @@ def test_margin_projection_uses_the_overnight_rate():
     assert margin_ratio(1, 84_000.0, -1, BIP_SPEC, 1_000.0) == pytest.approx(840.0 * 0.256625 / 1_000.0)
     assert margin_ratio(1, 84_000.0, 1, BIP_SPEC, 1_000.0, overnight=False) < margin_ratio(1, 84_000.0, 1, BIP_SPEC, 1_000.0)
     assert margin_ratio(0, 84_000.0, 1, BIP_SPEC, 0.0) == 0.0 and math.isinf(margin_ratio(1, 1.0, 1, BIP_SPEC, 0.0))
+    for price, equity in [(math.nan, 1_000.0), (math.inf, 1_000.0), (84_000.0, math.nan), (84_000.0, math.inf)]:
+        assert math.isinf(margin_ratio(1, price, 1, BIP_SPEC, equity)), (price, equity)
     n = max_contracts_for_margin(84_000.0, 1, BIP_SPEC, 1_000.0)
     assert n == 3 and margin_ratio(n, 84_000.0, 1, BIP_SPEC, 1_000.0) <= 0.70 < margin_ratio(n + 1, 84_000.0, 1, BIP_SPEC, 1_000.0)
 ```
@@ -3668,7 +3707,7 @@ def to_tick(price: float, tick: float, direction: int) -> float:
 
 
 def basis_ratio(fut_mid: float, spot_mid: float) -> float:
-    if fut_mid <= 0 or spot_mid <= 0:
+    if not (math.isfinite(fut_mid) and math.isfinite(spot_mid)) or fut_mid <= 0 or spot_mid <= 0:
         raise ValueError(f"bad mids {fut_mid} / {spot_mid}")
     return fut_mid / spot_mid
 
@@ -3711,7 +3750,7 @@ def margin_ratio(contracts: int, price: float, side: int, product: ProductSpec, 
                  overnight: bool = True) -> float:
     if contracts <= 0:
         return 0.0
-    if equity <= 0:
+    if not (math.isfinite(price) and math.isfinite(equity)) or equity <= 0:
         return math.inf
     return contracts * product.contract_size * price * product.margin_rate(side, overnight) / equity
 
@@ -3735,14 +3774,19 @@ def stage_contracts(
     cfg: BotConfig,
     full_cap: int | None = None,
 ) -> tuple[int, str]:
-    """(contracts, reason). 0 contracts = skip the signal (recorded, not traded)."""
+    """(contracts, reason). 0 contracts = skip the signal (recorded, not traded). Fails closed on a
+    non-finite price or equity, a bad direction, or a negative `full_cap`."""
+    if full_cap is not None and full_cap < 0:
+        raise ValueError(f"bad full_cap {full_cap}")
+    if direction not in (1, -1) or not all(map(math.isfinite, (entry, stop, equity))) or equity <= 0:
+        return 0, "bad sizing inputs"
     if direction * (entry - stop) <= 0:
         return 0, "stop on the wrong side of the entry"
     if stage in ("SHADOW", "CANARY"):
         risk = risk_per_contract(entry, stop, cfg.costs)
         if risk > CANARY_MAX_RISK * equity:
             return 0, f"1-contract risk {risk:.2f} USD > {CANARY_MAX_RISK:.0%} of equity {equity:.2f}"
-        return 1, "canary: 1 contract"
+        return 1, f"{stage.lower()}: 1 contract"
     if stage == "FULL":
         n = size_contracts(equity, entry, stop, direction, CONSERVATIVE, risk_mult, cfg.costs)
         if n == 0:
@@ -3759,7 +3803,7 @@ def stage_contracts(
 uv run --group live pytest tests/live/test_pricing.py -q
 ```
 
-Expected: `15 passed`.
+Expected: `22 passed`.
 
 - [ ] **Step 5: Commit**
 
