@@ -6,28 +6,28 @@
 
 **Architecture:** Every hour at hh:00:30 the runtime replays the whole frozen engine exactly like the paper runtime (`run_backtest(cfg, df, HOLDOUT_START, None, allow_holdout=True)` inside the paper trace) on the frame plus one flat placeholder bar, and reads the target after the bar that just closed — open position, its stop and TPs, the exit or entry queued at that close (`live/target.py`). A pure planner (`live/reconcile.py`) turns target × exchange state into actions; an executor (`live/executor.py`) sends them through an `Exchange` protocol with intent-before-send idempotency (deterministic `client_order_id`, SQLite journal) — `CoinbaseExchange` (SDK 1.8.4) in CANARY/FULL, `ShadowExchange` (real previews, virtual book) in SHADOW, `SimExchange` in every test. A one-second main loop adds the watchdog (stop gap, margin, account breakers, session), Telegram commands, the external heartbeat, the daily summary and the hourly audit against the paper ledger. No strategy-fingerprinted file is edited: new code lives in `src/ewbot/live/`, plus `live` sub-commands in `cli.py`, `deploy/live/` and an ops runbook.
 
-**Tech Stack:** Python 3.12.13 (uv), the existing dependencies (numpy, pandas, pyarrow, requests, PyYAML) plus `coinbase-advanced-py==1.8.4` in a new `live` dependency group (it brings cryptography, PyJWT, websockets 13.1, backoff); SQLite (stdlib `sqlite3`, WAL); pytest; Docker (`python:3.12.13-slim-bookworm`, `ghcr.io/astral-sh/uv:0.12.13`, both pinned by digest) with Docker Compose on Ubuntu 24.04; Telegram Bot API (`sendMessage`, `getUpdates`); healthchecks.io; age + rclone (Cloudflare R2) for backups.
+**Tech Stack:** Python 3.12.13 (uv), the existing dependencies (numpy, pandas, pyarrow, requests, PyYAML) plus `coinbase-advanced-py==1.8.4` (REST) and `websockets==13.1` (the price feed's client, already the SDK's own dependency) in a new `live` dependency group (the SDK brings cryptography, PyJWT, websockets 13.1, backoff); SQLite (stdlib `sqlite3`, WAL); pytest; Docker (`python:3.12.13-slim-bookworm`, `ghcr.io/astral-sh/uv:0.12.13`, both pinned by digest) with Docker Compose on Ubuntu 24.04; Telegram Bot API (`sendMessage`, `getUpdates`); healthchecks.io; age + rclone (Cloudflare R2) for backups.
 
-**Spec:** `docs/superpowers/specs/2026-10-03-ewbot-plan3-live-trading-design.md` (parents: `docs/superpowers/specs/2026-10-01-elliott-wave-btc-bot-design.md`, `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`). The spec's §2 Coinbase API facts were researched on 2026-10-03, the day this plan was written, so they stand in for the re-check required by spec §6.1; this plan additionally verified the SDK 1.8.4 source (generic `RESTClient.get/post`, `WSClient`, JWT signing) and recorded the real public `GET /market/products/BIP-20DEC30-CDE` and `/market/product_book` responses used as fixtures.
+**Spec:** `docs/superpowers/specs/2026-10-03-ewbot-plan3-live-trading-design.md` (parents: `docs/superpowers/specs/2026-10-01-elliott-wave-btc-bot-design.md`, `docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md`). The spec's §2 Coinbase API facts were researched on 2026-10-03, the day this plan was written, so they stand in for the re-check required by spec §6.1; this plan additionally verified the SDK 1.8.4 source (generic `RESTClient.get/post`, `WSClient` - not used: it opens wss:// without verifying the certificate or the host name -, JWT signing) and recorded the real public `GET /market/products/BIP-20DEC30-CDE` and `/market/product_book` responses used as fixtures.
 
 ## Global Constraints
 
 - Work on branch `feat/plan3-live` (from `docs/live-design`, or from `master` once PR #5 with the spec and this plan is merged), from the repository root; the venv must be Python 3.12.13 (`uv run python --version`; if not, `uv venv --python 3.12.13 && uv sync`).
 - Tests: `uv run pytest …` in Tasks 1–2, `uv run --group live pytest …` from Task 3 on (it keeps the `live` group installed; a plain `uv sync` later would remove it).
-- Never modify a strategy-fingerprinted file (Plan 2 spec §5.1, Plan 3 spec §3.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Never modify `holdout.lock`, `backtest/**`, `data/coinbase_history.py`, `src/ewbot/paper/**` or `.github/workflows/**`. Allowed: create `src/ewbot/live/**`, `tests/live/**`, `deploy/live/**`, `docs/live-trading.md`; modify `src/ewbot/cli.py`, the one `ALLOWED_TRUE` line of `tests/paper/test_static.py` (Decision D2) and `pyproject.toml` + `uv.lock` only through `uv add --group live coinbase-advanced-py==1.8.4` (Decision D1).
+- Never modify a strategy-fingerprinted file (Plan 2 spec §5.1, Plan 3 spec §3.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Never modify `holdout.lock`, `backtest/**`, `data/coinbase_history.py`, `src/ewbot/paper/**` or `.github/workflows/**`. Allowed: create `src/ewbot/live/**`, `tests/live/**`, `deploy/live/**`, `docs/live-trading.md`; modify `src/ewbot/cli.py`, the one `ALLOWED_TRUE` line of `tests/paper/test_static.py` (Decision D2) and `pyproject.toml` + `uv.lock` only through `uv add --group live coinbase-advanced-py==1.8.4` (Task 3) and `uv add --group live websockets==13.1` (Task 8; Decision D1).
 - Fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1` over 25 files and lock `sha256` `d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45` are pinned in `live/preflight.py`; the runtime refuses to start when either differs, or when the API key can transfer, or when the product is not 0.01 BTC / $5 tick / whole contracts.
 - Frozen inputs: params only from `holdout.lock`; config = `holdout_config(BotConfig(), params)`; replay from the first cached bar with `start_ts = HOLDOUT_START`; signals from the spot `BTC-USD` hourly candles of the public Coinbase Exchange API (`data.coinbase_history.update_cache`, as the paper runtime); no CLI option changes any of it.
 - Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short (recorded 2026-10-03). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
 - Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 for the first 30 days of FULL.
 - Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s (no price once the last good one is older than 60 s; a connection without a message for 15 s is reopened, a feed silent for 5 minutes is alerted); heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min); daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour.
-- Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90%; real-account breakers −3% from the New York day's first equity and −15% from the peak → flatten and pause, each on two balance reads in a row (a balance that is not a finite amount above 0 is no reading; `/resume` re-bases only the breaker that tripped).
+- Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90%; real-account breakers −3% from the New York day's first equity and −15% from the peak → flatten and pause, each on two balance reads in a row (a balance that is not a finite amount above 0 is no reading, and three in a row are an incident that pauses entries; `/resume` re-bases only the breaker that tripped).
 - Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name.
 - Tests never touch the network, a real account, the real `data/cache` or `<repo>/holdout.lock`: `SimExchange`, recorded JSON fixtures, fake sessions, synthetic candles (`tests.paper.helpers.synth_frame`) and temp-dir locks. Exception: `check_fingerprint()` hashes the working tree's strategy files (read-only), as the paper fingerprint test does.
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Decisions for the controller (sign off before Task 3 / before merging)
 
-**D1 — the SDK dependency changes `uv.lock`, whichever way it is added; use a `live` dependency group (recommended).** Verified 2026-10-03 with uv 0.12.13 in a scratch copy: `uv add coinbase-advanced-py==1.8.4` (main dependency), `uv add --optional live …` (extra) and `uv add --group live …` (PEP 735 group) all rewrite `uv.lock` the same way — additively (+226 lines: `coinbase-advanced-py`, `cryptography`, `cffi`, `pycparser`, `pyjwt`, `websockets 13.1`, `backoff`), no existing package version changed, no line removed. The paper runtime's environment digest includes `uv_lock_sha256` (`paper/environment.py`), so after the merge the first paper run sees a new environment: a discrepancy found in that one run (none is expected) would be classified `ENVIRONMENT_CHANGE` instead of `UNEXPLAINED`; every later run is classified normally, the epoch and the criterion-4 28-day clock are not touched (only a fingerprint change opens an epoch). The group is the better of the three: `uv sync --frozen` in `paper.yml` and `ci.yml` installs the default groups only (`dev`), so the paper and CI runners keep exactly today's packages (no SDK, no `cryptography` on a job holding `contents: write`), while the Docker image installs `--group live` from the same lock. The zero-change alternative — leave `uv.lock` alone and install the SDK in the image from a hash-pinned `deploy/live/requirements-live.txt` — removes even the one-run window but creates a second lock that can drift from `uv.lock`, and the SDK compatibility test would only run where someone installed the SDK by hand; choose it only if the one-run `ENVIRONMENT_CHANGE` window is unacceptable. Merge timing: right after a paper run with 0 new discrepancies, then check the next run (Task 16 Step 2).
+**D1 — the SDK dependency changes `uv.lock`, whichever way it is added; use a `live` dependency group (recommended).** Verified 2026-10-03 with uv 0.12.13 in a scratch copy: `uv add coinbase-advanced-py==1.8.4` (main dependency), `uv add --optional live …` (extra) and `uv add --group live …` (PEP 735 group) all rewrite `uv.lock` the same way — additively (+226 lines: `coinbase-advanced-py`, `cryptography`, `cffi`, `pycparser`, `pyjwt`, `websockets 13.1`, `backoff`), no existing package version changed, no line removed. The paper runtime's environment digest includes `uv_lock_sha256` (`paper/environment.py`), so after the merge the first paper run sees a new environment: a discrepancy found in that one run (none is expected) would be classified `ENVIRONMENT_CHANGE` instead of `UNEXPLAINED`; every later run is classified normally, the epoch and the criterion-4 28-day clock are not touched (only a fingerprint change opens an epoch). The group is the better of the three: `uv sync --frozen` in `paper.yml` and `ci.yml` installs the default groups only (`dev`), so the paper and CI runners keep exactly today's packages (no SDK, no `cryptography` on a job holding `contents: write`), while the Docker image installs `--group live` from the same lock. The zero-change alternative — leave `uv.lock` alone and install the SDK in the image from a hash-pinned `deploy/live/requirements-live.txt` — removes even the one-run window but creates a second lock that can drift from `uv.lock`, and the SDK compatibility test would only run where someone installed the SDK by hand; choose it only if the one-run `ENVIRONMENT_CHANGE` window is unacceptable. Merge timing: right after a paper run with 0 new discrepancies, then check the next run (Task 16 Step 2). Task 8 declares `websockets==13.1` in the same group (the price feed's client; already locked as the SDK's dependency): `uv.lock` changes only in the project's own group metadata, no package or version.
 
 **D2 — `live/target.py` joins the `allow_holdout=True` allowlist.** `tests/paper/test_static.py` asserts the exact set of modules that may replay into the holdout period (`{"backtest/holdout.py", "paper/runner.py"}`). The live runtime has to replay exactly like the paper runtime, so the set grows by exactly this one module (one line in Task 4). Calling `TradingEngine` directly instead would bypass the guard silently. No file under `src/ewbot/paper/` changes.
 
@@ -42,9 +42,9 @@
 5. **Protection and TP1** (spec §4.2, §4.4). Legs: 1 contract → one bracket (TP1 + stop); more → TP1 size (`engine.position_mgr._tp1_split`) + stop, and the rest + TP2 + stop; after the live TP1 one bracket (rest + TP2) with the stop tightened to at least the live entry price (break-even). A 1-contract CANARY trade therefore exits whole at TP1 while the engine keeps its remainder. When the engine's TP1 has filled but the live TP1 has not, what the resting TP1 leg has left is closed at market (`Reduce TP1_SYNC`, only while the session is OPEN and the TP1 leg rests - a vanished one may already have filled; until then both legs stay). A signal without TP2 is skipped (strategy A always sets one). A smaller live position counts as a bracket fill only when our resting legs still cover exactly the position: the TP1 leg used up is the live TP1 (break-even); a partial TP1 keeps the TP1 leg for the rest; any other reduction is unexplained (`UNEXPLAINED_REDUCTION`: alert, the stop stays, the rest is protected). More contracts than the trade holds (a manual order, a reduction that did not fill) are reduced at market while the session is OPEN (`Reduce EXCESS`, spec §4.4) - until then, or while another reduction is pending, the legs cover the whole position (brackets only reduce); a position taken over is capped at the stage maximum (SHADOW/CANARY 1, FULL 3 in its first 30 days) and the rest reduced. A reduction the venue refuses because our brackets already cover the position (`CLOSE_CONFLICTS`) makes room first - the TP1 leg is cancelled for `TP1_SYNC`, the legs shrink to the size after it for `EXCESS` / `MARGIN` (placed first) - and is resent under a new id; when it does not fill the legs go back for the whole position. Legs never exceed the position, and a close waiting for the session keeps missing legs placed at the stop in force. A TP1 leg emptied by its own stop (both legs share it) reads as the live TP1: the rest's break-even stop is then through the market and fills at once; if the venue refuses it, the old leg (its stop triggered already) stays, with the watchdog as the backstop (runbook).
 6. **Stop moves.** Working protection is never removed before its replacement rests. Replace first (new bracket, then cancel the old one; brackets only reduce, spec §4.2); only when the venue refuses the replacement with a known overlap refusal code (`OVERLAP_REFUSALS`, to be confirmed in CANARY) while our brackets plus the new leg really exceed the position is the old one cancelled first - the gap is tracked as unprotected time (`LEG_GAP`, the designed path on such a venue, not an order failure) and a replacement that then fails puts the old terms back at once (`LEG_RESTORED`; a known narrow limit: if the old leg's cancel is only queued and the venue still counts it, the replacement and the restore can both be refused as overlaps and that leg is missing until the next pass, tracked as unprotected time). A replacement whose outcome is unknown (429, 5xx, timeout) or that is refused for any other reason (order entry disabled, a price, an unknown code) keeps the old leg (`BRACKET_FAILED`) and the move is tried again on the next pass; an unconfirmed one found among the open orders replaces the old leg at once. A resting bracket of ours the trade does not list (accepted right before a crash, an unconfirmed replacement that reached the venue) is taken over by its client order id and terms (`LEG_ADOPTED`; never one whose cancel is queued); other brackets of ours are cancelled only once every wanted leg rests; the trade records the new stop only once every leg rests at it. `orders/edit` on a bracket (the order's total size: filled + left) is used only with `EWBOT_LIVE_EDIT_STOPS=1`, after CANARY confirms it (spec §6.2). With no resting stop and the price through the stop, the watchdog closes at once; with a resting stop gapped past its 5% limit (`STOP_LIMIT_OFFSET`, the Create Order reference; spec §4.2 assumed 1%) for 10 s, it closes at market (spec §4.2).
 7. **Idempotency and retries** (spec §4.2, §5.1). Intent before send; a PENDING intent (ambiguous error, killed process) is looked up by `client_order_id` (orders created up to 5 min before it) before the same id is sent again; a duplicate-id answer resolves to the existing order; a PENDING intent not on the exchange after 10 min is ABANDONED (checked every minute). Reads are retried 3 times in the adapter; an ambiguous entry is looked up and re-sent with the same id on the next polls only until 5 minutes after its bar's close, then skipped (`진입이 실패하면 건너뛰고`); a failed close is retried on every poll with a new id, with an alert each time (`청산이 실패하면 계속 재시도하면서 경보`) - a close goes out with the brackets resting (both only reduce; the brackets go with the position) and they are cancelled only when the venue refuses the close because they rest (`CLOSE_CONFLICTS`, after a fresh session read; the close is then resent at once), and after every failed or unconfirmed close the legs are made the ones for the position left (placed again when none rests, on later passes too), so a close that keeps failing never leaves the position unprotected; `close_position` can only reduce, so a late duplicate close cannot open a position. Restart recovery also rebuilds a trade whose entry was accepted but not yet recorded (only when no trade with that id was recorded: a position appearing after our trade closed is a foreign one, adopted at its own entry price) and records a close accepted right before a crash with its reason; a failed read during recovery is recorded and counted unresolved, never raised; the open trade's resting brackets are its legs again at restart (no false unprotected time). An accepted entry whose fill could not be read in time (or one still PENDING: looked up first; while that lookup fails - or while the fill of an accepted one cannot be read - the position is protected at once with a provisional trade from the entry's intent, settled as ours or as a foreign position once the lookup answers) is rebuilt from its intent on the next pass (not treated as a foreign position); a rebuilt trade opens at its entry order's creation time, so the protection latency (`PROTECTED_FIRST`, `PROTECT_SLOW`) includes an outage. A reduction is recorded on the trade before it is sent (`pending_reduce`: id, size, reason, the position it was sent against, the trade once done): while its outcome is unknown no other reduction is planned and it is resolved by its id first (looked up; re-sent under the same id only when the venue does not have it and the position shows no reduction); the position showing it settles it as ours (`TP1_SYNC` → the live TP1) - never an unexplained reduction or a second sale. Protection planned together with a reduction waits until the reduction is known to have filled.
-8. **Exchange state vs. prices.** Positions and orders are read over REST (every 10 s while a trade is open or an intent is pending): one source of truth for reconcile, read as one state - the position is read again after the orders and the pair is used only when both reads agree (3 tries, else the poll is skipped), so a fill between the reads never pairs a stale position with a vanished leg. Because Coinbase may show a fill in the orders before the position, a leg that left the book is looked up before it is placed again: one with fills is not placed again for 30 s (the next read folds the fill). Prices for the watchdog come from the WebSocket `ticker` + `heartbeats` channels (SDK `WSClient`; the mid of the ticker's best bid and ask - the REST quote's measure - and only finite prices above 0), with the spec's fallback: silent for 60 s → REST every 10 s, and a REST price older than 60 s is no price (the stop-gap check waits, the brackets keep protecting). The feed reopens a connection that brought no message for 15 s itself (the SDK's handler can end without an error on a server close) with a 1-60 s backoff, and a feed silent for 5 minutes is alerted; a reconnect or a `sequence_num` gap forces an immediate REST poll. The WebSocket `user` channel is not used.
+8. **Exchange state vs. prices.** Positions and orders are read over REST (every 10 s while a trade is open or an intent is pending): one source of truth for reconcile, read as one state - the position is read again after the orders and the pair is used only when both reads agree (3 tries, else the poll is skipped), so a fill between the reads never pairs a stale position with a vanished leg. Because Coinbase may show a fill in the orders before the position, a leg that left the book is looked up before it is placed again: one with fills is not placed again for 30 s (the next read folds the fill). Prices for the watchdog come from the WebSocket `ticker` + `heartbeats` channels (Coinbase's public market-data endpoint `wss://advanced-trade-ws.coinbase.com`, which serves spot and US futures without a key: no JWT is sent, and the `websockets` sync client verifies TLS - SDK 1.8.4's `WSClient` verifies neither the certificate nor the host name; the mid of the ticker's best bid and ask - the REST quote's measure - and only finite prices above 0), with the spec's fallback: silent for 60 s → REST every 10 s, and a REST price older than 60 s is no price (the stop-gap check waits, the brackets keep protecting). The feed reopens a lost or closed connection, and one that brought no message for 15 s, itself with a 1-60 s backoff, and a feed silent for 5 minutes is alerted; a reconnect or a `sequence_num` gap forces an immediate REST poll. The WebSocket `user` channel is not used.
 9. **SHADOW** runs the complete runtime against `ShadowExchange`: reads (product, session, quotes, balance, key permissions) are real; every order is first checked with the real `POST /orders/preview` (journaled for gate ③) and then executed on a virtual book (`SimExchange`) that follows the real futures price. Sizing is CANARY's, on the real balance (so the account must be funded during SHADOW). After a restart the open virtual position is restored from the journal (`ShadowExchange.restore`) and its brackets are re-placed, so the SHADOW restart test exercises the real recovery path.
-10. **Stages** change only through `ewbot live stage <to> --confirm` with a flat book (journal and Coinbase); promotions need every gate (one stage at a time). A running runtime notices the new stage within a minute and exits once flat; Docker (`restart: unless-stopped`) starts it in the new stage. Incidents: in CANARY the CANARY failure events (unprotected > 60 s, audit mismatch, breaker, transfer key, protection slower than 30 s, a foreign order or position, more contracts than the trade holds or fewer than its legs explain) pause entries (spec §6.2 `자동으로 일시 정지`); in FULL the major incidents pause and demote to CANARY. Pause never stops protection or exits.
+10. **Stages** change only through `ewbot live stage <to> --confirm` with a flat book (journal and Coinbase); promotions need every gate (one stage at a time). A running runtime notices the new stage within a minute and exits once flat; Docker (`restart: unless-stopped`) starts it in the new stage. Incidents: in CANARY the CANARY failure events (unprotected > 60 s, audit mismatch, breaker, transfer key, protection slower than 30 s, a foreign order or position, more contracts than the trade holds or fewer than its legs explain) pause entries (spec §6.2 `자동으로 일시 정지`); in every stage three balance reads in a row that are not a finite amount above 0 pause entries (`BAD_EQUITY`, never a flatten); in FULL the major incidents pause and demote to CANARY. Pause never stops protection or exits.
 11. **Gates operationalised.** SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED` or `REDUCE_FAILED` event (the cancel-first fallback on a venue that refuses overlapping brackets writes `LEG_GAP` only: the designed path, not a failure; so do `CLOSE_CONFLICT` / `REDUCE_CONFLICT`, refusals answered by making room); CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
 12. **Audit** (spec §3.5): the journal stores the engine decisions in the paper ledger's format; hourly (from minute 50) they are compared with the paper ledger's current epoch (known_at in (epoch start, epoch through_ts]); any mismatch is alerted once and, in CANARY/FULL, is a major incident.
 13. **Costs in the daily summary**: entry slippage against the engine's reference (spot `entry_ref` × ratio), stop slippage of bracket stop fills against the stop price (every filled leg is read back with `get_order` and journaled as `BRACKET_FILL`), measured fees vs. the paper cost model (`execution.costs.fee`); funding is not measured separately (Coinbase books it into the balance) — the summary says so.
@@ -64,7 +64,7 @@
 | `src/ewbot/live/reconcile.py` | 6 | `LiveTrade` state, `observe`, `desired_legs`, `plan` (pure) |
 | `src/ewbot/live/executor.py` | 7 | intent-before-send, entries, brackets, closes, reductions, restart recovery |
 | `src/ewbot/live/watchdog.py` | 8 | stop gap, margin status, account breakers, session watch, price source |
-| `src/ewbot/live/feed.py` | 8 | WebSocket ticker feed (SDK `WSClient`), gaps, reconnect backoff |
+| `src/ewbot/live/feed.py` | 8 | WebSocket ticker feed (Coinbase's public endpoint, no key, `websockets` client with verified TLS), gaps, reconnect backoff |
 | `src/ewbot/live/notify.py` | 9 | `[LIVE]` Telegram notifier (paper `TelegramSender`, dedupe) |
 | `src/ewbot/live/control.py` | 9 | Telegram commands (long poll, allowlisted chat, persisted offset) |
 | `src/ewbot/live/health.py` | 9 | heartbeat pings (healthchecks.io) |
@@ -76,7 +76,7 @@
 | `src/ewbot/live/runtime.py` | 12 | `LiveRuntime` main loop, `status_lines` |
 | `src/ewbot/live/app.py` | 13 | production wiring (exchange, notifier, feed, control, heartbeat, audit) |
 | `src/ewbot/cli.py` (modify) | 13 | `ewbot live` sub-commands: run, preflight, status, stage, backup |
-| `pyproject.toml`, `uv.lock` (via `uv add`) | 3 | `live` dependency group: `coinbase-advanced-py==1.8.4` |
+| `pyproject.toml`, `uv.lock` (via `uv add`) | 3, 8 | `live` dependency group: `coinbase-advanced-py==1.8.4`, `websockets==13.1` |
 | `tests/paper/test_static.py` (one line) | 4 | `live/target.py` in `ALLOWED_TRUE` |
 | `tests/live/*` | 1–15 | unit, fixture, parity, chaos, CLI and deploy tests; `helpers.py` (7), `harness.py` (12), `fixtures/coinbase.json` (3) |
 | `deploy/live/Dockerfile`, `Dockerfile.dockerignore`, `docker-compose.yml` | 15 | image and service |
@@ -94,17 +94,17 @@
 | 5 | Price mapping, stage sizing, margin projection | 22 |
 | 6 | Reconcile planner | 29 |
 | 7 | Executor: intent-before-send, protection, closes, recovery | 65 |
-| 8 | Watchdog and WebSocket feed | 18 |
+| 8 | Watchdog and WebSocket feed | 19 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 6 |
 | 10 | Paper audit, stages and gates | 9 |
 | 11 | Settings and preflight | 7 |
 | 12 | `ShadowExchange` and the runtime loop | 23 |
-| 13 | CLI `ewbot live …` and production wiring | 7 |
+| 13 | CLI `ewbot live …` and production wiring | 8 |
 | 14 | Parity and chaos integration tests | 26 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 345 more tests, `965 passed, 1 skipped` (`966 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 347 more tests, `967 passed, 1 skipped` (`968 passed` with the cache), about 80 s.
 
 ---
 
@@ -2061,7 +2061,6 @@ def test_helpers():
 def test_the_pinned_sdk_matches_the_calls_this_adapter_makes(monkeypatch):
     """Runs only with the `live` dependency group installed (uv run --group live pytest)."""
     rest = pytest.importorskip("coinbase.rest")
-    ws = pytest.importorskip("coinbase.websocket")
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -2070,8 +2069,6 @@ def test_the_pinned_sdk_matches_the_calls_this_adapter_makes(monkeypatch):
     assert {"key_file", "timeout", "rate_limit_headers"} <= set(init)
     assert {"url_path", "params", "public"} <= set(inspect.signature(rest.RESTClient.get).parameters)
     assert {"url_path", "data"} <= set(inspect.signature(rest.RESTClient.post).parameters)
-    for name in ("open", "subscribe", "close"):
-        assert callable(getattr(ws.WSClient, name))
 
     pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()
@@ -7136,12 +7133,13 @@ EOF
 
 **Files:**
 - Create: `src/ewbot/live/watchdog.py`, `src/ewbot/live/feed.py`
+- Modify (through `uv add` only): `pyproject.toml`, `uv.lock` - `websockets==13.1` in the `live` group (Decision D1)
 - Test: `tests/live/test_watchdog.py`
 
 **Interfaces:**
-- Consumes: `ewbot.config.BreakerParams` (daily 3%, total 15%), `ewbot.live.exchange`, `ewbot.live.journal.Journal`, `ewbot.live.pricing` (margin constants, `margin_ratio`, `max_contracts_for_margin`, `stop_gapped`), `tests.live.helpers` (`Clock`, `journal`, `sim`); the SDK `coinbase.websocket.WSClient` (only inside `sdk_ws_factory`'s factory, and in one test that is skipped without the `live` group).
-- Produces (`ewbot.live.watchdog`): `NY`, `GAP_GRACE_S = 10.0`, `WS_STALE_S = 60.0`, `REST_POLL_S = 10.0`, `MAINTENANCE_NOTICE_S`; `class StopGapWatch(grace_s=10.0)` with `check(direction, stop_price, price, now) -> bool` (a wall clock stepping back re-arms it at the new time) and `reset()`; frozen `MarginStatus(ratio, level: "OK"|"WARN"|"REDUCE", reduce_by=0)`, `margin_status(contracts, price, side, product, equity) -> MarginStatus`; `ny_date(ts) -> str`; `class BadEquity(ValueError)`; `class AccountGuard(journal, params=None)` (journal key `account_guard`) with `state()`, `update(equity, now) -> "DAILY_LOSS" | "TOTAL_DD" | None` (newly tripped only, on the second breaching observation in a row; the peak only rises to the lower of two observations in a row; an equity that is not finite and above 0 raises `BadEquity` and writes nothing), `reset(equity, now) -> list[str]` (re-bases only the breakers that tripped - the peak after `TOTAL_DD`, the day's reference after `DAILY_LOSS`, which a `TOTAL_DD` trip marks too - and names them; `[]` and no change without a trip; `BadEquity` likewise); `class SessionWatch` with `update(info, now) -> list[("SESSION" | "MAINTENANCE", text)]` (a window already under way is announced too; an unknown end reads `미정`); `class PriceSource(exchange, feed=None, *, clock, stale_s=60.0, poll_s=10.0)` with `futures_price() -> float | None` (a usable WebSocket price at most `stale_s` old, else the REST mid read at most every `poll_s` - an error or a book without a finite bid and ask above 0 keeps the last good one - and `None` once that is older than `stale_s`) and `.mode` (`"ws"` / `"rest"`).
-- Produces (`ewbot.live.feed`): `CHANNELS = ("ticker", "heartbeats")`, `MAX_BACKOFF_S = 60.0`, `SILENT_S = 15.0`, `HEALTHY_S = 60.0`, `OPEN_TIMEOUT_S = 10`, frozen `Tick(price, ts)`, `usable_price(x) -> float | None` (finite and above 0), `ticker_price(ticker) -> float | None` (the best bid / ask mid, else the trade price); `class TickerFeed(products, ws_factory, *, clock=time.time, sleep=None, max_backoff=60.0, silent_s=15.0, healthy_s=60.0)` (`sleep=None`: the backoff waits on the stop event, so `stop()` ends it) with `on_message(raw)` (never raises: unreadable messages and unusable prices count in `bad_messages`), `latest(product_id) -> Tick | None`, `age() -> float | None`, `take_resync() -> bool`, `run()` (reconnects on a failure or `silent_s` without a message; backoff 1 s doubling to `max_backoff`, reset after `healthy_s` of messages), `start() -> Thread`, `stop()`, attributes `gaps`, `connects`, `failures`, `messages`, `bad_messages`, `last_error` (an exception type name, `silent for 15 s` or a server error message); `class SdkSocket(client)` (`open`, `subscribe`, `sleep_with_exception_check`, `close`: when `WSClient.close()` raises on a socket that is not open, it stops, joins and closes the client's event loop); `sdk_ws_factory(key_file) -> factory(on_message=...) -> SdkSocket` (SDK `WSClient(key_file=..., retry=False, timeout=OPEN_TIMEOUT_S)`, imported lazily).
+- Consumes: `ewbot.config.BreakerParams` (daily 3%, total 15%), `ewbot.live.exchange`, `ewbot.live.journal.Journal`, `ewbot.live.pricing` (margin constants, `margin_ratio`, `max_contracts_for_margin`, `stop_gapped`), `tests.live.helpers` (`Clock`, `journal`, `sim`); `websockets.sync.client.connect` (websockets 13.1, dependency group `live`; imported lazily in `PublicSocket.open`, and in one test that is skipped without the group).
+- Produces (`ewbot.live.watchdog`): `NY`, `GAP_GRACE_S = 10.0`, `WS_STALE_S = 60.0`, `REST_POLL_S = 10.0`, `MAINTENANCE_NOTICE_S`; `class StopGapWatch(grace_s=10.0)` with `check(direction, stop_price, price, now) -> bool` (a wall clock stepping back re-arms it at the new time) and `reset()`; frozen `MarginStatus(ratio, level: "OK"|"WARN"|"REDUCE", reduce_by=0)`, `margin_status(contracts, price, side, product, equity) -> MarginStatus`; `ny_date(ts) -> str`; `class BadEquity(ValueError)`; `class AccountGuard(journal, params=None)` (journal key `account_guard`) with `state()`, `update(equity, now) -> "DAILY_LOSS" | "TOTAL_DD" | None` (newly tripped only, on the second breaching observation in a row; the peak only rises to the lower of two observations in a row; the day's reference is the day's first observation - a single read, an accepted limit; an equity that is not finite and above 0 raises `BadEquity` and writes nothing), `reset(equity, now) -> list[str]` (re-bases only the breakers that tripped - the peak after `TOTAL_DD`, the day's reference after `DAILY_LOSS`, which a `TOTAL_DD` trip marks too - and names them; `[]` and no change without a trip; `BadEquity` likewise); `class SessionWatch` with `update(info, now) -> list[("SESSION" | "MAINTENANCE", text)]` (a window already under way is announced too; an unknown end reads `미정`); `class PriceSource(exchange, feed=None, *, clock, stale_s=60.0, poll_s=10.0)` with `futures_price() -> float | None` (a usable WebSocket price at most `stale_s` old, else the REST mid read at most every `poll_s` - an error or a book without a finite bid and ask above 0 keeps the last good one - and `None` once that is older than `stale_s`) and `.mode` (`"ws"` / `"rest"`).
+- Produces (`ewbot.live.feed`): `CHANNELS = ("ticker", "heartbeats")`, `MAX_BACKOFF_S = 60.0`, `SILENT_S = 15.0`, `HEALTHY_S = 60.0`, `OPEN_TIMEOUT_S = 10`, `PUBLIC_WS_URL = "wss://advanced-trade-ws.coinbase.com"`, frozen `Tick(price, ts)`, `usable_price(x) -> float | None` (finite and above 0), `ticker_price(ticker) -> float | None` (the best bid / ask mid, else the trade price); `class TickerFeed(products, ws_factory, *, clock=time.time, sleep=None, max_backoff=60.0, silent_s=15.0, healthy_s=60.0)` (`sleep=None`: the backoff waits on the stop event, so `stop()` ends it) with `on_message(raw)` (never raises: unreadable messages and unusable prices count in `bad_messages`), `latest(product_id) -> Tick | None`, `age() -> float | None`, `take_resync() -> bool`, `run()` (drives `ws_factory(on_message=...)` sockets through `open()`, `subscribe(products, channels)`, `pump(seconds)`, `close()`; reconnects on a failure, a lost or closed connection or `silent_s` without a message; backoff 1 s doubling to `max_backoff`, reset after `healthy_s` of messages), `start() -> Thread`, `stop()`, attributes `gaps`, `connects`, `failures`, `messages`, `bad_messages`, `last_error` (an exception type name, `silent for 15 s` or a server error message); `class PublicSocket(url, on_message, *, connect=None, open_timeout=OPEN_TIMEOUT_S)` (`open()` calls `connect(url, ssl=ssl.create_default_context(), open_timeout=...)` - certificate and host name verified - `subscribe()` sends one keyless `{"type": "subscribe", "product_ids", "channel"}` per channel, `pump(seconds)` hands over what arrives and raises on a lost or closed connection, `close()`); `public_ws_factory(url=PUBLIC_WS_URL, *, connect=None) -> factory(on_message=...) -> PublicSocket` (no credential).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -7150,16 +7148,17 @@ EOF
 ```python
 from __future__ import annotations
 
+import inspect
 import json
 import math
-import os
-import threading
+import ssl
 import time
+from importlib import metadata
 
 import pytest
 
 from ewbot.live.exchange import Quote, SessionInfo, Unavailable
-from ewbot.live.feed import HEALTHY_S, SILENT_S, Tick, TickerFeed, sdk_ws_factory
+from ewbot.live.feed import HEALTHY_S, PUBLIC_WS_URL, SILENT_S, Tick, TickerFeed, public_ws_factory
 from ewbot.live.sim import BIP_SPEC
 from ewbot.live.watchdog import AccountGuard, BadEquity, PriceSource, SessionWatch, StopGapWatch, margin_status
 from tests.live.helpers import Clock, journal, sim
@@ -7383,9 +7382,9 @@ def test_a_message_the_feed_cannot_read_never_reaches_the_sdk():
 
 
 class ScriptedWS:
-    """One connection. `script` is "refuse" (open fails) or steps consumed one per sleep_with_exception_check:
-    "msg" delivers a heartbeat, "quiet" returns without one (an SDK whose handler ended), "drop" raises like
-    the SDK on a lost connection, "stop" stops the feed. An exhausted script stays quiet; after 500 steps in
+    """One connection. `script` is "refuse" (open fails) or steps consumed one per pump(1): "msg" delivers a
+    heartbeat, "quiet" returns without one (a connection that fell silent), "drop" raises like a lost
+    connection, "stop" stops the feed. An exhausted script stays quiet; after 500 opens and steps in
     all the feed is stopped (a feed that never notices silence must not hang the test)."""
 
     steps = 0
@@ -7397,6 +7396,9 @@ class ScriptedWS:
         self.used = 0
 
     def open(self):
+        ScriptedWS.steps += 1
+        if ScriptedWS.steps > 500:
+            self.feed.stop()
         self.log.append("open")
         if self.script == "refuse":
             raise ConnectionRefusedError("refused")
@@ -7404,7 +7406,7 @@ class ScriptedWS:
     def subscribe(self, products, channels):
         self.log.append(f"subscribe {','.join(products)} {','.join(channels)}")
 
-    def sleep_with_exception_check(self, s):
+    def pump(self, s):
         ScriptedWS.steps += 1
         self.used += 1
         step = self.script.pop(0) if self.script else "quiet"
@@ -7440,9 +7442,9 @@ def test_feed_reconnects_with_backoff_and_requests_a_resync():
 
 
 def test_a_silent_connection_is_torn_down_and_opened_again():
-    """A server close (1000/1001) ends the SDK's handler without an error: sleep_with_exception_check keeps
-    returning and no message comes. The heartbeats channel sends one every second, so SILENT_S without one
-    means the connection is gone."""
+    """A connection can stay open and bring nothing (a half-open TCP connection, a server that stopped
+    sending): pump keeps returning and no message comes. The heartbeats channel sends one every second, so
+    SILENT_S without one means the connection is gone."""
     feed, log, waits = scripted([["msg"], ["msg", "stop"]])
     feed.run()
     assert feed.connects == 2 and waits == [1.0]
@@ -7480,24 +7482,64 @@ def test_stop_ends_a_backoff_wait_at_once():
     assert feed.failures >= 1 and not th.is_alive()
 
 
-def test_the_sdk_client_releases_its_loop_thread_after_a_failed_open(tmp_path, monkeypatch):
-    sdk = pytest.importorskip("coinbase.websocket")  # dependency group `live`
+class FakeConnection:
+    """Stands in for a websockets ClientConnection: recv() hands out `inbox`, then raises `end`."""
 
-    async def refused(*args, **kwargs):
-        raise OSError("connection refused")
+    def __init__(self, inbox: list[str], end: BaseException) -> None:
+        self.inbox, self.end = inbox, end
+        self.sent: list[dict] = []
+        self.closed = False
 
-    monkeypatch.setattr(sdk.websocket_base.websockets, "connect", refused)  # no network
-    key = tmp_path / "key.json"
-    key.write_text(json.dumps({"name": "organizations/o/apiKeys/k", "privateKey": "unused"}))
-    make = sdk_ws_factory(key)
-    threads, fds = threading.active_count(), len(os.listdir("/dev/fd"))
-    for _ in range(5):
-        ws = make(on_message=lambda raw: None)
-        assert (ws.client.timeout, ws.client.retry) == (10, False)  # bounded handshake; TickerFeed reconnects
-        with pytest.raises(sdk.WSClientException):
-            ws.open()
-        ws.close()  # the SDK's own close() raises here and leaves its event-loop thread running
-    assert (threading.active_count(), len(os.listdir("/dev/fd"))) == (threads, fds)
+    def send(self, text: str) -> None:
+        self.sent.append(json.loads(text))
+
+    def recv(self, timeout: float | None = None) -> str:
+        if self.inbox:
+            return self.inbox.pop(0)
+        raise self.end
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_the_public_socket_subscribes_without_a_key_over_verified_tls():
+    beat = json.dumps({"channel": "heartbeats", "sequence_num": 1})
+    conn = FakeConnection([beat, ticker(FUT, 60_000.0, 2)], ConnectionResetError("lost"))
+    opened: list[tuple[str, dict]] = []
+
+    def connect(url, **kw):  # no network: what the socket asks of websockets.sync.client.connect
+        opened.append((url, kw))
+        return conn
+
+    got: list[str] = []
+    ws = public_ws_factory(connect=connect)(on_message=got.append)
+    ws.open()
+    [(url, kw)] = opened
+    assert url == PUBLIC_WS_URL == "wss://advanced-trade-ws.coinbase.com" and kw["open_timeout"] == 10
+    ctx = kw["ssl"]  # the default context: the certificate chain and the host name are verified
+    assert isinstance(ctx, ssl.SSLContext) and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    ws.subscribe([FUT, "BTC-USD"], ["ticker", "heartbeats"])
+    assert conn.sent == [{"type": "subscribe", "product_ids": [FUT, "BTC-USD"], "channel": "ticker"},
+                         {"type": "subscribe", "product_ids": [FUT, "BTC-USD"], "channel": "heartbeats"}]  # no jwt
+    with pytest.raises(ConnectionResetError):  # a lost connection reaches TickerFeed.run
+        ws.pump(1)
+    assert got == [beat, ticker(FUT, 60_000.0, 2)]
+    quiet = FakeConnection([], TimeoutError())
+    ws2 = public_ws_factory(connect=lambda url, **kw: quiet)(on_message=got.append)
+    ws2.open()
+    ws2.pump(0.01)  # nothing within the time: returns (TickerFeed counts the silence)
+    ws2.close()
+    assert quiet.closed and len(got) == 2
+
+
+def test_the_pinned_websockets_client_takes_the_arguments_the_socket_passes():
+    """Runs only with the `live` dependency group installed (websockets 13.1, declared there)."""
+    client = pytest.importorskip("websockets.sync.client")
+    assert metadata.version("websockets") == "13.1"
+    assert {"ssl", "open_timeout"} <= set(inspect.signature(client.connect).parameters)
+    for name in ("send", "recv", "close"):
+        assert callable(getattr(client.ClientConnection, name))
+    assert "timeout" in inspect.signature(client.ClientConnection.recv).parameters
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -7509,6 +7551,12 @@ uv run --group live pytest tests/live/test_watchdog.py -q
 Expected: collection error `ModuleNotFoundError: No module named 'ewbot.live.feed'`.
 
 - [ ] **Step 3: Write minimal implementation**
+
+Declare the feed's WebSocket client in the `live` group (Decision D1: already locked as the SDK's dependency, so `uv.lock` changes only in the project's group metadata):
+
+```bash
+uv add --group live websockets==13.1
+```
 
 **File: `src/ewbot/live/watchdog.py`**
 
@@ -7614,7 +7662,8 @@ class AccountGuard:
     raise a reference: a breaker trips on the second observation in a row that breaches it (one poll - a
     minute in the runtime - after the first), and the peak only rises to a level two observations in a row
     reached (the lower of the two), so a single wrong balance read, low or high, cannot flatten the account.
-    The day's reference is the first observation of the New York day."""
+    The day's reference is the first observation of the New York day - a single read (accepted limit: a wrong
+    high read at exactly that moment can trip DAILY_LOSS two reads later; it errs toward flat and paused)."""
 
     KEY = "account_guard"
 
@@ -7736,38 +7785,41 @@ class PriceSource:
 ```python
 """WebSocket ticker feed (Plan 3 spec 2 `WebSocket`, 5.1).
 
-The SDK's WSClient (coinbase-advanced-py 1.8.4, dependency group `live`) runs the connection in its own
-event-loop thread; this class subscribes to the `ticker` and `heartbeats` channels of the futures and spot
-products, keeps the price per product - the mid of the ticker's best bid and ask (what the REST quote
-measures), its last trade price only when those are missing; only a finite price above 0 - and the time of
-the last message, and watches the per-connection `sequence_num` for gaps.
+Coinbase's public market-data endpoint (PUBLIC_WS_URL: spot and US futures) serves the `ticker` and
+`heartbeats` channels without a key or JWT (WebSocket Endpoints reference, checked 2026-10-03), so the feed
+holds no credential. It connects with the `websockets` sync client (dependency group `live`) and the
+default TLS context, which verifies the certificate chain and the host name; the SDK's WSClient is not used
+(SDK 1.8.4 opens wss:// with an SSLContext that verifies neither). This class subscribes to both channels
+for the futures and spot products, keeps the price per product - the mid of the ticker's best bid and ask
+(what the REST quote measures), its last trade price only when those are missing; only a finite price above
+0 - and the time of the last message, and watches the per-connection `sequence_num` for gaps.
 
-`run` owns every reconnect (the SDK's own retry is off: its backoff would race this one). A connection that
-fails, raises, or brings no message for SILENT_S (the heartbeats channel sends one every second; a server
-close 1000/1001 ends the SDK's handler without any error, so silence is how that shows) is torn down and
-opened again after an exponential backoff: 1 s doubling to 60 s, back to 1 s only once a connection has
-carried messages for HEALTHY_S. `stop()` also ends a backoff wait at once. Every (re)connect and every
-sequence gap sets `resync`, so the runtime re-reads positions and orders over REST. A message that cannot
-be read is counted (`bad_messages`) and never raised into the SDK (that would end its handler for good).
-`failures` and `last_error` (an exception's type name only - its text might carry a token - or "silent for
-15 s", or a server error message) tell the runtime why the feed is down. The runtime reads prices through
-watchdog.PriceSource, which uses REST polling once the feed has been silent for 60 s."""
+`run` owns every reconnect. A connection that fails, closes (a clean 1000/1001 close included), raises, or
+brings no message for SILENT_S (the heartbeats channel sends one every second, so silence means the
+connection is gone) is torn down and opened again after an exponential backoff: 1 s doubling to 60 s, back
+to 1 s only once a connection has carried messages for HEALTHY_S. `stop()` also ends a backoff wait at once.
+Every (re)connect and every sequence gap sets `resync`, so the runtime re-reads positions and orders over
+REST. A message that cannot be read is counted (`bad_messages`) and never raised. `failures` and
+`last_error` (an exception's type name only, "silent for 15 s", or a server error message) tell the runtime
+why the feed is down. The runtime reads prices through watchdog.PriceSource, which uses REST polling once
+the feed has been silent for 60 s."""
 
 from __future__ import annotations
 
 import json
 import math
+import ssl
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Sequence
 
 CHANNELS = ("ticker", "heartbeats")
 MAX_BACKOFF_S = 60.0
 SILENT_S = 15.0  # no message for this long (heartbeats come every second): the connection is gone
 HEALTHY_S = 60.0  # a connection that carried messages this long resets the backoff to 1 s
-OPEN_TIMEOUT_S = 10  # the SDK's opening-handshake timeout (none by default: a stalled handshake hangs)
+OPEN_TIMEOUT_S = 10  # the opening handshake (TCP, TLS, HTTP upgrade) times out after this
+PUBLIC_WS_URL = "wss://advanced-trade-ws.coinbase.com"  # public market data: no key, no JWT
 
 
 @dataclass(frozen=True, slots=True)
@@ -7893,7 +7945,7 @@ class TickerFeed:
                     seen = self.messages
                 up = silent = 0
                 while not self._stop.is_set():
-                    ws.sleep_with_exception_check(1)  # raises what the SDK's handler hit (a lost connection)
+                    ws.pump(1)  # hands over what arrives within 1 s; raises when the connection is lost
                     up += 1
                     with self._lock:
                         count = self.messages
@@ -7923,49 +7975,52 @@ class TickerFeed:
         return th
 
 
-class SdkSocket:
-    """The SDK's WSClient as TickerFeed drives it, with a close() that always releases the client's
-    event-loop thread: WSClient.close() (SDK 1.8.4) raises before it stops and joins its loop when the
-    socket is not open - a connection that never opened, or one the server closed - which would leak one
-    thread and three file descriptors per failed connection."""
+class PublicSocket:
+    """One connection to Coinbase's public market-data WebSocket, as TickerFeed drives it. `connect` is
+    `websockets.sync.client.connect` (tests pass a fake); a wss:// URL gets the default TLS context."""
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, url: str, on_message: Callable[[str], None], *,
+                 connect: Callable[..., Any] | None = None, open_timeout: float = OPEN_TIMEOUT_S) -> None:
+        self.url = url
+        self.on_message = on_message
+        self.connect = connect
+        self.open_timeout = open_timeout
+        self.conn: Any = None
 
     def open(self) -> None:
-        self.client.open()
+        if self.connect is None:
+            from websockets.sync.client import connect  # dependency group `live`
+
+            self.connect = connect
+        ctx = ssl.create_default_context() if self.url.startswith("wss://") else None
+        self.conn = self.connect(self.url, ssl=ctx, open_timeout=self.open_timeout)
 
     def subscribe(self, products: list[str], channels: list[str]) -> None:
-        self.client.subscribe(products, channels)
+        for channel in channels:  # one subscribe message per channel; public channels take no jwt
+            self.conn.send(json.dumps({"type": "subscribe", "product_ids": list(products), "channel": channel}))
 
-    def sleep_with_exception_check(self, s: int) -> None:
-        self.client.sleep_with_exception_check(s)
+    def pump(self, seconds: float) -> None:
+        """Hand every message that arrives within `seconds` to on_message; a lost or closed connection raises
+        (websockets' ConnectionClosed, a clean close included)."""
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                raw = self.conn.recv(timeout=left)
+            except TimeoutError:
+                return
+            self.on_message(raw if isinstance(raw, str) else bytes(raw).decode("utf-8", "replace"))
 
     def close(self) -> None:
-        try:
-            self.client.close()
-            return
-        except Exception:  # noqa: BLE001 - the socket was not open: stop the client's loop here
-            pass
-        loop, thread = getattr(self.client, "loop", None), getattr(self.client, "thread", None)
-        if loop is None or loop.is_closed():
-            return
-        loop.call_soon_threadsafe(loop.stop)
-        if thread is not None:
-            thread.join(5.0)
-        if thread is None or not thread.is_alive():
-            loop.close()
+        if self.conn is not None:
+            self.conn.close()
 
 
-def sdk_ws_factory(key_file: Path) -> Callable[..., Any]:
-    """WSClient factory for production (the CDP key signs the subscription JWTs). The SDK's retry is off -
-    TickerFeed.run reconnects - and the opening handshake times out after OPEN_TIMEOUT_S."""
+def public_ws_factory(url: str = PUBLIC_WS_URL, *,
+                      connect: Callable[..., Any] | None = None) -> Callable[..., PublicSocket]:
+    """TickerFeed's ws_factory for production: a PublicSocket on Coinbase's public endpoint (no credential)."""
 
-    def make(on_message: Callable[[str], None]) -> SdkSocket:
-        from coinbase.websocket import WSClient  # dependency group `live`
-
-        return SdkSocket(WSClient(key_file=str(key_file), on_message=on_message, retry=False,
-                                  timeout=OPEN_TIMEOUT_S))
+    def make(on_message: Callable[[str], None]) -> PublicSocket:
+        return PublicSocket(url, on_message, connect=connect)
 
     return make
 ```
@@ -7976,12 +8031,12 @@ def sdk_ws_factory(key_file: Path) -> Callable[..., Any]:
 uv run --group live pytest tests/live/test_watchdog.py -q
 ```
 
-Expected: `18 passed` (without the `live` group the SDK test is skipped: `17 passed, 1 skipped`).
+Expected: `19 passed` (without the `live` group the `websockets` test is skipped: `18 passed, 1 skipped`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/ewbot/live/watchdog.py src/ewbot/live/feed.py tests/live/test_watchdog.py
+git add src/ewbot/live/watchdog.py src/ewbot/live/feed.py tests/live/test_watchdog.py pyproject.toml uv.lock
 git commit -m "$(cat <<'EOF'
 feat(live): watchdog (stop gap, margin, account breakers, session) and WebSocket ticker feed
 
@@ -9351,7 +9406,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`FakeFetch`, `make_lock`, `synth_frame`, `ts`), `tests.live.helpers`.
 - Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position (`reconcile.expected_contracts`) back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
-- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check -, the margin, and the WebSocket feed: no message for `FEED_ALERT_S` → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back), `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply` (`/resume` re-bases only a breaker that tripped, `AccountGuard.reset`; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
+- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin, and the WebSocket feed: no message for `FEED_ALERT_S` → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back), `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply` (`/resume` re-bases only a breaker that tripped, `AccountGuard.reset`; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9599,17 +9654,24 @@ def test_the_account_breaker_flattens_and_pauses(h):
     assert not g["daily_tripped"] and g["day_ref"] == h.ex.balance().equity and g["peak"] == peak  # the peak stays
 
 
-def test_a_balance_that_is_not_a_finite_amount_is_alerted_once_and_never_trips(h):
+def test_a_balance_that_is_not_a_finite_amount_never_trips_and_pauses_entries_after_three_reads(h):
     entered(h)
     guard = h.rt.guard.state()
     h.ex.balance = lambda: Balance(math.nan, None)  # a broken balance read
-    for k in range(3):
-        h.at(ENTRY_BAR + 95 + 60 * k)
-    assert h.ex.position() is not None and paused(h.journal) is None and "BREAKER" not in h.alerts.kinds()
-    assert h.alerts.kinds().count("BAD_EQUITY") == 1 and h.rt.guard.state() == guard
-    del h.ex.balance  # good reads again
+    h.at(ENTRY_BAR + 95)
+    h.at(ENTRY_BAR + 155)
+    assert h.alerts.kinds().count("BAD_EQUITY") == 1 and paused(h.journal) is None  # alerted once, not an incident yet
+    h.at(ENTRY_BAR + 215)  # the third in a row: an incident that pauses entries - never a flatten
+    assert paused(h.journal)["reason"] == "incident BAD_EQUITY"
+    assert h.journal.events(kind="INCIDENT")[-1]["data"]["kind"] == "BAD_EQUITY"
+    assert h.ex.position() is not None and len(h.ex.open_orders()) == 1  # still protected
+    assert "BREAKER" not in h.alerts.kinds() and h.rt.guard.state() == guard
     h.at(ENTRY_BAR + 275)
+    assert h.alerts.kinds().count("INCIDENT") == 1  # once per episode
+    del h.ex.balance  # good reads again
+    h.at(ENTRY_BAR + 335)
     assert h.alerts.kinds().count("BAD_EQUITY") == 1 and h.rt.guard.state()["equity"] > 0
+    assert paused(h.journal) is not None  # resuming is the user's decision (/resume)
 
 
 def test_contracts_added_by_hand_are_reduced_and_pause_canary(h):
@@ -9659,13 +9721,13 @@ def test_a_silent_feed_is_alerted_once_per_outage(h):
     h.rt = h.make_runtime(feed=feed)
     h.rt.startup()
     feed.on_message(json.dumps({"channel": "heartbeats", "sequence_num": 1}))  # the last message, at +30
-    feed.failures, feed.last_error = 3, "WSClientException"  # TickerFeed.run's record of its reconnects
+    feed.failures, feed.last_error = 3, "ConnectionRefusedError"  # TickerFeed.run's record of its reconnects
     for k in range(7):  # +30 ... +390: silent from +90 on, alerted at +330 (5 minutes after the last message)
         if k == 4:
             feed.failures += 2
         h.at(ENTRY_BAR + 30 + 60 * k)
     texts = [t for kind, t in h.alerts.items if kind == "FEED"]
-    assert len(texts) == 1 and "REST" in texts[0] and "재연결 실패 2회" in texts[0] and "WSClientException" in texts[0]
+    assert len(texts) == 1 and "REST" in texts[0] and "재연결 실패 2회" in texts[0] and "ConnectionRefusedError" in texts[0]
     feed.on_message(json.dumps({"channel": "heartbeats", "sequence_num": 2}))  # back at +390
     h.at(ENTRY_BAR + 450)
     assert [t for kind, t in h.alerts.items if kind == "FEED"][-1] == "[가격 피드 복구] 웹소켓 가격 수신 재개"
@@ -9983,7 +10045,8 @@ data over (prices, queued commands), and every trading decision is taken on the 
             leg), observed and reconciled against the last target (protection right after fills, the
             TP1 break-even, deferred closes)
   minute    journal heartbeat, external heartbeat, session state, account breakers (a balance that is not
-            a finite amount above 0 is alerted, never a sample), margin (80% warn, 90% reduce), the
+            a finite amount above 0 is alerted, never a sample; three such reads in a row are an incident
+            that pauses entries), margin (80% warn, 90% reduce), the
             WebSocket feed's health (silent for 5 minutes: alerted once per outage, and when it is back),
             pending intents resolved (or abandoned after 10 min), the 15:30 New York
             overnight-margin report, the daily summary (09:00 New York)
@@ -10051,6 +10114,7 @@ FLATTEN_CONFIRM_S = 60.0
 EXPIRY_WARN_DAYS = 30
 SNAPSHOT_TRIES = 3  # position / orders / position reads until both position reads agree
 FEED_ALERT_S = 300.0  # the WebSocket feed silent this long is alerted (the watchdog's prices come from REST)
+BAD_EQUITY_PAUSE_READS = 3  # balance reads in a row that are not a finite amount above 0: incident, entries paused
 HEARTBEAT_KEY = "heartbeat"
 AUDIT_KEY = "audit"
 
@@ -10105,7 +10169,7 @@ class LiveRuntime:
         self.active = False
         self.flatten_until: float | None = None
         self.exit_code: int | None = None
-        self.bad_equity = False  # the last balance read was not an observation (alerted once per episode)
+        self.bad_equity_reads = 0  # balance reads in a row that were not an observation
         self.feed_down_since: float | None = None
         self.feed_failures = 0  # the feed's failure count when this outage began
         self.feed_alerted = False
@@ -10387,13 +10451,19 @@ class LiveRuntime:
         except ExchangeError:
             return
         except BadEquity:  # not an observation: no breaker sample and no margin check this minute
-            if not self.bad_equity:
+            self.bad_equity_reads += 1
+            if self.bad_equity_reads == 1:
                 self.journal.add_event(now, "BAD_EQUITY", {"equity": repr(equity)})
                 self.alert("BAD_EQUITY", f"[잔고 이상] 자산 값 {equity!r}: 손실 한도와 증거금 점검을 건너뜀 "
                                          "(정상 값이 읽히면 다시 점검)")
-            self.bad_equity = True
+            if self.bad_equity_reads == BAD_EQUITY_PAUSE_READS:  # persistent: no new risk without a balance
+                if paused(self.journal) is None:
+                    pause(self.journal, "incident BAD_EQUITY", now)
+                self._incident("BAD_EQUITY", now)
+                self.alert("INCIDENT", f"[중대 사건] 잔고 이상이 {BAD_EQUITY_PAUSE_READS}회 연속: 신규 진입 일시 정지 "
+                                       "(보호 주문과 청산은 계속, 재개는 /resume)")
             return
-        self.bad_equity = False
+        self.bad_equity_reads = 0
         if trip is not None:
             self.alert("BREAKER", f"[실계좌 손실 한도] {trip}: 전량 청산하고 일시 정지 (자산 {equity:,.2f} USD)")
             self.journal.add_event(now, "BREAKER", {"kind": trip, "equity": equity})
@@ -10666,7 +10736,7 @@ EOF
 
 **Interfaces:**
 - Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
-- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier`, `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, dataclass `Wired(runtime, feed, control, heartbeat, notify)`, `build(settings, lock, real, journal) -> Wired` (hands the preflight-checked lock to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange` and the module-level `update_cache`.
+- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier`, `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `price_feed(settings) -> TickerFeed | None` (the ticker feed on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), dataclass `Wired(runtime, feed, control, heartbeat, notify)`, `build(settings, lock, real, journal) -> Wired` (hands the preflight-checked lock to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`.
 - Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm]`, `backup --out PATH`; `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`. Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
 
 - [ ] **Step 1: Write the failing test**
@@ -10708,6 +10778,7 @@ def live_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_live_settings", lambda: settings)
     monkeypatch.setattr(cli, "_live_lock", lambda: (lock_path, lock["sha256"]))
     monkeypatch.setattr(live_app, "real_exchange", lambda s: ex)
+    monkeypatch.setattr(live_app, "price_feed", lambda s: None)  # no WebSocket in tests
     monkeypatch.setattr(live_app, "update_cache", lambda product, cache_dir: FakeFetch(df, clock)(cache_dir))
     monkeypatch.setattr(cli, "LIVE_REFUSAL_WAIT_S", 0.0)
     return settings, ex, lock
@@ -10720,6 +10791,12 @@ def test_live_parser_has_no_strategy_options():
                  ["live", "stage", "paper"], ["live", "backup"]):
         with pytest.raises(SystemExit):
             build_parser().parse_args(argv)
+
+
+def test_the_price_feed_uses_the_public_endpoint_without_a_key():
+    feed = live_app.price_feed(LiveSettings())  # no key file: the public ticker and heartbeats need none
+    sock = feed.ws_factory(on_message=feed.on_message)  # built, never opened (no network)
+    assert feed.products == ["BIP-20DEC30-CDE", "BTC-USD"] and sock.url == "wss://advanced-trade-ws.coinbase.com"
 
 
 def test_preflight_offline_and_online(live_env, capsys, monkeypatch):
@@ -10824,8 +10901,9 @@ Expected: collection error `ImportError: cannot import name 'app' from 'ewbot.li
 
 ```python
 """Production wiring of `ewbot live` (Plan 3): settings -> Coinbase exchange (ShadowExchange in SHADOW),
-journal, [LIVE] notifier, WebSocket feed, Telegram control, heartbeat and paper audit -> LiveRuntime.
-The CLI calls these factories; tests replace `real_exchange` and `paper_status` (no network)."""
+journal, [LIVE] notifier, WebSocket price feed (Coinbase's public endpoint: no key), Telegram control,
+heartbeat and paper audit -> LiveRuntime. The CLI calls these factories; tests replace `real_exchange`,
+`price_feed` and `paper_status` (no network)."""
 
 from __future__ import annotations
 
@@ -10841,7 +10919,7 @@ from ewbot.live.audit import AuditError, fetch_paper_ledger
 from ewbot.live.coinbase import CoinbaseExchange
 from ewbot.live.control import TelegramControl
 from ewbot.live.exchange import Exchange
-from ewbot.live.feed import TickerFeed, sdk_ws_factory
+from ewbot.live.feed import TickerFeed, public_ws_factory
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
 from ewbot.live.notify import LiveNotifier
@@ -10888,6 +10966,11 @@ def paper_status(s: LiveSettings, now: float) -> dict[str, Any] | None:
         return None
 
 
+def price_feed(s: LiveSettings) -> TickerFeed | None:
+    """The WebSocket ticker feed for the watchdog (public channels: no key, verified TLS)."""
+    return TickerFeed([s.futures_id, s.spot_id], public_ws_factory())
+
+
 @dataclass
 class Wired:
     runtime: LiveRuntime
@@ -10901,7 +10984,7 @@ def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journa
     notify = notifier(s)
     stage, _ = journal.stage()
     ex = stage_exchange(real, journal, stage, notify)
-    feed = TickerFeed([s.futures_id, s.spot_id], sdk_ws_factory(s.key_file)) if s.key_file is not None else None
+    feed = price_feed(s)
     commands: queue.Queue[str] = queue.Queue()
     control = (TelegramControl(s.telegram_token, s.telegram_chat, journal)
                if s.telegram_token and s.telegram_chat else None)
@@ -11221,7 +11304,7 @@ uv run --group live pytest tests/live/test_cli_live.py tests/paper/test_cli_pape
 uv run ewbot live --help
 ```
 
-Expected: `33 passed` (7 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, backup`.
+Expected: `34 passed` (8 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, backup`.
 
 - [ ] **Step 5: Commit**
 
@@ -11683,7 +11766,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `334 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `336 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -12183,7 +12266,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - Telegram commands (only from `TELEGRAM_CHAT_ID`): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` within 60 s (close at market - the brackets go with the position - and pause), `/help`.
 - Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes).
-- **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker; the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket message for 5 minutes (with the reconnect failures and the last error), `[가격 피드 복구]` that it is back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect). `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives.
+- **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker, on Coinbase's public market-data endpoint (`wss://advanced-trade-ws.coinbase.com`: no API key, TLS certificate and host name verified); the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket message for 5 minutes (with the reconnect failures and the last error), `[가격 피드 복구]` that it is back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect). `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives; three such reads in a row are an incident (`[중대 사건] 잔고 이상이 3회 연속`) that pauses new entries - the position and its brackets stay, nothing is closed. Check the balance in the Coinbase app, then `/resume`.
 - The daily summary (09:00 New York) shows the stage, the position, the cycle, the paper comparison, the fills of the last 24 h (entry slippage vs. the engine's reference, stop slippage vs. the stop price, measured fees vs. the paper cost model; funding is part of the balance change) and the margin.
 - **A stop that empties the TP1 leg first** (FULL only: a 1-contract CANARY trade has one bracket). Both legs share the stop. When the price falls through it, the TP1 leg's stop can fill a poll before the TP2 leg's: the runtime then reads the smaller position as the live TP1 (`TP1_FILLED`, Telegram `[TP1 체결]`) and re-places the rest with a break-even stop that is already through the market, so it fills at once - or, if Coinbase refuses a stop through the market (`BRACKET_FAILED`), the old leg stays: its stop has triggered already and fills, and if the price gapped past its 5% limit the watchdog closes at market (`STOP_GAP`). Either way the rest leaves at about the stop; for that trade `TP1_FILLED` is not a take-profit (its `BRACKET_FILL` events show the stop prices).
 - **A close or a stop move that keeps failing.** Protection is never cancelled before the venue took its replacement. A close goes out with the brackets resting; a failed close (`CLOSE_FAILED`, Telegram `[청산 실패 - 재시도 중]`) is retried on every poll with a new id and the brackets stay. Only if Coinbase refuses a close because brackets rest (`CLOSE_CONFLICT`) are they cancelled - after a session check - and the close is sent again at once; after every failed close the legs are placed again if none rests, so the position is protected while the close is retried. A flip waits (up to 5 s) until no bracket of the old side rests, else the new entry is skipped (`[진입 건너뜀]`). A stop move keeps the old leg whenever the new one is not confirmed (429, 5xx, timeout) or refused for any reason other than a known overlap refusal (`BRACKET_FAILED`, `[보호 주문 실패]`; e.g. order entry disabled); only a known overlap refusal while our brackets would exceed the position cancels the old leg first (`LEG_GAP`, no alert: not an order failure) and puts it back at once if the new one fails (`LEG_RESTORED`). A bracket Coinbase accepted while the answer was lost is found among the open orders or taken over by its client order id (`LEG_ADOPTED`).
@@ -12256,7 +12339,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `965 passed, 1 skipped` without a candle cache (`966 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `967 passed, 1 skipped` without a candle cache (`968 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -12291,7 +12374,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `966 passed` with the real cache (`965 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `968 passed` with the real cache (`967 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
