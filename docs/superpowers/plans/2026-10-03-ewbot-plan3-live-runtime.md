@@ -20,7 +20,7 @@
 - Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short (recorded 2026-10-03). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
 - Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 for the first 30 days of FULL.
 - Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s (no price once the last good one is older than 60 s; a connection without a message for 15 s is reopened, a feed without a futures price for 5 minutes while the market is open is alerted); heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min); daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour.
-- Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90% (only on a real futures price, never on a stand-in); real-account breakers −3% from the New York day's first equity and −15% from the peak → flatten and pause, each on two balance reads in a row (a balance that is not a finite amount above 0 is no reading, and three in a row are an incident that pauses entries; `/resume` re-bases only the breaker that tripped).
+- Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90% (only on a real futures price, never on a stand-in); real-account breakers −3% from the New York day's opening equity and −15% from the peak → flatten and pause, each reference the median of three balance reads (the day's first three; after a `/resume` that re-based it, that read and the next two) and each breaker tripping on two breaching reads in a row (a balance that is not a finite amount above 0 is no reading, and three in a row are an incident that pauses entries; `/resume` re-bases only the breaker that tripped).
 - Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name.
 - Tests never touch the network, a real account, the real `data/cache` or `<repo>/holdout.lock`: `SimExchange`, recorded JSON fixtures, fake sessions, synthetic candles (`tests.paper.helpers.synth_frame`) and temp-dir locks. Exception: `check_fingerprint()` hashes the working tree's strategy files (read-only), as the paper fingerprint test does.
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -94,17 +94,17 @@
 | 5 | Price mapping, stage sizing, margin projection | 22 |
 | 6 | Reconcile planner | 29 |
 | 7 | Executor: intent-before-send, protection, closes, recovery | 65 |
-| 8 | Watchdog and WebSocket feed | 21 |
+| 8 | Watchdog and WebSocket feed | 27 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 6 |
 | 10 | Paper audit, stages and gates | 9 |
 | 11 | Settings and preflight | 7 |
-| 12 | `ShadowExchange` and the runtime loop | 24 |
+| 12 | `ShadowExchange` and the runtime loop | 25 |
 | 13 | CLI `ewbot live …` and production wiring | 8 |
 | 14 | Parity and chaos integration tests | 26 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 350 more tests, `970 passed, 1 skipped` (`971 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 357 more tests, `977 passed, 1 skipped` (`978 passed` with the cache), about 80 s.
 
 ---
 
@@ -7138,7 +7138,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.config.BreakerParams` (daily 3%, total 15%), `ewbot.live.exchange`, `ewbot.live.journal.Journal`, `ewbot.live.pricing` (margin constants, `margin_ratio`, `max_contracts_for_margin`, `stop_gapped`), `tests.live.helpers` (`Clock`, `journal`, `sim`); `websockets.sync.client.connect` (websockets 13.1, dependency group `live`; imported lazily in `PublicSocket.open`, and in one test that is skipped without the group).
-- Produces (`ewbot.live.watchdog`): `NY`, `GAP_GRACE_S = 10.0`, `WS_STALE_S = 60.0`, `REST_POLL_S = 10.0`, `MAINTENANCE_NOTICE_S`; `class StopGapWatch(grace_s=10.0)` with `check(direction, stop_price, price, now) -> bool` (a wall clock stepping back re-arms it at the new time) and `reset()`; frozen `MarginStatus(ratio, level: "OK"|"WARN"|"REDUCE", reduce_by=0)`, `margin_status(contracts, price, side, product, equity) -> MarginStatus`; `ny_date(ts) -> str`; `class BadEquity(ValueError)`; `class AccountGuard(journal, params=None)` (journal key `account_guard`) with `state()`, `update(equity, now) -> "DAILY_LOSS" | "TOTAL_DD" | None` (newly tripped only, on the second breaching observation in a row; the peak only rises to the lower of two observations in a row; the day's reference is the higher of the New York day's first two observations (after a re-base: of the reset's read and the next one), so one wrong low read cannot disable `DAILY_LOSS` - a wrong high one among them can trip it, an accepted limit; an equity that is not finite and above 0 raises `BadEquity` and writes nothing), `reset(equity, now) -> list[str]` (re-bases only the breakers that tripped - the peak after `TOTAL_DD`, the day's reference after `DAILY_LOSS`, which a `TOTAL_DD` trip marks too - and names them; `[]` and no change without a trip; `BadEquity` likewise); `class SessionWatch` with `update(info, now) -> list[("SESSION" | "MAINTENANCE", text)]` (a window already under way is announced too; an unknown end reads `미정`); `class PriceSource(exchange, feed=None, *, clock, stale_s=60.0, poll_s=10.0)` with `futures_price() -> float | None` (a usable WebSocket price at most `stale_s` old, else the REST mid read at most every `poll_s` - an error or a book without a finite bid and ask above 0 keeps the last good one - and `None` once that is older than `stale_s`) and `.mode` (`"ws"` / `"rest"`).
+- Produces (`ewbot.live.watchdog`): `NY`, `GAP_GRACE_S = 10.0`, `WS_STALE_S = 60.0`, `REST_POLL_S = 10.0`, `MAINTENANCE_NOTICE_S`, `BASING_READS = 3`; `class StopGapWatch(grace_s=10.0)` with `check(direction, stop_price, price, now) -> bool` (a wall clock stepping back re-arms it at the new time) and `reset()`; frozen `MarginStatus(ratio, level: "OK"|"WARN"|"REDUCE", reduce_by=0)`, `margin_status(contracts, price, side, product, equity) -> MarginStatus`; `ny_date(ts) -> str`; `class BadEquity(ValueError)`; `class AccountGuard(journal, params=None)` (journal key `account_guard`) with `state()`, `update(equity, now) -> "DAILY_LOSS" | "TOTAL_DD" | None` (newly tripped only, on the second breaching observation in a row, each judged against the reference as it then stands; references are based on three reads - the day's on the New York day's first three, the peak on the first three ever, and after a re-base on the reset's read and the next two - as the highest read so far until the third, then their median; after basing the peak only rises to the lower of two observations in a row; so one wrong read, high or low, at any position neither trips a breaker nor leaves a reference looser than the truth for more than that read - two wrong basing reads, a real move within the basing reads or two wrong reads in a row can, the accepted limits; an equity that is not finite and above 0 raises `BadEquity` and writes nothing), `reset(equity, now) -> list[str]` (re-bases only the breakers that tripped - the peak after `TOTAL_DD`, the day's reference after `DAILY_LOSS`, which a `TOTAL_DD` trip marks too - with this read as the first of their three basing reads, and names them; `[]` and no change without a trip; `BadEquity` likewise); `class SessionWatch` with `update(info, now) -> list[("SESSION" | "MAINTENANCE", text)]` (a window already under way is announced too; an unknown end reads `미정`); `class PriceSource(exchange, feed=None, *, clock, stale_s=60.0, poll_s=10.0)` with `futures_price() -> float | None` (a usable WebSocket price at most `stale_s` old, else the REST mid read at most every `poll_s` - an error or a book without a finite bid and ask above 0 keeps the last good one - and `None` once that is older than `stale_s`) and `.mode` (`"ws"` / `"rest"`).
 - Produces (`ewbot.live.feed`): `CHANNELS = ("ticker", "heartbeats")`, `MAX_BACKOFF_S = 60.0`, `SILENT_S = 15.0`, `HEALTHY_S = 60.0`, `OPEN_TIMEOUT_S = 10`, `PUBLIC_WS_URL = "wss://advanced-trade-ws.coinbase.com"`, frozen `Tick(price, ts)`, `usable_price(x) -> float | None` (finite and above 0), `ticker_price(ticker) -> float | None` (the best bid / ask mid, else the trade price); `class TickerFeed(products, ws_factory, *, clock=time.time, sleep=None, max_backoff=60.0, silent_s=15.0, healthy_s=60.0)` (`sleep=None`: the backoff waits on the stop event, so `stop()` ends it) with `on_message(raw)` (never raises: an unreadable message counts in `unreadable_messages`, a ticker entry without a usable price in `unpriced_tickers`; a server `error` message sets `last_error` and is no liveness), `latest(product_id) -> Tick | None`, `age() -> float | None`, `take_resync() -> bool`, `run()` (drives `ws_factory(on_message=...)` sockets through `open()`, `subscribe(products, channels)`, `pump(seconds)`, `close()`; reconnects on a failure, a lost or closed connection or `silent_s` without a message; backoff 1 s doubling to `max_backoff`, reset after `healthy_s` of messages), `start() -> Thread`, `stop()`, attributes `gaps`, `connects`, `failures`, `messages`, `unreadable_messages`, `unpriced_tickers`, `last_error` (an exception type name, `silent for 15 s` or a server error message); `class PublicSocket(url, on_message, *, connect=None, open_timeout=OPEN_TIMEOUT_S)` (`open()` calls `connect(url, ssl=ssl.create_default_context(), open_timeout=...)` - certificate and host name verified - `subscribe()` sends one keyless `{"type": "subscribe", "product_ids", "channel"}` per channel, `pump(seconds)` hands over what arrives and raises on a lost or closed connection, `close()`); `public_ws_factory(url=PUBLIC_WS_URL, *, connect=None) -> factory(on_message=...) -> PublicSocket` (no credential).
 
 - [ ] **Step 1: Write the failing test**
@@ -7199,17 +7199,19 @@ def test_margin_levels_use_the_overnight_rate():
 def test_account_guard_trips_on_two_breaching_reads_once_a_day_and_survives_a_restart(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)
-    assert g.update(10_000.0, NY_NOON) is None
-    assert g.update(9_701.0, NY_NOON + 60) is None
-    assert g.update(9_700.0, NY_NOON + 120) is None  # -3%: one breaching read is not enough
-    assert g.update(9_700.0, NY_NOON + 180) == "DAILY_LOSS"  # the second in a row trips (one poll later)
-    assert g.update(9_600.0, NY_NOON + 240) is None  # once per New York day
+    for k in range(3):  # the day's first three reads set its reference (their median)
+        assert g.update(10_000.0, NY_NOON + 60 * k) is None
+    assert g.update(9_701.0, NY_NOON + 180) is None
+    assert g.update(9_700.0, NY_NOON + 240) is None  # -3%: one breaching read is not enough
+    assert g.update(9_700.0, NY_NOON + 300) == "DAILY_LOSS"  # the second in a row trips (one poll later)
+    assert g.update(9_600.0, NY_NOON + 360) is None  # once per New York day
     g2 = AccountGuard(jr)  # restart
     assert g2.state()["daily_tripped"] and g2.state()["peak"] == 10_000.0
-    assert g2.update(9_600.0, NY_NOON + 86_400) is None  # next day: new reference 9_600
-    assert g2.update(8_500.0, NY_NOON + 86_460) is None
-    assert g2.update(8_500.0, NY_NOON + 86_520) == "TOTAL_DD"  # 15% below the 10_000 peak, twice
-    assert g2.update(8_000.0, NY_NOON + 86_580) is None
+    for k in range(3):  # next day: new reference 9_600
+        assert g2.update(9_600.0, NY_NOON + 86_400 + 60 * k) is None
+    assert g2.update(8_500.0, NY_NOON + 86_580) is None
+    assert g2.update(8_500.0, NY_NOON + 86_640) == "TOTAL_DD"  # 15% below the 10_000 peak, twice
+    assert g2.update(8_000.0, NY_NOON + 86_700) is None
     jr.close()
 
 
@@ -7231,51 +7233,63 @@ def test_one_bad_balance_read_never_trips_a_breaker_nor_raises_the_peak(tmp_path
     jr.close()
 
 
-def test_a_low_first_read_of_the_day_does_not_disable_the_daily_breaker(tmp_path):
-    jr = journal(tmp_path)
-    g = AccountGuard(jr)
-    g.update(10_000.0, NY_NOON)
-    g.update(9_000.0, NY_NOON + 86_400)  # the next day's first read is wrong low (a funding settlement, say)
-    g.update(10_000.0, NY_NOON + 86_460)
-    assert g.state()["day_ref"] == 10_000.0  # the higher of the day's first two observations
-    assert g.update(9_650.0, NY_NOON + 86_520) is None
-    assert g.update(9_650.0, NY_NOON + 86_580) == "DAILY_LOSS"
-    jr.close()
+@pytest.mark.parametrize("wrong", [12_000.0, 8_000.0], ids=["high", "low"])
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_one_wrong_basing_read_neither_trips_nor_loosens_a_breaker(tmp_path, wrong, position):
+    """The first reads base both the peak and the day's reference: one of them 20% off, either way, at any of the
+    three positions. Neither breaker trips, both references end at the true 10_000 (looser for at most that one
+    read), and a real -3.5% move afterwards still trips DAILY_LOSS on its second read."""
+    g = AccountGuard(journal(tmp_path))
+    reads = [10_000.0] * 3
+    reads[position] = wrong
+    refs = []
+    for k, equity in enumerate(reads + [10_000.0] * 3):
+        assert g.update(equity, NY_NOON + 60 * k) is None
+        refs.append((g.state()["day_ref"], g.state()["peak"]))
+    assert refs[3:] == [(10_000.0, 10_000.0)] * 3  # the median of three: the wrong read set neither reference
+    assert sum(1 for day_ref, peak in refs if min(day_ref, peak) < 10_000.0) <= 1
+    assert g.update(9_650.0, NY_NOON + 360) is None
+    assert g.update(9_650.0, NY_NOON + 420) == "DAILY_LOSS"
 
 
-def test_a_low_read_at_resume_does_not_disable_the_daily_breaker(tmp_path):
-    jr = journal(tmp_path)
-    g = AccountGuard(jr)
-    g.update(10_000.0, NY_NOON)
-    g.update(9_650.0, NY_NOON + 60)
-    assert g.update(9_650.0, NY_NOON + 120) == "DAILY_LOSS"
-    assert g.reset(8_000.0, NY_NOON + 180) == ["DAILY_LOSS"]  # /resume read a wrong low balance
-    g.update(9_650.0, NY_NOON + 240)
-    assert g.state()["day_ref"] == 9_650.0  # the higher of the reset read and the next one
-    assert g.update(9_300.0, NY_NOON + 300) is None
-    assert g.update(9_300.0, NY_NOON + 360) == "DAILY_LOSS"
-    jr.close()
+@pytest.mark.parametrize("wrong", [12_000.0, 8_000.0], ids=["high", "low"])
+def test_one_wrong_read_at_resume_neither_trips_nor_loosens_a_breaker(tmp_path, wrong):
+    g = AccountGuard(journal(tmp_path))
+    for k in range(3):
+        g.update(10_000.0, NY_NOON + 60 * k)
+    g.update(8_400.0, NY_NOON + 180)
+    assert g.update(8_400.0, NY_NOON + 240) == "TOTAL_DD"  # it marks the day too
+    assert g.reset(wrong, NY_NOON + 300) == ["TOTAL_DD", "DAILY_LOSS"]  # /resume read a wrong balance (truth: 8_400)
+    refs = []
+    for k in range(4):
+        assert g.update(8_400.0, NY_NOON + 360 + 60 * k) is None
+        refs.append((g.state()["day_ref"], g.state()["peak"]))
+    assert refs[1:] == [(8_400.0, 8_400.0)] * 3  # the median of the reset's read and the next two
+    assert min(refs[0]) >= 8_400.0  # after the reset's own read, never looser than a read seen
+    assert g.update(8_100.0, NY_NOON + 600) is None  # a real -3.5% from 8_400
+    assert g.update(8_100.0, NY_NOON + 660) == "DAILY_LOSS"
 
 
 def test_resume_rebases_only_the_breaker_that_tripped(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)
-    g.update(10_000.0, NY_NOON)
-    g.update(9_800.0, NY_NOON + 60)
+    for k in range(3):
+        g.update(10_000.0, NY_NOON + 60 * k)
+    g.update(9_800.0, NY_NOON + 180)
     before = g.state()
-    assert g.reset(9_800.0, NY_NOON + 120) == [] and g.state() == before  # /pause then /resume: nothing changes
-    g.update(9_700.0, NY_NOON + 180)
-    assert g.update(9_650.0, NY_NOON + 240) == "DAILY_LOSS"
-    assert g.reset(9_650.0, NY_NOON + 300) == ["DAILY_LOSS"]
+    assert g.reset(9_800.0, NY_NOON + 240) == [] and g.state() == before  # /pause then /resume: nothing changes
+    g.update(9_700.0, NY_NOON + 300)
+    assert g.update(9_650.0, NY_NOON + 360) == "DAILY_LOSS"
+    assert g.reset(9_650.0, NY_NOON + 420) == ["DAILY_LOSS"]
     st = g.state()
     assert (st["day_ref"], st["peak"], st["daily_tripped"]) == (9_650.0, 10_000.0, False)  # the peak stays
-    g.update(8_400.0, NY_NOON + 360)
-    assert g.update(8_400.0, NY_NOON + 420) == "TOTAL_DD"  # 16% below the peak (it marks the day too)
-    assert g.reset(8_400.0, NY_NOON + 480) == ["TOTAL_DD", "DAILY_LOSS"]
+    g.update(8_400.0, NY_NOON + 480)
+    assert g.update(8_400.0, NY_NOON + 540) == "TOTAL_DD"  # 16% below the peak (it marks the day too)
+    assert g.reset(8_400.0, NY_NOON + 600) == ["TOTAL_DD", "DAILY_LOSS"]
     st = g.state()
     assert (st["peak"], st["day_ref"], st["total_tripped"], st["daily_tripped"]) == (8_400.0, 8_400.0, False, False)
     with pytest.raises(BadEquity):
-        g.reset(math.nan, NY_NOON + 540)
+        g.reset(math.nan, NY_NOON + 660)
     jr.close()
 
 
@@ -7594,7 +7608,7 @@ uv add --group live websockets==13.1
                  that limit and the position is still open 10 s later, the runtime closes at market.
   margin_status  overnight-margin projection of the open position: >= 80% warn, >= 90% reduce back to
                  the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
-  AccountGuard   real-account breakers: equity <= the New York day's first equity x 0.97, or <= the peak
+  AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.97, or <= the peak
                  x 0.85 -> flatten and pause (spec 4.5), on the second observation in a row that breaches.
                  State lives in the journal (survives restarts).
   SessionWatch   session state changes and the next scheduled maintenance (noticed 24 h ahead, or at once
@@ -7628,6 +7642,7 @@ GAP_GRACE_S = 10.0
 WS_STALE_S = 60.0
 REST_POLL_S = 10.0
 MAINTENANCE_NOTICE_S = 24 * 3600
+BASING_READS = 3  # a reference (the day's, a re-based peak) is the median of its first three valid reads
 
 
 class StopGapWatch:
@@ -7683,16 +7698,34 @@ def _observed(equity: float) -> float:
     return e
 
 
+def _basing(reads: list[float], e: float) -> tuple[list[float] | None, float]:
+    """A reference being based on its first BASING_READS reads: the highest read so far until the last one
+    arrives (never looser than a read seen), then their median - and basing is over (None)."""
+    reads = [*reads, e]
+    if len(reads) < BASING_READS:
+        return reads, max(reads)
+    return None, sorted(reads)[len(reads) // 2]
+
+
 class AccountGuard:
     """Real-account breakers (spec 4.5). Only a finite equity above 0 is an observation; anything else raises
-    BadEquity and changes nothing (the runtime alerts it). One observation can neither trip a breaker nor
-    raise a reference: a breaker trips on the second observation in a row that breaches it (one poll - a
-    minute in the runtime - after the first), and the peak only rises to a level two observations in a row
-    reached (the lower of the two), so a single wrong balance read, low or high, cannot flatten the account.
-    The day's reference is the higher of the New York day's first two observations (after a reset that
-    re-based it: the reset's read and the next one), so one wrong low read - at the midnight funding
-    settlement, or at /resume - cannot disable DAILY_LOSS for the day (accepted limit: a wrong high read among
-    those two can trip it two reads later; it errs toward flat and paused)."""
+    BadEquity and changes nothing (the runtime alerts it).
+
+    References are based on three reads. The day's reference is the median of the New York day's first three
+    observations; the peak is the median of the first three ever and, after a reset re-based either, the
+    reference is the median of the reset's read and the next two. Until its third read arrives a reference is
+    the highest read so far (never looser than any read seen). After basing, the peak only rises to a level
+    two observations in a row reached (the lower of the two). A breaker trips on the second observation in a
+    row that breaches it, each judged against the reference as it then stands (one poll - a minute in the
+    runtime - after the first). So one wrong balance read, high or low, at any position - a basing read
+    (the midnight funding settlement, say), the /resume read or any later one - neither trips a breaker nor
+    leaves a reference looser than the truth for more than that one read.
+
+    Accepted limits: two wrong reads among a reference's three basing reads set it - two wrong high ones can
+    trip that breaker two reads later; two wrong low ones loosen it, the day's reference until the next New
+    York day, a re-based peak until two true reads in a row lift it - and so does a real move within those
+    reads (the first ~2 minutes of the day); two wrong high reads in a row raise the peak; two wrong low reads
+    in a row trip a breaker."""
 
     KEY = "account_guard"
 
@@ -7706,15 +7739,18 @@ class AccountGuard:
     def update(self, equity: float, now: float) -> str | None:
         """The breaker newly tripped by this equity observation (DAILY_LOSS / TOTAL_DD), else None."""
         e = _observed(equity)
-        st = self.state() or {"peak": e, "day": None, "day_ref": e, "daily_tripped": False,
+        st = self.state() or {"peak": e, "peak_reads": [], "day": None, "day_ref": e, "daily_tripped": False,
                               "total_tripped": False}
         prev = st.get("equity")
         day = ny_date(now)
         if st["day"] != day:
-            st.update(day=day, day_ref=e, day_ref_check=True, daily_tripped=False, daily_breach=False)
-        elif st.get("day_ref_check"):  # the day's second observation, or the first after a reset
-            st.update(day_ref=max(float(st["day_ref"]), e), day_ref_check=False)
-        st["peak"] = max(float(st["peak"]), e if prev is None else min(e, float(prev)))
+            st.update(day=day, day_reads=[], daily_tripped=False, daily_breach=False)
+        if st.get("day_reads") is not None:
+            st["day_reads"], st["day_ref"] = _basing(st["day_reads"], e)
+        if st.get("peak_reads") is not None:
+            st["peak_reads"], st["peak"] = _basing(st["peak_reads"], e)
+        else:
+            st["peak"] = max(float(st["peak"]), e if prev is None else min(e, float(prev)))
         total = e <= st["peak"] * (1.0 - self.params.total_dd)
         daily = e <= st["day_ref"] * (1.0 - self.params.daily_loss)
         trip = None
@@ -7729,19 +7765,19 @@ class AccountGuard:
         return trip
 
     def reset(self, equity: float, now: float) -> list[str]:
-        """After the user resumes: only a breaker that tripped is re-based at this equity - the peak after
-        TOTAL_DD, the day's reference after DAILY_LOSS (a TOTAL_DD trip marks the day too; the next observation
-        raises it if higher) - and its name is returned. A resume without a trip changes nothing."""
+        """After the user resumes: only a breaker that tripped is re-based - the peak after TOTAL_DD, the day's
+        reference after DAILY_LOSS (a TOTAL_DD trip marks the day too) - starting from this read as the first of
+        its three basing reads, and its name is returned. A resume without a trip changes nothing."""
         e = _observed(equity)
         st = self.state()
         done: list[str] = []
         if not st:
             return done
         if st.get("total_tripped"):
-            st.update(peak=e, total_tripped=False, total_breach=False)
+            st.update(peak=e, peak_reads=[e], total_tripped=False, total_breach=False)
             done.append("TOTAL_DD")
         if st.get("daily_tripped"):
-            st.update(day=ny_date(now), day_ref=e, day_ref_check=True, daily_tripped=False, daily_breach=False)
+            st.update(day=ny_date(now), day_ref=e, day_reads=[e], daily_tripped=False, daily_breach=False)
             done.append("DAILY_LOSS")
         if done:
             st["equity"] = e
@@ -8066,7 +8102,7 @@ def public_ws_factory(url: str = PUBLIC_WS_URL, *,
 uv run --group live pytest tests/live/test_watchdog.py -q
 ```
 
-Expected: `21 passed` (without the `live` group the `websockets` test is skipped: `20 passed, 1 skipped`).
+Expected: `27 passed` (without the `live` group the `websockets` test is skipped: `26 passed, 1 skipped`).
 
 - [ ] **Step 5: Commit**
 
@@ -9441,7 +9477,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`FakeFetch`, `make_lock`, `synth_frame`, `ts`), `tests.live.helpers`.
 - Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position (`reconcile.expected_contracts`) back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
-- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin (never acted on without a futures price: one `MARGIN` alert and `MARGIN_NO_PRICE` event per episode; the 15:30 report and the daily summary show the entry price instead only when it is usable), and the WebSocket feed: no futures tick for `FEED_ALERT_S` while the session is OPEN → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back), `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply` (`/resume` re-bases only a breaker that tripped, `AccountGuard.reset`; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
+- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin (never acted on without a futures price: one `MARGIN` alert and `MARGIN_NO_PRICE` event per episode; the 15:30 report and the daily summary show the entry price instead only when it is usable), and the WebSocket feed: no futures tick for `FEED_ALERT_S` while the session is OPEN → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back; the 15:30 report's reads are retried every minute until 16:00, the first failure alerted, and the day is marked done only once they succeed), `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply` (`/resume` re-bases only a breaker that tripped, `AccountGuard.reset`, from the median of that read and the next two; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9676,15 +9712,17 @@ def test_bracket_fills_are_recorded_for_the_cost_report(h):
 
 
 def test_the_account_breaker_flattens_and_pauses(h):
-    entered(h)
+    entered(h)  # the day's first balance read
+    h.at(ENTRY_BAR + 90)
+    h.at(ENTRY_BAR + 150)  # three reads: the day's reference (their median)
     h.ex.cash -= 400.0  # equity 10_000 -> ~9_600: the daily -3% breaker
-    h.at(ENTRY_BAR + 95)
+    h.at(ENTRY_BAR + 210)
     assert h.ex.position() is not None and paused(h.journal) is None  # one breaching balance read is not enough
-    h.at(ENTRY_BAR + 155)  # the next minute's read breaches again
+    h.at(ENTRY_BAR + 270)  # the next minute's read breaches again
     assert h.ex.position() is None and paused(h.journal)["reason"] == "breaker DAILY_LOSS"
     assert "BREAKER" in h.alerts.kinds() and h.journal.events(kind="INCIDENT")[-1]["data"]["kind"] == "BREAKER"
     peak = h.rt.guard.state()["peak"]
-    assert h.rt.handle("/resume", ENTRY_BAR + 160).endswith("손실 한도 기준을 현재 자산으로 재설정: DAILY_LOSS")
+    assert h.rt.handle("/resume", ENTRY_BAR + 280).endswith("(지금과 다음 두 번 조회의 중앙값): DAILY_LOSS")
     g = h.rt.guard.state()
     assert not g["daily_tripped"] and g["day_ref"] == h.ex.balance().equity and g["peak"] == peak  # the peak stays
 
@@ -9759,24 +9797,49 @@ def test_a_feed_without_futures_prices_is_alerted_once_per_outage(h):
     tick = json.dumps({"channel": "ticker", "events": [{"tickers": [{"product_id": h.ex.futures_id, "price": "26744.5"}]}]})
     feed.on_message(tick)  # the last futures price, at +30
     feed.failures = 3  # TickerFeed.run's count of failed connections so far
-    for k in range(8):  # heartbeats keep the connection fresh, but no futures price: stale from +150, alerted at +450
-        if k == 1:
-            feed.on_message(json.dumps({"type": "error", "message": "failure to subscribe"}))  # the ticker refused
-        if k == 4:
-            feed.failures += 2
+    h.ex.set_session("CLOSE")
+    for k in range(8):  # a closed venue has no trades: eight minutes without a futures price are no outage
         feed.on_message(beat)
         h.at(ENTRY_BAR + 30 + 60 * k)
+    assert "FEED" not in h.alerts.kinds()
+    h.ex.set_session("OPEN")
+    for k in range(6):  # open, heartbeats fresh, no futures price: counted from +510, alerted at +810
+        if k == 1:
+            feed.on_message(json.dumps({"type": "error", "message": "failure to subscribe"}))  # the ticker refused
+        if k == 3:
+            feed.failures += 2
+        feed.on_message(beat)
+        h.at(ENTRY_BAR + 510 + 60 * k)
     texts = [t for kind, t in h.alerts.items if kind == "FEED"]
     assert len(texts) == 1 and "REST" in texts[0] and "재연결 실패 2회" in texts[0]
     assert "server error: failure to subscribe" in texts[0]
-    feed.on_message(tick)  # futures prices again at +450
-    h.at(ENTRY_BAR + 510)
+    h.ex.set_session("CLOSE")  # the venue closes during the outage: still the same outage
+    h.at(ENTRY_BAR + 870)
+    h.at(ENTRY_BAR + 930)
+    feed.on_message(tick)  # futures prices again
+    h.at(ENTRY_BAR + 990)
     assert [t for kind, t in h.alerts.items if kind == "FEED"][-1] == "[가격 피드 복구] 웹소켓 선물 가격 수신 재개"
-    h.ex.set_session("CLOSE")  # a closed venue has no trades: no outage
-    for k in range(8):
-        h.at(ENTRY_BAR + 570 + 60 * k)
     assert h.alerts.kinds().count("FEED") == 2 and [e["kind"] for e in h.journal.events()
                                                     if e["kind"].startswith("FEED")] == ["FEED_DOWN", "FEED_UP"]
+    assert h.journal.events(kind="FEED_UP")[-1]["data"]["down_s"] == 480.0  # since +510, the close included
+
+
+def test_a_failed_read_at_the_overnight_margin_check_is_retried_not_lost(h):
+    entered(h)
+    t = ts("2024-03-14 19:31")  # 15:31 New York (EDT)
+    h.ex.fail_next("position", RateLimited("429"), times=2)  # the margin check's position read, then the report's
+    h.rt.minute(t)
+    assert [x for k, x in h.alerts.items if k == "MARGIN_1530"] == [
+        "[15:30 증거금 점검] 조회 실패: 429 (16시 전까지 매분 다시 시도)"]
+    h.rt.minute(t + 60)  # still before 16:00: read again, reported
+    h.rt.minute(t + 120)
+    texts = [x for k, x in h.alerts.items if k == "MARGIN_1530"]
+    assert len(texts) == 2 and texts[1].startswith("[15:30 증거금 점검] 16시 오버나이트 기준 예상")
+    h.ex.fail_next("balance", RateLimited("429"), times=2)  # the next day: the breaker's balance read, the report's
+    h.rt.minute(t + 86_400)
+    h.rt.minute(t + 86_460)
+    texts = [x for k, x in h.alerts.items if k == "MARGIN_1530"]
+    assert texts[2:] == ["[15:30 증거금 점검] 조회 실패: 429 (16시 전까지 매분 다시 시도)", texts[1]]
 
 
 def test_margin_is_never_acted_on_without_a_futures_price(tmp_path):
@@ -10118,7 +10181,7 @@ data over (prices, queued commands), and every trading decision is taken on the 
             WebSocket feed's health (no futures price for 5 minutes while the session is OPEN: alerted once
             per outage, and when it is back),
             pending intents resolved (or abandoned after 10 min), the 15:30 New York
-            overnight-margin report, the daily summary (09:00 New York)
+            overnight-margin report (its reads retried every minute until 16:00), the daily summary (09:00 New York)
             with expiry reminders and the daily key-permission check, the paper audit (from minute 50),
             and the stage-change restart
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
@@ -10504,8 +10567,8 @@ class LiveRuntime:
                 pass
         local = datetime.fromtimestamp(now, NY)
         today = local.date().isoformat()
-        if (local.hour, local.minute) >= MARGIN_CHECK_NY and local.hour < 16 and self._once("margin1530", today):
-            self._overnight_report(now)
+        if (local.hour, local.minute) >= MARGIN_CHECK_NY and local.hour < 16 and self.journal.get("once:margin1530") != today:
+            self._overnight_report(now)  # marks the day done once its reads succeed
         if local.hour >= DAILY_HOUR_NY and self._once("daily", today):
             self.daily(now)
         if datetime.fromtimestamp(now, UTC).minute >= AUDIT_MINUTE and self._once("audit", int(now) // H1):
@@ -10544,7 +10607,10 @@ class LiveRuntime:
             self.executor.flatten(f"BREAKER_{trip}", self._ctx(now))
             return
         t = self.executor.trade()
-        pos = self.ex.position() if t is not None and t.status == "OPEN" else None
+        try:
+            pos = self.ex.position() if t is not None and t.status == "OPEN" else None
+        except ExchangeError:
+            return  # the next minute checks the margin again (the rest of the minute still runs)
         if pos is None or self.product is None:
             return
         price = self.prices.futures_price()
@@ -10582,7 +10648,8 @@ class LiveRuntime:
             self.feed_down_since, self.feed_alerted = None, False
             return
         if self.session is None or not self.session.is_open:
-            self.feed_down_since = None  # no trades while the venue is not OPEN: only OPEN time counts
+            if not self.feed_alerted:  # no trades while the venue is not OPEN: only OPEN time counts to an alert
+                self.feed_down_since = None
             return
         if self.feed_down_since is None:
             self.feed_down_since = now
@@ -10598,13 +10665,21 @@ class LiveRuntime:
                            f"(재연결 실패 {failures}회, 마지막 오류 {feed.last_error or '-'})")
 
     def _overnight_report(self, now: float) -> None:
-        pos = self.ex.position()
-        if pos is None or self.product is None:
-            return
+        """The 15:30 New York check before the 16:00 overnight margin. Failed reads are retried every minute until
+        16:00 (the first failure of the day is alerted); the day is marked done once the reads succeed."""
+        today = datetime.fromtimestamp(now, NY).date().isoformat()
         try:
-            equity = usable_price(self.ex.balance().equity)
-        except ExchangeError:
+            pos = self.ex.position()
+            balance = self.ex.balance() if pos is not None else None
+        except ExchangeError as exc:
+            if self._once("margin1530fail", today):
+                self.journal.add_event(now, "MARGIN_1530", {"ratio": None, "error": str(exc)[:200]})
+                self.alert("MARGIN_1530", f"[15:30 증거금 점검] 조회 실패: {str(exc)[:120]} (16시 전까지 매분 다시 시도)")
             return
+        self._once("margin1530", today)
+        if pos is None or balance is None or self.product is None:
+            return
+        equity = usable_price(balance.equity)
         price = self.prices.futures_price() or usable_price(pos.avg_entry)  # a report: the entry price may stand in
         if price is None or equity is None:
             self.journal.add_event(now, "MARGIN_1530", {"ratio": None, "contracts": pos.contracts})
@@ -10700,7 +10775,7 @@ class LiveRuntime:
             except (ExchangeError, BadEquity):
                 rebased = None
             if rebased:
-                reply += f" · 손실 한도 기준을 현재 자산으로 재설정: {', '.join(rebased)}"
+                reply += f" · 손실 한도 기준을 다시 잡음 (지금과 다음 두 번 조회의 중앙값): {', '.join(rebased)}"
             elif rebased is None:
                 reply += " · 잔고를 읽지 못해 손실 한도 기준은 그대로 (발동 중이면 다시 /resume)"
         elif cmd == "/flatten":
@@ -10802,7 +10877,7 @@ def audit_from_journal(journal: Journal) -> AuditResult | None:
 uv run --group live pytest tests/live/test_runtime.py -q
 ```
 
-Expected: `24 passed`.
+Expected: `25 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -11857,7 +11932,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `339 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `346 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -12254,7 +12329,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - One Docker container on a US-East VPS runs `ewbot live run` (`deploy/live/docker-compose.yml`, `restart: unless-stopped`). It trades the frozen strategy (params from the committed `holdout.lock`, conservative risk) on the Coinbase CFM future `BIP-20DEC30-CDE` (0.01 BTC per contract, $5 tick). Signals come from the same spot BTC-USD hourly candles as the paper runtime.
 - Every hour at hh:00:30 it replays the whole engine (as the paper runtime does) and reads the target after the bar that just closed: the position the engine holds, its stop and TPs, an exit or an entry queued at that close. It then makes the Coinbase account match that target (`src/ewbot/live/reconcile.py`): market entries, two `trigger_bracket_gtc` orders as protection (TP1 size + stop, the rest + TP2 + stop; one bracket for 1 contract), stop moves, TP1 break-even, closes. If the bar has not arrived 2 minutes after the close, the decision is held and the resting brackets keep protecting the position.
-- Between cycles: every second the stop-gap watchdog (the bracket's stop fills as a limit 5% beyond the stop, Coinbase's trigger_bracket rule; if the price is past that limit for 10 s, the position is closed at market); every 10 s while a trade is open the position and orders are re-read and protection is repaired; every minute the session state, the account breakers (−3% a New York day, −15% from the peak, each on two balance reads in a row: flatten and pause), the overnight-margin projection (80% warns, 90% reduces to 70%), the WebSocket price feed's health, the heartbeat to healthchecks.io and the stage-change check; at 15:30 New York an overnight-margin report; at 09:00 New York the daily summary; from minute 50 of every hour the comparison of the live engine decisions with the paper ledger.
+- Between cycles: every second the stop-gap watchdog (the bracket's stop fills as a limit 5% beyond the stop, Coinbase's trigger_bracket rule; if the price is past that limit for 10 s, the position is closed at market); every 10 s while a trade is open the position and orders are re-read and protection is repaired; every minute the session state, the account breakers (−3% from the New York day's opening, −15% from the peak - each reference the median of three balance reads, each breaker tripping on two breaching reads in a row: flatten and pause), the overnight-margin projection (80% warns, 90% reduces to 70%), the WebSocket price feed's health, the heartbeat to healthchecks.io and the stage-change check; at 15:30 New York an overnight-margin report; at 09:00 New York the daily summary; from minute 50 of every hour the comparison of the live engine decisions with the paper ledger.
 - Everything is recorded in the SQLite journal `/var/lib/ewbot/journal.sqlite`: every order intent before it is sent (deterministic `client_order_id`, so a restart never doubles an order), events, the engine decisions, the cycles and the stage history.
 - The GitHub Actions paper runtime keeps running as the independent audit. Telegram messages of the live runtime start with `[LIVE]`, the paper runtime's with `[ewbot paper]`.
 
@@ -12362,7 +12437,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - Telegram commands (only from `TELEGRAM_CHAT_ID`): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` within 60 s (close at market - the brackets go with the position - and pause), `/help`.
 - Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes).
-- **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker, on Coinbase's public market-data endpoint (`wss://advanced-trade-ws.coinbase.com`: no API key, TLS certificate and host name verified); the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket futures price for 5 minutes while the market is open (with the reconnect failures and the last error; `server error: ...` means Coinbase refused the subscription), `[가격 피드 복구]` that futures prices are back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect) and the margin check is skipped - never reduced on a stand-in price - with one `[증거금 점검: 가격 없음]` alert until a price is back. `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives; three such reads in a row are an incident (`[중대 사건] 잔고 이상이 3회 연속`) that pauses new entries - the position and its brackets stay, nothing is closed. Check the balance in the Coinbase app, then `/resume`.
+- **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker, on Coinbase's public market-data endpoint (`wss://advanced-trade-ws.coinbase.com`: no API key, TLS certificate and host name verified); the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket futures price for 5 minutes while the market is open (with the reconnect failures and the last error; `server error: ...` means Coinbase refused the subscription), `[가격 피드 복구]` that futures prices are back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect) and the margin check is skipped - never reduced on a stand-in price - with one `[증거금 점검: 가격 없음]` alert until a price is back. `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives; three such reads in a row are an incident (`[중대 사건] 잔고 이상이 3회 연속`) that pauses new entries - the position and its brackets stay, nothing is closed. Check the balance in the Coinbase app, then `/resume`. `[15:30 증거금 점검] 조회 실패` means the 15:30 check could not read the position or the balance; it is retried every minute until 16:00.
 - The daily summary (09:00 New York) shows the stage, the position, the cycle, the paper comparison, the fills of the last 24 h (entry slippage vs. the engine's reference, stop slippage vs. the stop price, measured fees vs. the paper cost model; funding is part of the balance change) and the margin.
 - **A stop that empties the TP1 leg first** (FULL only: a 1-contract CANARY trade has one bracket). Both legs share the stop. When the price falls through it, the TP1 leg's stop can fill a poll before the TP2 leg's: the runtime then reads the smaller position as the live TP1 (`TP1_FILLED`, Telegram `[TP1 체결]`) and re-places the rest with a break-even stop that is already through the market, so it fills at once - or, if Coinbase refuses a stop through the market (`BRACKET_FAILED`), the old leg stays: its stop has triggered already and fills, and if the price gapped past its 5% limit the watchdog closes at market (`STOP_GAP`). Either way the rest leaves at about the stop; for that trade `TP1_FILLED` is not a take-profit (its `BRACKET_FILL` events show the stop prices).
 - **A close or a stop move that keeps failing.** Protection is never cancelled before the venue took its replacement. A close goes out with the brackets resting; a failed close (`CLOSE_FAILED`, Telegram `[청산 실패 - 재시도 중]`) is retried on every poll with a new id and the brackets stay. Only if Coinbase refuses a close because brackets rest (`CLOSE_CONFLICT`) are they cancelled - after a session check - and the close is sent again at once; after every failed close the legs are placed again if none rests, so the position is protected while the close is retried. A flip waits (up to 5 s) until no bracket of the old side rests, else the new entry is skipped (`[진입 건너뜀]`). A stop move keeps the old leg whenever the new one is not confirmed (429, 5xx, timeout) or refused for any reason other than a known overlap refusal (`BRACKET_FAILED`, `[보호 주문 실패]`; e.g. order entry disabled); only a known overlap refusal while our brackets would exceed the position cancels the old leg first (`LEG_GAP`, no alert: not an order failure) and puts it back at once if the new one fails (`LEG_RESTORED`). A bracket Coinbase accepted while the answer was lost is found among the open orders or taken over by its client order id (`LEG_ADOPTED`).
@@ -12402,7 +12477,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app.
 - **API key leaked or a transfer-permission alert**: delete the key in the CDP portal at once (open brackets stay), create a new View + Trade key bound to the VPS IP, replace the file and restart.
 - **A start refused by the preflight** (fingerprint, lock, key, product): the message names the failing check. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag.
-- **Breaker or incident pause**: read `/status` and the latest journal events, fix the cause, then `/resume`. `/resume` re-bases only the breaker that tripped, at the current equity (the day's reference after −3%, the peak after −15% - which also marks the day); a `/pause` → `/resume` without a trip changes neither. If the balance cannot be read at that moment, the reply says so and a tripped breaker still blocks entries: send `/resume` again. The latest journal events:
+- **Breaker or incident pause**: read `/status` and the latest journal events, fix the cause, then `/resume`. `/resume` re-bases only the breaker that tripped (the day's reference after −3%, the peak after −15% - which also marks the day), as the median of the `/resume` balance read and the next two; a `/pause` → `/resume` without a trip changes neither. If the balance cannot be read at that moment, the reply says so and a tripped breaker still blocks entries: send `/resume` again. The latest journal events:
 
   ```bash
   docker compose -f deploy/live/docker-compose.yml exec live python -c "from ewbot.live.journal import Journal; [print(e['ts'], e['kind'], e['data']) for e in Journal('/data/journal.sqlite').events()[-40:]]"
@@ -12436,7 +12511,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `970 passed, 1 skipped` without a candle cache (`971 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `977 passed, 1 skipped` without a candle cache (`978 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -12471,7 +12546,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `971 passed` with the real cache (`970 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `978 passed` with the real cache (`977 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
