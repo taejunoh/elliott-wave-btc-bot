@@ -2,8 +2,13 @@
 
 Used by every live test (no network) and, wrapped by ShadowExchange (live/shadow.py), as the virtual
 book of the SHADOW stage. It models what the runtime relies on:
-  - market orders are IOC: they fill at the ask (buy) / bid (sell) while the session is OPEN, possibly
-    only partly (`market_fill_ratio`), the rest is cancelled;
+  - order intake is never more forgiving than the venue: a size that is not a whole number of
+    base_increment (min one contract), a price off the price_increment grid ($5) or a bracket whose
+    take-profit is not beyond its stop in the profit direction is rejected (PlaceResult not ok,
+    edit_bracket False, a preview with errors);
+  - market orders and close_position are IOC: they fill at the ask (buy) / bid (sell) while the session
+    is OPEN, possibly only partly (`market_fill_ratio`), the rest is cancelled; a bracket left with
+    nothing to reduce is cancelled at once;
   - trigger_bracket_gtc orders only ever REDUCE the position (help-center behaviour; the API has no
     reduce_only field): a bracket whose position is gone, or would be increased, is cancelled; a fill
     never exceeds the contracts left; `bracket_fill_cap` makes fills partial;
@@ -14,7 +19,8 @@ book of the SHADOW stage. It models what the runtime relies on:
   - nothing fills while the session is not OPEN; market orders are rejected then;
   - fault injection: `fail_next(method, exc)` raises on the next call(s) of a method (429 / 5xx /
     outages) and `crash_after_accept(method)` raises SimCrash right AFTER the order was accepted (a
-    process killed between send and journal update);
+    process killed between send and journal update); a method that does not honour them (FAULT_METHODS,
+    CRASH_METHODS) is refused with ValueError instead of being silently ignored;
   - a repeated client_order_id returns the existing order (`duplicate="existing"`) or an error
     (`duplicate="error"`): Coinbase documents both, the real behaviour is confirmed in CANARY."""
 
@@ -74,6 +80,15 @@ class SimOrder:
 
 
 class SimExchange:
+    # fail_next() works on every method that calls _fault(); crash_after_accept() on those that call
+    # _accepted() after accepting an order. A subclass overriding one without that call narrows these.
+    FAULT_METHODS: frozenset[str] = frozenset({
+        "product", "session", "quote", "position", "open_orders", "get_order", "find_order", "balance",
+        "key_permissions", "place_market", "place_bracket", "edit_bracket", "cancel", "close_position",
+        "preview_market", "preview_bracket",
+    })
+    CRASH_METHODS: frozenset[str] = frozenset({"place_market", "place_bracket", "close_position"})
+
     def __init__(
         self,
         product: ProductSpec = BIP_SPEC,
@@ -129,11 +144,15 @@ class SimExchange:
         return self._match()
 
     def fail_next(self, method: str, exc: BaseException, times: int = 1) -> None:
+        if method not in self.FAULT_METHODS:
+            raise ValueError(f"fail_next: {method!r} never raises injected faults")
         self._faults.setdefault(method, []).extend([exc] * times)
 
     def crash_after_accept(self, method: str, exc: BaseException | None = None) -> None:
         """The next `method` call is accepted, then raises `exc` (default SimCrash: the process dies;
         an Unavailable: the reply was lost, e.g. a timeout after the venue created the order)."""
+        if method not in self.CRASH_METHODS:
+            raise ValueError(f"crash_after_accept: {method!r} does not accept orders")
         self._crash_after[method] = exc if exc is not None else SimCrash(method)
 
     def _fault(self, method: str) -> None:
@@ -197,6 +216,30 @@ class SimExchange:
         self._fault("key_permissions")
         return self.permissions
 
+    # ------------------------------------------------------------------ order intake (the venue's checks)
+    @staticmethod
+    def _on_grid(x: float, step: float) -> bool:
+        """x is a positive whole multiple of step."""
+        x = float(x)
+        if not math.isfinite(x) or x <= 0:
+            return False
+        n = x / step
+        return abs(n - round(n)) < 1e-6
+
+    def _rejected(self, size: float, side: int = 0, limit: float | None = None,
+                  stop: float | None = None) -> str | None:
+        """The venue's failure reason for this order, or None: the size in whole base increments (at least
+        one), prices on the tick grid, a bracket's take-profit beyond its stop in the profit direction."""
+        if not self._on_grid(size, self.spec.base_increment):
+            return "INVALID_SIZE_PRECISION"
+        if limit is not None and not self._on_grid(limit, self.spec.price_increment):
+            return "INVALID_PRICE_PRECISION"
+        if stop is not None and not self._on_grid(stop, self.spec.price_increment):
+            return "INVALID_STOP_PRICE_PRECISION"
+        if limit is not None and stop is not None and side * (stop - limit) <= 0:
+            return "INVALID_BRACKET_PRICES"
+        return None
+
     # ------------------------------------------------------------------ writes
     def _duplicate(self, client_order_id: str) -> PlaceResult | None:
         for o in self.orders.values():
@@ -220,14 +263,13 @@ class SimExchange:
         dup = self._duplicate(client_order_id)
         if dup is not None:
             return dup
+        reason = self._rejected(size)
+        if reason is not None:
+            return PlaceResult(client_order_id, None, False, reason)
         if self.session_state != SESSION_OPEN:
             return PlaceResult(client_order_id, None, False, "SESSION_NOT_OPEN")
         o = self._new(client_order_id, side, "MARKET", size)
-        qty = int(math.floor(size * self.market_fill_ratio + 1e-9))
-        if qty > 0:
-            half = self.spread / 2.0
-            self._fill(o, qty, self.fut_price + side * half)
-        o.status = "FILLED" if o.filled == o.size else "CANCELLED"  # IOC: the unfilled rest is cancelled
+        self._execute_market(o)
         self._accepted("place_market")
         return PlaceResult(client_order_id, o.order_id, True)
 
@@ -238,6 +280,9 @@ class SimExchange:
         dup = self._duplicate(client_order_id)
         if dup is not None:
             return dup
+        reason = self._rejected(size, side, limit_price, stop_price)
+        if reason is not None:
+            return PlaceResult(client_order_id, None, False, reason)
         if self.pos is None or self.pos.side != -side:
             return PlaceResult(client_order_id, None, False, "NO_POSITION_TO_REDUCE")
         if self.reject_overlap:
@@ -255,6 +300,8 @@ class SimExchange:
         o = self.orders.get(order_id)
         if not self.edit_supported or o is None or o.status != "OPEN" or o.triggered:
             return False
+        if self._rejected(size, o.side, limit_price, stop_price) is not None:
+            return False
         o.size, o.limit_price, o.stop_price = int(size), float(limit_price), float(stop_price)
         self._match()
         return True
@@ -271,28 +318,41 @@ class SimExchange:
         dup = self._duplicate(client_order_id)
         if dup is not None:
             return dup
+        reason = None if size is None else self._rejected(size)
+        if reason is not None:
+            return PlaceResult(client_order_id, None, False, reason)
         if self.session_state != SESSION_OPEN:
             return PlaceResult(client_order_id, None, False, "SESSION_NOT_OPEN")
         if self.pos is None:
             return PlaceResult(client_order_id, None, False, "NO_OPEN_POSITION")
         qty = self.pos.contracts if size is None else min(int(size), self.pos.contracts)
-        side = -self.pos.side
-        o = self._new(client_order_id, side, "MARKET", qty)
-        self._fill(o, qty, self.fut_price + side * self.spread / 2.0)
-        o.status = "FILLED"
-        self._match()
+        o = self._new(client_order_id, -self.pos.side, "MARKET", qty)
+        self._execute_market(o)
         self._accepted("close_position")
         return PlaceResult(client_order_id, o.order_id, True)
 
     def preview_market(self, side: int, size: int) -> PreviewResult:
         self._fault("preview_market")
-        return PreviewResult(not self.preview_errors, self.preview_errors)
+        return self._preview_result(self._rejected(size))
 
     def preview_bracket(self, side: int, size: int, limit_price: float, stop_price: float) -> PreviewResult:
         self._fault("preview_bracket")
-        return PreviewResult(not self.preview_errors, self.preview_errors)
+        return self._preview_result(self._rejected(size, side, limit_price, stop_price))
+
+    def _preview_result(self, reason: str | None) -> PreviewResult:
+        errors = self.preview_errors + ((f"PREVIEW_{reason}",) if reason else ())
+        return PreviewResult(not errors, errors)
 
     # ------------------------------------------------------------------ matching
+    def _execute_market(self, o: SimOrder) -> None:
+        """IOC at the touch: market_fill_ratio of the size fills, the unfilled rest is cancelled; a bracket
+        left with nothing to reduce is cancelled at once."""
+        qty = int(math.floor(o.size * self.market_fill_ratio + 1e-9))
+        if qty > 0:
+            self._fill(o, qty, self.fut_price + o.side * self.spread / 2.0)
+        o.status = "FILLED" if o.filled == o.size else "CANCELLED"
+        self._match()
+
     def _fill(self, o: SimOrder, qty: int, price: float) -> None:
         cs = self.spec.contract_size
         pos = self.pos

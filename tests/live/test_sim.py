@@ -47,7 +47,7 @@ def test_brackets_only_reduce_and_take_profit_at_the_limit(ex):
     assert ex.position() is None
     assert [o.client_order_id for o in ex.open_orders()] == []
     ex.place_market("e2", -1, 1)  # a later bracket for a long cannot increase the new short
-    r = ex.place_bracket("b3", -1, 1, 59_000.0, 61_000.0)
+    r = ex.place_bracket("b3", -1, 1, 61_000.0, 59_000.0)
     assert not r.ok and r.error == "NO_POSITION_TO_REDUCE"
 
 
@@ -162,5 +162,73 @@ def test_edit_and_close(ex):
     assert ex.close_position("x1", size=1).ok and ex.position().contracts == 1
     assert ex.close_position("x2").ok and ex.position() is None
     assert ex.close_position("x3").error == "NO_OPEN_POSITION"
-    ex.set_prices(60_000.0)
-    assert ex.open_orders() == []  # the orphaned bracket is cancelled on the next match
+    assert ex.open_orders() == []  # the orphaned bracket is cancelled by the close itself
+
+
+def test_prices_off_the_tick_grid_are_rejected(ex):
+    ex.place_market("e1", 1, 1)
+    r = ex.place_bracket("b1", -1, 1, 60_502.5, 59_000.0)  # $5 tick
+    assert not r.ok and r.error == "INVALID_PRICE_PRECISION"
+    r = ex.place_bracket("b2", -1, 1, 60_500.0, 59_001.0)
+    assert not r.ok and r.error == "INVALID_STOP_PRICE_PRECISION"
+    assert not ex.place_bracket("b3", -1, 1, float("nan"), 59_000.0).ok
+    assert ex.open_orders() == [] and not ex.preview_bracket(-1, 1, 60_500.0, 59_001.0).ok
+    b = ex.place_bracket("b4", -1, 1, 60_500.0, 59_000.0)
+    ex.edit_supported = True
+    assert not ex.edit_bracket(b.order_id, 1, 60_500.0, 59_002.5)
+    assert ex.get_order(b.order_id).stop_price == 59_000.0
+
+
+def test_sizes_must_be_whole_contracts(ex):
+    for size in (1.5, 0, -1):
+        r = ex.place_market(f"e{size}", 1, size)
+        assert not r.ok and r.error == "INVALID_SIZE_PRECISION"
+    assert ex.orders == {} and ex.position() is None and not ex.preview_market(1, 1.5).ok
+    assert ex.place_market("e2", 1, 2.0).ok and ex.position().contracts == 2  # a whole number is fine
+    assert ex.place_bracket("b1", -1, 0.5, 61_000.0, 59_000.0).error == "INVALID_SIZE_PRECISION"
+    assert ex.close_position("x1", size=1.5).error == "INVALID_SIZE_PRECISION"
+    assert ex.position().contracts == 2 and ex.open_orders() == []
+
+
+def test_bracket_take_profit_and_stop_must_be_on_their_sides(ex):
+    ex.place_market("e1", 1, 1)  # long: the sell bracket's take-profit must be above its stop
+    for tp, stop in ((59_000.0, 61_000.0), (60_000.0, 60_000.0)):
+        r = ex.place_bracket(f"b{tp}", -1, 1, tp, stop)
+        assert not r.ok and r.error == "INVALID_BRACKET_PRICES"
+    b = ex.place_bracket("b1", -1, 1, 61_000.0, 59_000.0)
+    ex.edit_supported = True
+    assert not ex.edit_bracket(b.order_id, 1, 59_000.0, 61_000.0)
+    ex.close_position("x1")
+    ex.place_market("s1", -1, 1)  # short: the buy bracket's take-profit must be below its stop
+    assert ex.place_bracket("b2", 1, 1, 61_000.0, 59_000.0).error == "INVALID_BRACKET_PRICES"
+    assert ex.place_bracket("b3", 1, 1, 59_000.0, 61_000.0).ok
+
+
+def test_close_position_honours_the_market_fill_ratio(ex):
+    ex.place_market("e1", 1, 3)
+    ex.market_fill_ratio = 0.5
+    r = ex.close_position("x1")
+    o = ex.get_order(r.order_id)
+    assert r.ok and (o.size, o.filled, o.status) == (3, 1, "CANCELLED") and ex.position().contracts == 2
+    r = ex.close_position("x2", size=1)  # floor(0.5): nothing fills, the IOC rest is cancelled
+    assert r.ok and ex.get_order(r.order_id).status == "CANCELLED" and ex.position().contracts == 2
+
+
+def test_a_market_order_cancels_orphaned_brackets_at_once(ex):
+    ex.place_market("e1", 1, 1)
+    b = ex.place_bracket("b1", -1, 1, 62_000.0, 59_500.0)
+    assert ex.place_market("x1", -1, 1).ok and ex.position() is None
+    assert ex.open_orders() == [] and ex.get_order(b.order_id).status == "CANCELLED"
+
+
+def test_fault_injection_only_accepts_methods_that_honour_it(ex):
+    for bad in ("place_order", "set_prices"):
+        with pytest.raises(ValueError):
+            ex.fail_next(bad, RateLimited("429"))
+    for bad in ("cancel", "edit_bracket", "quote", "place_order"):
+        with pytest.raises(ValueError):
+            ex.crash_after_accept(bad)
+    ex.fail_next("cancel", Unavailable("503"))
+    ex.crash_after_accept("close_position")
+    with pytest.raises(Unavailable):
+        ex.cancel([])
