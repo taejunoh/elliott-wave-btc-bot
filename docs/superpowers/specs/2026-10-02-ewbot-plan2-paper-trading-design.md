@@ -134,7 +134,7 @@ paper 브랜치(코드 이력과 분리):
 ## 6. 운영
 
 ### 6.1 워크플로 `paper.yml`
-- **트리거**: `schedule: cron "7 * * * *"`(매시 7분), `workflow_dispatch`
+- **트리거**: 주 트리거는 외부(Cloudflare Workers cron)가 매시 37분(UTC)에 호출하는 `workflow_dispatch`다. `schedule: cron "52 */3 * * *"`(3시간마다 52분)는 드물게 도는 백업이다. 입력 없는 `workflow_dispatch`는 수동 실행도 겸한다. (2026-10-03 변경: GitHub `schedule`이 부하 때 실행을 누락한다. 매시 `7 * * * *` 약 13회 중 2회만 실행되어 4번 기준의 커버리지를 지킬 수 없었다. 커버리지는 트리거와 무관하게 성공 실행이 있는 시간을 센다. 설정은 `docs/paper-trading.md`의 "Reliable hourly trigger".)
 - **동시성**: `concurrency: {group: paper, cancel-in-progress: false}`
 - **권한**: `contents: write`
 - **단계**
