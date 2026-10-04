@@ -18,15 +18,18 @@ is taken before its alert.
   watch     every second while a trade is open (or the journal shows one at start): the stop-gap check on the
             futures price, and a close when no stop rests (refused bracket) and the price is through the stop -
             at most one close per 10 s per trade, after a pass that observes the account first (a bracket fill
-            is recorded as such), its alert after it and saying whether it closed
-  poll      every 10 s while a trade is open, an intent is pending or a flatten stands (60 s otherwise, at once
-            after a WebSocket resync; the loop's cadence runs on a monotonic clock): a reduce
+            is recorded as such), its alert after it and saying whether it closed; any refusal of such a close is
+            taken for a close conflict (the brackets protect nothing there: executor `any_refusal`)
+  poll      every 10 s while a trade is open, an intent is pending, our latest entry is unsettled (accepted, no trade
+            records it: Executor.unsettled_entry) or a flatten stands (60 s otherwise; after a WebSocket resync at
+            once, but a resync poll at most once per 10 s; the loop's cadence runs on a monotonic clock): a reduce
             with an unknown outcome is resolved by its client order id first; then position and open
             orders are re-read as one state (the position read again after the orders, repeated until
             both reads agree: a fill between the reads never pairs a stale position with a vanished
             leg), observed and reconciled against the last target (protection right after fills, the
             TP1 break-even, deferred closes). Every entry and adoption is sized by the more conservative of
-            the stage this process runs in and the journal's (a demotion applies at once). After each pass an
+            the stage this process runs in and the journal's (a demotion applies at once). A futures/spot basis
+            more than 2% from 1 is no basis: no level is mapped and no entry sized with it (alerted, limited). After each pass an
             order failure is resolved or recorded unresolved (CANARY gate 2: a bracket not replaced within
             30 s, a close or reduction not done by the next pass - a CANARY failure that pauses), and a manual
             intervention or an unresolved order failure is one incident per episode, not one per pass. Bracket
@@ -41,21 +44,26 @@ is taken before its alert.
             this check never skips the rest of the minute. Then session state, account breakers (a balance
             that is not
             a finite amount above 0 is alerted, never a sample; three such reads in a row are an incident
-            that pauses entries), margin (80% warn, 90% reduce; never acted on without a futures price), the
+            that pauses entries; a `ewbot live rebase` request re-bases both references with this minute's read),
+            the account's readability (a position, session or balance read failing for 3 minutes while there is
+            something to manage - 15 otherwise - is alerted, with limited repeats, and when it reads again; 30
+            minutes with something to manage also sends healthchecks.io a /fail), margin (80% warn, 90% reduce; never acted on without a futures price), the
             WebSocket feed's health (no futures price for 5 minutes while the session is OPEN: alerted once
             per outage, and when it is back),
             pending intents resolved (or abandoned after 10 min), the 15:30 New York
             overnight-margin report (its reads retried every minute until 16:00), the daily summary (09:00 New York)
             with expiry reminders and the daily key-permission check (each marked done for the day only once it
-            succeeded), the paper audit (from minute 50, up
+            succeeded; the summary also counts the feed's sequence gaps), the paper audit (from minute 50, up
             to the last bar whose cycle ended OK: the paper ledger is fetched on a worker thread - the loop never
             waits on GitHub, a DNS lookup included -, one fetch at a time, given up after 60 s, and compared on the
             loop once it is there; a revised bar is alerted only, a decision missing on one side is pending until
             the next audit confirms it, a different decision is a major incident at once; a failed audit is
             stored as failed and alerted), and the stage-change restart (a new stage or stint once flat: no open
-            trade, no order of unknown outcome, no standing flatten, no position or order of ours)
+            trade, no order of unknown outcome, no standing flatten, no position or order of ours) - each step
+            guarded on its own: one that keeps failing never skips the ones after it
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
-            reconcile. The candle download runs on a worker thread, waited for at most 5 s when it starts (a hung
+            reconcile. The replay runs on the loop: about 2 s on a laptop, 5-10 s on a 1-vCPU VPS, while the
+            watchdog and the commands wait (it can add that much to the stop-gap watchdog's 10 s grace). The candle download runs on a worker thread, waited for at most 5 s when it starts (a hung
             request never stops the loop); retried every 15 s - at once when a running download ends - while the bar is
             missing or the candles cannot be downloaded; 2 minutes after the close the decision is held and only
             protection is kept (spec 4.1 step 1). An engine error, or any failure after the replay, ends the bar's
@@ -69,7 +77,9 @@ is taken before its alert.
 Errors in alerts and in the journal go through the settings' redaction; repeating failure alerts (a close, a
 bracket, a loop section that keeps failing) go out at once, then with growing gaps (1 to 30 minutes) while the
 failure lasts. The start reads the product and the session with retries for up to 5 minutes, then refuses
-(StartupRefused: `ewbot live run` starts again after a short wait - an outage, not a configuration error). The process
+(StartupRefused: `ewbot live run` starts again after a short wait - an outage, not a configuration error); then it
+recovers and runs its first pass - against the hour's decision stored before the restart, when it was taken - before
+the candle download (minutes with an empty cache), so a position is protected first. The process
 runs the stage `ewbot live run` gives it (`LiveDeps.stage`, live.app.process_stage): after a demotion to SHADOW with
 something real left it stays on the real account in the last real stage - entries blocked by the journal's SHADOW cap -
 until flat. A stop request (`stop_requested`: SIGTERM, Ctrl-C) ends the start's read retries, or the loop after the
@@ -97,11 +107,11 @@ from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
 from ewbot.live.control import Command
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, Order, Position, ProductSpec, SessionInfo
-from ewbot.live.executor import Executor
+from ewbot.live.executor import CLOSE_CONFLICTS, OVERLAP_REFUSALS, Executor
 from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
-from ewbot.live.pricing import MARGIN_ENTRY_MAX, basis_ratio, map_level, margin_ratio, stage_contracts
+from ewbot.live.pricing import MARGIN_ENTRY_MAX, BasisOutOfBand, basis_ratio, map_level, margin_ratio, stage_contracts
 from ewbot.live.reconcile import (
     Action,
     Adopt,
@@ -111,6 +121,7 @@ from ewbot.live.reconcile import (
     PlanContext,
     Protect,
     Skip,
+    entry_position,
     is_ours,
     observe,
     plan,
@@ -129,7 +140,7 @@ from ewbot.live.stage import (
     paused,
     resume,
 )
-from ewbot.live.target import Target, TargetError, compute_target, frozen_config
+from ewbot.live.target import Target, TargetEntry, TargetError, TargetPosition, compute_target, frozen_config
 from ewbot.live.watchdog import (
     NY,
     WS_STALE_S,
@@ -138,6 +149,7 @@ from ewbot.live.watchdog import (
     PriceSource,
     SessionWatch,
     StopGapWatch,
+    fresh,
     margin_status,
     ny_date,
 )
@@ -194,6 +206,11 @@ STARTUP_RETRY_S = 2.0  # ... the wait doubling up to STARTUP_RETRY_MAX_S
 STARTUP_RETRY_MAX_S = 60.0
 FETCH_WAIT_S = 5.0  # the loop waits at most this long for a candle download (a worker thread), then ticks on
 STOP_GRACE_S = 90.0  # a stop request waits at most this long while the open trade has no resting stop (docker: 150 s)
+REBASE_KEY = "rebase_request"  # `ewbot live rebase --confirm`: the breakers re-based at the next minute
+UNREADABLE_ALERT_S = 180.0  # an account read failing this long while there is something to manage is alerted ...
+UNREADABLE_IDLE_ALERT_S = 900.0  # ... this long otherwise
+UNREADABLE_FAIL_S = 1800.0  # ... and with something to manage this long healthchecks.io gets a /fail as well
+READS = {"positions": "포지션·주문", "session": "장 상태", "balance": "잔고"}  # the account reads that are watched
 # what a flatten did by the end of its first pass: the /flatten_confirm reply and the breaker alert say it
 FLATTEN_OUTCOME = {
     "done": "전량 청산 완료",
@@ -275,6 +292,8 @@ class LiveDeps:
     expiry: dict[str, str] = field(default_factory=dict)
     redact: Callable[[str], str] = lambda text: text  # removes the settings' secrets from error texts (live.app.redact)
     stage: str | None = None  # the stage this process runs (live.app.process_stage); None: the journal's
+    close_conflicts: tuple[str, ...] = ()  # refusal codes added to executor.CLOSE_CONFLICTS (EWBOT_CLOSE_CONFLICTS)
+    overlap_refusals: tuple[str, ...] = ()  # ... and to executor.OVERLAP_REFUSALS (EWBOT_OVERLAP_REFUSALS)
 
 
 def _utc(ts: float) -> str:
@@ -298,7 +317,9 @@ class LiveRuntime:
         self.stage = deps.stage or recorded  # after a demotion with something real left: the last real stage
         self.executor = Executor(self.ex, self.journal, clock=deps.clock, sleep=deps.sleep, alert=self._repeating,
                                  tp1_frac=self.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops,
-                                 entry_deadline_s=ENTRY_DEADLINE_S)
+                                 entry_deadline_s=ENTRY_DEADLINE_S,
+                                 overlap_refusals=OVERLAP_REFUSALS | frozenset(deps.overlap_refusals),
+                                 close_conflicts=CLOSE_CONFLICTS | frozenset(deps.close_conflicts))
         self.prices = PriceSource(self.ex, deps.feed, clock=deps.clock)
         self.gap = StopGapWatch()
         self.guard = AccountGuard(self.journal, self.cfg.breakers)
@@ -333,6 +354,11 @@ class LiveRuntime:
         self.tg_conflicts = 0  # the control's HTTP 409 count at the last minute
         self.hc_failed_at: float | None = None  # the latest /fail for Telegram of this episode
         self.hb_alerted = False  # failing healthchecks.io pings were alerted
+        self.read_fail: dict[str, tuple[float, str]] = {}  # account read (READS) -> (monotonic since, last error)
+        self.unreadable_alerted = False  # the unreadable account was alerted (its recovery is alerted too)
+        self.resync_wanted = False  # the feed asked for a resync poll (run at most once per POLL_ACTIVE_S)
+        self.resync_polls = 0
+        self.feed_marks: tuple[int, int, int] = (0, 0, 0)  # the feed's gaps, connects and the resync polls at the last summary
         raised = self.journal.get(RAISED_KEY) or {}  # the planned manual incidents in force, and their stint
         self.raised = {(str(k), int(t)) for k, t in raised.get("items", [])}
         self.raised_stint, self.raised_ended = raised.get("stint"), raised.get("ended")
@@ -374,10 +400,12 @@ class LiveRuntime:
         self.alert(kind, text)
 
     def _busy(self) -> bool:
-        """Poll fast and watch: a trade is open, an order's outcome is unknown or a flatten stands (journal only)."""
+        """Poll fast and watch: a trade is open, an order's outcome is unknown, our latest entry is unsettled (accepted,
+        no trade records it: its position is protected at the next pass) or a flatten stands (journal only)."""
         t = self.executor.trade()
         return ((t is not None and t.status == "OPEN") or bool(self.journal.intents(status="PENDING"))
-                or self.journal.get(FLATTEN_KEY) is not None)
+                or self.journal.get(FLATTEN_KEY) is not None
+                or self.executor.unsettled_entry(self.clock()) is not None)
 
     def _loop_error(self, section: str, exc: BaseException, now: float) -> None:
         """A failing loop section (called inside its `except`): journaled every time, alerted limited, traceback."""
@@ -418,6 +446,12 @@ class LiveRuntime:
             fut = self.ex.quote(self.ex.futures_id).mid
             ratio = basis_ratio(fut, self.ex.quote(self.ex.spot_id).mid)
             price = fut  # what the break-even stop is judged against (reconcile.desired_legs)
+        except BasisOutOfBand as exc:  # a stale or one-sided book: no level mapped, no entry sized (stop in force kept)
+            held = self._limited("BASIS")
+            if held is not None:
+                self.journal.add_event(now, "BASIS_BAND", {"error": str(exc)[:200]})
+                self.alert("BASIS", f"[호가 이상] {exc} - 손절 이동과 신규 진입 보류 (거래소의 보호 주문은 그대로)"
+                           + (f" (같은 경보 {held}건 생략)" if held else ""))
         except (ExchangeError, ValueError):
             pass
         session_open = self.session is not None and self.session.is_open
@@ -425,8 +459,10 @@ class LiveRuntime:
         tick = self.product.price_increment if self.product is not None else 5.0
         stage, cap = self._limits(now)
         most = cap if stage == "FULL" else 1  # the stage maximum for a position taken over (a real one in SHADOW too)
+        own = self.executor.unsettled_entry(now)  # without a target, a position on its side is taken over from it
         return PlanContext(now=now, ratio=ratio, tick=tick, session_open=session_open, entry_contracts=n,
-                           entry_block=block, max_contracts=most, price=price)
+                           entry_block=block, max_contracts=most, price=price,
+                           own_entry=None if own is None else entry_position(own["payload"]))
 
     def _entry_size(self, now: float, ratio: float | None, session_open: bool) -> tuple[int, str | None]:
         t = self.target
@@ -452,6 +488,9 @@ class LiveRuntime:
         stage, cap = self._limits(now)
         if cap == 0 and self.stage != "SHADOW":
             return 0, "단계가 SHADOW로 바뀜: 실주문을 내지 않음 (포지션이 없으면 재시작)"
+        rate = self.product.margin_rate(e.direction, True)
+        if not (math.isfinite(rate) and rate > 0):  # a rate read as 0 would turn the 70% limit off: never sized blind
+            return 0, "증거금률을 읽지 못함"
         tick = self.product.price_increment
         entry = e.entry_ref * ratio
         stop = map_level(e.stop, ratio, tick, e.direction)
@@ -498,6 +537,10 @@ class LiveRuntime:
                 wait = min(wait * 2, STARTUP_RETRY_MAX_S)
 
     def startup(self) -> dict[str, int]:
+        """Read the product and the session (retried), recover (executor.recover) and run a first pass - against this
+        hour's decision as stored before the restart when the hour was decided, else protection only - and only then
+        download the candles (the first download of the history takes minutes: never inside a timed cycle, and never
+        before a position is protected) and refresh a decided hour's target."""
         now = self.clock()
         if self.journal.stage()[1] is None:
             self.journal.set_stage("SHADOW", "initial", now)
@@ -506,10 +549,6 @@ class LiveRuntime:
         self.session = self._startup_read("session", self.ex.session)
         now = self.clock()
         notices = self.sessions.update(self.session, now)  # a maintenance within 24 h is announced at start too
-        try:  # the first download of the candle history takes minutes: never inside a timed cycle
-            self._frame()
-        except Exception as exc:  # noqa: BLE001 - the cycle retries the fetch
-            self.journal.add_event(now, "FETCH_ERROR", {"error": self.d.redact(f"{type(exc).__name__}: {exc}")[:200]})
         if isinstance(self.ex, ShadowExchange):
             self.ex.restore(self.executor.trade())
         out = self.executor.recover()
@@ -520,31 +559,54 @@ class LiveRuntime:
         recorded = self.journal.stage()[0]
         kept = "" if recorded == self.stage else (f" (기록된 단계 {recorded}: 실계좌에 남은 포지션·주문을 관리하고 정리되면 "
                                                   f"{recorded}(으)로 다시 시작, 신규 진입 없음)")
-        self.alert("STARTUP", f"[시작] 단계 {self.stage}{kept} · 재시작 복구 {out} · {_utc(now)}")
+        extra = sorted(set(self.d.close_conflicts) | set(self.d.overlap_refusals))
+        codes = f" · 추가 거부 코드 {', '.join(extra)}" if extra else ""
+        self.alert("STARTUP", f"[시작] 단계 {self.stage}{kept} · 재시작 복구 {out}{codes} · {_utc(now)}")
         for kind, text in notices:
             self.journal.add_event(now, kind, {"text": text})
             self.alert(kind, f"[장 상태] {text}")
         restored = self._breaker_in_force(now)
         self._flatten_outcome, self._flatten_own = "unread", restored is not None  # the start's passes report it
+        bar = int(now) // H1 * H1 - H1
+        row = self._cycle_row(bar)
+        decided = self._decided_until()  # never decided again into its row: the restart keeps an on-time cycle
         try:
-            bar = int(now) // H1 * H1 - H1
-            row = self._cycle_row(bar)
-            decided = self._decided_until()  # never decided again into its row: the restart keeps an on-time cycle
             if row is not None and row["status"] in ("HOLD", "ERROR"):
                 self.done_bar = bar  # held or failed before the restart: the hold stands, only protection this hour
             elif decided and decided == bar:
                 self.done_bar = bar - H1  # this hour's bar: its target again, its row untouched (download retried)
-                self._cycle_due(now)
+                self.target = self._stored_target(bar)  # meanwhile the decision taken before the restart
             elif decided:
                 self.done_bar = decided  # this hour's bar never started or a crash left it RUNNING: decided as usual
             self.active = self._busy()
-            self.poll(now)
+            self.poll(now)  # protection first: before the candle download
         finally:
             self._flatten_own = False
+        try:  # the first download of the candle history takes minutes: never inside a timed cycle
+            self._frame()
+        except Exception as exc:  # noqa: BLE001 - the cycle retries the fetch
+            self.journal.add_event(self.clock(), "FETCH_ERROR",
+                                   {"error": self.d.redact(f"{type(exc).__name__}: {exc}")[:200]})
+        if decided and decided == bar:
+            self._cycle_due(self.clock())  # the decided hour's target again (its row untouched)
         if restored is not None:  # the flatten's first pass ran: the alert says what happened
             self.alert("BREAKER", f"[실계좌 손실 한도] {restored}: 재시작 때 발동 중 - 일시 정지 · "
                                   f"{FLATTEN_OUTCOME[self._flatten_outcome]}")
         return out
+
+    def _stored_target(self, bar: int) -> Target | None:
+        """The target of `bar` as the cycle stored it before a restart (the journal's `target`), without its decisions;
+        None when it is another bar's or cannot be read."""
+        data = self.journal.get("target")
+        try:
+            if not isinstance(data, dict) or int(data["bar_ts"]) != bar:
+                return None
+            pos, ent = data.get("position"), data.get("entry")
+            return Target(bar, float(data["close"]), None if pos is None else TargetPosition(**pos),
+                          data.get("exit_reason"), None if ent is None else TargetEntry(**ent), (),
+                          data.get("exit_queued_ts"), bool(data.get("stop_pending_reopen")))
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def _breaker_in_force(self, now: float) -> str | None:
         """At start: a breaker still tripped (the daily one for today) while the journal's trade is open and no
@@ -706,6 +768,7 @@ class LiveRuntime:
         self._after_pass = []
         self.executor.resolve_reduce()  # a reduce with an unknown outcome: looked up by its id, never a second one
         pos, orders = self._snapshot()
+        self._read_ok("positions")
         trade = self.executor.trade()
         seen, events = observe(trade, pos, orders, now)
         # the trades this pass found protected: resting stop legs cover the position (reconcile.observe)
@@ -736,6 +799,7 @@ class LiveRuntime:
                 self._read_session(now)
             except ExchangeError as exc:
                 self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
+                self._read_failed("session", exc)
         ctx = self._ctx(now)
         planned = plan(self.target, seen, pos, orders, ctx)
         req = self.journal.get(FLATTEN_KEY)
@@ -805,6 +869,9 @@ class LiveRuntime:
         close waits for the reopen (alerted once per request) and the position stays protected: the planner's
         protection and takeover only. Its alerts and skips stay."""
         if pos is None:
+            t = self.executor.trade()
+            if t is not None and t.status == "OPEN":  # a flat read its resting legs contradict (observe): next read
+                return planned
             self._flattened(req, now, closed=False)
             return planned
         keep: list[Action] = [a for a in planned if isinstance(a, (Alert, Skip))]
@@ -947,11 +1014,21 @@ class LiveRuntime:
             self.journal.add_event(start, ORDER_UNRESOLVED, {"kind": first["kind"], "trade_id": first["trade_id"],
                                                             "failed_ts": first["ts"], "event_id": first["id"]})
         self._incident(ORDER_UNRESOLVED, start)  # the pause first, the alert second
+        note = self._unresolved_note()
         for ep in opened:
             mine = [f for f in unresolved if f["episode"] == ep]
             kinds = ", ".join(sorted({f["kind"] for f in mine}))
             self.alert(ORDER_UNRESOLVED, f"[주문 실패 미해결] 거래 {mine[0]['trade_id']}: {kinds} - 제시간에 해결되지 않음 "
-                                         "(CANARY 기준 ② 실패)")
+                                         f"({note})")
+
+    def _unresolved_note(self) -> str:
+        """What an unresolved order failure does in the journal's stage (stage.on_incident)."""
+        stage = self.journal.stage()[0]
+        if stage == "CANARY":
+            return "CANARY 기준 ② 실패: 일시 정지"
+        if stage == "FULL":
+            return "CANARY 실패 기준: FULL의 3계약 상한이 30일 더 유지됨"
+        return f"{stage}: 기록만 (CANARY라면 기준 ② 실패)"
 
     def _record_fills(self, trade: LiveTrade | None, orders: list[Order], now: float) -> None:
         """The bracket fills of the journal's trade for the cost report (BRACKET_FILL, increments: every contract
@@ -1000,10 +1077,12 @@ class LiveRuntime:
 
     def poll(self, now: float) -> None:
         self.last_poll = self.mono()
+        self.resync_wanted = False  # every poll reads the whole state
         try:
             self.reconcile(now)
         except ExchangeError as exc:
             self.journal.add_event(now, "POLL_ERROR", {"error": self.d.redact(str(exc))[:200]})
+            self._read_failed("positions", exc)
 
     def watch(self, now: float) -> None:
         t = self.executor.trade()
@@ -1040,8 +1119,8 @@ class LiveRuntime:
         if kind == "STOP_UNPROTECTED" and cur.unprotected_since is None:
             return  # the pass placed the stop again: the bracket and the stop-gap check take over
         done = False
-        try:
-            done = self.executor.close(kind, self._ctx(now))
+        try:  # the brackets protect nothing here (gapped, or no stop): any refusal is taken for a close conflict
+            done = self.executor.close(kind, self._ctx(now), any_refusal=True)
         except ExchangeError as exc:
             self.journal.add_event(now, "WATCH_ERROR", {"trade_id": t.trade_id, "kind": kind,
                                                         "error": self.d.redact(str(exc))[:200]})
@@ -1061,6 +1140,7 @@ class LiveRuntime:
 
     # ------------------------------------------------------------------ every minute
     def minute(self, now: float) -> None:
+        """The minute's steps, each guarded on its own: one that keeps failing never skips the ones after it."""
         self.last_minute = self.mono()
         self.journal.put(HEARTBEAT_KEY, now)
         try:
@@ -1068,34 +1148,116 @@ class LiveRuntime:
         except Exception as exc:  # noqa: BLE001 - never at the cost of the session, breaker and margin checks
             self.journal.add_event(now, "LOOP_ERROR", {"section": "telegram", "error": type(exc).__name__})
             print(f"[LIVE] telegram and heartbeat check failed: {type(exc).__name__}", file=sys.stderr)
+        steps: list[tuple[str, Callable[[float], None]]] = [
+            ("session", self._minute_session), ("money", self._money), ("account", self._account_check),
+            ("feed", self._feed_health), ("pending", self._resolve_pending), ("margin1530", self._margin_1530_due),
+            ("daily", self._daily_step), ("audit", self._audit_due), ("stage", self._stage_change)]
+        for name, step in steps:
+            try:
+                step(now)
+            except Exception as exc:  # noqa: BLE001 - journaled, alerted (limited); the next step still runs
+                self._loop_error(name, exc, now)
+
+    def _minute_session(self, now: float) -> None:
         try:
-            if self._read_session(now):
-                self.poll(now)  # deferred closes run right after the reopen (spec 4.5)
+            reopened = self._read_session(now)
         except ExchangeError as exc:
             self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
-        try:
-            self._money(now)
-        except Exception as exc:  # noqa: BLE001 - a failing breaker or margin step never skips the rest of the minute
-            self._loop_error("money", exc, now)
-        self._feed_health(now)
+            self._read_failed("session", exc)
+            return
+        self._read_ok("session")
+        if reopened:
+            self.poll(now)  # deferred closes run right after the reopen (spec 4.5)
+
+    def _resolve_pending(self, now: float) -> None:
         if self.journal.intents(status="PENDING"):
             try:
                 self.executor.resolve_pending()
             except ExchangeError:
                 pass
+
+    def _margin_1530_due(self, now: float) -> None:
         local = datetime.fromtimestamp(now, NY)
         today = local.date().isoformat()
         if (local.hour, local.minute) >= MARGIN_CHECK_NY and local.hour < 16 and self.journal.get("once:margin1530") != today:
             self._overnight_report(now)  # marks the day done once its reads succeed
+
+    def _daily_step(self, now: float) -> None:
+        local = datetime.fromtimestamp(now, NY)
         if local.hour >= DAILY_HOUR_NY:
-            self._daily_due(now, today)
+            self._daily_due(now, local.date().isoformat())
+
+    def _audit_due(self, now: float) -> None:
         if datetime.fromtimestamp(now, UTC).minute >= AUDIT_MINUTE and self._once("audit", int(now) // H1):
             self._audit_start(now)
+
+    def _stage_change(self, now: float) -> None:
         stage, since = self.journal.stage()
         if (stage != self.stage or since != self.stage_since) and self.flat():  # a new stage or a new stint
             again = " (다시 시작)" if stage == self.stage else ""
             self.alert("STAGE", f"[단계 변경] {self.stage} → {stage}{again}: 재시작해 적용")
             self.exit_code = 0
+
+    # ------------------------------------------------------------------ the account's readability
+    def _read_failed(self, what: str, exc: BaseException) -> None:
+        """An account read (READS) failed: the episode of `what` begins now (monotonic), or goes on with this error."""
+        why = self.d.redact(f"{type(exc).__name__}: {exc}")[:160]
+        since = self.read_fail[what][0] if what in self.read_fail else self.mono()
+        self.read_fail[what] = (since, why)
+
+    def _read_ok(self, what: str) -> None:
+        self.read_fail.pop(what, None)
+
+    def _unreadable_for(self) -> float | None:
+        """How long (monotonic) some account read has failed without a success since; None: every one reads."""
+        if not self.read_fail:
+            return None
+        return max(self.mono() - min(since for since, _ in self.read_fail.values()), 0.0)
+
+    def _account_check(self, now: float) -> None:
+        """Every minute: an account read (positions and orders, the session, the balance) failing for
+        UNREADABLE_ALERT_S while there is something to manage - an open trade, an order of unknown outcome, an
+        unsettled entry, a flatten - or UNREADABLE_IDLE_ALERT_S otherwise is alerted (repeats limited), saying what
+        stops meanwhile; and once every read works again, that it does (ACCOUNT_READABLE). A revoked or expired key,
+        a changed VPS address or a Coinbase outage would otherwise go unnoticed: the heartbeat goes on."""
+        down = self._unreadable_for()
+        if down is None:
+            if self.unreadable_alerted:
+                self.unreadable_alerted = False
+                self.journal.add_event(now, "ACCOUNT_READABLE", {})
+                self.alert("ACCOUNT", "[계좌 조회 복구] Coinbase 계정을 다시 읽음: 보호·청산·감시가 다시 돌아감")
+            return
+        busy = self._busy()
+        if down < (UNREADABLE_ALERT_S if busy else UNREADABLE_IDLE_ALERT_S):
+            return
+        held = self._limited("ACCOUNT_UNREADABLE")
+        if held is None:
+            return
+        self.unreadable_alerted = True
+        reads = ", ".join(READS[w] for w in sorted(self.read_fail))
+        last = next(iter(sorted(self.read_fail.items(), key=lambda kv: kv[1][0], reverse=True)))[1][1]
+        self.journal.add_event(now, "ACCOUNT_UNREADABLE", {"down_s": round(down, 1), "reads": sorted(self.read_fail),
+                                                           "error": last, "busy": busy})
+        t = self.executor.trade()
+        if t is not None and t.status == "OPEN":
+            what = (f"거래 {t.trade_id} {_side(t.direction)} {t.contracts}계약: 거래소의 손절·TP 주문은 그대로지만 손절 이동, "
+                    "청산, 손절 갭 감시는 조회가 돌아올 때까지 멈춤")
+        elif self.journal.get(FLATTEN_KEY) is not None:
+            what = "대기 중인 전량 청산이 멈춤 (조회가 돌아오면 다시 보냄)"
+        elif busy:
+            what = "결과 미확인 주문의 확인과 보호가 멈춤"
+        else:
+            what = "포지션 없음 - 신규 진입도 하지 않음"
+        self.alert("ACCOUNT", f"[계좌 조회 불가] Coinbase를 {down / 60:.0f}분째 읽지 못함 ({reads}: {last}) - {what}. "
+                              "API 키(만료·폐기), VPS IP 허용 목록, Coinbase 상태 확인"
+                   + (f" (같은 경보 {held}건 생략)" if held else ""))
+
+    def _account_problem(self) -> str | None:
+        """For healthchecks.io: the account unreadable for UNREADABLE_FAIL_S while there is something to manage."""
+        down = self._unreadable_for()
+        if down is None or down < UNREADABLE_FAIL_S or not self._busy():
+            return None
+        return f"Coinbase 계정 조회 불가 {down / 60:.0f}분 (관리 중인 포지션·주문 있음)"
 
     def _read_session(self, now: float) -> bool:
         """Read the session (every minute; every pass while a flatten waits for the reopen), journal and alert its
@@ -1174,13 +1336,16 @@ class LiveRuntime:
         sending = self._notify_problem(now)
         if sending is not None:
             down.append(sending)
+        account = self._account_problem()  # an account unreadable with something to manage: the email path too
         hb = self.d.heartbeat
-        if down:
+        if down or account is not None:
             if self.hc_failed_at is None or now - self.hc_failed_at >= HC_REFAIL_S:
                 self.hc_failed_at = now
-                self.journal.add_event(now, "TELEGRAM_UNUSABLE", {"reasons": down})
+                self.journal.add_event(now, "TELEGRAM_UNUSABLE" if down else "ACCOUNT_UNREADABLE_FAIL",
+                                       {"reasons": down + ([account] if account else [])})
                 if hb is not None:
-                    hb.fail("[LIVE] 텔레그램 사용 불가 - " + "; ".join(down))
+                    hb.fail(" · ".join((["[LIVE] 텔레그램 사용 불가 - " + "; ".join(down)] if down else [])
+                                       + ([f"[LIVE] {account}"] if account else [])))
             if now - self.hc_failed_at < HC_WITHHOLD_S:
                 return  # no success ping yet: the check stays down (a failed /fail brings it down after its grace)
         else:
@@ -1200,9 +1365,13 @@ class LiveRuntime:
     def _money(self, now: float) -> None:
         try:
             equity = self.ex.balance().equity
-            trip = self.guard.update(equity, now)  # trips on the second breaching read in a row
-        except ExchangeError:
+        except ExchangeError as exc:
+            self._read_failed("balance", exc)
             return
+        self._read_ok("balance")
+        try:
+            rebased = self._rebase_due(equity, now)  # a capital change re-based both breakers with this read
+            trip = None if rebased else self.guard.update(equity, now)  # trips on the second breaching read in a row
         except BadEquity:  # not an observation: no breaker sample and no margin check this minute
             self.bad_equity_reads += 1
             if self.bad_equity_reads == 1:
@@ -1213,7 +1382,7 @@ class LiveRuntime:
                 if paused(self.journal) is None:
                     pause(self.journal, "incident BAD_EQUITY", now)
                 self._incident("BAD_EQUITY", now)
-                self.alert("INCIDENT", f"[중대 사건] 잔고 이상이 {BAD_EQUITY_PAUSE_READS}회 연속: 신규 진입 일시 정지 "
+                self.alert("INCIDENT", f"[잔고 이상 지속] 잔고 이상이 {BAD_EQUITY_PAUSE_READS}회 연속: 신규 진입 일시 정지 "
                                        "(보호 주문과 청산은 계속, 재개는 /resume)")
             return
         self.bad_equity_reads = 0
@@ -1249,6 +1418,29 @@ class LiveRuntime:
             self.alert("MARGIN", f"[증거금 경고] 오버나이트 기준 {st.ratio:.0%} (80% 이상)")
         elif st.level == "REDUCE" and st.reduce_by > 0:
             self._margin_reduce(equity, price, now)
+
+    def _rebase_due(self, equity: float, now: float) -> bool:
+        """A `ewbot live rebase --confirm` request (REBASE_KEY): both breakers' references are based again from this
+        read (AccountGuard.rebase; BadEquity for an unusable read - the request waits for a good one), journaled
+        (REBASED: before and after) and alerted; refused while a flatten stands (REBASE_REFUSED). True when applied."""
+        req = self.journal.get(REBASE_KEY)
+        if req is None:
+            return False
+        if self.journal.get(FLATTEN_KEY) is not None:
+            self.journal.put(REBASE_KEY, None)
+            self.journal.add_event(now, "REBASE_REFUSED", {"requested_ts": req.get("ts"), "why": "flatten"})
+            self.alert("REBASE", "[손실 한도 기준 재설정 거부] 전량 청산이 진행 중 - 끝난 뒤 다시 요청 (ewbot live rebase --confirm)")
+            return False
+        before, after = self.guard.rebase(equity, now)
+        self.journal.put(REBASE_KEY, None)
+        self.journal.add_event(now, "REBASED", {"requested_ts": req.get("ts"), "before": before, "after": after})
+
+        def usd(x: Any) -> str:
+            return "-" if x is None else f"{float(x):,.2f}"
+
+        self.alert("REBASE", f"[손실 한도 기준 재설정] 일 기준 {usd(before['day_ref'])} → {usd(after['day_ref'])} USD, 최고점 "
+                             f"{usd(before['peak'])} → {usd(after['peak'])} USD (지금과 다음 두 번 조회의 중앙값으로 확정)")
+        return True
 
     def _margin_reduce(self, equity: float, price: float, now: float) -> None:
         """90% of the account at the overnight rate: back to <= 70% at market, after a pass that observes the account
@@ -1286,7 +1478,7 @@ class LiveRuntime:
         if feed is None:
             return
         tick = feed.latest(self.ex.futures_id)
-        if tick is not None and now - tick.ts <= WS_STALE_S:
+        if tick is not None and fresh(now - tick.ts, WS_STALE_S):
             if self.feed_alerted:
                 self.journal.add_event(now, "FEED_UP", {"down_s": now - (self.feed_down_since or now)})
                 self.alert("FEED", "[가격 피드 복구] 웹소켓 선물 가격 수신 재개")
@@ -1503,7 +1695,16 @@ class LiveRuntime:
                     lines.append(f"오버나이트 증거금 {margin_ratio(pos.contracts, price, pos.side, self.product, equity):.0%}")
         except ExchangeError:
             lines.append("잔고를 읽지 못함")
+        feed, marks = self.d.feed, self.feed_marks
+        if feed is not None:  # the feed's sequence gaps since the last summary (a SHADOW week-1 check: Task 16)
+            now_marks = (int(feed.gaps), int(feed.connects), self.resync_polls)
+            gaps, connects, resyncs = (a - b for a, b in zip(now_marks, marks))
+            self.journal.add_event(now, "WEBSOCKET_STATS", {"gaps": gaps, "connects": connects, "resync_polls": resyncs})
+            lines.append(f"가격 피드 (지난 요약 이후): 순서 끊김 {gaps}건 · 재연결 {connects}회 · 그 때문에 다시 읽은 조회 "
+                         f"{resyncs}회")
+            marks = now_marks
         self.alert("DAILY", "\n".join(lines))
+        self.feed_marks = marks
         for name, day in sorted(self.d.expiry.items()):
             try:
                 left = (datetime.fromisoformat(str(day)).date() - local).days
@@ -1538,7 +1739,12 @@ class LiveRuntime:
             reply = "일시 정지: 신규 진입 중단 (보호 주문과 청산은 계속)"
         elif cmd == "/resume":
             resume(self.journal, now)
-            reply = "재개: 다음 신호부터 진입"
+            _, cap = self._limits(now)
+            if cap == 0 and self.stage != "SHADOW":  # a demotion to SHADOW: this process opens nothing real
+                reply = ("재개: 단, 단계가 SHADOW로 바뀌어 실계좌 신규 진입은 없음 (남은 포지션·주문을 관리하고 정리되면 "
+                         "SHADOW로 다시 시작)")
+            else:
+                reply = "재개: 다음 신호부터 진입"
             if self.journal.get(FLATTEN_KEY) is not None:
                 reply += " · 대기 중인 전량 청산은 계속 (포지션이 없어질 때까지)"
             try:  # only a breaker that tripped is re-based at the current equity
@@ -1588,11 +1794,16 @@ class LiveRuntime:
 
     def tick(self) -> None:
         now, mono = self.clock(), self.mono()
+        if self.d.feed is not None and self.d.feed.take_resync():  # a reconnect or a sequence gap: read everything
+            self.resync_wanted = True
+        regular = self._due(self.last_poll, POLL_ACTIVE_S if self.active else POLL_IDLE_S, mono)
+        resync = self.resync_wanted and self._due(self.last_poll, POLL_ACTIVE_S, mono)  # at most once per 10 s
+        if resync and not regular:
+            self.resync_polls += 1
         sections: list[tuple[str, Callable[[float], None], bool]] = [
             ("commands", self._commands, self.d.commands is not None),
             ("watch", self.watch, self.active),
-            ("poll", self.poll, self._due(self.last_poll, POLL_ACTIVE_S if self.active else POLL_IDLE_S, mono)
-             or (self.d.feed is not None and self.d.feed.take_resync())),
+            ("poll", self.poll, regular or resync),
             ("audit", self._audit_poll, self.audit_job is not None),
             ("minute", self.minute, self._due(self.last_minute, 60.0, mono)),
             ("cycle", self._cycle_due, True),

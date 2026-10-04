@@ -1269,7 +1269,8 @@ def test_a_restart_retries_the_target_of_an_hour_already_decided(tmp_path):
     hs.fetch.fail = 2  # the start's download and the target's refresh fail
     hs.rt = hs.make_runtime()
     hs.rt.startup()
-    assert hs.rt.target is None and hs.rt.next_try == ENTRY_BAR + 1815  # retried, not given up for the hour
+    # retried, not given up for the hour; meanwhile the hour's decision stored before the restart stands
+    assert hs.rt.target is not None and hs.rt.target.bar_ts == SIGNAL and hs.rt.next_try == ENTRY_BAR + 1815
     hs.at(ENTRY_BAR + 1815)
     assert hs.rt.target is not None and hs.rt.done_bar == SIGNAL
     assert [(c["bar_ts"], c["status"], c["finished_ts"]) for c in hs.journal.cycles()] == decided  # its row untouched
@@ -1812,4 +1813,299 @@ def test_a_stop_request_waits_while_the_open_trade_has_no_resting_stop(tmp_path,
         assert not hs.ex.open_orders() and stopped["unprotected"] is True
         assert STOP_GRACE_S - 1 <= stopped["ticks"] <= STOP_GRACE_S + 1
         assert "경고" in [t for k, t in hs.alerts.items if k == "STOPPED"][-1]
+    hs.journal.close()
+
+
+# ----------------------------------------------------------------------------- final review fix round
+
+
+def covered(hs: Harness) -> bool:
+    """The venue's position is covered by resting stops of ours."""
+    pos = hs.ex.position()
+    return pos is not None and sum(o.size - o.filled for o in hs.ex.open_orders() if o.stop_price) >= pos.contracts
+
+
+def crashed_after_entry(tmp_path) -> Harness:
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.ex.crash_after_accept("place_market")  # filled, then the process dies before the journal hears back
+    with pytest.raises(SimCrash):
+        hs.at(ENTRY_BAR + 30)
+    hs.journal.close()
+    hs.journal = Journal(tmp_path / "journal.sqlite")
+    return hs
+
+
+def test_a_restart_without_a_target_protects_our_unsettled_entry_at_once(tmp_path):
+    """Final review A-A (probe pA): killed right after the venue took our entry, restarted in the same hour while the
+    lookups fail and no candles can be had (no target all hour). The start's own pass takes the position over from the
+    entry's intent (provisional, its levels) - it was left unprotected for the hour - and still alerts it."""
+    hs = crashed_after_entry(tmp_path)
+    hs.clock.now = ENTRY_BAR + 70
+
+    def down(cid, since):
+        hs.ex.calls.append("find_order")
+        raise Unavailable("503")
+
+    hs.ex.find_order = down
+    hs.fetch.fail = 10_000
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    assert hs.rt.target is None and covered(hs) and hs.rt.active
+    assert hs.journal.events(kind="ADOPTED_PROVISIONAL")[0]["data"]["why"] == "LOOKUP_FAILED"
+    assert "UNKNOWN_POSITION" in hs.alerts.kinds()  # still alerted (and an incident) as an unknown position
+    tr = hs.rt.executor.trade()
+    assert (tr.trade_id, tr.stop_price) == (SIGNAL, hs.journal.intent(f"ewb-e-{SIGNAL}-L")["payload"]["stop"])
+    hs.journal.close()
+
+
+def test_the_start_protects_before_it_downloads_the_candles(tmp_path):
+    """Final review B minor 5: the start's recovery and first pass run before the candle download (minutes with an
+    empty cache), so a crash right after a fill is protected at once, not after the download."""
+    hs = crashed_after_entry(tmp_path)
+    hs.clock.now = ENTRY_BAR + 70
+    seen: list[bool] = []
+    fetch = hs.fetch
+
+    def recording(cache_dir):
+        seen.append(covered(hs))
+        return fetch(cache_dir)
+
+    hs.rt = hs.make_runtime(fetch=recording)
+    hs.rt.startup()
+    assert seen and seen[0] is True and covered(hs)
+    hs.journal.close()
+
+
+def test_an_accepted_entry_whose_fill_is_unread_keeps_the_fast_polls(h):
+    """Final review A-B (probe pB): the entry is accepted and fills, its fill read fails through the 10 s wait
+    (ENTRY_UNCONFIRMED): nothing is OPEN or PENDING, yet the runtime keeps polling every 10 s - covered at the next
+    poll, not a minute later (PROTECT_SLOW)."""
+    real = h.ex.get_order
+
+    def degraded(oid):
+        if h.clock() < ENTRY_BAR + 45:
+            h.ex.calls.append("get_order")
+            raise Unavailable("503")
+        return real(oid)
+
+    h.ex.get_order = degraded
+    h.at(ENTRY_BAR + 30)
+    assert h.journal.events(kind="ENTRY_UNCONFIRMED") and h.rt.executor.trade() is None and h.rt.active
+    t = int(h.clock()) + 1
+    while not covered(h) and t < ENTRY_BAR + 120:
+        h.at(t)
+        t += 1
+    assert covered(h) and h.clock() <= ENTRY_BAR + 51
+    assert not [e for e in h.journal.events(kind="INCIDENT") if e["data"]["kind"] == "PROTECT_SLOW"]
+
+
+class RefusesCloseBesideBrackets(SimExchange):
+    """close_position refused while a bracket of ours rests, with a code CLOSE_CONFLICTS does not know."""
+
+    def close_position(self, client_order_id, size=None):
+        if any(o.kind == "BRACKET" and o.status == "OPEN" for o in self.orders.values()):
+            self.calls.append("close_position")
+            return PlaceResult(client_order_id, None, False, "INVALID_CLOSE_POSITION_REQUEST: brackets rest")
+        return super().close_position(client_order_id, size)
+
+
+def test_a_gapped_stops_close_refused_with_an_unknown_code_still_goes_out(tmp_path):
+    """Final review A-C (probe pC): a gapped stop's watchdog close refused with an unknown code was retried every 10 s
+    forever (the triggered stop's limit never fills). The watchdog's close takes any refusal for a conflict: the
+    brackets are cancelled and the close goes out."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.ex = RefusesCloseBesideBrackets(clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    t = hs.rt.executor.trade()
+    for k in range(6):  # a tick every 10 s at a price 7% below the stop: past its 5% limit
+        hs.price(t.stop_price * 0.93)
+        hs.at(ENTRY_BAR + 60 + 10 * k)
+    assert hs.ex.position() is None and hs.journal.events(kind="CLOSE_CONFLICT")
+    assert hs.rt.executor.trade().exit_reason == "STOP_GAP"
+    hs.journal.close()
+
+
+def test_the_extra_refusal_codes_reach_the_executor(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    rt = hs.make_runtime(close_conflicts=("BRACKETS_REST",), overlap_refusals=("TOO_MANY_BRACKETS",))
+    assert {"BRACKETS_REST", "OPEN_BRACKET_ORDERS"} <= rt.executor.close_conflicts
+    assert {"TOO_MANY_BRACKETS", "INSUFFICIENT_POSITION_SIZE"} <= rt.executor.overlap_refusals
+    hs.journal.close()
+
+
+class Blind(SimExchange):
+    """The position read says flat (a reply of another shape) while `blind` is set."""
+
+    blind = False
+
+    def position(self):
+        p = super().position()
+        return None if self.blind else p
+
+
+def test_a_flat_read_its_resting_legs_contradict_keeps_the_trade_and_its_brackets(tmp_path):
+    """Final review A-D (probe pD): one flat read while the trade's legs all still rest whole closed the trade's record,
+    cancelled its brackets and freed the next entry to stack on the real position. The trade stays OPEN with its
+    brackets until a second read agrees; a standing flatten is not marked done by it either."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.ex = Blind(clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    hs.rt._request_flatten("USER_FLATTEN", "USER", ENTRY_BAR + 40)  # a flatten stands when the wrong read comes
+    hs.ex.blind = True
+    hs.at(ENTRY_BAR + 45)
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="FLAT_UNCONFIRMED")
+    assert [o.size for o in hs.ex.open_orders()] == [1] and hs.ex.pos is not None  # the bracket still rests
+    assert hs.journal.get(runtime_mod.FLATTEN_KEY) is not None and not hs.journal.events(kind="FLATTENED")
+    hs.ex.blind = False
+    hs.at(ENTRY_BAR + 60)  # the position reads again: the flatten closes it
+    assert hs.ex.position() is None and hs.journal.get(runtime_mod.FLATTEN_KEY) is None
+    assert hs.journal.events(kind="FLATTENED")[-1]["data"]["closed"] is True
+    hs.journal.close()
+
+
+def test_a_basis_outside_its_band_holds_entries_and_stop_moves_and_is_alerted(tmp_path):
+    """Final review A minor 3: futures and spot mids more than 2% apart are no basis: no level is mapped and no entry
+    sized with it (the entry is skipped, the stop in force stays), alerted with limited repeats."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, ratio=1.03)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    for k in range(5):
+        hs.at(ENTRY_BAR + 30 + 10 * k)
+    assert hs.ex.position() is None and "호가" in hs.journal.events(kind="SKIP")[0]["data"]["reason"]
+    band = [t for k, t in hs.alerts.items if k == "BASIS"]
+    assert len(band) == 1 and "2%" in band[0] and hs.journal.events(kind="BASIS_BAND")
+    hs.journal.close()
+
+
+def test_an_entry_is_never_sized_without_a_margin_rate(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.rt.product = dataclasses.replace(hs.rt.product, overnight_margin=(0.0, 0.0))
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position() is None and "증거금률" in hs.journal.events(kind="SKIP")[0]["data"]["reason"]
+    hs.journal.close()
+
+
+def test_a_rebase_request_rebases_both_breakers_at_the_next_minute(h):
+    """Final review B-2: `ewbot live rebase --confirm` journals a request; the runtime - the breakers' one writer - applies
+    it at its next minute with that minute's balance read (the first of three basing reads), journaled and alerted
+    with before and after; refused while a flatten stands."""
+    entered(h)
+    h.at(ENTRY_BAR + 100)
+    h.ex.cash -= 1_000.0  # a withdrawal of 10%: two reads would trip both breakers
+    h.journal.put(runtime_mod.REBASE_KEY, {"ts": ENTRY_BAR + 120})
+    h.at(ENTRY_BAR + 160)
+    assert h.journal.get(runtime_mod.REBASE_KEY) is None
+    rebased = h.journal.events(kind="REBASED")[0]["data"]
+    assert rebased["after"]["day_ref"] == h.ex.balance().equity and rebased["before"]["day_ref"] > rebased["after"]["day_ref"]
+    assert [t for k, t in h.alerts.items if k == "REBASE"][0].startswith("[손실 한도 기준 재설정]")
+    for k in range(2, 6):
+        h.at(ENTRY_BAR + 100 + 60 * k)
+    assert "BREAKER" not in h.alerts.kinds() and h.ex.position() is not None
+    h.rt._request_flatten("USER_FLATTEN", "USER", ENTRY_BAR + 500)
+    h.journal.put(runtime_mod.REBASE_KEY, {"ts": ENTRY_BAR + 500})
+    h.rt.minute(ENTRY_BAR + 520)
+    assert h.journal.events(kind="REBASE_REFUSED") and h.journal.get(runtime_mod.REBASE_KEY) is None
+
+
+class GappyFeed:
+    """A feed that asks for a resync at every tick (a gap a second) and counts its gaps."""
+
+    def __init__(self) -> None:
+        self.gaps = self.connects = self.failures = 0
+        self.last_error = None
+
+    def take_resync(self) -> bool:
+        self.gaps += 3
+        return True
+
+    def latest(self, product_id):
+        return None
+
+
+def test_resync_polls_are_paced_and_the_feed_gaps_reach_the_daily_summary(tmp_path):
+    """Final review B-3: a sequence gap asks for a REST poll; however often it asks, a resync poll runs at most once
+    per POLL_ACTIVE_S (it forced one every second), and the daily summary shows the gap count."""
+    hs = Harness(tmp_path, ENTRY_BAR + 1000)
+    feed = GappyFeed()
+    hs.rt = hs.make_runtime(feed=feed)
+    hs.price(26_700.0)
+    hs.rt.startup()
+    polls = 0
+    real = hs.rt.poll
+
+    def counting(now):
+        nonlocal polls
+        polls += 1
+        real(now)
+
+    hs.rt.poll = counting
+    for k in range(1, 61):
+        hs.at(ENTRY_BAR + 1000 + k)
+    assert 5 <= polls <= 7  # about every 10 s, not every second
+    hs.rt.daily(ENTRY_BAR + 1100)
+    daily = [t for k, t in hs.alerts.items if k == "DAILY"][-1]
+    assert "순서 끊김" in daily and hs.journal.events(kind="WEBSOCKET_STATS")[-1]["data"]["gaps"] > 0
+    hs.journal.close()
+
+
+def test_each_late_step_of_the_minute_is_guarded(h):
+    """Final review B minor 9: one step of the minute that keeps failing (here the feed check) never skips the daily
+    summary, the audit or the stage-change exit after it."""
+    def broken(now):
+        raise RuntimeError("feed state unreadable")
+
+    h.rt._feed_health = broken
+    h.journal.set_stage("SHADOW", "demotion", ENTRY_BAR + 40)
+    h.rt.minute(ENTRY_BAR + 100)
+    assert h.journal.events(kind="LOOP_ERROR")[-1]["data"]["section"] == "feed"
+    assert h.journal.get("once:daily") is not None and h.rt.exit_code == 0
+
+
+def test_alert_wording_matches_what_happened(h):
+    """Final review B minor 11: /resume says entries stay blocked under a SHADOW demotion; an unresolved order failure
+    names what it does in this stage; three bad balance reads are not called a major incident."""
+    entered(h)
+    h.journal.set_stage("SHADOW", "demotion", ENTRY_BAR + 40)
+    reply = h.rt.handle("/resume", ENTRY_BAR + 50)
+    assert "SHADOW" in reply and "다음 신호부터 진입" not in reply
+    h.journal.set_stage("FULL", "test", ENTRY_BAR + 60)
+    assert "3계약 상한" in h.rt._unresolved_note() and "CANARY 기준 ② 실패" not in h.rt._unresolved_note()
+    h.journal.set_stage("CANARY", "test", ENTRY_BAR + 70)
+    assert "CANARY 기준 ② 실패" in h.rt._unresolved_note()
+    h.ex.balance = lambda: Balance(math.nan, None)
+    for k in range(3):
+        h.rt.minute(ENTRY_BAR + 100 + 60 * k)
+    texts = [t for k, t in h.alerts.items if k == "INCIDENT"]
+    assert texts and not texts[-1].startswith("[중대 사건]")
+
+
+def test_an_unreadable_account_without_exposure_is_alerted_after_fifteen_minutes(tmp_path):
+    """Final review B-1: with nothing to manage, a Coinbase account that cannot be read is alerted after about 15
+    minutes (3 with a trade, an order of unknown outcome or a flatten: test_chaos), and again when it reads."""
+    hs = Harness(tmp_path, ENTRY_BAR + 1000)
+    hs.price(26_700.0)
+    hs.rt.startup()
+    for m in ("position", "open_orders", "balance", "session"):
+        hs.ex.fail_next(m, ExchangeError("HTTP 401: Unauthorized"), times=10_000)
+    t0 = ENTRY_BAR + 1000
+    for k in range(1, 18):
+        hs.at(t0 + 60 * k)
+        if k < 14:
+            assert "ACCOUNT" not in hs.alerts.kinds()
+    first = [t for k, t in hs.alerts.items if k == "ACCOUNT"]
+    assert len(first) == 1 and first[0].startswith("[계좌 조회 불가]") and "HTTP 401" in first[0]
+    hs.ex.clear_faults()
+    hs.at(t0 + 60 * 19)
+    assert [t for k, t in hs.alerts.items if k == "ACCOUNT"][-1].startswith("[계좌 조회 복구]")
+    assert hs.journal.events(kind="ACCOUNT_READABLE")
     hs.journal.close()

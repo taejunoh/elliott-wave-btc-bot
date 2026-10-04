@@ -10,12 +10,14 @@ told apart by the leg their client order id names (`ewb-b-<trade>-<leg>-<generat
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 import ewbot.engine.loop as loop_mod
-from ewbot.live.exchange import PlaceResult, RateLimited, Unavailable
+from ewbot.live.exchange import ExchangeError, PlaceResult, RateLimited, Unavailable
 from ewbot.live.feed import TickerFeed
+from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
 from ewbot.live.sim import SimCrash
 from ewbot.live.stage import paused
@@ -163,8 +165,10 @@ def test_websocket_drop_falls_back_to_rest_polling_and_a_gap_forces_a_resync(tmp
     polls = len([c for c in h.ex.calls if c == "position"])
     feed.on_message(ticker(h.ex.futures_id, 26_750.0, 2))
     feed.on_message(ticker(h.ex.futures_id, 26_750.0, 9))  # 3..8 lost
-    h.at(ENTRY_BAR + 96)  # a resync request polls at once, before the 10 s poll interval
-    assert len([c for c in h.ex.calls if c == "position"]) > polls and feed.gaps == 1
+    h.at(ENTRY_BAR + 96)  # a resync request polls - but at most once per 10 s: the last poll ran at +95
+    assert len([c for c in h.ex.calls if c == "position"]) == polls and feed.gaps == 1 and h.rt.resync_wanted
+    h.at(ENTRY_BAR + 105)
+    assert len([c for c in h.ex.calls if c == "position"]) > polls and not h.rt.resync_wanted
 
 
 def test_rate_limits_and_outages_never_stop_the_loop(tmp_path):
@@ -427,3 +431,47 @@ def test_a_stop_crossed_during_the_cfm_halt_closes_at_the_reopen(tmp_path):
     h.at(HALT + 3600 + 30)  # minute (OPEN, nothing to close yet), then the halt bar's cycle
     assert h.rt.target.stop_pending_reopen and h.ex.position() is None
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_HALT"
+
+
+class Pings:
+    """healthchecks.io: GET pings and POSTed /fails, recorded."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bytes | None]] = []
+
+    def get(self, url, timeout=None):
+        self.calls.append(("GET", url, None))
+        return SimpleNamespace(status_code=200)
+
+    def post(self, url, data=None, timeout=None):
+        self.calls.append(("POST", url, data))
+        return SimpleNamespace(status_code=200)
+
+
+def test_an_account_that_stays_unreadable_with_an_open_trade_is_alerted_and_failed_out_of_band(tmp_path):
+    """Final review B-1 (probe probe_unreadable): every authenticated read fails (a revoked key, a changed VPS
+    address, an outage) while a CANARY trade is open - the brackets rest, but no stop move, close or gap watch
+    can happen. It used to reach the user only through the next day's summary. Now: alerted within about 3
+    minutes, repeats limited, healthchecks.io gets a /fail after 30 minutes, and the recovery is alerted."""
+    h = started(tmp_path)
+    pings = Pings()
+    h.rt = h.make_runtime(heartbeat=Heartbeat("https://hc-ping.com/check", session=pings, clock=h.clock))
+    h.rt.startup()
+    h.at(ENTRY_BAR + 30)
+    assert h.rt.executor.trade() is not None
+    t0 = ENTRY_BAR + 40
+    for m in ("position", "open_orders", "balance", "session", "quote", "get_order", "find_order", "key_permissions"):
+        h.ex.fail_next(m, ExchangeError("HTTP 401: Unauthorized"), times=100_000)
+    for k in range(1, 6 * 40):  # 40 minutes, a tick every 10 s
+        h.at(t0 + 10 * k)
+    seen = [(e["ts"], e["data"]) for e in h.journal.events(kind="ACCOUNT_UNREADABLE")]
+    texts = [t for kind, t in h.alerts.items if kind == "ACCOUNT"]
+    assert 180 <= seen[0][0] - t0 <= 250 and seen[0][1]["busy"] and len(texts) <= 6
+    assert texts[0].startswith("[계좌 조회 불가]") and "HTTP 401" in texts[0] and "손절 이동" in texts[0]
+    fails = [c for c in pings.calls if c[0] == "POST"]
+    assert len(fails) == 1 and "Coinbase 계정 조회 불가" in fails[0][2].decode()
+    assert h.journal.events(kind="ACCOUNT_UNREADABLE_FAIL")[0]["ts"] - t0 >= 1800
+    h.ex.clear_faults()
+    h.at(t0 + 2_460)
+    assert [t for kind, t in h.alerts.items if kind == "ACCOUNT"][-1].startswith("[계좌 조회 복구]")
+    assert h.journal.events(kind="ACCOUNT_READABLE") and h.ex.position() is not None
