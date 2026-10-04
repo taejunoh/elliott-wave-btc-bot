@@ -6,9 +6,13 @@ tests replace `real_exchange`, `price_feed` and `paper_status` (no network).
 
 Real exposure is never hidden behind the virtual book: `process_stage` keeps a process on the real account in the
 last real stage while a demoted journal still holds something real (an open trade or an order of unknown outcome
-of ours) or the real account shows a position or our orders, and `stage_exchange` wraps the exchange in
-ShadowExchange only for SHADOW. `StopRequest` turns SIGTERM (`docker stop`) and SIGINT into a graceful stop;
-`fatal_backoff` keeps a crash loop's restarts and alerts sparse."""
+of ours) or the real account shows orders of ours, and `stage_exchange` wraps the exchange in ShadowExchange only
+for SHADOW; a position the bot has nothing of (no order of ours, nothing in the journal) - the user's own - is
+never traded at start: the start is refused (RealExposure), as is a journal never CANARY or FULL beside an
+account that cannot be read (AccountUnreadable). `StopRequest` turns SIGTERM (`docker stop`) and SIGINT into a
+graceful stop; `fatal_backoff` keeps a crash loop's restarts and alerts sparse - and short while the journal
+shows something real to manage; a start refused for a Coinbase outage is tried again soon (OUTAGE_WAIT_S), its
+alert sent once an hour (`outage_alert`)."""
 
 from __future__ import annotations
 
@@ -36,7 +40,7 @@ from ewbot.live.journal import Journal
 from ewbot.live.notify import LiveNotifier
 from ewbot.live.preflight import EXPIRY_MARGIN_DAYS, PRODUCT_EXPIRY
 from ewbot.live.reconcile import is_ours
-from ewbot.live.runtime import LiveDeps, LiveRuntime
+from ewbot.live.runtime import FLATTEN_KEY, LiveDeps, LiveRuntime
 from ewbot.live.settings import LiveSettings, SettingsError
 from ewbot.live.shadow import ShadowExchange
 from ewbot.paper.criteria import golive_status
@@ -50,11 +54,22 @@ FATAL_REPEAT_S = 900.0  # a fatal exit within this of the previous one waits bef
 FATAL_WAIT_S = 60.0  # ... first this long, doubling with every repeat ...
 FATAL_WAIT_MAX_S = 1800.0  # ... up to this
 FATAL_ALERT_S = 3600.0  # one [중단] alert and healthchecks.io /fail per error type in this time, across restarts
+FATAL_EXPOSED_WAIT_S = 120.0  # ... but never longer than this while the journal shows something real to manage
+OUTAGE_KEY = "outage_refusal"  # journal: when a start refused for a Coinbase outage was last alerted
+OUTAGE_WAIT_S = 60.0  # a start refused because Coinbase could not be read is tried again after this (not 10 minutes)
+OUTAGE_ALERT_S = 3600.0  # ... and its [시작 거부] alert goes out at most once in this time, across restarts
 
 
 class RealExposure(RuntimeError):
-    """The real account holds a position or orders of ours, but the journal was never CANARY or FULL (lost or
-    replaced): the start is refused rather than run SHADOW beside them."""
+    """The start is refused rather than run SHADOW beside something real or trade what is not the bot's: the real account
+    holds orders of ours while the journal was never CANARY or FULL (lost or replaced), or a position the bot has nothing
+    of - no order of ours on the account, nothing real in the journal: the user's own (runbook: never hold a manual
+    position in this account)."""
+
+
+class AccountUnreadable(RealExposure):
+    """A journal never CANARY or FULL and a real account that cannot be read at start: a position of ours may be
+    there, so the start is refused - an outage, tried again soon (OUTAGE_WAIT_S)."""
 
 
 def real_exchange(s: LiveSettings) -> Exchange:
@@ -97,42 +112,53 @@ def journal_exposure(journal: Journal) -> str | None:
     return None
 
 
-def account_exposure(real: Exchange) -> str | None:
-    """A position or orders of ours on the real account (None: neither); raises ExchangeError when unreadable."""
+def account_exposure(real: Exchange) -> tuple[str | None, bool]:
+    """(what the real account holds - a position, orders of ours - or None for neither, whether an order of ours rests);
+    raises ExchangeError when unreadable."""
     pos = real.position()
     ours = [o for o in real.open_orders() if is_ours(o)]
     if pos is None and not ours:
-        return None
+        return None, False
     held = [] if pos is None else [f"포지션 {'롱' if pos.side > 0 else '숏'} {pos.contracts}계약"]
-    return "실계좌에 " + ", ".join(held + ([f"봇 주문 {len(ours)}건"] if ours else []))
+    return "실계좌에 " + ", ".join(held + ([f"봇 주문 {len(ours)}건"] if ours else [])), bool(ours)
 
 
-def process_stage(journal: Journal, real: Exchange) -> tuple[str, str | None]:
+def process_stage(journal: Journal, real: Exchange | None) -> tuple[str, str | None]:
     """The stage this process runs, and why when it is not the journal's. CANARY and FULL run as recorded. Any other
     stage - SHADOW - runs on the virtual book only when nothing real is left: after a demotion, the journal's open
-    trade or orders of unknown outcome that are real (`journal_exposure`) or a position or orders of ours on the real
-    account (read here; unreadable counts as there) keep the process on the real account in the last real stage of the
-    stage history - entries stay blocked by the journal's SHADOW cap - until it is flat and restarts. A journal never
-    CANARY or FULL holds nothing real; a position or our orders on the real account then refuse the start
-    (RealExposure), an unreadable account does not."""
+    trade or orders of unknown outcome that are real (`journal_exposure`), or orders of ours on the real account (read
+    here; unreadable counts as there), keep the process on the real account in the last real stage of the stage
+    history - entries stay blocked by the journal's SHADOW cap - until it is flat and restarts. The account counts as
+    the bot's only through orders of ours or the journal: a position with neither - the user's own - refuses the start
+    (RealExposure), never traded nor run beside. A journal never CANARY or FULL holds nothing real: orders of ours on
+    the real account (a lost or replaced journal) refuse the start too, and so does an account that cannot be read
+    (AccountUnreadable: nothing proves it flat). `real=None` (an offline preflight): the journal alone."""
     stage, _ = journal.stage()
     if stage in REAL_STAGES:
         return stage, None
     last = last_real_stage(journal)
-    why = journal_exposure(journal) if last is not None else None
-    if why is None:
-        try:
-            why = account_exposure(real)
-        except ExchangeError as exc:
-            if last is None:
-                return stage, None
-            why = f"실계좌를 읽지 못함 ({type(exc).__name__}: {exc})"
-    if why is None:
+    held = journal_exposure(journal) if last is not None else None
+    if held is not None and last is not None:
+        return last, held
+    if real is None:
         return stage, None
+    try:
+        what, ours = account_exposure(real)
+    except ExchangeError as exc:
+        why = f"실계좌를 읽지 못함 ({type(exc).__name__}: {exc})"
+        if last is None:
+            raise AccountUnreadable(f"{why} - 저널에 CANARY/FULL 기록이 없어 실계좌에 봇의 포지션·주문이 없음을 확인해야 "
+                                    f"{stage}로 시작함 (곧 다시 시도)") from None
+        return last, why
+    if what is None:
+        return stage, None
+    if not ours:
+        raise RealExposure(f"{what} - 봇 주문도 저널 기록도 없는 포지션 (사용자의 수동 포지션): 거래하지도, 옆에서 "
+                           f"{stage}로 시작하지도 않음 - Coinbase 앱에서 정리 (이 계좌에서는 수동 거래 금지)")
     if last is None:
-        raise RealExposure(f"{why} - 저널에 CANARY/FULL 기록이 없어 {stage}로 시작하지 않음 (저널을 복구하거나 "
+        raise RealExposure(f"{what} - 저널에 CANARY/FULL 기록이 없어 {stage}로 시작하지 않음 (저널을 복구하거나 "
                            "Coinbase에서 직접 정리)")
-    return last, why
+    return last, what
 
 
 def stage_exchange(real: Exchange, journal: Journal, stage: str, notify: Callable[[str, str], Any]) -> Exchange:
@@ -182,24 +208,46 @@ def fatal_report(exc: BaseException, s: LiveSettings) -> str:
 
 def fatal_backoff(journal: Journal | None, kind: str, now: float) -> tuple[float, bool]:
     """(how long a fatal exit waits before exiting, whether to alert it). A fatal within FATAL_REPEAT_S of the previous
-    one waits FATAL_WAIT_S, doubling with every repeat up to FATAL_WAIT_MAX_S (Docker's restarts stay sparse); the
-    [중단] alert and the /fail go out once per error type per FATAL_ALERT_S, across restarts (the journal keeps the
-    record). Without a usable journal: the longest wait, alerted."""
+    one's exit - its time plus its wait: a long wait never resets the streak - waits FATAL_WAIT_S, doubling with every
+    repeat up to FATAL_WAIT_MAX_S (Docker's restarts stay sparse), but at most FATAL_EXPOSED_WAIT_S while the journal
+    shows something real to manage (a real open trade or order of unknown outcome, a standing flatten: the brackets
+    protect meanwhile, nothing else does); the [중단] alert and the /fail go out once per error type per FATAL_ALERT_S,
+    across restarts (the journal keeps the record). Without a usable journal: the longest wait, alerted."""
     try:
         if journal is None:
             raise RuntimeError("no journal")
         st = journal.get(FATAL_KEY) or {}
         last = st.get("ts")
-        repeat = last is not None and 0 <= now - float(last) < FATAL_REPEAT_S
+        repeat = last is not None and 0 <= now - (float(last) + float(st.get("wait", 0.0))) < FATAL_REPEAT_S
         streak = int(st.get("streak", 0)) + 1 if repeat else 1
+        wait = 0.0 if streak == 1 else min(FATAL_WAIT_S * 2 ** (streak - 2), FATAL_WAIT_MAX_S)
+        if wait > FATAL_EXPOSED_WAIT_S and (journal_exposure(journal) is not None
+                                            or journal.get(FLATTEN_KEY) is not None):
+            wait = FATAL_EXPOSED_WAIT_S
         alerted = {k: float(v) for k, v in (st.get("alerted") or {}).items() if 0 <= now - float(v) < FATAL_ALERT_S}
         alert = kind not in alerted
         if alert:
             alerted[kind] = now
-        journal.put(FATAL_KEY, {"ts": now, "type": kind, "streak": streak, "alerted": alerted})
+        journal.put(FATAL_KEY, {"ts": now, "type": kind, "streak": streak, "wait": wait, "alerted": alerted})
     except Exception:  # noqa: BLE001 - the journal itself may be what failed
         return FATAL_WAIT_MAX_S, True
-    return (0.0 if streak == 1 else min(FATAL_WAIT_S * 2 ** (streak - 2), FATAL_WAIT_MAX_S)), alert
+    return wait, alert
+
+
+def outage_alert(journal: Journal | None, now: float) -> bool:
+    """Whether a start refused for a Coinbase outage (`retry` preflight checks, StartupRefused, AccountUnreadable) is
+    alerted now: once per OUTAGE_ALERT_S across restarts (the journal keeps the time) - such a start is tried again every
+    OUTAGE_WAIT_S. Without a usable journal: alerted."""
+    try:
+        if journal is None:
+            return True
+        last = journal.get(OUTAGE_KEY)
+        if last is not None and 0 <= now - float(last) < OUTAGE_ALERT_S:
+            return False
+        journal.put(OUTAGE_KEY, now)
+    except Exception:  # noqa: BLE001 - never at the cost of the refusal itself
+        return True
+    return True
 
 
 def paper_fetcher(s: LiveSettings) -> Callable[[], dict[str, Any]] | None:

@@ -14,7 +14,7 @@ from ewbot import cli
 from ewbot.cli import build_parser, main
 from ewbot.live import app as live_app
 from ewbot.live.audit import AuditResult
-from ewbot.live.exchange import ExchangeError, KeyPermissions
+from ewbot.live.exchange import ExchangeError, KeyPermissions, Unavailable
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
 from ewbot.live.notify import LiveNotifier
@@ -162,18 +162,19 @@ def test_run_refuses_without_a_key_file_or_a_passing_preflight(live_env, monkeyp
     out = capsys.readouterr().out
     assert "preflight alerts: FAILED - CANARY needs TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EWBOT_HEALTHCHECK_URL" in out
     # Coinbase unreadable at start after a passing preflight: the reads are retried, then the start is refused (exit 2,
-    # the refusal wait) - never a fatal exit with a healthchecks.io /fail
+    # the short outage wait) - never a fatal exit with a healthchecks.io /fail
     jr = Journal(settings.journal_path)
     jr.set_stage("SHADOW", "test", NOW)
     jr.close()
     monkeypatch.setattr("ewbot.live.runtime.STARTUP_READ_MAX_S", 0.0)
+    monkeypatch.setattr(live_app, "OUTAGE_WAIT_S", 2.0)
 
     def down() -> None:
         raise ExchangeError("session: 503")
 
     ex.session = down
     waits.clear()
-    assert main(["live", "run"]) == 2 and "refusing: session 조회 실패" in capsys.readouterr().err and sum(waits) == 3.0
+    assert main(["live", "run"]) == 2 and "refusing: session 조회 실패" in capsys.readouterr().err and sum(waits) == 2.0
     del ex.session
     # settings refused (e.g. a secret in the environment): `live run` waits too, the other commands do not
     waits.clear()
@@ -209,7 +210,7 @@ def test_a_refused_start_stops_the_feed_and_flushes_before_its_wait(live_env, mo
 
     seen: list[bool] = []
     monkeypatch.setattr(live_app, "price_feed", lambda s: Feed())
-    monkeypatch.setattr(cli, "LIVE_REFUSAL_WAIT_S", 2.0)
+    monkeypatch.setattr(live_app, "OUTAGE_WAIT_S", 2.0)  # the start's reads failed: an outage
     monkeypatch.setattr("ewbot.cli.time.sleep", lambda s: seen.append(Feed.running))
     monkeypatch.setattr("ewbot.live.runtime.STARTUP_READ_MAX_S", 0.0)
 
@@ -596,3 +597,132 @@ def test_paper_status_fails_closed_on_any_error(monkeypatch, capsys):
     assert live_app.paper_status(s, NOW) is None
     err = capsys.readouterr().err
     assert "RuntimeError" in err and "ghp_SECRET" not in err
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# final fix
+
+
+def test_a_start_refused_for_a_coinbase_outage_starts_again_soon_and_alerts_once_an_hour(alerting, monkeypatch, capsys):
+    """Final fix (Task 12): Coinbase unreadable at start (the preflight's key or product read: 429, 5xx, timeout - or the
+    start's own reads) is an outage, not a configuration error: tried again after OUTAGE_WAIT_S, not 10 minutes, its
+    [시작 거부] alert sent once an hour across restarts. A configuration refusal keeps the long wait and its alert."""
+    s, sender, posts = alerting
+    ex = live_app.real_exchange(s)
+    waits: list[float] = []
+    monkeypatch.setattr("ewbot.cli.time.sleep", waits.append)
+    monkeypatch.setattr(cli, "LIVE_REFUSAL_WAIT_S", 9.0)
+    monkeypatch.setattr(live_app, "OUTAGE_WAIT_S", 3.0)
+    clock = [NOW]
+    monkeypatch.setattr("ewbot.cli.time.time", lambda: clock[0])
+    ex.fail_next("key_permissions", Unavailable("503"), times=2)  # the preflight's key read, at both starts
+    assert main(["live", "run"]) == 2 and sum(waits) == 3.0 and "preflight key: FAILED" in capsys.readouterr().out
+    clock[0] += 70
+    assert main(["live", "run"]) == 2 and sum(waits) == 6.0
+    refusals = [t for t in sender.texts if "[시작 거부]" in t]
+    assert len(refusals) == 1 and "3초마다 다시 시작" in refusals[0] and posts == []  # once; never a /fail
+    transfer = SimExchange(permissions=KeyPermissions(True, True, True))  # a configuration problem
+    monkeypatch.setattr(live_app, "real_exchange", lambda _s: transfer)
+    waits.clear()
+    assert main(["live", "run"]) == 2 and sum(waits) == 9.0
+    assert len([t for t in sender.texts if "[시작 거부]" in t]) == 2
+
+
+def test_the_account_is_the_bots_only_through_its_orders_or_the_journal(live_env, monkeypatch, capsys):
+    """Final fix (Task 13 N-1, N-2): a position with no order of ours and nothing real in the journal is the user's own
+    - the start is refused, never traded (a demoted journal ran it as CANARY and closed or adopted it) nor run beside;
+    with a bracket of ours resting it is the bot's (managed in the last real stage). A journal never CANARY or FULL
+    beside an account that cannot be read is refused (nothing proves it flat) - as an outage."""
+    settings, ex, _ = live_env
+    jr = Journal(settings.journal_path)
+    jr.set_stage("CANARY", "promotion", NOW - 7200)
+    jr.set_stage("SHADOW", "demotion", NOW - 3600)
+    ex.place_market("manual", -1, 2)  # the user's own short, after the demotion
+    with pytest.raises(live_app.RealExposure, match="수동 포지션") as err:
+        live_app.process_stage(jr, ex)
+    assert not isinstance(err.value, live_app.AccountUnreadable)
+    ex.place_bracket("ewb-b-7-tp1-3", 1, 2, 26_000.0, 27_500.0)  # a bracket of ours on it: the bot's
+    assert live_app.process_stage(jr, ex) == ("CANARY", "실계좌에 포지션 숏 2계약, 봇 주문 1건")
+    jr.close()
+    fresh = Journal(settings.journal_path.parent / "fresh.sqlite")
+
+    def down() -> None:
+        raise ExchangeError("positions: 503")
+
+    ex.position = down
+    with pytest.raises(live_app.AccountUnreadable, match="실계좌를 읽지 못함"):
+        live_app.process_stage(fresh, ex)  # never SHADOW beside what may be real
+    assert live_app.process_stage(fresh, None) == ("SHADOW", None)  # offline: the journal alone
+    fresh.close()
+    waits: list[float] = []
+    monkeypatch.setattr("ewbot.cli.time.sleep", waits.append)
+    monkeypatch.setattr(live_app, "OUTAGE_WAIT_S", 4.0)
+    settings.journal_path.unlink()  # a fresh journal on an account that cannot be read: refused as an outage
+    assert main(["live", "run"]) == 2 and sum(waits) == 4.0 and "실계좌를 읽지 못함" in capsys.readouterr().err
+
+
+def test_a_crash_loop_reaches_the_longest_wait_and_waits_short_while_something_real_is_open(tmp_path):
+    """Final fix (Task 13 N-3, N-4): the repeat is judged from the previous fatal's exit (its time plus its wait), so a
+    deterministic crash loop climbs to FATAL_WAIT_MAX_S instead of resetting once a wait passed 15 minutes; while the
+    journal shows something real to manage the wait stays at FATAL_EXPOSED_WAIT_S (the brackets protect meanwhile)."""
+    def loop(jr: Journal) -> list[float]:
+        now, out = NOW, []
+        for _ in range(9):
+            wait, _ = live_app.fatal_backoff(jr, "TypeError", now)
+            out.append(wait)
+            now += wait + 20.0  # Docker starts it again; it crashes 20 s later
+        return out
+
+    flat = Journal(tmp_path / "flat.sqlite")
+    assert loop(flat) == [0.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1800.0, 1800.0, 1800.0]
+    flat.close()
+    real = Journal(tmp_path / "real.sqlite")
+    real.put("trade", {"status": "OPEN", "trade_id": 7, "legs": [{"order_id": "9f1c-real"}]})
+    assert loop(real) == [0.0, 60.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0]
+    real.close()
+
+
+def test_live_preflight_checks_the_stage_the_run_would_run(live_env, monkeypatch, capsys):
+    """Final fix (Task 13 N-6): a demoted journal with something real left runs its last real stage (CANARY: the alerts
+    are required) - `live preflight` checks that stage, online and offline (the journal alone), and refuses like the run
+    when the account holds a position that is not the bot's."""
+    settings, ex, _ = live_env
+    jr = Journal(settings.journal_path)
+    jr.set_stage("CANARY", "promotion", NOW - 7200)
+    jr.set_stage("SHADOW", "demotion", NOW - 3600)
+    jr.put("trade", {"status": "OPEN", "trade_id": 7, "legs": [{"order_id": "9f1c-real"}]})
+    jr.close()
+    for argv in (["live", "preflight"], ["live", "preflight", "--offline"]):
+        assert main(argv) == 2
+        res = capsys.readouterr()
+        assert "stage CANARY: 저널의 거래 7가 실계좌에서 열려 있음" in res.err
+        assert "preflight alerts: FAILED - CANARY needs TELEGRAM_BOT_TOKEN" in res.out
+    jr = Journal(settings.journal_path)
+    jr.put("trade", None)
+    jr.close()
+    ex.place_market("manual", 1, 1)
+    assert main(["live", "preflight"]) == 2 and "수동 포지션" in capsys.readouterr().err
+    assert main(["live", "preflight", "--offline"]) == 0  # offline: the journal alone (SHADOW)
+
+
+def test_a_settings_refusal_waits_under_the_stop_handler(live_env, monkeypatch, capsys):
+    """Final fix (Task 13 N-7): the 10-minute wait of a settings refusal runs with the SIGTERM handler installed, so
+    `docker stop` ends it at once instead of after the stop grace period's SIGKILL."""
+    before = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(cli, "LIVE_REFUSAL_WAIT_S", 30.0)
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not before, "no SIGTERM handler during the refusal wait"
+        if len(slept) == 2:
+            handler(signal.SIGTERM, None)  # what `docker stop` delivers
+
+    monkeypatch.setattr("ewbot.cli.time.sleep", sleep)
+
+    def refused() -> LiveSettings:
+        raise SettingsError("TELEGRAM_BOT_TOKEN is set in the environment")
+
+    monkeypatch.setattr(cli, "_live_settings", refused)
+    assert main(["live", "run"]) == 2 and slept == [1.0, 1.0] and signal.getsignal(signal.SIGTERM) is before

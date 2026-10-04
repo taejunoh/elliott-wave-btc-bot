@@ -480,6 +480,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
 
 
 LIVE_REFUSAL_WAIT_S = 600.0  # a refused start waits before exiting: Docker restarts it, alerts stay sparse
+# (a start refused because Coinbase could not be read - an outage - waits live_app.OUTAGE_WAIT_S instead)
 ALERTS_GATE = "알림 설정 (Telegram 알림·명령, 헬스체크)"  # a promotion to CANARY or FULL needs them (preflight `alerts`)
 
 
@@ -513,9 +514,10 @@ def _exchange(s: LiveSettings) -> Exchange:
 def _live_run(s: LiveSettings) -> int:
     """`ewbot live run`: the preflight for the process's stage (`live_app.process_stage`: a demoted journal with
     something real left runs its last real stage), then the runtime until a stage change (exit 0, Docker starts it
-    again), a stop (SIGTERM / Ctrl-C: after the current tick, exit 0), a refusal (exit 2 after LIVE_REFUSAL_WAIT_S) or
-    a fatal error (exit 1, after a back-off when it repeats). The wiring is closed - the Telegram poller and the feed
-    stopped, the queued messages flushed - before any wait, and on every exit."""
+    again), a stop (SIGTERM / Ctrl-C: after the current tick, exit 0), a refusal (exit 2 after LIVE_REFUSAL_WAIT_S - or,
+    when only Coinbase could not be read, an outage, after live_app.OUTAGE_WAIT_S, alerted once an hour) or a fatal
+    error (exit 1, after a back-off when it repeats). The wiring is closed - the Telegram poller and the feed stopped,
+    the queued messages flushed - before any wait, and on every exit."""
     stop = live_app.StopRequest()
     notify = live_app.notifier(s)
     journal: Journal | None = None
@@ -533,11 +535,13 @@ def _live_run(s: LiveSettings) -> int:
             notify.flush(10.0)
             notify.stop()
 
-    def refuse(why: str) -> int:
+    def refuse(why: str, outage: bool = False) -> int:
         print(f"refusing: {why}", file=sys.stderr)
-        notify("PREFLIGHT", f"[시작 거부] {why}")
+        if not outage or live_app.outage_alert(journal, time.time()):
+            again = f" (Coinbase를 읽지 못함: {live_app.OUTAGE_WAIT_S:.0f}초마다 다시 시작, 알림은 1시간에 한 번)" if outage else ""
+            notify("PREFLIGHT", f"[시작 거부] {why}{again}")
         close()  # nothing keeps polling Telegram or the feed during the wait: a command sent now is answered later
-        stop.wait(LIVE_REFUSAL_WAIT_S)
+        stop.wait(live_app.OUTAGE_WAIT_S if outage else LIVE_REFUSAL_WAIT_S)
         return 2
 
     def fatal(exc: Exception) -> int:
@@ -563,18 +567,20 @@ def _live_run(s: LiveSettings) -> int:
             try:
                 stage, why = live_app.process_stage(journal, real)
             except live_app.RealExposure as exc:
-                return refuse(str(exc))
+                return refuse(str(exc), outage=isinstance(exc, live_app.AccountUnreadable))
             if why is not None:
                 print(f"stage {stage}: {why} (journal stage {journal.stage()[0]})", file=sys.stderr)
             path, sha, file_sha = _live_lock()
             checks, lock = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
             if not _print_checks(checks) or lock is None:
-                return refuse("시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in checks if not c.ok))
+                failed = [c for c in checks if not c.ok]
+                return refuse("시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in failed),
+                              outage=bool(failed) and all(c.retry for c in failed))
             wired = live_app.build(s, lock, real, journal, stage, notify)
             stop.attach(wired.runtime)
             return 0 if stop.requested else wired.runtime.run_forever()
-        except live_runtime.StartupRefused as exc:  # Coinbase unreadable for minutes at start: refused, no /fail
-            return refuse(str(exc))
+        except live_runtime.StartupRefused as exc:  # Coinbase unreadable for minutes at start: an outage, no /fail
+            return refuse(str(exc), outage=True)
         except KeyboardInterrupt:  # a deliberate stop where no handler could be installed
             return 0
         except Exception as exc:  # noqa: BLE001 - every other failure, the wiring's included, is fatal
@@ -586,11 +592,8 @@ def _live_run(s: LiveSettings) -> int:
 
 
 def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
-    stage = "SHADOW"
-    if s.journal_path.exists():
-        journal = Journal(s.journal_path)
-        stage = journal.stage()[0]
-        journal.close()
+    """The checks `live run` makes, for the stage it would run (`live_app.process_stage`: a demoted journal with
+    something real left checks its last real stage; --offline reads the journal only)."""
     real = None
     if not args.offline:
         try:
@@ -598,6 +601,18 @@ def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
         except SettingsError as exc:
             print(f"refusing: {exc}", file=sys.stderr)
             return 2
+    stage = "SHADOW"
+    if s.journal_path.exists():
+        journal = Journal(s.journal_path)
+        try:
+            stage, why = live_app.process_stage(journal, real)
+        except live_app.RealExposure as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            journal.close()
+        if why is not None:
+            print(f"stage {stage}: {why}", file=sys.stderr)
     path, sha, file_sha = _live_lock()
     checks, _ = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
     return 0 if _print_checks(checks) else 2
@@ -761,8 +776,10 @@ def cmd_live(args: argparse.Namespace) -> int:
         s = _live_settings()
     except SettingsError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
-        if args.live_cmd == "run":
-            live_app.StopRequest().wait(LIVE_REFUSAL_WAIT_S)  # no Telegram without settings: Docker's restarts sparse
+        if args.live_cmd == "run":  # no Telegram without settings: Docker's restarts sparse; a stop ends the wait
+            stop = live_app.StopRequest()
+            with stop.installed():
+                stop.wait(LIVE_REFUSAL_WAIT_S)
         return 2
     if args.live_cmd == "run":
         return _live_run(s)
