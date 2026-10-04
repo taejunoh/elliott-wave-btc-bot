@@ -8,19 +8,22 @@
 #                                                 (--i-understand instead: no question)
 # Before the running runtime is touched, the new image runs its offline preflight with the service's real
 # configuration (the journal's stage, the secrets and key files, the read-only root, no capabilities). The swap
-# happens only outside the minutes hh:58-hh:05 UTC (the hour's cycle and its entries), keeps the running image as
-# ewbot-live:previous and waits for the new runtime's loop heartbeat: 3 minutes (10 on the VPS's first deployment,
-# which downloads the candle history first), else the previous image is started again (only after a flat-book check).
+# happens only outside the minutes hh:54-hh:05 UTC (a swap, its wait and a rollback with its own wait end before the
+# hour's cycle at hh:00:30; entries go out until hh:05), keeps the running image as ewbot-live:previous and waits for a
+# loop heartbeat from a container of the new image: 3 minutes (10 on the VPS's first deployment, which downloads the
+# candle history first). A failed `up -d` or no such heartbeat is a failed start: the previous image is started
+# again - only when it still finds the book flat.
 # Exit codes:
 #   0  deployed, the new runtime is up
 #   2  refused, nothing changed: no such tag, a tag off origin/master, local changes or untracked files (src, deploy,
 #      pyproject.toml, uv.lock, holdout.lock), an image that does not build or fails its preflight, the minutes
-#      hh:58-hh:05 UTC, a book that could not be checked, --recover not confirmed
+#      hh:54-hh:05 UTC, a book that could not be checked, --recover not confirmed
 #   3  refused, nothing changed: not flat (an open trade, an order of unknown outcome, a standing flatten, a position or
 #      a resting order)
 #   4  the new runtime did not come up: rolled back, the previous image runs again and is up
-#   5  the new runtime did not come up and was left running (--recover, a first deployment), or the rolled-back
-#      previous image did not come up either: act now (runbook, "Deploying a new version")
+#   5  the new runtime did not come up and nothing was rolled back (--recover, a first deployment, or a book the
+#      previous image did not find flat), or the rolled-back previous image did not come up either: act now (runbook,
+#      "Deploying a new version")
 # The checkout is moved to <tag> for the build and moved back on every refusal and on a rollback.
 set -euo pipefail
 
@@ -57,15 +60,31 @@ on_exit() {
   fi
 }
 
-wait_up() {  # $1: seconds. 0 once a runtime started after this call has journaled its loop heartbeat
-  local limit="$1" since now elapsed
+runs_image() {  # $1: an image id. 0 when the service has a container and every one runs that image
+  local want="$1" cids cid have
+  cids="$("${COMPOSE[@]}" ps -q live </dev/null 2>/dev/null)" || return 1
+  if [ -z "$cids" ]; then
+    return 1
+  fi
+  for cid in $cids; do
+    have="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)" || return 1
+    if [ "$have" != "$want" ]; then
+      return 1
+    fi
+  done
+}
+
+wait_up() {  # $1: seconds, $2: the image id. 0 once a container of that image journaled a loop heartbeat after this call
+  local limit="$1" want="$2" since now elapsed
   since="$(date +%s)"
   while :; do
     sleep 10
     now="$(date +%s)"
     elapsed=$((now - since))
-    # --max-age below the time since the swap: only the new runtime's heartbeat counts, never the old one's
-    if "${COMPOSE[@]}" exec -T live ewbot live status --json --max-age "$((elapsed - 1))" </dev/null >/dev/null 2>&1; then
+    # the container must be the new image's (a failed recreate leaves the old one running - and heartbeating), and
+    # --max-age below the time since the swap: only a heartbeat journaled after it counts
+    if runs_image "$want" \
+      && "${COMPOSE[@]}" exec -T live ewbot live status --json --max-age "$((elapsed - 1))" </dev/null >/dev/null 2>&1; then
       return 0
     fi
     if [ "$elapsed" -ge "$limit" ]; then
@@ -75,7 +94,7 @@ wait_up() {  # $1: seconds. 0 once a runtime started after this call has journal
 }
 
 main() {
-  local recover=0 confirmed=0 tag="" arg root changes untracked image minute rc answer first wait_s why
+  local recover=0 confirmed=0 tag="" arg root changes untracked image minute rc answer first wait_s why want up
   for arg in "$@"; do
     case "$arg" in
       --recover) recover=1 ;;
@@ -129,10 +148,11 @@ main() {
     fi
   fi
 
-  # Last check before the swap: never across the hour's cycle (hh:00:30) and its entries (sent until hh:05:00).
+  # Last check before the swap: the swap, its wait and a rollback with its own wait end before the hour's cycle
+  # (hh:00:30), and nothing is swapped while that cycle's entries may go out (until hh:05:00).
   minute="$(date -u +%M)"
-  if [ "$((10#$minute))" -ge 58 ] || [ "$((10#$minute))" -le 5 ]; then
-    refuse "it is hh:$minute UTC: no swap from hh:58 to hh:05 (the hour's cycle and its entries) - run it again from hh:06"
+  if [ "$((10#$minute))" -ge 54 ] || [ "$((10#$minute))" -le 5 ]; then
+    refuse "it is hh:$minute UTC: no swap from hh:54 to hh:05 (the hour's cycle and its entries) - run it again from hh:06"
   fi
 
   if [ "$recover" -eq 0 ]; then
@@ -153,18 +173,24 @@ main() {
     first=0
   fi
   docker image tag "$image" ewbot-live:current
+  want="$(docker image inspect -f '{{.Id}}' ewbot-live:current)"
   # EWBOT_IMAGE pinned: an EWBOT_IMAGE in deploy/live/.env never decides what runs
-  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || echo "warning: up -d failed" >&2
+  up=0
+  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || up=$?
   wait_s="$UP_WAIT_S"
   if [ "$first" -eq 1 ]; then
     wait_s="$FIRST_UP_WAIT_S"
   fi
-  if wait_up "$wait_s"; then
+  if [ "$up" -eq 0 ] && wait_up "$wait_s" "$want"; then
     MOVED=0
     echo "deployed $image (tagged ewbot-live:current; the one before is ewbot-live:previous); follow it with: ${COMPOSE[*]} logs -f live"
     return 0
   fi
-  echo "$image: no loop heartbeat ${wait_s}s after the start - read ${COMPOSE[*]} logs live" >&2
+  if [ "$up" -ne 0 ]; then
+    echo "$image: up -d failed (exit $up) - a failed start" >&2
+  else
+    echo "$image: no loop heartbeat from a container of it ${wait_s}s after the start - read ${COMPOSE[*]} logs live" >&2
+  fi
   if [ "$recover" -eq 1 ] || [ "$first" -eq 1 ]; then
     MOVED=0
     why="no previous image"
@@ -175,9 +201,24 @@ main() {
     exit 5
   fi
   restore_checkout
+  # The new runtime may have traded meanwhile: roll back only to a book the previous image still finds flat.
+  rc=0
+  EWBOT_IMAGE=ewbot-live:previous "${COMPOSE[@]}" run --rm --no-deps -T live status --json --exchange --require-flat \
+    </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    git checkout --quiet --detach "$tag" || echo "warning: could not check out $tag again" >&2
+    why="the book is not flat any more"
+    if [ "$rc" -ne 3 ]; then
+      why="the book could not be checked (exit $rc)"
+    fi
+    echo "not rolled back: $why - $image keeps starting: /status, the logs, then act now (runbook, Deploying a new version)" >&2
+    exit 5
+  fi
   docker image tag ewbot-live:previous ewbot-live:current
-  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || echo "warning: up -d failed" >&2
-  if wait_up "$UP_WAIT_S"; then
+  want="$(docker image inspect -f '{{.Id}}' ewbot-live:current)"
+  up=0
+  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || up=$?
+  if [ "$up" -eq 0 ] && wait_up "$UP_WAIT_S" "$want"; then
     echo "rolled back: ewbot-live:current is the previous image again and it is up ($image kept for a look)" >&2
     exit 4
   fi

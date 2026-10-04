@@ -136,7 +136,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     sudo systemctl start ewbot-backup.service && journalctl -u ewbot-backup.service -n 20
     ```
 
-    The log ends with `backup uploaded: r2:ewbot-backups/journal-….sqlite.age` and the `ewbot-backup` check turns up. A backup is made inside the running container, or in a one-off container of the same image while the service is stopped; a run that hangs is stopped after 30 minutes (`TimeoutStartSec`) and reported as failed. Restoring: see "Restoring the journal" - do it once during SHADOW (the restore drill).
+    The log ends with `backup uploaded: r2:ewbot-backups/journal-….sqlite.age` and the `ewbot-backup` check turns up. A backup is made inside the running container, or in a one-off container of the same image while the service is stopped; a run that hangs is stopped after 30 minutes (`TimeoutStartSec`) and reported as failed, and every run first removes the plaintext copies a killed run left in `/var/lib/ewbot/backup`. Restoring: see "Restoring the journal" - try it once during SHADOW (the restore drill).
 
 ## Daily operation
 
@@ -224,7 +224,23 @@ The journal holds the open trade, the order intents, the stage history and the g
    On a new VPS there is no container yet: skip the stop and the start, `deploy.sh --recover` starts it ("Recovering from VPS loss").
 4. Check `[시작]` in Telegram and `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status`. What happened after the backup is not in the restored journal: a trade opened since is a position the journal does not know (adopted when the engine holds it - in CANARY a failure that pauses entries: check, then `/resume` - or closed), a trade that closed since is found closed, and the hours since the backup have no cycle (SHADOW ② fails: restart the stint, `ewbot live stage shadow --restart --confirm`).
 
-**Restore drill** (once during SHADOW, with the book flat, outside hh:59 to hh:03): take a backup (`sudo systemctl start ewbot-backup.service`), restore it by steps 1–4 and check that `ewbot live status` shows the same stage, cycles and gates as before. It proves the age key, the R2 copy and this sequence before they are needed (and counts as a restart for SHADOW ④).
+**Restore drill** (once during SHADOW; it never touches the live journal or the running runtime): take a backup (`sudo systemctl start ewbot-backup.service`), download and decrypt it on the laptop (step 1) and send it into a drill directory - never over the live journal:
+
+```bash
+ssh <admin>@<vps> 'sudo install -d -m 700 -o 1000 -g 1000 /var/lib/ewbot/drill && sudo install -m 600 -o 1000 -g 1000 /dev/stdin /var/lib/ewbot/drill/journal.sqlite' < journal.sqlite
+```
+
+Then on the VPS, as `ewbot`, check it with the image - a sound SQLite file (`ok`) that reads like the live journal (the same stage, cycles and gates as the live status, up to the backup's time) - and remove it:
+
+```bash
+cd ~/elliott-wave-btc-bot
+docker compose -f deploy/live/docker-compose.yml run --rm --no-deps -T --entrypoint python live -c "import sqlite3; print(sqlite3.connect('/data/drill/journal.sqlite').execute('PRAGMA integrity_check').fetchone()[0])"
+docker compose -f deploy/live/docker-compose.yml run --rm --no-deps -T -e EWBOT_LIVE_DIR=/data/drill live status
+docker compose -f deploy/live/docker-compose.yml exec live ewbot live status
+rm -rf /var/lib/ewbot/drill
+```
+
+It proves the age key, the R2 copy and the transfer before they are needed. The restart for SHADOW ④ stays a step of its own (Stage transitions, step 2).
 
 ## Recovering from VPS loss
 
@@ -241,14 +257,14 @@ The brackets on Coinbase keep protecting an open position while the VPS is gone 
    cd ~/elliott-wave-btc-bot && bash deploy/live/deploy.sh --recover <the tag that ran before>
    ```
 
-   Type `recover <tag>` when asked. It still checks the tag, the checkout and the preflight and keeps out of hh:58 to hh:05; the first start downloads the candle history, so it waits up to 10 minutes for the heartbeat.
+   Type `recover <tag>` when asked. It still checks the tag, the checkout and the preflight and keeps out of hh:54 to hh:05; the first start downloads the candle history, so it waits up to 10 minutes for the heartbeat.
 7. Verify: `[시작]` in Telegram, `/status` answered, `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status --exchange` (the position and the open orders as in the Coinbase app), the healthchecks.io checks up again; then "Restoring the journal", step 4.
 
 ## Deploying a new version
 
 - The image verifies Coinbase's TLS certificates with the base image's CA store (`ca-certificates`, part of `python:3.12.13-slim-bookworm`); the build stops if `/etc/ssl/certs/ca-certificates.crt` is missing (a new base image without it): keep the pinned base, or install `ca-certificates` in the Dockerfile.
-- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` (as `ewbot`, in the checkout). Nothing changes and the checkout goes back where it was when it refuses (exit 2) a missing tag or one off `master`, local changes or untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's own configuration (a one-off container of the new image with the service's mounts, secrets file, key file, user and read-only root: fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`, the settings, the alerts the journal's stage needs), the minutes hh:58 to hh:05 UTC (the hour's cycle at hh:00:30 and its entries until hh:05: run it again from hh:06) or a book it could not check; or (exit 3) any open trade, order of unknown outcome, standing flatten, position or resting order.
-- The swap keeps the running image as `ewbot-live:previous`, tags the new one `ewbot-live:current`, recreates the container and waits up to 3 minutes (10 on a first deployment) for the new runtime's loop heartbeat. Without one it starts `ewbot-live:previous` again with the previous checkout: exit 4 when that one is up again - read the failed release's log (`journalctl -t ewbot-live`) before the next try -, exit 5 when it is not either (act now: the logs, "Emergency procedures"). Rollback by hand = deploy the previous tag.
+- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` (as `ewbot`, in the checkout). Nothing changes and the checkout goes back where it was when it refuses (exit 2) a missing tag or one off `master`, local changes or untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's own configuration (a one-off container of the new image with the service's mounts, secrets file, key file, user and read-only root: fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`, the settings, the alerts the journal's stage needs), the minutes hh:54 to hh:05 UTC (a swap, its wait and a rollback with its own wait end before the hour's cycle at hh:00:30, and nothing is swapped while its entries may go out, until hh:05: run it again from hh:06) or a book it could not check; or (exit 3) any open trade, order of unknown outcome, standing flatten, position or resting order.
+- The swap keeps the running image as `ewbot-live:previous`, tags the new one `ewbot-live:current`, recreates the container and waits up to 3 minutes (10 on a first deployment) for a loop heartbeat journaled after the swap by a container of the new image (an old container still running after a failed recreate heartbeats too: it never counts). A failed `up -d` or no such heartbeat is a failed start: deploy.sh checks the book with `ewbot-live:previous` and the previous checkout - the new runtime may have traded meanwhile - and only if it is flat starts `ewbot-live:previous` again: exit 4 when that one is up again - read the failed release's log (`journalctl -t ewbot-live`) before the next try -, exit 5 when it is not either, or when the book was not flat (or could not be read) and nothing was rolled back (act now: `/status`, the logs, "Emergency procedures"). Rollback by hand = deploy the previous tag.
 - `deploy.sh --recover <tag>` deploys while a position is open, for two cases only: a release that crash-loops while it holds a position (`[중단]` again and again, `/flatten` not acted on) and a new VPS after a VPS loss. It skips only the flat-book check (it prints the book instead), asks you to type `recover <tag>` (`--i-understand` skips the question) and never rolls back by itself (exit 5 when the new runtime does not come up); the new runtime takes over the position and its brackets through the restart recovery. Spec 5.2 allows deploys only with a flat book: this is the documented exception for bringing the runtime back.
 - A change to any strategy-fingerprinted file (`types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/`) is refused by the preflight and would reset the paper runtime's out-of-sample counter: never deploy one.
 

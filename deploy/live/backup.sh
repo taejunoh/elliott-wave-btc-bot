@@ -4,8 +4,9 @@
 # in a one-off container of it when the service is stopped), encrypted with age to EWBOT_BACKUP_AGE_RECIPIENT (the
 # private key stays off the VPS) and copied with rclone to EWBOT_BACKUP_REMOTE (default r2:ewbot-backups, a
 # Cloudflare R2 bucket). Every run pings its own healthchecks.io check EWBOT_BACKUP_PING_URL - /start, then success
-# or /fail with the exit code -, so a backup that fails, hangs or never runs is alerted. Settings: the root-only file
-# /etc/ewbot/backup.env (systemd's EnvironmentFile; never in the repository).
+# or /fail with the exit code -, so a backup that fails, hangs or never runs is alerted, and first removes the
+# plaintext copies an earlier run could not (killed). Settings: the root-only file /etc/ewbot/backup.env (systemd's
+# EnvironmentFile; never in the repository).
 set -euo pipefail
 
 PING="${EWBOT_BACKUP_PING_URL:-}"
@@ -38,6 +39,8 @@ if [ -z "$PING" ]; then
   echo "warning: EWBOT_BACKUP_PING_URL is not set in /etc/ewbot/backup.env - a failed backup alerts nobody" >&2
 fi
 ping_check /start
+# plaintext copies a killed run (SIGKILL, power loss) left behind: never kept on the VPS
+rm -f -- "$DATA"/backup/journal-*.sqlite
 if [ -z "${EWBOT_BACKUP_AGE_RECIPIENT:-}" ]; then
   echo "set EWBOT_BACKUP_AGE_RECIPIENT (an age1... public key) in /etc/ewbot/backup.env" >&2
   exit 1
