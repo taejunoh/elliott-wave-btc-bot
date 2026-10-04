@@ -1,0 +1,11 @@
+# /etc/systemd/system/ewbot-backup.service (docs/live-trading.md, "Backups")
+[Unit]
+Description=ewbot live journal backup (encrypted, off-site)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=ewbot
+EnvironmentFile=/etc/ewbot/backup.env
+ExecStart=/usr/bin/bash /home/ewbot/elliott-wave-btc-bot/deploy/live/backup.sh

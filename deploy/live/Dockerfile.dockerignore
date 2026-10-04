@@ -1,0 +1,9 @@
+# Build context of deploy/live/Dockerfile (BuildKit reads <Dockerfile>.dockerignore): everything is
+# excluded except what the image needs - never .git, .venv, data/, reports/ or any secret.
+*
+!pyproject.toml
+!uv.lock
+!holdout.lock
+!src/
+**/__pycache__
+**/*.pyc

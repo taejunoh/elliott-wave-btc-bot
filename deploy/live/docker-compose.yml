@@ -1,0 +1,37 @@
+# ewbot live runtime on the VPS (docs/live-trading.md). deploy/live/deploy.sh builds ewbot-live:<tag>,
+# checks it, tags it ewbot-live:current and runs `docker compose -f deploy/live/docker-compose.yml up -d`.
+# Host paths: /var/lib/ewbot (journal, candle cache, backups; owned by uid 1000) and /etc/ewbot (secrets,
+# mode 700 dir / 600 files, owned by uid 1000), mounted read-only. Non-secret settings may be overridden
+# in deploy/live/.env (EWBOT_EXPIRY, EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO). The products are fixed and a
+# secret in the environment is refused at start (ewbot.live.settings): never add one here or in .env.
+name: ewbot-live
+services:
+  live:
+    image: ${EWBOT_IMAGE:-ewbot-live:current}
+    restart: unless-stopped
+    init: true  # PID 1 is an init that hands SIGTERM to ewbot (python as PID 1 would not get it by default)
+    user: "1000:1000"
+    environment:
+      EWBOT_LIVE_DIR: /data
+      EWBOT_SECRETS_FILE: /run/ewbot/live.env
+      EWBOT_COINBASE_KEY_FILE: /run/ewbot/cdp_api_key.json
+      EWBOT_PAPER_REPO: ${EWBOT_PAPER_REPO:-taejunoh/elliott-wave-btc-bot}
+      EWBOT_LIVE_EDIT_STOPS: ${EWBOT_LIVE_EDIT_STOPS:-0}
+      EWBOT_EXPIRY: ${EWBOT_EXPIRY:-}
+      TZ: UTC
+    volumes:
+      - /var/lib/ewbot:/data
+      - /etc/ewbot:/run/ewbot:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 150s  # a stop finishes the current tick (at worst ~100 s: candle retries, a fill wait) + 10 s flush
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
