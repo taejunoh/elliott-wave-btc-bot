@@ -19,7 +19,9 @@ were equal up to the paper's previous run (a bar Coinbase changed between the li
 paper's at :37); FINGERPRINT_CHANGE for PAPER_FINGERPRINT; else UNEXPLAINED - also whenever the data cannot
 be compared (no live candles, no paper hash), and once the two candle histories differ before the decision
 (a revision is only recognised at the bar where they part). `data_hash(ts)` is the live candles'
-`data_fingerprint(df, 0, ts)`; the paper ledger holds the same hash per decision and per run.
+`data_fingerprint(df, 0, ts)`; the paper ledger holds the same hash per decision and per run. A DATA_REVISION is
+explained, as paper criterion 4 ignores explained causes: it is reported (and alerted) but fails no audit
+(`AuditResult.ok`, `unexplained`); every other mismatch does.
 
 A ledger that is not a schema-1 paper ledger (`paper.ledger.Ledger.from_dict`) or whose epochs or decisions
 are malformed is an AuditError, like a failed fetch: never a passing audit.
@@ -97,23 +99,29 @@ class AuditResult:
     window: tuple[int, int]  # (exclusive, inclusive) known_at bounds
     compared: int
     matched: int
-    mismatches: tuple[dict[str, Any], ...]  # {"id", "type", "cause", "paper", "live"}
+    mismatches: tuple[dict[str, Any], ...]  # {"id", "type", "cause", "known_at", "paper", "live"}
     as_of: float  # when the audit ran
     error: str | None = None  # the audit failed (fetch, invalid ledger): never a pass
 
+    def unexplained(self, after: float | None = None) -> list[dict[str, Any]]:
+        """The mismatches the data do not explain (every cause but DATA_REVISION); with `after`, only those of
+        decisions first known after it (a PAPER_FINGERPRINT mismatch, which has no decision, always counts)."""
+        return [m for m in self.mismatches if m.get("cause") != "DATA_REVISION"
+                and (after is None or m.get("known_at") is None or m["known_at"] > after)]
+
     @property
     def ok(self) -> bool:
-        return self.error is None and self.compared > 0 and not self.mismatches
+        return self.error is None and self.compared > 0 and not self.unexplained()
 
     @classmethod
     def failed(cls, error: str, as_of: float) -> AuditResult:
         return cls((0, 0), 0, 0, (), float(as_of), error)
 
     def to_json(self) -> dict[str, Any]:
-        """For the journal: every mismatch as id, type and cause (the decisions go to the alert's event)."""
+        """For the journal: every mismatch as id, type, cause and known_at (the decisions go to the alert's event)."""
         return {"as_of": self.as_of, "window": list(self.window), "compared": self.compared, "matched": self.matched,
-                "mismatches": [{"id": m.get("id"), "type": m.get("type"), "cause": m.get("cause")}
-                               for m in self.mismatches], "error": self.error}
+                "mismatches": [{"id": m.get("id"), "type": m.get("type"), "cause": m.get("cause"),
+                                "known_at": m.get("known_at")} for m in self.mismatches], "error": self.error}
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> AuditResult:
@@ -179,7 +187,7 @@ def _audit(live: Sequence[dict[str, Any]], led: Ledger, baseline: str | None, si
     mismatches: list[dict[str, Any]] = []
     if baseline is not None and epoch.get("fingerprint") != baseline:
         mismatches.append({"id": f"EPOCH:{epoch['id']}", "type": "PAPER_FINGERPRINT", "cause": "FINGERPRINT_CHANGE",
-                           "paper": epoch.get("fingerprint"), "live": baseline})
+                           "known_at": None, "paper": epoch.get("fingerprint"), "live": baseline})
     matched = 0
     for did in sorted(paper.keys() | mine.keys()):
         a, b = mine.get(did), paper.get(did)
@@ -190,5 +198,5 @@ def _audit(live: Sequence[dict[str, Any]], led: Ledger, baseline: str | None, si
         ref = b if b is not None else a
         assert ref is not None
         cause = "DATA_REVISION" if revised(int(ref["ts"]), b) else "UNEXPLAINED"
-        mismatches.append({"id": did, "type": kind, "cause": cause, "paper": b, "live": a})
+        mismatches.append({"id": did, "type": kind, "cause": cause, "known_at": known_at(ref), "paper": b, "live": a})
     return AuditResult((lo, hi), len(paper.keys() | mine.keys()), matched, tuple(mismatches), float(now))

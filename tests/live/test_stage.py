@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
+from datetime import UTC, datetime
 
 import pytest
 import requests
@@ -23,6 +25,7 @@ from ewbot.live.stage import (
     on_incident,
     pause,
     paused,
+    restart_canary,
     resume,
     shadow_gates,
     transition,
@@ -102,14 +105,16 @@ def test_a_bar_revised_between_the_two_fetches_is_a_data_revision():
     live = [dec("TRAIL", t, 7200, 3.5)]
     revised = {t - 3600: "h-before", t: "h-live"}  # the live candles: equal up to the paper's previous run, not at t
     res = audit(live, ledger(paper, runs=runs), now=NOW, data_hash=revised.get)
-    assert [(m["type"], m["cause"]) for m in res.mismatches] == [("DIFFERENT", "DATA_REVISION")] and not res.ok
+    assert [(m["type"], m["cause"]) for m in res.mismatches] == [("DIFFERENT", "DATA_REVISION")]
+    assert res.ok and res.unexplained() == []  # explained by the data (as paper criterion 4): no failure
     alone = audit(live, ledger([], runs=runs), now=NOW, data_hash=revised.get)  # the paper's run at t has its hash
     assert [(m["type"], m["cause"]) for m in alone.mismatches] == [("MISSING_IN_PAPER", "DATA_REVISION")]
     same = {t - 3600: "h-before", t: "h-paper"}  # the same candles
     parted_before = {t - 3600: "x", t: "h-live"}  # different before the bar already: not located at this bar
     for hashes in (same, parted_before):
         assert audit(live, ledger(paper, runs=runs), now=NOW, data_hash=hashes.get).mismatches[0]["cause"] == "UNEXPLAINED"
-    assert audit(live, ledger(paper, runs=runs), now=NOW).mismatches[0]["cause"] == "UNEXPLAINED"  # no live candles
+    unexplained = audit(live, ledger(paper, runs=runs), now=NOW)  # no live candles
+    assert unexplained.mismatches[0]["cause"] == "UNEXPLAINED" and not unexplained.ok
 
 
 def test_a_ledger_that_is_not_a_valid_paper_ledger_is_an_audit_error():
@@ -287,6 +292,27 @@ def test_the_audit_gate_needs_a_passing_audit_that_covers_the_stage_up_to_now(tm
     jr.close()
 
 
+def test_an_explained_revision_does_not_fail_the_audit_gates(tmp_path):
+    jr, now = shadow_journal(tmp_path)
+    window = (0, int(now) // H1 * H1 - 2 * H1)
+
+    def gate(*mismatches: dict) -> tuple[bool, str]:
+        res = AuditResult(window, 12, 12 - len(mismatches), mismatches, now - 600)
+        g = {g.name: g for g in shadow_gates(jr, now, AuditResult.from_json(res.to_json()))}[AUDIT_GATE]
+        return g.met, g.detail
+
+    revision = {"id": "TRAIL:36000:7200", "type": "DIFFERENT", "cause": "DATA_REVISION", "known_at": 36_000}
+    assert gate(revision) == (True, f"비교 12건, 불일치 0건, 봉 수정 1건 (원인 설명됨, 미반영) ({window_text(window)})")
+    for m in ({**revision, "cause": "UNEXPLAINED"}, {**revision, "type": "MISSING_IN_LIVE", "cause": "UNEXPLAINED"},
+              {"id": "EPOCH:2", "type": "PAPER_FINGERPRINT", "cause": "FINGERPRINT_CHANGE", "known_at": None}):
+        assert gate(revision, m)[0] is False and gate(m)[1].startswith("비교 12건, 불일치 1건")
+    jr.close()
+
+
+def window_text(window: tuple[int, int]) -> str:
+    return datetime.fromtimestamp(window[1], UTC).strftime("%Y-%m-%d %H:%M UTC") + " 봉까지"
+
+
 def test_canary_needs_shadow_paper_and_a_trade_key(tmp_path):
     jr, now = shadow_journal(tmp_path)
     assert all(g.met for g in canary_entry_gates(jr, now, good(now), PAPER_OK, KEY))
@@ -314,9 +340,10 @@ def test_transitions_need_confirm_flat_book_and_met_gates(tmp_path):
     transition(jr, "CANARY", now, gates, confirm=True, flat=True)
     assert jr.stage() == ("CANARY", now)
     jr.set_stage("FULL", "test", now + 1)
-    with pytest.raises(StageError, match="flat"):  # a demotion needs a flat book too
-        transition(jr, "CANARY", now + 2, [], confirm=True, flat=False)
-    transition(jr, "CANARY", now + 2, [], confirm=True, flat=True)  # a demotion needs no gates
+    with pytest.raises(StageError, match="--confirm"):
+        transition(jr, "CANARY", now + 2, [], confirm=False, flat=True)
+    # a demotion needs no gates and is written with a position open: the runtime sizes for it at once
+    transition(jr, "CANARY", now + 2, [], confirm=True, flat=False)
     transition(jr, "SHADOW", now + 3, [], confirm=True, flat=True)
     assert [(e["data"]["from"], e["data"]["to"]) for e in jr.events(kind="STAGE")] == [
         ("SHADOW", "CANARY"), ("FULL", "CANARY"), ("CANARY", "SHADOW")]
@@ -373,6 +400,42 @@ def test_every_canary_failure_pauses_canary_and_keeps_full_closed(tmp_path):
     assert [g.name for g in canary_gates(jr, now, None) if not g.met] == ["모의매매 대조 (최근 감사 통과)"]
     failed = AuditResult.failed("paper ledger fetch failed: HTTP 502", now)
     assert [g.name for g in canary_gates(jr, now, failed) if not g.met] == ["모의매매 대조 (최근 감사 통과)"]
+    jr.close()
+
+
+def test_a_failed_canary_stint_can_be_restarted_and_its_gates_count_from_then(tmp_path):
+    jr = canary_journal(tmp_path)
+    now = S0 + 20 * DAY
+    before = {"id": f"TRAIL:{int(S0) + 3600}:3600", "type": "DIFFERENT", "cause": "UNEXPLAINED",
+              "known_at": int(S0) + 3600}  # the decision mismatch of this stint
+    jr.add_event(S0 + 3600, "AUDIT_MISMATCH", {"items": [before]})
+    assert on_incident(jr, "AUDIT_MISMATCH", S0 + 3600) == ["paused"]
+    audit_now = AuditResult((0, int(now) // H1 * H1 - 2 * H1), 50, 49, (before,), now - 600)
+    assert not all(g.met for g in full_entry_gates(jr, now, audit_now, PAPER_ALL, KEY))  # without a restart: blocked
+    for kw in ({"confirm": False, "flat": True}, {"confirm": True, "flat": False}):
+        with pytest.raises(StageError):
+            restart_canary(jr, now, **kw)
+    restart_canary(jr, now, confirm=True, flat=True)
+    assert jr.stage() == ("CANARY", now) and jr.events(kind="STAGE")[-1]["data"] == {
+        "from": "CANARY", "to": "CANARY", "reason": "restart"}
+    resume(jr, now + 1)  # the pause is the user's to lift, as always
+    later = now + 30 * DAY
+    audit_later = dataclasses.replace(audit_now, window=(0, int(later) // H1 * H1 - 2 * H1), as_of=later - 600)
+    unmet = [g.name for g in full_entry_gates(jr, later, audit_later, PAPER_ALL, KEY) if not g.met]
+    assert unmet == ["완결 거래 3건 이상 또는 90일", "① 보호 주문이 체결 후 30초 안에 걸림", "⑤ 비용 실측치 비교"]
+    for k in range(3):  # the new stint's own trades
+        jr.add_event(now + (k + 1) * DAY, "PROTECTED_FIRST", {"trade_id": 10 + k, "after_entry_s": 3.0})
+        jr.add_event(now + (k + 1) * DAY + 3600, "CLOSED", {"trade_id": 10 + k, "reason": "BRACKET"})
+    jr.add_event(now + 5 * DAY, "COSTS", {"fills": 6})
+    gates = full_entry_gates(jr, later, audit_later, PAPER_ALL, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)  # the earlier mismatch and incident belong to the old stint
+    assert "단계 시작 전 불일치 1건 제외" in {g.name: g.detail for g in gates}["모의매매 대조 (최근 감사 통과)"]
+    after = {**before, "id": f"TRAIL:{int(now) + 7200}:3600", "known_at": int(now) + 7200}
+    audit_bad = dataclasses.replace(audit_later, mismatches=(before, after))
+    assert not all(g.met for g in full_entry_gates(jr, later, audit_bad, PAPER_ALL, KEY))
+    jr.set_stage("FULL", "test", later)
+    with pytest.raises(StageError, match="only a CANARY stint"):
+        restart_canary(jr, later + 1, confirm=True, flat=True)
     jr.close()
 
 

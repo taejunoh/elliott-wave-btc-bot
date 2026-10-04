@@ -1,10 +1,10 @@
 """Operating stages SHADOW -> CANARY -> FULL, their gates, pause and incidents (Plan 3 spec 4.3, 6).
 
 The journal holds the stage history and the pause flag. Promotions need every gate met, a flat book and an
-explicit --confirm (the user's approval, spec 6.1); demotions need a flat book and --confirm. A running runtime
-keeps running until it is flat and then exits so Docker restarts it in the new stage (live/runtime.py), but it
-sizes every entry and adoption by the more conservative of its own stage and the journal's (`full_cap` reads the
-journal's current stage), so a demotion applies to the next order at once.
+explicit --confirm (the user's approval, spec 6.1); demotions need only --confirm and are written at once, an
+open position or not. A running runtime keeps running until it is flat and then exits so Docker restarts it in the
+new stage (live/runtime.py), but it sizes every entry and adoption by the more conservative of its own stage and
+the journal's (`full_cap` reads the journal's current stage), so a demotion applies to the next order at once.
 
 One CANARY failure definition for the pause and the gates (spec 6.2 CANARY `실패 시 자동으로 일시 정지`):
 `CANARY_FAIL` = the major incidents (`MAJOR`: unprotected > 60 s, an unexplained audit mismatch, a breaker, a
@@ -15,11 +15,15 @@ resolved in time is no CANARY failure). In CANARY each one pauses entries (`on_i
 FULL entry gates are unmet after any of them in the current CANARY stint, while the runtime is paused and
 without a current passing audit. In FULL the major incidents pause and demote to CANARY, and every CANARY
 failure restarts the 30-day clean window of the 3-contract cap (spec 6.2 FULL `이상이 없으면 상한을 해제`).
+After a CANARY failure the user may restart the CANARY stint (`restart_canary`: flat, --confirm; spec 6.2
+`재개는 사용자가 결정한다`) instead of going back to SHADOW: every CANARY gate then counts from the restart - trades,
+days, failures and the audit's mismatches; without it the failed stint keeps FULL closed.
 
 Gates (spec 6.2), all computed from the journal. Times are the journal's (the VPS clock, NTP-synchronised): a
 clock step moves every window with it.
   SHADOW pass   >= 14 days and >= 1 signal first known in the stage; (1) decisions equal the paper ledger's (an
-                audit from at or before the stage's start to at most AUDIT_MAX_AGE_S ago, with no mismatch);
+                audit from at or before the stage's start to at most AUDIT_MAX_AGE_S ago, with no mismatch the
+                data do not explain: a DATA_REVISION is shown, not counted);
                 (2) every hourly bar that closed in the stage has a cycle that ended OK within 2 min of the
                 close (a bar while the futures session was recorded closed is excused when it has none; a
                 cycle not yet past its deadline is not due); (3) every would-be order passed preview; (4)
@@ -28,7 +32,8 @@ clock step moves every window with it.
   CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
                 closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
                 manual intervention; (5) costs measured (a daily summary with fills); no other CANARY failure
-                (audit mismatch, breaker, transfer key); not paused; a current passing audit.
+                (audit mismatch, breaker, transfer key); not paused; a current audit without an unexplained
+                mismatch of a decision known in the stint.
   FULL start    CANARY pass + paper criteria 1-4 all met (incl. 50 out-of-sample trades)."""
 
 from __future__ import annotations
@@ -184,9 +189,11 @@ def _since(journal: Journal, stage: str) -> float | None:
     return float(hist[-1]["ts"])
 
 
-def audit_gate(name: str, res: AuditResult | None, since: float, now: float) -> Gate:
-    """A passing audit that covers the stage: its window starts at or before `since` and reaches a bar that
-    closed at most AUDIT_MAX_AGE_S ago. A failed audit (fetch, invalid ledger) is unmet, never the last good one."""
+def audit_gate(name: str, res: AuditResult | None, since: float, now: float, after: float | None = None) -> Gate:
+    """An audit that covers the stage - its window starts at or before `since` and reaches a bar that closed at most
+    AUDIT_MAX_AGE_S ago - with something compared and no unexplained mismatch (a DATA_REVISION is shown in the
+    detail but explained); with `after`, only mismatches of decisions first known after it count (a CANARY stint).
+    A failed audit (fetch, invalid ledger) is unmet, never the last good one."""
     if res is None:
         return Gate(name, False, "미실행")
     if res.error is not None:
@@ -196,7 +203,15 @@ def audit_gate(name: str, res: AuditResult | None, since: float, now: float) -> 
         return Gate(name, False, f"오래된 감사: {_utc(hi)} 봉까지 ({_utc(res.as_of)} 실행)")
     if lo > since:
         return Gate(name, False, f"감사 구간이 단계 시작 뒤부터 ({_utc(lo)} 이후)")
-    return Gate(name, res.ok, f"비교 {res.compared}건, 불일치 {len(res.mismatches)}건 ({_utc(hi)} 봉까지)")
+    counted = res.unexplained(after)
+    parts = [f"비교 {res.compared}건, 불일치 {len(counted)}건"]
+    revisions = sum(1 for m in res.mismatches if m.get("cause") == "DATA_REVISION")
+    if revisions:
+        parts.append(f"봉 수정 {revisions}건 (원인 설명됨, 미반영)")
+    earlier = len(res.unexplained()) - len(counted)
+    if earlier:
+        parts.append(f"단계 시작 전 불일치 {earlier}건 제외")
+    return Gate(name, res.compared > 0 and not counted, ", ".join(parts) + f" ({_utc(hi)} 봉까지)")
 
 
 def _closed_spans(journal: Journal, since: float, now: float) -> list[tuple[float, float]]:
@@ -318,7 +333,7 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
         Gate(G_COSTS, bool(costs), f"비용 보고 {len(costs)}회"),
         Gate(G_MAJOR, major_ok, major),
         Gate(G_RUNNING, p is None, "운영 중" if p is None else f"일시 정지: {p['reason']}"),
-        audit_gate(G_AUDIT_NOW, audit_result, since, now),
+        audit_gate(G_AUDIT_NOW, audit_result, since, now, after=since),
     ]
 
 
@@ -328,8 +343,10 @@ def full_entry_gates(journal: Journal, now: float, audit_result: AuditResult | N
 
 
 def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, confirm: bool, flat: bool) -> None:
-    """Record a stage change, or raise StageError with the reason. A promotion needs every gate of
-    REQUIRED_GATES[(current, to)] among `gates` and every gate given met (a second guard on the caller's set)."""
+    """Record a stage change, or raise StageError with the reason. A promotion needs a flat book, every gate of
+    REQUIRED_GATES[(current, to)] among `gates` and every gate given met (a second guard on the caller's set). A
+    demotion needs only --confirm: it is written at once, so a running runtime sizes for it from its next order
+    (`flat` is ignored; the CLI reports it)."""
     if to not in STAGES:
         raise StageError(f"unknown stage {to}")
     cur, _ = journal.stage()
@@ -337,9 +354,9 @@ def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, 
         raise StageError(f"already in {cur}")
     if not confirm:
         raise StageError("a stage change needs --confirm (the user's explicit approval)")
-    if not flat:
-        raise StageError("a stage change needs a flat book (no live or virtual position, no resting order)")
     promotion = STAGES.index(to) > STAGES.index(cur)
+    if promotion and not flat:
+        raise StageError("a promotion needs a flat book (no live or virtual position, no resting order)")
     if promotion and STAGES.index(to) - STAGES.index(cur) != 1:
         raise StageError(f"{cur} -> {to}: promote one stage at a time")
     if promotion:
@@ -351,3 +368,18 @@ def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, 
     reason = "promotion" if promotion else "demotion"
     journal.set_stage(to, reason, now)
     journal.add_event(now, "STAGE", {"from": cur, "to": to, "reason": reason})
+
+
+def restart_canary(journal: Journal, now: float, *, confirm: bool, flat: bool) -> None:
+    """Start a new CANARY stint after a CANARY failure, instead of going back to SHADOW (spec 6.2 `재개는 사용자가
+    결정한다`): only from CANARY, with --confirm and a flat book. Every CANARY gate then counts from now (trades,
+    days, failures, the audit's mismatches); the pause stays until /resume."""
+    cur, _ = journal.stage()
+    if cur != "CANARY":
+        raise StageError(f"only a CANARY stint can be restarted (stage {cur})")
+    if not confirm:
+        raise StageError("a restart needs --confirm (the user's explicit approval)")
+    if not flat:
+        raise StageError("a restart needs a flat book (no live or virtual position, no resting order)")
+    journal.set_stage("CANARY", "restart", now)
+    journal.add_event(now, "STAGE", {"from": "CANARY", "to": "CANARY", "reason": "restart"})
