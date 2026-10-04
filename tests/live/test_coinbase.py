@@ -5,6 +5,7 @@ import inspect
 import json
 from importlib import metadata
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -24,6 +25,14 @@ from ewbot.live.exchange import OPEN_STATUSES, ExchangeError, Position, RateLimi
 
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "coinbase.json").read_text(encoding="utf-8"))
 FUT = "BIP-20DEC30-CDE"
+# The real venue's answer to the five resting statuses in one List Orders request (first SHADOW deploy, 2026-10-04,
+# `ewbot live status --exchange --require-flat` with the view-only key on the real account).
+VENUE_ACTIVE = ("OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED")
+MULTI_STATUS_REFUSAL = ('{"error":"INVALID_ARGUMENT","error_details":"Cannot pass multiple statuses when requesting '
+                        'active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or CANCEL_QUEUED)","message":"Cannot pass '
+                        'multiple statuses when requesting active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or '
+                        'CANCEL_QUEUED)"}')
+EMPTY_PAGE = {"orders": [], "sequence": "0", "has_next": False, "cursor": ""}
 
 
 def http_error(status: int, text: str = "", headers: dict | None = None) -> requests.exceptions.HTTPError:
@@ -34,9 +43,17 @@ def http_error(status: int, text: str = "", headers: dict | None = None) -> requ
     return requests.exceptions.HTTPError(f"{status}", response=resp)
 
 
+def statuses(params: dict | None) -> list[str]:
+    """The order_status values a List Orders request sends (requests repeats the key for each item of a list)."""
+    value = (params or {}).get("order_status")
+    return [] if value is None else [value] if isinstance(value, str) else list(value)
+
+
 class RecordedClient:
     """Stands in for coinbase.rest.RESTClient: answers get/post from recorded JSON by (method, path).
-    An answer may be a fixture name, a list (consumed in order; exceptions are raised) or a callable."""
+    An answer may be a fixture name, a list (consumed in order; exceptions are raised) or a callable.
+    Like the venue, a List Orders request with more than one status, one of them active, is refused with HTTP 400
+    before any recorded answer is used."""
 
     def __init__(self, routes: dict) -> None:
         self.routes = routes
@@ -54,6 +71,9 @@ class RecordedClient:
 
     def get(self, url_path, params=None, public=False, **kwargs):
         self.calls.append(("GET", url_path, params, public))
+        asked = statuses(params)
+        if url_path == API + "/orders/historical/batch" and len(asked) > 1 and set(asked) & set(VENUE_ACTIVE):
+            raise http_error(400, MULTI_STATUS_REFUSAL)
         return self._answer(("GET", url_path), params)
 
     def post(self, url_path, params=None, data=None, **kwargs):
@@ -115,8 +135,18 @@ def test_balance_is_cash_plus_unrealized_pnl_and_permissions():
     assert (k.can_view, k.can_trade, k.can_transfer, k.portfolio_type) == (True, True, False, "DEFAULT")
 
 
-def test_open_orders_follow_the_cursor_and_parse_brackets():
-    ex, client, _ = make({("GET", "/orders/historical/batch"): ["orders_open_page1", "orders_open_page2"]})
+def by_status(pages: dict[str, list]):
+    """A List Orders route: each status answered from its own pages (consumed in order), no orders otherwise."""
+    def answer(params):
+        (status,) = statuses(params)
+        queue = pages.get(status) or []
+        return queue.pop(0) if queue else EMPTY_PAGE
+    return answer
+
+
+def test_open_orders_follow_each_status_cursor_and_parse_brackets():
+    ex, client, _ = make({("GET", "/orders/historical/batch"): by_status({
+        "OPEN": ["orders_open_page1", EMPTY_PAGE], "CANCEL_QUEUED": ["orders_open_page2"]})})
     orders = ex.open_orders()
     assert [(o.client_order_id, o.kind, o.size, o.limit_price, o.stop_price, o.status) for o in orders] == [
         ("ewb-b-1790942400-tp1-1", "BRACKET", 1, 83500.0, 85900.0, "OPEN"),
@@ -124,9 +154,10 @@ def test_open_orders_follow_the_cursor_and_parse_brackets():
     ]
     assert all(o.is_open for o in orders)
     assert orders[0].side == 1 and orders[0].created_ts == 1791028841
-    assert client.calls[0][2]["product_ids"] == [FUT]
-    assert client.calls[0][2]["order_status"] == ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"]
-    assert client.calls[1][2]["cursor"] == "c-2"
+    assert all(c[2]["product_ids"] == [FUT] and c[2]["limit"] == 250 for c in client.calls)
+    assert [(statuses(c[2]), c[2]["cursor"]) for c in client.calls] == [
+        (["PENDING"], None), (["QUEUED"], None), (["OPEN"], None), (["OPEN"], "c-2"), (["EDIT_QUEUED"], None),
+        (["CANCEL_QUEUED"], None)]
 
 
 def test_find_and_get_order():
@@ -493,9 +524,11 @@ def test_a_refused_cancel_of_an_order_that_already_ended_is_no_error(status):
     assert client.calls[-1][:2] == ("GET", API + "/orders/historical/o-refused")
 
 
-def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypatch):
-    """List Orders takes order_status as an exploded array; SDK 1.8.4 passes the list to requests unchanged
-    (list_orders(order_status: Optional[List[str]])), which repeats the key. Needs the `live` group."""
+def test_the_pinned_sdk_sends_one_resting_status_per_request(monkeypatch):
+    """List Orders takes order_status as an exploded array: SDK 1.8.4 passes the list to requests unchanged
+    (list_orders(order_status: Optional[List[str]])), which repeats the key - and the venue refuses two active statuses
+    in one request (HTTP 400, 2026-10-04; the fake HTTP layer answers the same). Through the real SDK and requests,
+    each request carries one status and together every resting status. Needs the `live` group."""
     rest = pytest.importorskip("coinbase.rest")
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -510,14 +543,19 @@ def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypa
     def fake_request(method, url, params=None, json=None, headers=None, timeout=None):
         urls.append(requests.Request(method, url, params=params).prepare().url)
         r = requests.Response()
-        r.status_code = 200
-        r._content = b'{"orders": [], "has_next": false, "cursor": ""}'
+        if len(parse_qs(urlsplit(urls[-1]).query).get("order_status", [])) > 1:  # the venue's rule
+            r.status_code, r._content = 400, MULTI_STATUS_REFUSAL.encode()
+        else:
+            r.status_code, r._content = 200, b'{"orders": [], "has_next": false, "cursor": ""}'
         return r
 
     monkeypatch.setattr(client.session, "request", fake_request)
+    with pytest.raises(requests.exceptions.HTTPError):  # the SDK's own call with two statuses: repeated, refused
+        client.list_orders(product_ids=[FUT], order_status=["OPEN", "CANCEL_QUEUED"])
+    urls.clear()
     assert CoinbaseExchange(client, FUT).open_orders() == []
-    query = urls[0].split("?", 1)[1]
-    assert [p.split("=")[1] for p in query.split("&") if p.startswith("order_status=")] == list(OPEN_STATUSES)
+    assert [parse_qs(urlsplit(u).query)["order_status"] for u in urls] == [
+        ["PENDING"], ["QUEUED"], ["OPEN"], ["EDIT_QUEUED"], ["CANCEL_QUEUED"]]
 
 
 # ---------------------------------------------------------------------------- Final fix (non-finite amounts, replies)
@@ -670,3 +708,76 @@ def test_a_429_on_public_market_data_never_holds_a_private_request():
     client.routes[("GET", API + "/market/product_book")] = ["book_bip"]
     now[0] += 6
     assert ex.quote(FUT).bid == 84655.0
+
+
+# ---------------------------------------------------------------------------- Hotfix (List Orders: one status each)
+def resting(*orders: tuple[str, str]) -> dict:
+    """One page holding a bracket of ours for each (order_id, status)."""
+    o = FIXTURES["orders_open_page1"]["orders"][0]
+    return {**EMPTY_PAGE, "orders": [{**o, "order_id": oid, "status": status} for oid, status in orders]}
+
+
+def test_open_orders_ask_one_resting_status_per_request():
+    """First SHADOW deploy (2026-10-04): Coinbase refused the five resting statuses in one List Orders request (HTTP 400
+    INVALID_ARGUMENT - the fake client answers the same), so the deploy's flat-book check could not read the book. Each
+    resting status is asked alone, in the order an order moves through them (placed, resting, an edit or a cancel
+    queued): an order that moves on between two requests is read in its later status."""
+    assert sorted(VENUE_ACTIVE) == sorted(OPEN_STATUSES)  # the venue's active statuses are the adapter's resting ones
+    ex, client, _ = make({("GET", "/orders/historical/batch"): by_status({})})
+    assert ex.open_orders() == []
+    assert [statuses(c[2]) for c in client.calls] == [["PENDING"], ["QUEUED"], ["OPEN"], ["EDIT_QUEUED"],
+                                                      ["CANCEL_QUEUED"]]
+
+
+def test_an_order_read_under_two_statuses_is_listed_once_as_last_read():
+    """An order whose cancel is queued between the OPEN request and the CANCEL_QUEUED one is in both replies: listed
+    once, as the later request read it (a queued cancel still rests: the executor never counts it as a leg)."""
+    ex, _, _ = make({("GET", "/orders/historical/batch"): by_status({
+        "OPEN": [resting(("o-1", "OPEN"), ("o-2", "OPEN"))], "CANCEL_QUEUED": [resting(("o-1", "CANCEL_QUEUED"))]})})
+    assert [(o.order_id, o.status) for o in ex.open_orders()] == [("o-1", "CANCEL_QUEUED"), ("o-2", "OPEN")]
+
+
+@pytest.mark.parametrize("failure", [
+    http_error(400, '{"error":"INVALID_ARGUMENT"}'),  # refused
+    http_error(503, "busy"),  # unavailable through every retry
+    {"sequence": "0", "has_next": False, "cursor": ""},  # no orders list: never read as none
+    {"orders": {"order_id": "o-x"}, "has_next": False, "cursor": ""},  # not a list
+    {"orders": [], "has_next": True, "cursor": ""},  # more pages, but no cursor to ask for them
+    {"orders": [], "has_next": True, "cursor": "c-again"},  # the same cursor again and again
+], ids=["refused", "unavailable", "no-orders", "orders-not-a-list", "no-cursor", "cursor-loop"])
+def test_open_orders_fail_closed_when_any_status_cannot_be_read(failure):
+    """Never a partial book read as complete: a status - or one of its pages - that cannot be read fails the whole read
+    (ExchangeError) whatever the other statuses answered, and nothing more is asked after it."""
+    for bad in OPEN_STATUSES:
+        def answer(params, bad=bad):
+            (status,) = statuses(params)
+            return failure if status == bad else resting((f"o-{status}", status))
+
+        ex, client, _ = make({("GET", "/orders/historical/batch"): answer})
+        with pytest.raises(ExchangeError):
+            ex.open_orders()
+        assert statuses(client.calls[-1][2]) == [bad]
+
+
+def test_the_requests_of_one_read_share_one_budget_of_waits():
+    """open_orders' five requests (and their pages), like find_order's pages, are one call of the adapter: their waits -
+    pacing and retries - add up to at most RETRY_SLEEP_MAX_S, then its error is raised (the loop reads again on its next
+    pass). A budget per request would hold the loop for 20 s here."""
+    asked: dict[str, int] = {}
+
+    def answer(params):
+        (status,) = statuses(params)
+        asked[status] = asked.get(status, 0) + 1
+        return http_error(429, "", {"Retry-After": "4"}) if asked[status] == 1 else EMPTY_PAGE
+
+    ex, client, slept = make({("GET", "/orders/historical/batch"): answer})
+    with pytest.raises(RateLimited):
+        ex.open_orders()
+    assert slept == [4.0, 4.0, 4.0] and len(client.calls) == 7  # the fourth status's wait would pass 15 s
+    pages: list = []
+    for n in range(4):
+        pages += [http_error(429, "", {"Retry-After": "4"}), {**EMPTY_PAGE, "has_next": True, "cursor": f"c-{n}"}]
+    ex2, _, slept2 = make({("GET", "/orders/historical/batch"): pages})
+    with pytest.raises(RateLimited):
+        ex2.find_order("ewb-e-1-L", since_ts=0)
+    assert slept2 == [4.0, 4.0, 4.0]

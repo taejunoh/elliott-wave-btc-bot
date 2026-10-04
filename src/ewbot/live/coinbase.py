@@ -18,6 +18,11 @@ wait that would pass it raises the call's error instead (the loop tries again on
 data and the private account and order endpoints apart: their pacing and their 429 windows are kept apart too, so a
 429 on a quote never holds back a close. A call so blocks the loop for at most
 RETRY_SLEEP_MAX_S plus its requests' own timeouts (10 s each), and in a 429 storm only the first call of a pass waits.
+A call of several requests - the pages of a List Orders query, open_orders' statuses - has one budget of waits.
+
+List Orders refuses two active statuses in one request (HTTP 400 INVALID_ARGUMENT "Cannot pass multiple statuses when
+requesting active orders", the real venue on 2026-10-04): open_orders() asks for each resting status alone
+(RESTING_SWEEP) and merges the replies by order id; any status or page it cannot read fails the whole read.
 
 Only ExchangeError (or ValueError for a side that is not +1/-1, a programming error) leaves this module:
 an unexpected reply shape is an ExchangeError, a reply that is not a JSON object - or an order reply without
@@ -44,7 +49,6 @@ import requests
 
 from ewbot.live.exchange import (
     FUTURES_PRODUCT,
-    OPEN_STATUSES,
     SPOT_PRODUCT,
     Balance,
     ExchangeError,
@@ -75,12 +79,24 @@ _REASON_FIELDS = ("new_order_failure_reason", "error", "preview_failure_reason")
 CANCEL_DONE = frozenset({"DUPLICATE_CANCEL_REQUEST", "ORDER_IS_FULLY_FILLED"})  # nothing rests any more
 RETRY_AFTER_MAX_S = 10.0  # never wait longer than the pacing cap on one 429
 RETRY_SLEEP_MAX_S = 15.0  # one call's waits (pacing and retries) add up to at most this: then its error is raised
+# open_orders' requests, one status each (OPEN_STATUSES), in the order an order moves through them - placed, resting, an
+# edit or a cancel queued -, so an order that moves on between two requests is read in its later status
+RESTING_SWEEP = ("PENDING", "QUEUED", "OPEN", "EDIT_QUEUED", "CANCEL_QUEUED")
 _PARSE_ERRORS = (KeyError, ValueError, TypeError, AttributeError, IndexError)
 
 
 class DuplicateClientOrderId(ExchangeError):
     """An HTTP 4xx whose body names DUPLICATE_CLIENT_ORDER_ID: an order with this id exists. The order
     calls turn it into PlaceResult(duplicate=True), so the executor looks the order up."""
+
+
+class _Waits:
+    """What one call of the adapter has waited so far (pacing and retries), shared by all its requests."""
+
+    __slots__ = ("slept",)
+
+    def __init__(self) -> None:
+        self.slept = 0.0
 
 
 @contextmanager
@@ -336,21 +352,23 @@ class CoinbaseExchange:
         self._wait_until[public] = self.clock() + min(max(wait, 0.0), RETRY_AFTER_MAX_S)
 
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
-              data: dict[str, Any] | None = None, public: bool = False, retry: bool = True) -> dict[str, Any]:
+              data: dict[str, Any] | None = None, public: bool = False, retry: bool = True,
+              waits: _Waits | None = None) -> dict[str, Any]:
+        """One request; `waits` is the budget of the call it belongs to (a call of several requests passes its own)."""
         tries = self.attempts if retry else 1
         left = self._limited_until[public] - self.clock()
         if 0 < left <= RETRY_AFTER_MAX_S:  # a 429's Retry-After still runs: nothing sent (a clock step back ignores it)
             raise RateLimited(f"rate limited: {left:.0f} s left of the last HTTP 429's Retry-After (nothing sent)",
                               retry_after=left)
-        slept = 0.0
+        waits = _Waits() if waits is None else waits
         for attempt in range(tries):
             delay = self._wait_until[public] - self.clock()
             if delay > 0:
-                if slept + delay > RETRY_SLEEP_MAX_S:
+                if waits.slept + delay > RETRY_SLEEP_MAX_S:
                     raise RateLimited(f"rate limited: the pacing wait of {delay:.0f} s passes the call's "
                                       f"{RETRY_SLEEP_MAX_S:.0f} s budget (nothing sent)", retry_after=delay)
                 self.sleep(delay)
-                slept += delay
+                waits.slept += delay
             try:
                 if method == "GET":
                     resp = self.client.get(API + path, params=params, public=public)
@@ -365,10 +383,10 @@ class CoinbaseExchange:
                 if not err.retryable or attempt == tries - 1:
                     raise err from None
                 wait = min(err.retry_after, RETRY_AFTER_MAX_S) if isinstance(err, RateLimited) else self.backoff_s * 2**attempt
-                if slept + wait > RETRY_SLEEP_MAX_S:  # the loop tries again on its next pass
+                if waits.slept + wait > RETRY_SLEEP_MAX_S:  # the loop tries again on its next pass
                     raise err from None
                 self.sleep(wait)
-                slept += wait
+                waits.slept += wait
                 continue
             self._limited_until[public] = 0.0  # answered: no 429 runs any more
             resp = dict(resp)
@@ -450,23 +468,42 @@ class CoinbaseExchange:
             side = str(p.get("side") or "").removeprefix(POSITION_SIDE_PREFIX)
             return Position(_side_of(side, _POSITION_SIDES, "position"), n, _opt(p.get("avg_entry_price")) or 0.0)
 
-    def _orders(self, params: dict[str, Any]) -> list[Order]:
+    def _orders(self, params: dict[str, Any], waits: _Waits | None = None) -> list[Order]:
+        """Every page of a List Orders query, one budget of waits for all of them. A page that cannot be read or
+        followed - no `orders` list (the reference requires it), `has_next` without a new cursor - is an
+        ExchangeError: never a partial list read as complete."""
+        waits = _Waits() if waits is None else waits
         out: list[Order] = []
         cursor: str | None = None
+        asked: set[str] = set()
         while True:
-            page = self._call("GET", "/orders/historical/batch",
+            page = self._call("GET", "/orders/historical/batch", waits=waits,
                               params={**params, "product_ids": [self.futures_id], "limit": 250, "cursor": cursor})
             with _parsing("orders"):
-                out += [parse_order(o) for o in page.get("orders") or []]
-                cursor = page.get("cursor") or None
-                more = bool(page.get("has_next"))
-            if not more or not cursor:
-                return out
+                orders = page["orders"]
+                if not isinstance(orders, list):
+                    raise TypeError("orders is not a list")
+                out += [parse_order(o) for o in orders]
+                if not page.get("has_next"):
+                    return out
+                cursor = str(page.get("cursor") or "")
+                if not cursor or cursor in asked:
+                    raise ValueError("has_next without a new cursor")
+                asked.add(cursor)
 
     def open_orders(self) -> list[Order]:
-        """Every resting order: order_status is a repeated query parameter (List Orders reference,
-        `explode: true`; SDK 1.8.4 list_orders takes `order_status: List[str]`)."""
-        return [o for o in self._orders({"order_status": list(OPEN_STATUSES)}) if o.is_open]
+        """Every resting order. List Orders refuses two active statuses in one request (HTTP 400, 2026-10-04; the
+        legacy reference: OPEN cannot be paired with another status), and none of them is documented to cover another:
+        one request per resting status (RESTING_SWEEP, `order_status` a one-item list - SDK 1.8.4 list_orders takes
+        `List[str]`), each followed through its pages, merged by order id - an order in two replies moved on between
+        them and keeps the later read. The requests are one call: their waits share RETRY_SLEEP_MAX_S, and the first
+        status that cannot be read fails the read (ExchangeError) - never a book read without it."""
+        waits = _Waits()
+        found: dict[str, Order] = {}
+        for status in RESTING_SWEEP:
+            for o in self._orders({"order_status": [status]}, waits):
+                found[o.order_id] = o
+        return [o for o in found.values() if o.is_open]
 
     def get_order(self, order_id: str) -> Order:
         reply = self._call("GET", f"/orders/historical/{order_id}")
