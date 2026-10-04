@@ -18,7 +18,7 @@
 - Fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1` over 25 files and lock `sha256` `d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45` are pinned in `live/preflight.py`; the runtime refuses to start when either differs, or when the API key can transfer, or when the product is not 0.01 BTC / $5 tick / whole contracts.
 - Frozen inputs: params only from `holdout.lock`; config = `holdout_config(BotConfig(), params)`; replay from the first cached bar with `start_ts = HOLDOUT_START`; signals from the spot `BTC-USD` hourly candles of the public Coinbase Exchange API (`data.coinbase_history.update_cache`, as the paper runtime); no CLI option changes any of it.
 - Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short (recorded 2026-10-03). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
-- Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 until FULL has run 30 days without a CANARY failure (each one restarts the 30 days; spec §6.2 `이상이 없으면`); every entry and adoption is sized by the more conservative of the running stage and the journal's (a demotion applies to the next order at once).
+- Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 until FULL has run 30 days without a CANARY failure and with no manual intervention still in force (each one restarts the 30 days; spec §6.2 `이상이 없으면`); every entry and adoption is sized by the more conservative of the running stage and the journal's (a demotion applies to the next order at once).
 - Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s (no price once the last good one is older than 60 s; a connection without a message for 15 s is reopened, a feed without a futures price for 5 minutes while the market is open is alerted); heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min; Telegram unusable - 10 minutes of failures, a stuck sender or 3 refused messages in a row → a `/fail`, success pings withheld at most 30 minutes, the `/fail` repeated every 3 hours while it lasts); Telegram alerts are queued and sent by a background thread (never awaited; a protective action goes before its alert), commands come only from the user's private chat, a command sent more than 120 s before the loop reads it is ignored and `/flatten_confirm` counts within 60 s of `/flatten` by the messages' dates; daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour (up to the last bar whose cycle ended OK).
 - Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90% (only on a real futures price, never on a stand-in); real-account breakers −3% from the New York day's opening equity and −15% from the peak → flatten and pause, each reference the median of three balance reads (the day's first three; after a `/resume` that re-based it, that read and the next two) and each breaker tripping on two breaching reads in a row (a balance that is not a finite amount above 0 is no reading, and three in a row are an incident that pauses entries; `/resume` re-bases only the breaker that tripped).
 - Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name (healthchecks.io gets an exception's type name only; Telegram texts, loop errors and tracebacks go through the settings' redaction; a `LiveSettings` repr shows no secret).
@@ -44,8 +44,8 @@
 7. **Idempotency and retries** (spec §4.2, §5.1). Intent before send; a PENDING intent (ambiguous error, killed process) is looked up by `client_order_id` (orders created up to 5 min before it) before the same id is sent again; a duplicate-id answer resolves to the existing order; a PENDING intent not on the exchange after 10 min is ABANDONED (checked every minute). Reads are retried 3 times in the adapter; an ambiguous entry is looked up and re-sent with the same id on the next polls only until 5 minutes after its bar's close, then skipped (`진입이 실패하면 건너뛰고`); a failed close is retried on every poll with a new id, with an alert each time (`청산이 실패하면 계속 재시도하면서 경보`) - a close goes out with the brackets resting (both only reduce; the brackets go with the position) and they are cancelled only when the venue refuses the close because they rest (`CLOSE_CONFLICTS`, after a fresh session read; the close is then resent at once), and after every failed or unconfirmed close the legs are made the ones for the position left (placed again when none rests, on later passes too), so a close that keeps failing never leaves the position unprotected; `close_position` can only reduce, so a late duplicate close cannot open a position. Restart recovery also rebuilds a trade whose entry was accepted but not yet recorded (only when no trade with that id was recorded: a position appearing after our trade closed is a foreign one, adopted at its own entry price) and records a close accepted right before a crash with its reason; a failed read during recovery is recorded and counted unresolved, never raised; the open trade's resting brackets are its legs again at restart (no false unprotected time). An accepted entry whose fill could not be read in time (or one still PENDING: looked up first; while that lookup fails - or while the fill of an accepted one cannot be read - the position is protected at once with a provisional trade from the entry's intent, settled as ours or as a foreign position once the lookup answers) is rebuilt from its intent on the next pass (not treated as a foreign position); a rebuilt trade opens at its entry order's creation time, so the protection latency (`PROTECTED_FIRST`, `PROTECT_SLOW`) includes an outage. A reduction is recorded on the trade before it is sent (`pending_reduce`: id, size, reason, the position it was sent against, the trade once done): while its outcome is unknown no other reduction is planned and it is resolved by its id first (looked up; re-sent under the same id only when the venue does not have it and the position shows no reduction); the position showing it settles it as ours (`TP1_SYNC` → the live TP1) - never an unexplained reduction or a second sale. Protection planned together with a reduction waits until the reduction is known to have filled.
 8. **Exchange state vs. prices.** Positions and orders are read over REST (every 10 s while a trade is open or an intent is pending): one source of truth for reconcile, read as one state - the position is read again after the orders and the pair is used only when both reads agree (3 tries, else the poll is skipped), so a fill between the reads never pairs a stale position with a vanished leg. Because Coinbase may show a fill in the orders before the position, a leg that left the book is looked up before it is placed again: one with fills is not placed again for 30 s (the next read folds the fill). Prices for the watchdog come from the WebSocket `ticker` + `heartbeats` channels (Coinbase's public market-data endpoint `wss://advanced-trade-ws.coinbase.com`, which serves spot and US futures without a key: no JWT is sent, and the `websockets` sync client verifies TLS - SDK 1.8.4's `WSClient` verifies neither the certificate nor the host name; the mid of the ticker's best bid and ask - the REST quote's measure - and only finite prices above 0), with the spec's fallback: silent for 60 s → REST every 10 s, and a REST price older than 60 s is no price (the stop-gap check waits, the brackets keep protecting). The feed reopens a lost or closed connection, and one that brought no message for 15 s, itself with a 1-60 s backoff, and a feed without a futures price for 5 minutes while the session is OPEN (a dead connection, or a refused subscription while the heartbeats still flow) is alerted; a reconnect or a `sequence_num` gap forces an immediate REST poll. The WebSocket `user` channel is not used.
 9. **SHADOW** runs the complete runtime against `ShadowExchange`: reads (product, session, quotes, balance, key permissions) are real; every order is first checked with the real `POST /orders/preview` (journaled for gate ③) and then executed on a virtual book (`SimExchange`) that follows the real futures price. Sizing is CANARY's, on the real balance (so the account must be funded during SHADOW). After a restart the open virtual position is restored from the journal (`ShadowExchange.restore`) and its brackets are re-placed, so the SHADOW restart test exercises the real recovery path.
-10. **Stages** change only through `ewbot live stage <to> --confirm`. A promotion (one stage at a time) needs every gate and a flat book (journal and Coinbase) before it is written; a demotion is written at once - the running runtime sizes for it from its next order - and the command then reports whether the book is flat. After a CANARY failure `ewbot live stage canary --restart --confirm` (flat book) starts a new CANARY stint whose gates all count from the restart (no SHADOW again). A running runtime notices the new stage within a minute and exits once flat; Docker (`restart: unless-stopped`) starts it in the new stage; until then it sizes every entry and adoption by the more conservative of its stage and the journal's (`stage.full_cap` is the journal stage's maximum: SHADOW 0 real orders, CANARY 1, FULL 3 until released - never "no cap" after a demotion). One CANARY failure set (`stage.CANARY_FAIL`) serves the pause and the gates: unprotected > 60 s, an unexplained audit mismatch, a breaker, a transfer key, protection slower than 30 s, a foreign order or position, more contracts than the trade holds or fewer than its legs explain, the trade's position flipped to the other side, and an order failure the executor did not resolve in time (`ORDER_UNRESOLVED`: a bracket not replaced within 30 s, a close or a reduction not done by the next pass; one resolved in time is none). In CANARY each pauses entries (spec §6.2 `자동으로 일시 정지`) and keeps the CANARY pass gate unmet for the rest of that CANARY stint (until the user restarts it); a manual intervention the planner keeps finding and an unresolved order failure are one incident per (kind, trade) episode, not one per pass; in every stage three balance reads in a row that are not a finite amount above 0 pause entries (`BAD_EQUITY`, never a flatten); in FULL the major incidents pause and demote to CANARY (with a `STAGE` event), and every other CANARY failure keeps the 3-contract cap for 30 more days. Pause never stops protection or exits.
-11. **Gates operationalised.** SHADOW `신호 1건 이상` = a signal first known in the stage (`known_at` after its start: the first cycle records every decision since 2024). SHADOW ① = a passing audit (no mismatch the data do not explain: a `DATA_REVISION` is shown in the detail, not counted - as paper criterion 4 ignores explained causes) whose window starts at or before the stage's start and reaches a bar that closed at most 3 hours ago; a failed audit is stored and unmet, never the last good one. SHADOW ② (`모든 사이클`) = every hourly bar that closed in the stage has a cycle that ended OK within 2 minutes of the close - a runtime that was down misses bars; a bar whose deadline is still ahead is not due, and one while the futures session was recorded closed (a `SESSION` event's `state`) is excused when it has none. SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `ORDER_UNRESOLVED`: the runtime watches every `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` and `ACTION_ERROR` of a Protect, Close or Reduce until it is resolved - its trade closed, or a later pass that saw a target and quotes had no order failure for that trade - or, for a bracket in a pass without a target or quotes, found the trade's resting stop legs covering its position (a close needs the close itself) - within 30 s for a bracket and by the next pass for a close or a reduction (the cancel-first fallback on a venue that refuses overlapping brackets writes `LEG_GAP` only: the designed path, not a failure; so do `CLOSE_CONFLICT` / `REDUCE_CONFLICT`, refusals answered by making room); CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The CANARY pass and FULL entry gates also need no other CANARY failure in the stint (audit mismatch, breaker, transfer key), the runtime not paused and a current audit without an unexplained mismatch of a decision known in the stint. `transition` refuses a promotion unless every gate of that promotion (`stage.REQUIRED_GATES`) is among those given and all are met. The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
+10. **Stages** change only through `ewbot live stage <to> --confirm`. A promotion (one stage at a time) needs every gate and a flat book (journal and Coinbase) before it is written; a demotion is written at once - the running runtime sizes for it from its next order - and the command then reports whether the book is flat. A failed stint is started again with `ewbot live stage shadow|canary --restart --confirm` (the current stage only, flat book; a `STAGE` event `restart`): SHADOW after a fix (spec §6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY after a CANARY failure (no SHADOW again); every gate of the stage then counts from the restart. A running runtime notices a new stage or a new stint within a minute and exits once flat; Docker (`restart: unless-stopped`) starts it in the new stage; until then it sizes every entry and adoption by the more conservative of its stage and the journal's (`stage.full_cap` is the journal stage's maximum: SHADOW 0 real orders, CANARY 1, FULL 3 until released - never "no cap" after a demotion). One CANARY failure set (`stage.CANARY_FAIL`) serves the pause and the gates: unprotected > 60 s, an unexplained audit mismatch, a breaker, a transfer key, protection slower than 30 s, a foreign order or position, more contracts than the trade holds or fewer than its legs explain, the trade's position flipped to the other side, and an order failure the executor did not resolve in time (`ORDER_UNRESOLVED`: a bracket not replaced within 30 s, a close or a reduction not done by the next pass; one resolved in time is none). In CANARY each pauses entries (spec §6.2 `자동으로 일시 정지`) and keeps the CANARY pass gate unmet for the rest of that CANARY stint (until the user restarts it); a manual intervention the planner keeps finding and an unresolved order failure are one incident per episode, not one per pass (a manual episode lasts while a pass still finds it, an order-failure episode while its trade has an open failure - with no trade open each failure is its own -, both within the stint), and a manual intervention still in force keeps the FULL cap; in every stage three balance reads in a row that are not a finite amount above 0 pause entries (`BAD_EQUITY`, never a flatten); in FULL the major incidents pause and demote to CANARY (with a `STAGE` event), and every other CANARY failure keeps the 3-contract cap for 30 more days. Pause never stops protection or exits.
+11. **Gates operationalised.** SHADOW `신호 1건 이상` = a signal first known in the stage (`known_at` after its start: the first cycle records every decision since 2024). SHADOW ① = a passing audit (no mismatch the data do not explain: a `DATA_REVISION` is shown in the detail, not counted - as paper criterion 4 ignores explained causes) whose window starts at or before the stage's start and reaches a bar that closed at most 3 hours ago; a failed audit is stored and unmet, never the last good one. SHADOW ② (`모든 사이클`) = every hourly bar that closed in the stage has a cycle that ended OK within 2 minutes of the close - a runtime that was down misses bars; a bar whose deadline is still ahead is not due, and one with no cycle row at all while the futures session was recorded closed is excused: from a `SESSION` event whose `state` is not OPEN (the runtime records the state at every start and every change) to the next `SESSION` or `STARTUP` event, at most 4 hours (spec §2: the longest closure is the quarterly 3-hour maintenance). A restart never rewrites a bar whose cycle ended OK: it takes that bar as done and only refreshes its target. SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `ORDER_UNRESOLVED`: the runtime watches every `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` and `ACTION_ERROR` of a Protect, Close or Reduce until it is resolved - its trade closed, or a later pass that saw a target and quotes had no order failure for that trade, a bracket only in a pass with the session OPEN that planned no Protect for the trade (its legs were the wanted ones) - or, for a bracket in a pass without a target, quotes or an OPEN session (a data-late hour; a venue refusing order entry while closed), found the trade's resting stop legs covering its position (a close needs the close itself) - within 30 s for a bracket and by the next pass for a close or a reduction (the cancel-first fallback on a venue that refuses overlapping brackets writes `LEG_GAP` only: the designed path, not a failure; so do `CLOSE_CONFLICT` / `REDUCE_CONFLICT`, refusals answered by making room); CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The CANARY pass and FULL entry gates also need no other CANARY failure in the stint (audit mismatch, breaker, transfer key), the runtime not paused and a current audit without an unexplained mismatch of a decision known in the stint. `transition` refuses a promotion unless every gate of that promotion (`stage.REQUIRED_GATES`) is among those given and all are met. The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
 12. **Audit** (spec §3.5): the journal stores the engine decisions in the paper ledger's format; hourly (from minute 50) they are compared with the paper ledger's current epoch (known_at in (its recording floor - the previous epoch's through_ts for a later epoch -, min(epoch through_ts, the last bar whose live cycle ended OK)]: a held or failed cycle is never a mismatch). Every mismatch has a cause like the paper runtime's: `DATA_REVISION` (the candles the two runtimes decided on differ at the decision's bar although they were equal at the paper's previous run) is alerted only and explained (it fails no audit gate); a decision missing on one side is `AUDIT_PENDING` and a major incident (`AUDIT_MISMATCH`, in CANARY/FULL) only if the next audit still finds it; a different decision or a paper fingerprint change is one at once. A ledger that is not a valid schema-1 paper ledger, like a failed fetch, is a failed audit: stored as failed, alerted once per episode.
 13. **Costs in the daily summary**: entry slippage against the engine's reference (spot `entry_ref` × ratio), stop slippage of bracket stop fills against the stop price (every filled leg is read back with `get_order` and journaled as `BRACKET_FILL`), measured fees vs. the paper cost model (`execution.costs.fee`); funding is not measured separately (Coinbase books it into the balance) — the summary says so.
 14. **Deployment**: only tags on `origin/master`, only with a flat book; the new image's offline preflight runs before anything else; the running image is `ewbot-live:current` (rollback = deploy the previous tag).
@@ -96,15 +96,15 @@
 | 7 | Executor: intent-before-send, protection, closes, recovery | 65 |
 | 8 | Watchdog and WebSocket feed | 27 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 13 |
-| 10 | Paper audit, stages and gates | 18 |
+| 10 | Paper audit, stages and gates | 20 |
 | 11 | Settings and preflight | 8 |
-| 12 | `ShadowExchange` and the runtime loop | 36 |
+| 12 | `ShadowExchange` and the runtime loop | 39 |
 | 13 | CLI `ewbot live …` and production wiring | 9 |
 | 14 | Parity and chaos integration tests | 26 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 386 more tests, `1006 passed, 1 skipped` (`1007 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 391 more tests, `1011 passed, 1 skipped` (`1012 passed` with the cache), about 80 s.
 
 ---
 
@@ -9160,8 +9160,8 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.paper.decisions` (`known_at`, `same_decision`), `ewbot.paper.ledger` (`Ledger.from_dict`, `LedgerError`: the schema-1 check), `ewbot.live.exchange` (`KeyPermissions`, `SESSION_OPEN`), `ewbot.live.journal.Journal`, `ewbot.live.pricing` (`FULL_CAP_CONTRACTS`, `FULL_CAP_DAYS`), `ewbot.types.H1`, `requests`.
-- Produces (`ewbot.live.audit`): `CONTENTS_API`, `FETCH_TIMEOUT = (5.0, 20.0)`, `FETCH_DEADLINE_S = 30.0`, `class AuditError(RuntimeError)`, `fetch_paper_ledger(repo, token, session=None, ref="paper", *, clock=time.monotonic) -> dict` (raw media type, streamed within a total deadline; any failure is an `AuditError` naming only the HTTP status or the exception type, raised outside the handler so that no request exception - its headers carry the token - is chained to it; a session it creates it closes), `recording_floor(epochs) -> int` (as `paper.runner._recording_floor`), frozen `AuditResult(window: (lo, hi), compared, matched, mismatches: tuple[dict, ...], as_of, error=None)` with `.ok` (no error, something compared, no unexplained mismatch), `unexplained(after=None)` (the mismatches whose cause is not `DATA_REVISION`; with `after`, of decisions first known after it - a `PAPER_FINGERPRINT` always counts), `failed(error, as_of)`, `to_json()` / `from_json(data)` (the journal's format: each mismatch as id, type, cause), `audit(live_decisions, ledger, baseline_fingerprint=None, since=None, until=None, *, now, data_hash=None) -> AuditResult` (known_at in (max(recording floor, since), min(epoch through_ts, until)]; mismatch types `MISSING_IN_LIVE`, `MISSING_IN_PAPER`, `DIFFERENT`, `PAPER_FINGERPRINT`, each with its decision's `known_at` and a `cause`: `DATA_REVISION` when `data_hash(ts)` - the live candles' `data_fingerprint(df, 0, ts)` - differs from the paper's hash at the decision's bar (its decision's `data_sha256`, else its run at that bar) and equals it at the paper's previous run, `FINGERPRINT_CHANGE`, else `UNEXPLAINED`; a ledger that is not a valid schema-1 paper ledger raises `AuditError`).
-- Produces (`ewbot.live.stage`): `STAGES = ("SHADOW", "CANARY", "FULL")`, `SHADOW_MIN_DAYS = 14`, `CYCLE_DEADLINE_S = 120`, `CANARY_MIN_TRADES = 3`, `CANARY_MAX_DAYS = 90`, `PROTECT_MAX_S = 30.0`, `AUDIT_MAX_AGE_S = 3 * 3600` (a gate's audit must reach a bar that closed at most this long ago), `PAUSE_KEY = "paused"`, `MAJOR`, `MANUAL` (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `ADOPTED`, `EXCESS_POSITION`, `UNEXPLAINED_REDUCTION`, `DIRECTION_MISMATCH`: the position changed outside our orders - brackets and closes only reduce, so only someone else's order can flip it), `ORDER_UNRESOLVED = "ORDER_UNRESOLVED"` (an order failure the runtime did not resolve in time), `CANARY_FAIL` (`MAJOR` + `PROTECT_SLOW` + `MANUAL` + `ORDER_UNRESOLVED`: the one CANARY failure set of the pause and the gates), `ORDER_FAILURES` (the order failures the runtime watches: `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` - not `LEG_GAP`, the executor's designed cancel-first fallback on a venue that refuses overlapping brackets); the gate names `G_*`, `SHADOW_PASS`, `CANARY_PASS`, `REQUIRED_GATES` (per promotion); `class StageError(RuntimeError)`, frozen `Gate(name, met, detail)`, `gate_lines(gates) -> list[str]`, `paused(journal) -> dict | None`, `pause(journal, reason, now)`, `resume(journal, now)`, `canary_failures(journal, since) -> {kind: (count, latest ts)}` (INCIDENT events of a `CANARY_FAIL` kind and events of those kinds themselves), `full_cap(journal, now) -> int | None` (the journal's current stage maximum, never more: SHADOW 0, CANARY 1, FULL `FULL_CAP_CONTRACTS` until it has run `FULL_CAP_DAYS` without a CANARY failure - each one restarts the window, on the journal's times -, then None), `on_incident(journal, kind, now) -> list[str]` (`"paused"`, `"demoted to CANARY"` with a `STAGE` event; in FULL another CANARY failure `"3-contract cap for 30 more days"`), `audit_gate(name, audit_result, since, now, after=None) -> Gate` (the CANARY gates pass `after=since`: a stint counts its own mismatches) (a passing audit from at or before `since` to a bar closed at most `AUDIT_MAX_AGE_S` ago; a failed one unmet), `shadow_gates(journal, now, audit_result)`, `canary_entry_gates(journal, now, audit_result, paper_status, perms)`, `canary_gates(journal, now, audit_result)`, `full_entry_gates(journal, now, audit_result, paper_status, perms)` (all `-> list[Gate]`), `restart_canary(journal, now, *, confirm, flat)` (a new CANARY stint: only from CANARY, flat, `STAGE` event reason `restart`; raises `StageError`), `transition(journal, to, now, gates, *, confirm, flat)` (raises `StageError`; a demotion needs only `confirm` - `flat` is ignored, the CLI reports it -; a promotion needs a flat book, every gate of `REQUIRED_GATES[(current, to)]` among `gates` and every gate met; writes a `STAGE` event). `paper_status` is the dict of `paper.criteria.golive_status`.
+- Produces (`ewbot.live.audit`): `CONTENTS_API`, `FETCH_TIMEOUT = (5.0, 20.0)`, `FETCH_DEADLINE_S = 30.0`, `class AuditError(RuntimeError)`, `fetch_paper_ledger(repo, token, session=None, ref="paper", *, clock=time.monotonic) -> dict` (raw media type, streamed within a total deadline; any failure is an `AuditError` naming only the HTTP status or the exception type, raised outside the handler so that no request exception - its headers carry the token - is chained to it; a session it creates it closes), `recording_floor(epochs) -> int` (as `paper.runner._recording_floor`), frozen `AuditResult(window: (lo, hi), compared, matched, mismatches: tuple[dict, ...], as_of, error=None)` with `.ok` (no error, something compared, no unexplained mismatch), `unexplained(after=None)` (the mismatches whose cause is not `DATA_REVISION`; with `after`, of decisions first known after it - a `PAPER_FINGERPRINT` always counts), `failed(error, as_of)`, `to_json()` / `from_json(data)` (the journal's format: each mismatch as id, type, cause), `audit(live_decisions, ledger, baseline_fingerprint=None, since=None, until=None, *, now, data_hash=None) -> AuditResult` (known_at in (max(recording floor, since), min(epoch through_ts, until)]; mismatch types `MISSING_IN_LIVE`, `MISSING_IN_PAPER`, `DIFFERENT`, `PAPER_FINGERPRINT`, each with its decision's `known_at` and a `cause`: `DATA_REVISION` when `data_hash(ts)` - the live candles' `data_fingerprint(df, 0, ts)` - differs from the paper's hash at the decision's bar (its decision's `data_sha256`, else its run at that bar) and equals it at the paper's previous run, `FINGERPRINT_CHANGE`, else `UNEXPLAINED`; a ledger that is not a valid schema-1 paper ledger raises `AuditError`, and so does a malformed live journal decision - its message names the live journal; `DECISION_KEYS`).
+- Produces (`ewbot.live.stage`): `STAGES = ("SHADOW", "CANARY", "FULL")`, `SHADOW_MIN_DAYS = 14`, `CYCLE_DEADLINE_S = 120`, `CANARY_MIN_TRADES = 3`, `CANARY_MAX_DAYS = 90`, `PROTECT_MAX_S = 30.0`, `AUDIT_MAX_AGE_S = 3 * 3600` (a gate's audit must reach a bar that closed at most this long ago), `PAUSE_KEY = "paused"`, `MAJOR`, `MANUAL` (`FOREIGN_ORDERS`, `UNKNOWN_POSITION`, `ADOPTED`, `EXCESS_POSITION`, `UNEXPLAINED_REDUCTION`, `DIRECTION_MISMATCH`: the position changed outside our orders - brackets and closes only reduce, so only someone else's order can flip it), `ORDER_UNRESOLVED = "ORDER_UNRESOLVED"` (an order failure the runtime did not resolve in time), `CANARY_FAIL` (`MAJOR` + `PROTECT_SLOW` + `MANUAL` + `ORDER_UNRESOLVED`: the one CANARY failure set of the pause and the gates), `ORDER_FAILURES` (the order failures the runtime watches: `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` - not `LEG_GAP`, the executor's designed cancel-first fallback on a venue that refuses overlapping brackets); the gate names `G_*`, `SHADOW_PASS`, `CANARY_PASS`, `REQUIRED_GATES` (per promotion); `class StageError(RuntimeError)`, frozen `Gate(name, met, detail)`, `gate_lines(gates) -> list[str]`, `paused(journal) -> dict | None`, `pause(journal, reason, now)`, `resume(journal, now)`, `canary_failures(journal, since) -> {kind: (count, latest ts)}` (INCIDENT events of a `CANARY_FAIL` kind and events of those kinds themselves), `full_cap(journal, now) -> int | None` (the journal's current stage maximum, never more: SHADOW 0, CANARY 1, FULL `FULL_CAP_CONTRACTS` until it has run `FULL_CAP_DAYS` without a CANARY failure - each one restarts the window, on the journal's times - and with no manual intervention in force - `RAISED_KEY`, the window then counting from its end -, then None), `SESSION_CLOSED_MAX_S = 4 * 3600` (the longest closure a recorded one excuses), `RAISED_KEY = "incidents_raised"` (the runtime's manual incidents in force: `{items, ended, stint}`), `on_incident(journal, kind, now) -> list[str]` (`"paused"`, `"demoted to CANARY"` with a `STAGE` event; in FULL another CANARY failure `"3-contract cap for 30 more days"`), `audit_gate(name, audit_result, since, now, after=None) -> Gate` (the CANARY gates pass `after=since`: a stint counts its own mismatches) (a passing audit from at or before `since` to a bar closed at most `AUDIT_MAX_AGE_S` ago; a failed one unmet), `shadow_gates(journal, now, audit_result)`, `canary_entry_gates(journal, now, audit_result, paper_status, perms)`, `canary_gates(journal, now, audit_result)`, `full_entry_gates(journal, now, audit_result, paper_status, perms)` (all `-> list[Gate]`), `restart_stint(journal, stage, now, *, confirm, flat)` (a new stint of the current stage, SHADOW or CANARY: flat, `STAGE` event reason `restart`; every gate of the stage counts from it - a restarted SHADOW audits the mismatches of its own decisions; raises `StageError`), `transition(journal, to, now, gates, *, confirm, flat)` (raises `StageError`; a demotion needs only `confirm` - `flat` is ignored, the CLI reports it -; a promotion needs a flat book, every gate of `REQUIRED_GATES[(current, to)]` among `gates` and every gate met; writes a `STAGE` event). `paper_status` is the dict of `paper.criteria.golive_status`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9185,6 +9185,7 @@ from ewbot.live.pricing import stage_contracts
 from ewbot.live.stage import (
     CANARY_FAIL,
     ORDER_FAILURES,
+    RAISED_KEY,
     Gate,
     StageError,
     canary_entry_gates,
@@ -9195,7 +9196,7 @@ from ewbot.live.stage import (
     on_incident,
     pause,
     paused,
-    restart_canary,
+    restart_stint,
     resume,
     shadow_gates,
     transition,
@@ -9307,10 +9308,12 @@ def test_a_ledger_that_is_not_a_valid_paper_ledger_is_an_audit_error():
     }
     live = [dec("TRAIL", 10800, 7200, 3.0)]
     for name, bad in cases.items():
-        with pytest.raises(AuditError):
+        with pytest.raises(AuditError, match="paper ledger"):
             audit(live, bad, now=NOW)
             pytest.fail(name)
     assert audit(live, good_ledger, now=NOW).ok
+    with pytest.raises(AuditError, match="live journal"):  # our own journal is malformed: said so
+        audit([{k: v for k, v in live[0].items() if k != "levels"}], good_ledger, now=NOW)
 
 
 class Resp:
@@ -9440,6 +9443,28 @@ def test_the_signal_and_cycle_gates_count_the_stage_itself(tmp_path):
     last = int(now) - H1  # closes at `now`
     jr.start_cycle(last, now + 30, "SHADOW")
     assert gate(CYCLE_GATE, now + 60).met and not gate(CYCLE_GATE, now + 200).met
+    jr.close()
+
+
+def test_a_closure_excuses_only_missing_cycles_and_ends_at_the_next_record(tmp_path):
+    jr = journal(tmp_path)
+    jr.set_stage("SHADOW", "initial", S0)
+    now = S0 + 2 * DAY
+
+    def gate() -> tuple[bool, str]:
+        g = {g.name: g for g in shadow_gates(jr, now, good(now))}[CYCLE_GATE]
+        return g.met, g.detail
+
+    down = range(int(S0) + 10 * H1, int(S0) + 40 * H1, H1)  # 30 hours without a cycle
+    hourly(jr, S0, now, skip=tuple(down))
+    jr.add_event(S0 + 10 * H1 + 60, "SESSION", {"text": "장 운영 상태 OPEN → CLOSE", "state": "CLOSE"})
+    assert gate() == (False, "18/44봉 (장 휴장 제외 4봉)")  # its reopen was never recorded: at most 4 h
+    jr.add_event(S0 + 11 * H1 + 600, "STARTUP", {"stage": "SHADOW"})  # a start ends it as well
+    assert gate() == (False, "18/47봉 (장 휴장 제외 1봉)")
+    bar = int(S0) + 10 * H1  # a cycle that ran during the closure and failed is no excuse
+    jr.start_cycle(bar, bar + H1 + 30, "SHADOW")
+    jr.finish_cycle(bar, bar + H1 + 40, "ERROR")
+    assert gate() == (False, "18/48봉")
     jr.close()
 
 
@@ -9584,8 +9609,8 @@ def test_a_failed_canary_stint_can_be_restarted_and_its_gates_count_from_then(tm
     assert not all(g.met for g in full_entry_gates(jr, now, audit_now, PAPER_ALL, KEY))  # without a restart: blocked
     for kw in ({"confirm": False, "flat": True}, {"confirm": True, "flat": False}):
         with pytest.raises(StageError):
-            restart_canary(jr, now, **kw)
-    restart_canary(jr, now, confirm=True, flat=True)
+            restart_stint(jr, "CANARY", now, **kw)
+    restart_stint(jr, "CANARY", now, confirm=True, flat=True)
     assert jr.stage() == ("CANARY", now) and jr.events(kind="STAGE")[-1]["data"] == {
         "from": "CANARY", "to": "CANARY", "reason": "restart"}
     resume(jr, now + 1)  # the pause is the user's to lift, as always
@@ -9604,8 +9629,40 @@ def test_a_failed_canary_stint_can_be_restarted_and_its_gates_count_from_then(tm
     audit_bad = dataclasses.replace(audit_later, mismatches=(before, after))
     assert not all(g.met for g in full_entry_gates(jr, later, audit_bad, PAPER_ALL, KEY))
     jr.set_stage("FULL", "test", later)
-    with pytest.raises(StageError, match="only a CANARY stint"):
-        restart_canary(jr, later + 1, confirm=True, flat=True)
+    with pytest.raises(StageError, match="only the current stage"):
+        restart_stint(jr, "CANARY", later + 1, confirm=True, flat=True)
+    with pytest.raises(StageError, match="only a SHADOW or CANARY stint"):
+        restart_stint(jr, "FULL", later + 1, confirm=True, flat=True)
+    jr.close()
+
+
+def test_a_failed_shadow_stint_can_be_restarted_and_its_gates_count_from_then(tmp_path):
+    jr, now = shadow_journal(tmp_path)
+    jr.add_event(S0 + 9000, "PREVIEW", {"ok": False, "errors": ["PREVIEW_INSUFFICIENT_FUND"]})
+    before = {"id": f"TRAIL:{int(S0) + 3600}:3600", "type": "DIFFERENT", "cause": "UNEXPLAINED",
+              "known_at": int(S0) + 3600}
+
+    def mismatched(at: float) -> AuditResult:
+        return AuditResult((0, int(at) // H1 * H1 - 2 * H1), 30, 29, (before,), at - 600)
+
+    met = {g.name: g.met for g in shadow_gates(jr, now, mismatched(now))}
+    assert not met[AUDIT_GATE] and not met["③ 냈을 주문 전부 preview 통과"]  # this stint cannot pass any more
+    with pytest.raises(StageError, match="flat"):
+        restart_stint(jr, "SHADOW", now, confirm=True, flat=False)
+    with pytest.raises(StageError, match="only the current stage"):
+        restart_stint(jr, "CANARY", now, confirm=True, flat=True)
+    restart_stint(jr, "SHADOW", now, confirm=True, flat=True)  # spec 6.2: fix, then SHADOW again
+    assert jr.stage() == ("SHADOW", now) and jr.events(kind="STAGE")[-1]["data"] == {
+        "from": "SHADOW", "to": "SHADOW", "reason": "restart"}
+    later = now + 15 * DAY  # the new stint's own 14 days, signal, cycles, previews and restarts
+    hourly(jr, now, later)
+    jr.add_event(now + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    jr.add_event(now + 5 * DAY, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    jr.add_decisions([dec("SIGNAL", int(now) + 7200, int(now) + 7200)], now=now + 10_900)
+    jr.add_event(now + 10_900, "PREVIEW", {"ok": True, "errors": []})
+    gates = shadow_gates(jr, later, mismatched(later))
+    assert all(g.met for g in gates), gate_lines(gates)  # the old stint's mismatch and preview are not counted
+    assert "단계 시작 전 불일치 1건 제외" in {g.name: g.detail for g in gates}[AUDIT_GATE]
     jr.close()
 
 
@@ -9629,11 +9686,17 @@ def test_the_cap_is_the_journal_stages_and_lifts_only_after_30_clean_days_of_ful
     assert full_cap(jr, S0 + 84 * DAY) == 3 and full_cap(jr, S0 + 85 * DAY) is None
     kw = dict(equity=200_000.0, entry=60_000.0, stop=59_400.0, direction=1, risk_mult=1.0, cfg=BotConfig())
     assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY), **kw)[0] == 303  # released: uncapped
+    # a manual intervention the runtime still finds (a foreign order left resting) keeps the cap while it lasts,
+    # and the 30 clean days count from its end
+    jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "ended": None, "stint": S0 + 5})
+    assert full_cap(jr, S0 + 150 * DAY) == 3
+    jr.put(RAISED_KEY, {"items": [], "ended": S0 + 151 * DAY, "stint": S0 + 5})
+    assert full_cap(jr, S0 + 180 * DAY) == 3 and full_cap(jr, S0 + 181 * DAY) is None
     # a major incident demotes in the journal while the FULL process still runs: the cap is CANARY's at once
-    assert on_incident(jr, "UNPROTECTED_60S", S0 + 86 * DAY) == ["paused", "demoted to CANARY"]
-    resume(jr, S0 + 86 * DAY + 1)
-    assert full_cap(jr, S0 + 86 * DAY + 2) == 1
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY + 2), **kw)[0] == 1
+    assert on_incident(jr, "UNPROTECTED_60S", S0 + 186 * DAY) == ["paused", "demoted to CANARY"]
+    resume(jr, S0 + 186 * DAY + 1)
+    assert full_cap(jr, S0 + 186 * DAY + 2) == 1
+    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 186 * DAY + 2), **kw)[0] == 1
     assert jr.events(kind="STAGE")[-1]["data"] == {"from": "FULL", "to": "CANARY",
                                                    "reason": "major incident UNPROTECTED_60S"}
     jr.close()
@@ -9695,7 +9758,8 @@ explained, as paper criterion 4 ignores explained causes: it is reported (and al
 (`AuditResult.ok`, `unexplained`); every other mismatch does.
 
 A ledger that is not a schema-1 paper ledger (`paper.ledger.Ledger.from_dict`) or whose epochs or decisions
-are malformed is an AuditError, like a failed fetch: never a passing audit.
+are malformed is an AuditError, like a failed fetch: never a passing audit; so is a malformed decision of the live
+journal (its message names the live journal).
 
 The ledger is read with the GitHub contents API (`EWBOT_PAPER_REPO`, fine-grained token with
 Contents: read on that repository only, `EWBOT_GITHUB_TOKEN`), raw media type (up to 100 MB)."""
@@ -9717,6 +9781,7 @@ CONTENTS_API = "https://api.github.com/repos/{repo}/contents/ledger.json"
 FETCH_TIMEOUT = (5.0, 20.0)  # connect, each read
 FETCH_DEADLINE_S = 30.0  # the whole fetch, body included: it runs on the protective main loop
 CHUNK = 1 << 16
+DECISION_KEYS = ("id", "kind", "ts", "price", "contracts", "reason", "trade_key", "levels", "setup", "direction")
 
 
 class AuditError(RuntimeError):
@@ -9822,6 +9887,18 @@ def audit(live: Sequence[dict[str, Any]], ledger: dict[str, Any], baseline_finge
         raise AuditError(f"paper ledger malformed: {type(exc).__name__}: {exc}"[:300]) from None
 
 
+def _live(live: Sequence[dict[str, Any]], inside: Callable[[dict[str, Any]], bool]) -> dict[str, dict[str, Any]]:
+    """The live journal's decisions in the window, each checked for the fields the comparison reads."""
+    try:
+        for d in live:
+            missing = [k for k in DECISION_KEYS if k not in d]
+            if missing or not isinstance(d["levels"], list):
+                raise KeyError(f"{d.get('id')}: {missing or 'levels'}")
+        return {d["id"]: d for d in live if inside(d)}
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
+        raise AuditError(f"live journal decision malformed: {type(exc).__name__}: {exc}"[:300]) from None
+
+
 def _audit(live: Sequence[dict[str, Any]], led: Ledger, baseline: str | None, since: int | None, until: int | None,
            now: float, data_hash: Callable[[int], str | None] | None) -> AuditResult:
     if not isinstance(led.epochs, list) or not led.epochs or not isinstance(led.decisions, list):
@@ -9834,8 +9911,8 @@ def _audit(live: Sequence[dict[str, Any]], led: Ledger, baseline: str | None, si
     def inside(d: dict[str, Any]) -> bool:
         return lo < known_at(d) <= hi
 
+    mine = _live(live, inside)
     paper = {d["id"]: d for d in led.decisions if inside(d)}
-    mine = {d["id"]: d for d in live if inside(d)}
     runs = sorted((int(r["last_bar_ts"]), str(r["data_sha256"])) for r in led.runs
                   if isinstance(r, dict) and r.get("status") == "ok" and r.get("data_sha256"))
     run_bars = [b for b, _ in runs]
@@ -9893,9 +9970,10 @@ resolved in time is no CANARY failure). In CANARY each one pauses entries (`on_i
 FULL entry gates are unmet after any of them in the current CANARY stint, while the runtime is paused and
 without a current passing audit. In FULL the major incidents pause and demote to CANARY, and every CANARY
 failure restarts the 30-day clean window of the 3-contract cap (spec 6.2 FULL `이상이 없으면 상한을 해제`).
-After a CANARY failure the user may restart the CANARY stint (`restart_canary`: flat, --confirm; spec 6.2
-`재개는 사용자가 결정한다`) instead of going back to SHADOW: every CANARY gate then counts from the restart - trades,
-days, failures and the audit's mismatches; without it the failed stint keeps FULL closed.
+A failed stint is started again with `restart_stint` (flat, --confirm, a STAGE event `restart`): SHADOW after a
+fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY after a CANARY failure (spec 6.2 `재개는 사용자가 결정한다`,
+no SHADOW again). Every gate of that stage then counts from the restart - days, signals, cycles, previews,
+restarts, trades, failures and the audit's mismatches; without a restart a failed stint keeps the promotion closed.
 
 Gates (spec 6.2), all computed from the journal. Times are the journal's (the VPS clock, NTP-synchronised): a
 clock step moves every window with it.
@@ -9903,9 +9981,10 @@ clock step moves every window with it.
                 audit from at or before the stage's start to at most AUDIT_MAX_AGE_S ago, with no mismatch the
                 data do not explain: a DATA_REVISION is shown, not counted);
                 (2) every hourly bar that closed in the stage has a cycle that ended OK within 2 min of the
-                close (a bar while the futures session was recorded closed is excused when it has none; a
-                cycle not yet past its deadline is not due); (3) every would-be order passed preview; (4)
-                restart test: at least one restart recovered with no unresolved intent.
+                close (a bar with no cycle row at all while the futures session was recorded closed is excused:
+                a span from a SESSION event whose state is not OPEN to the next SESSION or STARTUP event, at most
+                SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due); (3) every would-be order
+                passed preview; (4) restart test: at least one restart recovered with no unresolved intent.
   CANARY start  SHADOW pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission.
   CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
                 closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
@@ -9936,7 +10015,13 @@ CANARY_MIN_TRADES = 3
 CANARY_MAX_DAYS = 90
 PROTECT_MAX_S = 30.0
 AUDIT_MAX_AGE_S = 3 * 3600  # a gate's audit must reach a bar that closed at most this long ago
+# the longest closure spec 2 documents (the quarterly 3-hour maintenance; the weekly CFM halt is 1 hour) plus 1 hour:
+# a closure whose reopen was never recorded excuses no more than this
+SESSION_CLOSED_MAX_S = 4 * 3600
 PAUSE_KEY = "paused"
+# the manual interventions the runtime's planner still finds, one per (kind, trade id) episode (live/runtime.py):
+# {"items": [[kind, trade id], ...], "ended": when the last of them ended (None: never), "stint": their stage row}
+RAISED_KEY = "incidents_raised"
 MAJOR = ("UNPROTECTED_60S", "AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY")  # spec 6.2 중대 사건
 # the position changed outside our orders: a foreign order or position, more contracts than the trade holds,
 # fewer than its legs explain (reconcile.observe), the trade's position on the other side (brackets and closes only
@@ -10030,13 +10115,18 @@ def canary_failures(journal: Journal, since: float) -> dict[str, tuple[int, floa
 def full_cap(journal: Journal, now: float) -> int | None:
     """The most contracts the journal's current stage allows - never more than the stage that is in force:
     SHADOW 0 (no real order), CANARY 1, FULL FULL_CAP_CONTRACTS until it has run FULL_CAP_DAYS without a CANARY
-    failure (each one restarts the window, counted from the journal's event times), None (uncapped) only then."""
+    failure (each one restarts the window, counted from the journal's event times) and with no manual intervention
+    still in force (RAISED_KEY; the window then counts from its end), None (uncapped) only then."""
     stage, since = journal.stage()
     if stage == "CANARY":
         return 1
     if stage != "FULL" or since is None:
         return 0
-    clean_from = max([float(since)] + [last for _, last in canary_failures(journal, float(since)).values()])
+    raised = journal.get(RAISED_KEY) or {}
+    if raised.get("items"):
+        return FULL_CAP_CONTRACTS
+    ended = [float(raised["ended"])] if raised.get("ended") is not None and float(raised["ended"]) >= float(since) else []
+    clean_from = max([float(since)] + ended + [last for _, last in canary_failures(journal, float(since)).values()])
     return None if now - clean_from >= FULL_CAP_DAYS * DAY else FULL_CAP_CONTRACTS
 
 
@@ -10067,6 +10157,12 @@ def _since(journal: Journal, stage: str) -> float | None:
     return float(hist[-1]["ts"])
 
 
+def _restarted(journal: Journal) -> bool:
+    """The current stint began with `restart_stint`."""
+    hist = journal.stage_history()
+    return bool(hist) and hist[-1]["reason"] == "restart"
+
+
 def audit_gate(name: str, res: AuditResult | None, since: float, now: float, after: float | None = None) -> Gate:
     """An audit that covers the stage - its window starts at or before `since` and reaches a bar that closed at most
     AUDIT_MAX_AGE_S ago - with something compared and no unexplained mismatch (a DATA_REVISION is shown in the
@@ -10093,21 +10189,23 @@ def audit_gate(name: str, res: AuditResult | None, since: float, now: float, aft
 
 
 def _closed_spans(journal: Journal, since: float, now: float) -> list[tuple[float, float]]:
-    """Spans in which the futures session was recorded not OPEN: from a SESSION event whose `state` is not OPEN to
-    the next SESSION event that is OPEN, or to now (live/runtime.py records the state with each SESSION event)."""
+    """Spans in which the futures session was recorded not OPEN: from a SESSION event whose `state` is not OPEN
+    (live/runtime.py records the state with every change and at every start) to the next SESSION event of any state
+    or the next STARTUP - a reopen while the runtime was down is never recorded - and never longer than
+    SESSION_CLOSED_MAX_S."""
+    marks = sorted(journal.events(kind="SESSION", since=since) + journal.events(kind="STARTUP", since=since),
+                   key=lambda e: e["id"])
     spans: list[tuple[float, float]] = []
     start: float | None = None
-    for e in journal.events(kind="SESSION", since=since):
-        state = e["data"].get("state")
-        if state is None:
-            continue
-        if state != SESSION_OPEN and start is None:
-            start = float(e["ts"])
-        elif state == SESSION_OPEN and start is not None:
-            spans.append((start, float(e["ts"])))
+    for e in marks:
+        if start is not None:
+            spans.append((start, min(float(e["ts"]), start + SESSION_CLOSED_MAX_S)))
             start = None
+        state = e["data"].get("state") if e["kind"] == "SESSION" else None
+        if state is not None and state != SESSION_OPEN:
+            start = float(e["ts"])
     if start is not None:
-        spans.append((start, now))
+        spans.append((start, min(now, start + SESSION_CLOSED_MAX_S)))
     return spans
 
 
@@ -10123,8 +10221,8 @@ def _cycle_gate(journal: Journal, since: float, now: float) -> Gate:
         if (c is not None and c["status"] == "OK" and c["finished_ts"] is not None
                 and c["finished_ts"] - close <= CYCLE_DEADLINE_S):
             on_time += 1
-        elif any(s <= close + CYCLE_DEADLINE_S and close <= e for s, e in closed):
-            excused += 1
+        elif c is None and any(s <= close + CYCLE_DEADLINE_S and close <= e for s, e in closed):
+            excused += 1  # no cycle at all while the session was closed; a cycle that ran and failed counts
             continue
         due += 1
     detail = f"{on_time}/{due}봉" + (f" (장 휴장 제외 {excused}봉)" if excused else "")
@@ -10144,7 +10242,8 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     return [
         Gate(G_DAYS, days >= SHADOW_MIN_DAYS, f"{days:.1f}/{SHADOW_MIN_DAYS}일"),
         Gate(G_SIGNAL, len(signals) >= 1, f"단계 중 알게 된 신호 {len(signals)}건"),
-        audit_gate(G_AUDIT, audit_result, since, now),
+        # the first SHADOW audits the whole epoch; a restarted one counts the mismatches of its own decisions
+        audit_gate(G_AUDIT, audit_result, since, now, after=since if _restarted(journal) else None),
         _cycle_gate(journal, since, now),
         Gate(G_PREVIEW, bool(previews) and not failed, f"{len(previews) - len(failed)}/{len(previews)}"),
         Gate(G_RESTART, len(recoveries) >= 2 and len(clean) == len(recoveries),
@@ -10248,19 +10347,23 @@ def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, 
     journal.add_event(now, "STAGE", {"from": cur, "to": to, "reason": reason})
 
 
-def restart_canary(journal: Journal, now: float, *, confirm: bool, flat: bool) -> None:
-    """Start a new CANARY stint after a CANARY failure, instead of going back to SHADOW (spec 6.2 `재개는 사용자가
-    결정한다`): only from CANARY, with --confirm and a flat book. Every CANARY gate then counts from now (trades,
-    days, failures, the audit's mismatches); the pause stays until /resume."""
+def restart_stint(journal: Journal, stage: str, now: float, *, confirm: bool, flat: bool) -> None:
+    """Start a new stint of the current stage: SHADOW after a fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY
+    after a CANARY failure instead of going back to SHADOW (spec 6.2 `재개는 사용자가 결정한다`). Only for the current
+    stage, with --confirm and a flat book. Every gate of the stage then counts from now (days, signals, cycles,
+    previews, restarts, trades, failures, the audit's mismatches); a pause stays until /resume, and a running runtime
+    restarts into the new stint once flat."""
+    if stage not in ("SHADOW", "CANARY"):
+        raise StageError(f"only a SHADOW or CANARY stint can be restarted (not {stage})")
     cur, _ = journal.stage()
-    if cur != "CANARY":
-        raise StageError(f"only a CANARY stint can be restarted (stage {cur})")
+    if cur != stage:
+        raise StageError(f"only the current stage's stint can be restarted (stage {cur}, not {stage})")
     if not confirm:
         raise StageError("a restart needs --confirm (the user's explicit approval)")
     if not flat:
         raise StageError("a restart needs a flat book (no live or virtual position, no resting order)")
-    journal.set_stage("CANARY", "restart", now)
-    journal.add_event(now, "STAGE", {"from": "CANARY", "to": "CANARY", "reason": "restart"})
+    journal.set_stage(stage, "restart", now)
+    journal.add_event(now, "STAGE", {"from": stage, "to": stage, "reason": "restart"})
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -10269,7 +10372,7 @@ def restart_canary(journal: Journal, now: float, *, confirm: bool, flat: bool) -
 uv run --group live pytest tests/live/test_stage.py -q
 ```
 
-Expected: `18 passed`.
+Expected: `20 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -10736,7 +10839,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–11; `ewbot.backtest.holdout.data_fingerprint` (the audit's DATA_REVISION check), `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`FakeFetch`, `make_lock`, `synth_frame`, `ts`), `tests.live.helpers`.
 - Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position (`reconcile.expected_contracts`) back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
-- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0` (between the messages' Telegram dates), `COMMAND_MAX_AGE_S = 120.0`, `CONTROL_ALERT_FAILURES = 5`, `CONTROL_STUCK_S = 120.0`, `TELEGRAM_DOWN_S = 600.0`, `NOTIFY_STALL_S = 180.0`, `NOTIFY_REFUSALS = 3`, `HC_WITHHOLD_S = 1800.0`, `HC_REFAIL_S = 10_800.0`, `HEARTBEAT_ALERT_FAILURES = 3`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"` (`AuditResult.to_json`), `AUDIT_PENDING_KEY = "audit_pending"`, `ORDER_FAIL_KEY = "order_failures"`; `FAILURE_CLASS` / `ACTION_CLASS` (an order failure is about a bracket, a close or a reduction); dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue[Command] | None = None, control=None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={}, redact=identity)` (`redact` takes the settings' secrets out of error texts: loop, cycle and fetch errors and the loop's tracebacks on stderr) (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts` - 1 below FULL, `stage.full_cap` in FULL - and the entry size, both from `_limits(now)`: the more conservative of the stage this process runs in and the journal's, re-read every time, so a demotion applies to the next order at once (a real runtime whose journal is back in SHADOW sends no entry); a manual intervention it plans (`MANUAL_ALERTS`, `MANUAL_CLOSES`) is one incident per (kind, trade) episode (`RAISED_KEY`); after every completed pass `_order_failures` (with the trades the pass found protected: in a pass without a target or quotes a bracket failure is resolved by that protection) resolves each order failure or records it `ORDER_UNRESOLVED` - once per trade and episode -, an incident before its alert - a bracket not replaced within `PROTECT_MAX_S`, a close not done (a `CLOSED` event) or a reduction not done by the next pass; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does a planned `Close` of a foreign position (`UNKNOWN_POSITION`) or of the trade's position on the other side (`DIRECTION_MISMATCH`) and an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (first - in a guard that records a failure as `LOOP_ERROR` with section `telegram` and the type name, never skipping the rest of the minute - the Telegram command thread: started again when it died; a dead thread, one `CONTROL_STUCK_S` behind its own schedule (`overdue`; a hung request: reported, not replaced), `CONTROL_ALERT_FAILURES` failed polls in a row or a new HTTP 409 is alerted once per episode, `TELEGRAM_DOWN` / `TELEGRAM_UP`; and the external heartbeat: Telegram is unusable while such a problem has lasted `TELEGRAM_DOWN_S` or the notifier cannot deliver - its oldest failing message `TELEGRAM_DOWN_S` old, messages waiting `TELEGRAM_DOWN_S` with no attempt for `NOTIFY_STALL_S`, or `NOTIFY_REFUSALS` refusals in a row -, and then `heartbeat.fail` (`TELEGRAM_UNUSABLE`), the success pings withheld at most `HC_WITHHOLD_S` and the `/fail` repeated every `HC_REFAIL_S` while it lasts; otherwise `heartbeat.beat()`, and `HEARTBEAT_ALERT_FAILURES` failed pings in a row alerted once, `HEARTBEAT_FAILING`; then the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin (never acted on without a futures price: one `MARGIN` alert and `MARGIN_NO_PRICE` event per episode; the 15:30 report and the daily summary show the entry price instead only when it is usable), and the WebSocket feed: no futures tick for `FEED_ALERT_S` while the session is OPEN → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back; a session change is journaled as `SESSION` with the new `state` (the SHADOW cycle gate excuses hours the session was recorded closed); the 15:30 report's reads are retried every minute until 16:00, the first failure alerted, and the day is marked done only once they succeed), `run_audit(now) -> AuditResult | None` (up to the last bar whose cycle ended OK, with the live candles' hashes: a `DATA_REVISION` is alerted only - `AUDIT_REVISION` -, a decision missing on one side is `AUDIT_PENDING` until the next audit confirms it, a different decision or a paper fingerprint change is `AUDIT_MISMATCH` at once; a failed audit - any exception - is stored as `AuditResult.failed` and alerted once per episode, `AUDIT_ERROR`), `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now, sent=None) -> reply` (`sent`: the message's Telegram date, `now` when not given; `/flatten_confirm` counts only when sent within `FLATTEN_CONFIRM_S` of its `/flatten`; the loop handles the queue's `Command`s and ignores one sent more than `COMMAND_MAX_AGE_S` before it reads it: `COMMAND_STALE` event and the reply `오래된 명령 무시: /…`; `/resume` re-bases only a breaker that tripped, `AccountGuard.reset`, from the median of that read and the next two; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int` (alerts are only queued - `deps.notify` is the background `LiveNotifier` - and every protective action, a stop-gap or unprotected close, a breaker's pause and flatten, a margin reduction, an incident's pause - an audit mismatch's and a transfer-permission key's included -, is taken before its alert), `flat() -> bool`, attributes `cfg`, `stage`, `target`, `frame` (the last cycle's candles), `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only; the FULL cap, the last audit or its failure) and `audit_from_journal(journal) -> AuditResult | None` (the last stored audit, a failed one included).
+- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0` (between the messages' Telegram dates), `COMMAND_MAX_AGE_S = 120.0`, `CONTROL_ALERT_FAILURES = 5`, `CONTROL_STUCK_S = 120.0`, `TELEGRAM_DOWN_S = 600.0`, `NOTIFY_STALL_S = 180.0`, `NOTIFY_REFUSALS = 3`, `HC_WITHHOLD_S = 1800.0`, `HC_REFAIL_S = 10_800.0`, `HEARTBEAT_ALERT_FAILURES = 3`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"` (`AuditResult.to_json`), `AUDIT_PENDING_KEY = "audit_pending"`, `ORDER_FAIL_KEY = "order_failures"`; `FAILURE_CLASS` / `ACTION_CLASS` (an order failure is about a bracket, a close or a reduction); dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue[Command] | None = None, control=None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={}, redact=identity)` (`redact` takes the settings' secrets out of error texts: loop, cycle and fetch errors and the loop's tracebacks on stderr) (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (records the session state seen at start as a `SESSION` event and takes the last bar whose cycle ended OK as `done_bar` - when it is this hour's bar its target is decided again, its cycles row untouched; `executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"` (never rewrites a cycles row that ended OK), `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts` - 1 below FULL, `stage.full_cap` in FULL - and the entry size, both from `_limits(now)`: the more conservative of the stage this process runs in and the journal's, re-read every time, so a demotion applies to the next order at once (a real runtime whose journal is back in SHADOW sends no entry); a manual intervention it plans (`MANUAL_ALERTS`, `MANUAL_CLOSES`) is one incident per (kind, trade) episode within the stint (`stage.RAISED_KEY`, with the time the last one ended); after every completed pass `_order_failures(start, ctx, guarded, protecting)` (the trades the pass found protected and those it planned a Protect for: a bracket failure is resolved by a pass with a target, quotes and the session OPEN that planned no Protect for its trade, or - in a pass without them - by the protection found) resolves each order failure or records it `ORDER_UNRESOLVED` - once per episode: while its trade has an open failure, per failure while no trade is open, within the stint -, an incident before its alert - a bracket not replaced within `PROTECT_MAX_S`, a close not done (a `CLOSED` event) or a reduction not done by the next pass; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does a planned `Close` of a foreign position (`UNKNOWN_POSITION`) or of the trade's position on the other side (`DIRECTION_MISMATCH`) and an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (first - in a guard that records a failure as `LOOP_ERROR` with section `telegram` and the type name, never skipping the rest of the minute - the Telegram command thread: started again when it died; a dead thread, one `CONTROL_STUCK_S` behind its own schedule (`overdue`; a hung request: reported, not replaced), `CONTROL_ALERT_FAILURES` failed polls in a row or a new HTTP 409 is alerted once per episode, `TELEGRAM_DOWN` / `TELEGRAM_UP`; and the external heartbeat: Telegram is unusable while such a problem has lasted `TELEGRAM_DOWN_S` or the notifier cannot deliver - its oldest failing message `TELEGRAM_DOWN_S` old, messages waiting `TELEGRAM_DOWN_S` with no attempt for `NOTIFY_STALL_S`, or `NOTIFY_REFUSALS` refusals in a row -, and then `heartbeat.fail` (`TELEGRAM_UNUSABLE`), the success pings withheld at most `HC_WITHHOLD_S` and the `/fail` repeated every `HC_REFAIL_S` while it lasts; otherwise `heartbeat.beat()`, and `HEARTBEAT_ALERT_FAILURES` failed pings in a row alerted once, `HEARTBEAT_FAILING`; then the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin (never acted on without a futures price: one `MARGIN` alert and `MARGIN_NO_PRICE` event per episode; the 15:30 report and the daily summary show the entry price instead only when it is usable), and the WebSocket feed: no futures tick for `FEED_ALERT_S` while the session is OPEN → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back; a session change is journaled as `SESSION` with the new `state` (the SHADOW cycle gate excuses hours without a cycle the session was recorded closed); a new stage or a new stint (`restart_stint`) in the journal ends the process once flat (Docker starts it in the new stint); the 15:30 report's reads are retried every minute until 16:00, the first failure alerted, and the day is marked done only once they succeed), `run_audit(now) -> AuditResult | None` (up to the last bar whose cycle ended OK, with the live candles' hashes: a `DATA_REVISION` is alerted only - `AUDIT_REVISION` -, a decision missing on one side is `AUDIT_PENDING` until the next audit confirms it, a different decision or a paper fingerprint change is `AUDIT_MISMATCH` at once; a failed audit - any exception - is stored as `AuditResult.failed` and alerted once per episode, `AUDIT_ERROR`), `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now, sent=None) -> reply` (`sent`: the message's Telegram date, `now` when not given; `/flatten_confirm` counts only when sent within `FLATTEN_CONFIRM_S` of its `/flatten`; the loop handles the queue's `Command`s and ignores one sent more than `COMMAND_MAX_AGE_S` before it reads it: `COMMAND_STALE` event and the reply `오래된 명령 무시: /…`; `/resume` re-bases only a breaker that tripped, `AccountGuard.reset`, from the median of that read and the next two; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int` (alerts are only queued - `deps.notify` is the background `LiveNotifier` - and every protective action, a stop-gap or unprotected close, a breaker's pause and flatten, a margin reduction, an incident's pause - an audit mismatch's and a transfer-permission key's included -, is taken before its alert), `flat() -> bool`, attributes `cfg`, `stage`, `target`, `frame` (the last cycle's candles), `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only; the FULL cap, the last audit or its failure) and `audit_from_journal(journal) -> AuditResult | None` (the last stored audit, a failed one included).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -10835,16 +10938,26 @@ import pytest
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.live.audit import AuditError, audit
 from ewbot.live.control import Command
-from ewbot.live.exchange import Balance, ExchangeError, KeyPermissions, Order, Position, RateLimited, Unavailable
+from ewbot.live.exchange import (
+    Balance,
+    ExchangeError,
+    KeyPermissions,
+    Order,
+    PlaceResult,
+    Position,
+    RateLimited,
+    Unavailable,
+)
 from ewbot.live.feed import TickerFeed
 from ewbot.live.health import Heartbeat
 from ewbot.live.notify import LiveNotifier
 from ewbot.live.preflight import BASELINE_FINGERPRINT
-from ewbot.live.reconcile import pending_position
+from ewbot.live.journal import Journal
+from ewbot.live.reconcile import PlanContext, pending_position
 from ewbot.live.runtime import audit_from_journal, status_lines
 from ewbot.live.shadow import ShadowExchange
 from ewbot.live.sim import SimExchange
-from ewbot.live.stage import canary_gates, on_incident, paused, resume
+from ewbot.live.stage import canary_gates, full_cap, on_incident, paused, restart_stint, resume, shadow_gates
 from ewbot.live.target import compute_target
 from ewbot.paper.decisions import known_at
 from ewbot.paper.notify import SendError
@@ -11471,6 +11584,8 @@ def test_an_order_failure_is_a_canary_failure_only_when_not_resolved_in_time(h):
     t0 = trail + 3600 + 30
     h.at(t0)
     h.at(t0 + 10)  # the next poll replaces it
+    assert not h.journal.events(kind="ORDER_RESOLVED")  # the pass that placed it planned it: no proof yet
+    h.at(t0 + 20)  # this pass finds the legs as wanted (nothing planned for them): resolved
     assert len(h.journal.events(kind="BRACKET_FAILED", since=t0)) == 1 and h.journal.events(kind="STOP_MOVED", since=t0)
     assert [e["data"]["kind"] for e in h.journal.events(kind="ORDER_RESOLVED")] == ["BRACKET_FAILED"]
     assert paused(h.journal) is None and not h.journal.events(kind="ORDER_UNRESOLVED")
@@ -11478,15 +11593,101 @@ def test_an_order_failure_is_a_canary_failure_only_when_not_resolved_in_time(h):
     seen = noting(h, lambda: paused(h.journal))
     h.ex.fail_next("place_bracket", RateLimited("429"), times=50)
     h.ex.cancel([o.order_id for o in h.ex.open_orders()])  # the bracket cancelled by hand, and no new one goes out
-    for k in range(2, 6):
+    for k in range(3, 7):
         h.at(t0 + 10 * k)
         assert paused(h.journal) is None  # within 30 s of the failure: still being retried
-    h.at(t0 + 60)
-    h.at(t0 + 70)  # still failing: the same episode, recorded once
+    h.at(t0 + 70)
+    h.at(t0 + 80)  # still failing: the same episode, recorded once
     assert [e["data"]["kind"] for e in h.journal.events(kind="ORDER_UNRESOLVED")] == ["BRACKET_FAILED"]
     assert paused(h.journal)["reason"] == "incident ORDER_UNRESOLVED"
     assert [p is not None for k, _, p in seen if k == "ORDER_UNRESOLVED"] == [True]  # paused before the alert
-    assert not {g.name: g.met for g in canary_gates(h.journal, t0 + 70, None)}["② 손절 이동과 청산이 목표와 일치"]
+    assert not {g.name: g.met for g in canary_gates(h.journal, t0 + 80, None)}["② 손절 이동과 청산이 목표와 일치"]
+
+
+def test_a_stop_move_refused_while_the_session_is_closed_is_no_canary_failure(h):
+    trail = ts("2024-03-14 07:00")
+    h.walk(ENTRY_BAR, trail + 3600)
+    h.price(float(h.bar(trail + 3600)["open"]))
+    h.ex.set_session("CLOSE")
+    placed = h.ex.place_bracket
+
+    def entry_disabled(cid, *args, **kw):  # a venue that refuses order entry while the session is closed
+        if not h.ex.session().is_open:
+            return PlaceResult(cid, None, False, "ORDER_ENTRY_DISABLED")
+        return placed(cid, *args, **kw)
+
+    h.ex.place_bracket = entry_disabled
+    t0 = trail + 3600 + 30
+    for k in range(9):  # 80 s of refused moves while closed; the old leg keeps protecting
+        h.at(t0 + 10 * k)
+    assert len(h.journal.events(kind="BRACKET_FAILED", since=t0)) >= 5
+    assert not h.journal.events(kind="ORDER_UNRESOLVED") and paused(h.journal) is None
+    h.ex.set_session("OPEN")
+    for k in range(9, 13):
+        h.at(t0 + 10 * k)
+    assert h.journal.events(kind="STOP_MOVED", since=t0) and not h.journal.events(kind="ORDER_UNRESOLVED")
+
+
+def failure_pass(hs: Harness, now: float, *failures: tuple[str, dict]) -> None:
+    """One completed pass with a target and quotes, the session OPEN and nothing planned, after `failures`."""
+    for kind, data in failures:
+        hs.journal.add_event(now, kind, data)
+    hs.rt.target = SimpleNamespace()
+    hs.rt._order_failures(now, PlanContext(now=now, ratio=1.0, tick=5.0, session_open=True), set(), set())
+
+
+def test_a_new_unresolved_failure_after_an_episode_is_a_new_incident(tmp_path):
+    t0 = ENTRY_BAR + 30
+    for stage in ("CANARY", "FULL"):
+        hs = Harness(tmp_path / stage, t0, stage=stage, stage_days=1.0)
+        failure_pass(hs, t0, ("BRACKET_FAILED", {"trade_id": 7, "leg": "tp1"}))
+        failure_pass(hs, t0 + 40)  # not resolved within 30 s
+        resume(hs.journal, t0 + 60)
+        for k in range(1, 50):  # quiet passes for three days: the episode is over
+            failure_pass(hs, t0 + 60 + k * 5000)
+        later = t0 + 3 * 86_400
+        failure_pass(hs, later, ("CLOSE_FAILED", {"trade_id": 7, "reason": "TIME"}))  # the same trade, a new failure
+        failure_pass(hs, later + 10, ("CLOSE_FAILED", {"trade_id": 7, "reason": "TIME"}))
+        assert [(e["ts"], e["data"]["kind"]) for e in hs.journal.events(kind="ORDER_UNRESOLVED")] == [
+            (t0 + 40, "BRACKET_FAILED"), (later + 10, "CLOSE_FAILED")]
+        if stage == "CANARY":
+            assert paused(hs.journal)["reason"] == "incident ORDER_UNRESOLVED"  # paused again
+        else:
+            assert full_cap(hs.journal, t0 + 31 * 86_400) == 3  # the 30 clean days start again from the new one
+        hs.journal.close()
+    # no trade open: each failure is an episode of its own, and a restarted stint starts afresh
+    hs = Harness(tmp_path / "flat", t0, stage="CANARY", stage_days=1.0)
+    failure_pass(hs, t0, ("CLOSE_UNCONFIRMED", {"trade_id": 0, "reason": "UNKNOWN_POSITION"}))
+    failure_pass(hs, t0 + 10)
+    restart_stint(hs.journal, "CANARY", t0 + 100, confirm=True, flat=True)
+    resume(hs.journal, t0 + 101)
+    t = t0 + 20 * 86_400
+    failure_pass(hs, t, ("ACTION_ERROR", {"action": "Close", "error": "read timeout"}))
+    failure_pass(hs, t + 10)
+    assert [e["ts"] for e in hs.journal.events(kind="ORDER_UNRESOLVED")] == [t0 + 10, t + 10]
+    assert paused(hs.journal)["reason"] == "incident ORDER_UNRESOLVED"
+    assert not {g.name: g.met for g in canary_gates(hs.journal, t + 20, None)}["② 손절 이동과 청산이 목표와 일치"]
+    hs.journal.close()
+
+
+def test_a_shadow_runtime_restarted_mid_hour_keeps_its_cycle_and_restart_gates(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=None)  # SHADOW starts with this runtime
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.walk(ENTRY_BAR, ENTRY_BAR + 3 * 3600)
+    decided = [(c["bar_ts"], c["status"], c["finished_ts"]) for c in hs.journal.cycles()]
+    hs.journal.close()  # the restart of SHADOW gate 4, in the middle of the hour
+    hs.journal = Journal(tmp_path / "journal.sqlite")
+    hs.clock.now = ENTRY_BAR + 2 * 3600 + 2400
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    assert [(c["bar_ts"], c["status"], c["finished_ts"]) for c in hs.journal.cycles()] == decided  # never rewritten
+    assert hs.rt.done_bar == ENTRY_BAR + 3600 and hs.rt.target is not None  # this hour's target, decided again
+    hs.walk(ENTRY_BAR + 3 * 3600, ENTRY_BAR + 4 * 3600)
+    gates = {g.name: g for g in shadow_gates(hs.journal, ENTRY_BAR + 3 * 3600 + 200, None)}
+    for name in ("② 모든 사이클이 마감 후 2분 안에 끝남", "④ 장애·재시작 시험 통과"):
+        assert gates[name].met, (name, gates[name].detail)
+    hs.journal.close()
 
 
 def test_a_bracket_failure_in_an_hour_without_a_target_is_resolved_by_the_protection_seen(h):
@@ -11822,7 +12023,9 @@ is taken before its alert.
             failed audit is stored as failed and alerted), and the stage-change restart
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
             reconcile. Retried every 15 s while the bar is missing; 2 minutes after the close the
-            decision is held and only protection is kept (spec 4.1 step 1)."""
+            decision is held and only protection is kept (spec 4.1 step 1). A bar whose cycle ended OK is
+            never decided again into its cycles row: a restart takes the last such bar as done and only
+            refreshes its target (SHADOW gate 2 keeps the on-time row)."""
 
 from __future__ import annotations
 
@@ -11848,13 +12051,14 @@ from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.pricing import MARGIN_ENTRY_MAX, basis_ratio, map_level, margin_ratio, stage_contracts
-from ewbot.live.reconcile import Alert, Close, PlanContext, is_ours, observe, plan
+from ewbot.live.reconcile import Alert, Close, PlanContext, Protect, is_ours, observe, plan
 from ewbot.live.shadow import ShadowExchange
 from ewbot.live.stage import (
     MAJOR,
     ORDER_FAILURES,
     ORDER_UNRESOLVED,
     PROTECT_MAX_S,
+    RAISED_KEY,
     STAGES,
     full_cap,
     on_incident,
@@ -11909,7 +12113,6 @@ FAILURE_CLASS = {"BRACKET_FAILED": "bracket", "CLOSE_FAILED": "close", "CLOSE_UN
 ACTION_CLASS = {"Protect": "bracket", "Close": "close", "Reduce": "reduce"}  # an ACTION_ERROR (a read failed)
 MANUAL_ALERTS = ("FOREIGN_ORDERS", "UNKNOWN_POSITION", "EXCESS_POSITION")  # planned alerts that are incidents
 MANUAL_CLOSES = ("UNKNOWN_POSITION", "DIRECTION_MISMATCH")  # planned closes of a position changed outside our orders
-RAISED_KEY = "incidents_raised"  # the (kind, trade id) incidents the last pass planned: one incident per episode
 
 
 @dataclass
@@ -11947,7 +12150,7 @@ class LiveRuntime:
         self.ex = deps.exchange
         self.clock = deps.clock
         self.cfg = frozen_config(deps.lock)  # holdout_config(BotConfig(), lock params), checked
-        self.stage, _ = self.journal.stage()
+        self.stage, self.stage_since = self.journal.stage()  # the stint this process runs (a restart starts a new one)
         self.executor = Executor(self.ex, self.journal, clock=deps.clock, sleep=deps.sleep, alert=self.alert,
                                  tp1_frac=self.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops)
         self.prices = PriceSource(self.ex, deps.feed, clock=deps.clock)
@@ -11974,7 +12177,9 @@ class LiveRuntime:
         self.tg_conflicts = 0  # the control's HTTP 409 count at the last minute
         self.hc_failed_at: float | None = None  # the latest /fail for Telegram of this episode
         self.hb_alerted = False  # failing healthchecks.io pings were alerted
-        self.raised = {(str(k), int(t)) for k, t in self.journal.get(RAISED_KEY) or []}  # planned incidents in force
+        raised = self.journal.get(RAISED_KEY) or {}  # the planned manual incidents in force, and their stint
+        self.raised = {(str(k), int(t)) for k, t in raised.get("items", [])}
+        self.raised_stint, self.raised_ended = raised.get("stint"), raised.get("ended")
 
     # ------------------------------------------------------------------ helpers
     def alert(self, kind: str, text: str) -> None:
@@ -12065,7 +12270,7 @@ class LiveRuntime:
         now = self.clock()
         if self.journal.stage()[1] is None:
             self.journal.set_stage("SHADOW", "initial", now)
-            self.stage = "SHADOW"
+            self.stage, self.stage_since = self.journal.stage()
         self.product = self.ex.product()
         self.session = self.ex.session()
         self.sessions.update(self.session, now)
@@ -12077,7 +12282,15 @@ class LiveRuntime:
             self.ex.restore(self.executor.trade())
         out = self.executor.recover()
         self.journal.add_event(now, "STARTUP", {"stage": self.stage})
+        # the session state seen at start (a change is journaled by minute(); a reopen while down never is)
+        self.journal.add_event(now, "SESSION", {"text": f"시작 시 장 운영 상태 {self.session.state}",
+                                                "state": self.session.state})
         self.alert("STARTUP", f"[시작] 단계 {self.stage} · 재시작 복구 {out} · {_utc(now)}")
+        decided = self._decided_until()  # never decided again into its row: the restart keeps an on-time cycle
+        if decided:
+            self.done_bar = decided
+            if decided == int(now) // H1 * H1 - H1:  # this hour's bar: its target again, its row untouched
+                self.cycle(decided, now)
         self.poll(now)
         return out
 
@@ -12089,9 +12302,14 @@ class LiveRuntime:
         self.frame = fill_gaps(raw)
         return self.frame
 
+    def _cycle_ok(self, bar_ts: int) -> bool:
+        return any(int(c["bar_ts"]) == bar_ts and c["status"] == "OK" for c in self.journal.cycles(since_bar=bar_ts))
+
     def cycle(self, bar_ts: int, now: float) -> str:
-        """OK | LATE (bar not there yet) | ERROR."""
-        if self.next_try is None:
+        """OK | LATE (bar not there yet) | ERROR. A bar whose cycle already ended OK (before a restart) is decided
+        again for its target, its cycles row untouched."""
+        decided = self._cycle_ok(bar_ts)
+        if self.next_try is None and not decided:
             self.journal.start_cycle(bar_ts, now, self.stage)
         try:
             df = self._frame()
@@ -12100,7 +12318,8 @@ class LiveRuntime:
             target = compute_target(self.d.lock, df, bar_ts)
         except Exception as exc:  # noqa: BLE001 - the cycle fails, protection goes on
             why = self.d.redact(f"{type(exc).__name__}: {exc}")
-            self.journal.finish_cycle(bar_ts, self.clock(), "ERROR", why[:300])
+            if not decided:
+                self.journal.finish_cycle(bar_ts, self.clock(), "ERROR", why[:300])
             self.alert("CYCLE_ERROR", f"[사이클 오류] {_utc(bar_ts)} 봉: {why[:200]}")
             self.target = None
             return "ERROR"
@@ -12112,7 +12331,8 @@ class LiveRuntime:
             self.reconcile(self.clock())
         except ExchangeError as exc:  # the next poll reconciles against this target
             note += f"; reconcile deferred: {exc}"[:200]
-        self.journal.finish_cycle(bar_ts, self.clock(), "OK", note)
+        if not decided:
+            self.journal.finish_cycle(bar_ts, self.clock(), "OK", note)
         return "OK"
 
     def _cycle_due(self, now: float) -> None:
@@ -12126,7 +12346,8 @@ class LiveRuntime:
             self.next_try = now + CYCLE_RETRY_S
             return
         if status == "LATE":
-            self.journal.finish_cycle(bar, self.clock(), "HOLD", "bar missing 2 min after the close")
+            if not self._cycle_ok(bar):
+                self.journal.finish_cycle(bar, self.clock(), "HOLD", "bar missing 2 min after the close")
             self.target = None
             self.alert("DATA_LATE", f"[판단 보류] {_utc(bar)} 봉이 마감 후 2분 안에 오지 않음 (보호 주문 유지)")
         self.done_bar, self.next_try = bar, None
@@ -12179,11 +12400,13 @@ class LiveRuntime:
         # orders. One incident per (kind, trade) episode - until a pass no longer plans it -, not one per pass
         raised = ({(a.kind, tid) for a in actions if isinstance(a, Alert) and a.kind in MANUAL_ALERTS}
                   | {(a.reason, tid) for a in actions if isinstance(a, Close) and a.reason in MANUAL_CLOSES})
-        for kind, _ in sorted(raised - self.raised):
+        stint = self.journal.stage()[1]  # a new stint (a restart or a stage change) starts new episodes
+        for kind, _ in sorted(raised - (self.raised if self.raised_stint == stint else set())):
             self._incident(kind, now)
-        if raised != self.raised:
-            self.raised = raised
-            self.journal.put(RAISED_KEY, sorted([k, t] for k, t in raised))
+        if raised != self.raised or stint != self.raised_stint:
+            ended = now if self.raised and not raised else self.raised_ended  # the FULL cap's clean days count from it
+            self.raised, self.raised_stint, self.raised_ended = raised, stint, ended
+            self.journal.put(RAISED_KEY, {"items": sorted([k, t] for k, t in raised), "ended": ended, "stint": stint})
         if self.journal.events(kind="ADOPTED", since=now):  # a foreign position: taken over now, or a provisional
             self._incident("ADOPTED", now)  # trade settled as foreign (never our own entry rebuilt from its intent)
         t = self.executor.trade()
@@ -12192,21 +12415,26 @@ class LiveRuntime:
         if (t is not None and t.protected_ts is not None and t.protected_ts - t.opened_ts > PROTECT_MAX_S
                 and self._once(f"slow:{t.trade_id}")):
             self._incident("PROTECT_SLOW", now)
-        self._order_failures(now, ctx, guarded)
+        protecting = {tid} if tid and any(isinstance(a, Protect) for a in actions) else set()
+        self._order_failures(now, ctx, guarded, protecting)
 
-    def _order_failures(self, start: float, ctx: PlanContext, guarded: set[int]) -> None:
+    def _order_failures(self, start: float, ctx: PlanContext, guarded: set[int], protecting: set[int]) -> None:
         """CANARY gate 2 and its pause (spec 6.2), after every completed reconcile pass (begun at `start`; `guarded`: the
-        trades it found protected). Each order failure - stage.ORDER_FAILURES, or an ACTION_ERROR of a Protect, Close
-        or Reduce - is watched from the pass after it: it is resolved when its trade has closed since (a CLOSED event),
-        or, for a bracket or a reduction, by a pass that saw a target and quotes (a reduction also an OPEN session and
-        no reduction pending) and had no order failure for that trade; a pass without a target or quotes (a data-late
-        hour) cannot tell whether the legs are the wanted ones, so a bracket is then resolved by the protection itself:
-        the pass found the trade's resting stop legs covering its position. A bracket must be resolved within
-        PROTECT_MAX_S of its failure, a close or a reduction by the next pass; otherwise it is unresolved, a CANARY
-        failure (incident: it pauses CANARY, fails the CANARY gate and in FULL keeps the 3-contract cap): one
-        ORDER_UNRESOLVED event, incident and alert per trade and episode (until one of its failures is resolved),
-        the incident before the alert."""
-        st = self.journal.get(ORDER_FAIL_KEY) or {"seen": 0, "ts": 0.0, "open": [], "episodes": []}
+        trades it found protected; `protecting`: the trades it planned a Protect for). Each order failure -
+        stage.ORDER_FAILURES, or an ACTION_ERROR of a Protect, Close or Reduce - is watched from the pass after it. It
+        is resolved when its trade has closed since (a CLOSED event); a bracket also by a pass that saw a target and
+        quotes with the session OPEN and planned no Protect for the trade (its legs were the wanted ones) and had no
+        order failure for it - or, in a pass that could not judge or place the legs (no target or quotes: a
+        data-late hour; the session not OPEN: a venue that refuses order entry while closed), by the protection
+        itself: the pass found the trade's resting stop legs covering its position; a reduction by a pass that saw a
+        target and quotes with the session OPEN, no reduction pending and no order failure for the trade, or by its
+        REDUCED / REDUCE_SETTLED. A bracket must be resolved within PROTECT_MAX_S of its failure, a close or a
+        reduction by the next pass; otherwise it is unresolved, a CANARY failure (incident: it pauses CANARY, fails
+        the CANARY gate and in FULL keeps the 3-contract cap). Unresolved failures are grouped in episodes - per
+        trade, or per failure while no trade is open - recorded once (ORDER_UNRESOLVED event, incident, then alert):
+        an episode ends at the first completed pass where its trade has no open failure, and with the stint."""
+        stint = self.journal.stage()[1]
+        st = self.journal.get(ORDER_FAIL_KEY) or {"seen": 0, "ts": 0.0, "open": [], "episodes": [], "stint": stint}
         t = self.executor.trade()
         open_id = t.trade_id if t is not None and t.status == "OPEN" else 0
         new: list[dict[str, Any]] = []
@@ -12215,10 +12443,12 @@ class LiveRuntime:
                 cls = FAILURE_CLASS.get(kind) or ACTION_CLASS.get(str(e["data"].get("action")))
                 if e["id"] > int(st["seen"]) and cls is not None:
                     tid = int(e["data"].get("trade_id") or open_id)
-                    new.append({"id": e["id"], "kind": kind, "cls": cls, "trade_id": tid, "ts": float(e["ts"])})
+                    new.append({"id": e["id"], "kind": kind, "cls": cls, "trade_id": tid, "ts": float(e["ts"]),
+                                "episode": f"t{tid}" if tid else f"e{e['id']}"})  # no trade: an episode of its own
         failing = {f["trade_id"] for f in new if f["ts"] >= start}  # trades with an order failure in this pass
         whole = self.target is not None and ctx.ratio is not None  # the pass saw what the trade should look like
-        reducible = whole and ctx.session_open and (t is None or t.pending_reduce is None)
+        strict = whole and ctx.session_open  # ... and could place the legs: they are judged, not just the protection
+        reducible = strict and (t is None or t.pending_reduce is None)
 
         def after(f: dict[str, Any], kinds: tuple[str, ...]) -> float | None:
             """When the first event of `kinds` for f's trade after f was recorded (None: none yet)."""
@@ -12230,39 +12460,44 @@ class LiveRuntime:
         unresolved: list[dict[str, Any]] = []
         for f in st["open"]:
             closed = after(f, ("CLOSED",))
-            clean = f["trade_id"] not in failing and (reducible if f["cls"] == "reduce" else whole)
             if f["cls"] == "bracket":
                 deadline = f["ts"] + PROTECT_MAX_S
-                covered = not whole and f["trade_id"] in guarded and f["trade_id"] not in failing
-                if (closed is not None and closed <= deadline) or ((clean or covered) and start <= deadline):
+                if strict:  # the legs were the wanted ones: nothing planned for them, nothing failed
+                    ok = f["trade_id"] not in protecting and f["trade_id"] not in failing
+                else:  # the pass could not judge or place the legs: the protection it found
+                    ok = f["trade_id"] in guarded
+                if (closed is not None and closed <= deadline) or (ok and start <= deadline):
                     done.append(f)
                 else:
                     (kept if start <= deadline else unresolved).append(f)
             elif f["cls"] == "close":
                 (done if closed is not None else unresolved).append(f)
             else:
-                ok = closed is not None or clean or after(f, ("REDUCED", "REDUCE_SETTLED")) is not None
+                ok = (closed is not None or (reducible and f["trade_id"] not in failing)
+                      or after(f, ("REDUCED", "REDUCE_SETTLED")) is not None)
                 (done if ok else unresolved).append(f)
-        episodes = {int(x) for x in st.get("episodes", [])}  # trades with an unresolved failure not resolved since
-        opened = sorted({f["trade_id"] for f in unresolved} - episodes)
-        ended = {f["trade_id"] for f in done}
-        if new or done or unresolved:  # written only when something changed (one row, not one per pass)
+        # an episode lasts while its trade has an open failure (and within its stint): a later failure is a new one
+        episodes = set(st.get("episodes", [])) if st.get("stint") == stint else set()
+        opened = sorted({f["episode"] for f in unresolved} - episodes)
+        alive = (episodes | set(opened)) & {f["episode"] for f in kept + new}
+        if new or done or unresolved or alive != episodes or st.get("stint") != stint:  # one row, written on change
             seen = max([int(st["seen"])] + [f["id"] for f in new])
             self.journal.put(ORDER_FAIL_KEY, {"seen": seen, "ts": start, "open": kept + new,
-                                              "episodes": sorted((episodes | set(opened)) - ended)})
+                                              "episodes": sorted(alive), "stint": stint})
         for f in done:
             self.journal.add_event(start, "ORDER_RESOLVED", {"kind": f["kind"], "trade_id": f["trade_id"],
                                                              "failed_ts": f["ts"], "after_s": round(start - f["ts"], 3)})
         if not opened:
             return
-        for tid in opened:
-            first = min((f for f in unresolved if f["trade_id"] == tid), key=lambda f: f["id"])
-            self.journal.add_event(start, ORDER_UNRESOLVED, {"kind": first["kind"], "trade_id": tid,
+        for ep in opened:
+            first = min((f for f in unresolved if f["episode"] == ep), key=lambda f: f["id"])
+            self.journal.add_event(start, ORDER_UNRESOLVED, {"kind": first["kind"], "trade_id": first["trade_id"],
                                                             "failed_ts": first["ts"], "event_id": first["id"]})
         self._incident(ORDER_UNRESOLVED, start)  # the pause first, the alert second
-        for tid in opened:
-            kinds = ", ".join(sorted({f["kind"] for f in unresolved if f["trade_id"] == tid}))
-            self.alert(ORDER_UNRESOLVED, f"[주문 실패 미해결] 거래 {tid}: {kinds} - 제시간에 해결되지 않음 "
+        for ep in opened:
+            mine = [f for f in unresolved if f["episode"] == ep]
+            kinds = ", ".join(sorted({f["kind"] for f in mine}))
+            self.alert(ORDER_UNRESOLVED, f"[주문 실패 미해결] 거래 {mine[0]['trade_id']}: {kinds} - 제시간에 해결되지 않음 "
                                          "(CANARY 기준 ② 실패)")
 
     def _bracket_fills(self, trade: Any, still_open: set[str], now: float) -> None:
@@ -12348,9 +12583,10 @@ class LiveRuntime:
             self.daily(now)
         if datetime.fromtimestamp(now, UTC).minute >= AUDIT_MINUTE and self._once("audit", int(now) // H1):
             self.run_audit(now)
-        stage, _ = self.journal.stage()
-        if stage != self.stage and self.flat():
-            self.alert("STAGE", f"[단계 변경] {self.stage} → {stage}: 재시작해 적용")
+        stage, since = self.journal.stage()
+        if (stage != self.stage or since != self.stage_since) and self.flat():  # a new stage or a new stint
+            again = " (다시 시작)" if stage == self.stage else ""
+            self.alert("STAGE", f"[단계 변경] {self.stage} → {stage}{again}: 재시작해 적용")
             self.exit_code = 0
 
     def _control_problem(self, now: float) -> str | None:
@@ -12815,7 +13051,7 @@ def audit_from_journal(journal: Journal) -> AuditResult | None:
 uv run --group live pytest tests/live/test_runtime.py -q
 ```
 
-Expected: `36 passed`.
+Expected: `39 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -12841,7 +13077,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
 - Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier` (its sending thread started), `redact(text, settings) -> str` (the bot token, the GitHub token and the health-check URL replaced by `<secret>`), `fatal_report(exc, settings) -> str` (the traceback, `redact`ed), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `price_feed(settings) -> TickerFeed | None` (the ticker feed on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, notify=None) -> Wired` (hands the preflight-checked lock to `LiveDeps`, the Telegram control so the runtime watches it and `redact` for its error texts; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit test also `Heartbeat`, `notifier` and `TelegramControl`.
-- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `canary --restart` need a flat book before writing; a demotion is written first and the flat book reported after), `backup --out PATH` (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`; `live run` closes the wiring on every exit; on a fatal exception it sends healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text and stderr the `fatal_report`, and returns 1 (KeyboardInterrupt and SystemExit are re-raised). Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
+- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `shadow|canary --restart` - a new stint of the current stage - need a flat book before writing; a demotion is written first and the flat book reported after), `backup --out PATH` (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`; `live run` closes the wiring on every exit; on a fatal exception it sends healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text and stderr the `fatal_report`, and returns 1 (KeyboardInterrupt and SystemExit are re-raised). Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -13043,15 +13279,20 @@ def test_stage_changes_need_confirm_gates_and_a_flat_book(live_env, capsys):
     assert main(["live", "stage", "full", "--confirm"]) == 2 and "gates not met" in capsys.readouterr().err
     # a new CANARY stint after a CANARY failure: --confirm, a flat book, from CANARY only
     assert main(["live", "stage", "canary", "--restart"]) == 2 and "--confirm" in capsys.readouterr().err
-    assert main(["live", "stage", "full", "--restart", "--confirm"]) == 2 and "canary only" in capsys.readouterr().err
+    assert main(["live", "stage", "full", "--restart", "--confirm"]) == 2 and "SHADOW or CANARY" in capsys.readouterr().err
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 2 and "current stage" in capsys.readouterr().err
     assert main(["live", "stage", "canary", "--restart", "--confirm"]) == 0 and "restarted" in capsys.readouterr().out
     ex.place_market("manual", 1, 1)
     assert main(["live", "stage", "canary", "--restart", "--confirm"]) == 2 and "flat" in capsys.readouterr().err
     # a demotion is written first, then the book is reported: the runtime sizes for it at once
     assert main(["live", "stage", "shadow", "--confirm"]) == 0 and "book not flat" in capsys.readouterr().out
+    # SHADOW again after a fix (spec 6.2): its own restart, with a flat book
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 2 and "flat" in capsys.readouterr().err
+    ex.close_position("manual-x")
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 0 and "SHADOW stint restarted" in capsys.readouterr().out
     jr = Journal(settings.journal_path)
     assert jr.stage()[0] == "SHADOW"
-    assert [e["data"]["reason"] for e in jr.events(kind="STAGE")] == ["restart", "demotion"]
+    assert [e["data"]["reason"] for e in jr.events(kind="STAGE")] == ["restart", "demotion", "restart"]
     jr.close()
 ```
 
@@ -13269,7 +13510,7 @@ from ewbot.live.stage import (
     canary_gates,
     full_entry_gates,
     gate_lines,
-    restart_canary,
+    restart_stint,
     shadow_gates,
     transition,
 )
@@ -13302,7 +13543,7 @@ from ewbot.live.stage import (
     p_stage.add_argument("to", choices=("shadow", "canary", "full"))
     p_stage.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
     p_stage.add_argument("--restart", action="store_true",
-                         help="canary only: start a new CANARY stint after a CANARY failure (flat book)")
+                         help="shadow or canary, the current stage: start a new stint of it (flat book)")
     p_bk = live_sub.add_parser("backup", help="consistent copy of the journal (SQLite online backup)")
     p_bk.add_argument("--out", type=Path, required=True)
     return parser
@@ -13442,8 +13683,8 @@ def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
 
 
 def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
-    """A promotion (one stage up, every gate met) and a CANARY restart (--restart) need --confirm and a flat book
-    (journal and Coinbase) before anything is written. A demotion needs only --confirm: it is written first - a running
+    """A promotion (one stage up, every gate met) and a restart of the current SHADOW or CANARY stint (--restart)
+    need --confirm and a flat book (journal and Coinbase) before anything is written. A demotion needs only --confirm: it is written first - a running
     runtime sizes new entries for it at once - and then the command reports whether the book is flat (the runtime
     keeps protecting and managing an open position and restarts into the new stage once flat)."""
     journal = Journal(s.journal_path)
@@ -13475,13 +13716,12 @@ def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
             return 2
         if args.restart:
             try:
-                if to != "CANARY":
-                    raise StageError("--restart applies to canary only")
-                restart_canary(journal, now, confirm=args.confirm, flat=flat)
+                restart_stint(journal, to, now, confirm=args.confirm, flat=flat)
             except StageError as exc:
                 print(f"refusing: {exc}", file=sys.stderr)
                 return 2
-            print("CANARY stint restarted: every CANARY gate counts from now (a pause stays until /resume)")
+            print(f"{to} stint restarted: every {to} gate counts from now; the running runtime restarts into it "
+                  "within a minute (a pause stays until /resume)")
             return 0
         gates: list[Gate] = []
         audit = live_runtime.audit_from_journal(journal)
@@ -13941,7 +14181,8 @@ def test_an_exit_waits_for_the_reopen(tmp_path):
     h.at(exit_bar + 3600 + 100)  # the minute job sees OPEN and polls at once
     assert h.ex.position() is None
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "TIME"
-    assert [e["data"]["state"] for e in h.journal.events(kind="SESSION")] == ["CLOSE", "OPEN"]  # the SHADOW gate 2
+    # the state seen at start, then every change (SHADOW gate 2 excuses only hours recorded closed)
+    assert [e["data"]["state"] for e in h.journal.events(kind="SESSION")] == ["OPEN", "CLOSE", "OPEN"]
 
 
 def test_an_exit_queued_before_the_cfm_halt_closes_at_the_first_open_poll(tmp_path, monkeypatch):
@@ -14017,7 +14258,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `375 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `380 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -14185,7 +14426,7 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "healthchecks.io", "ewbot live stage canary --confirm", "/flatten", "deploy.sh",
                    "ewbot-backup.timer", "SHADOW", "CANARY", "FULL", "EWBOT_LIVE_EDIT_STOPS",
                    "spec §2 Coinbase facts", "ORDER_UNRESOLVED", "AUDIT_PENDING", "--restart --confirm",
-                   "book not flat"):
+                   "book not flat", "stage shadow --restart --confirm", "except hh:00 to hh:03"):
         assert needle in text, needle
 ```
 
@@ -14425,9 +14666,9 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 | Stage | What trades | Size | Pass gate (checked by `ewbot live status` / `ewbot live stage`) |
 |---|---|---|---|
-| SHADOW | nothing: every order is checked with Coinbase's `orders/preview` and executed on a virtual book that follows the real price | 1 contract (CANARY sizing) | ≥ 14 days and ≥ 1 signal first known during SHADOW; ① decisions 100% equal to the paper ledger (a comparison that covers the whole stage, reaches a bar closed at most 3 hours ago and has no mismatch the data do not explain - a bar Coinbase revised is shown, not counted); ② a cycle for every hourly bar of the stage, each finished ≤ 2 min after the close (an hour the runtime was down fails it; an hour the futures session was recorded closed is excused); ③ every would-be order passed preview; ④ a restart recovered cleanly |
+| SHADOW | nothing: every order is checked with Coinbase's `orders/preview` and executed on a virtual book that follows the real price | 1 contract (CANARY sizing) | ≥ 14 days and ≥ 1 signal first known during SHADOW; ① decisions 100% equal to the paper ledger (a comparison that covers the whole stage, reaches a bar closed at most 3 hours ago and has no mismatch the data do not explain - a bar Coinbase revised is shown, not counted); ② a cycle for every hourly bar of the stage, each finished ≤ 2 min after the close (an hour without a cycle - the runtime was down - fails it, unless the futures session was recorded closed then, for at most 4 hours; a cycle that ran and failed always counts; a restart never rewrites an hour already decided); ③ every would-be order passed preview; ④ a restart recovered cleanly |
 | CANARY | real orders | always 1 contract; a signal whose 1-contract risk exceeds 2% of the account is skipped | ≥ 3 closed trades or 90 days; ① protection ≤ 30 s after every fill; ② no order failure left unresolved (a bracket not replaced within 30 s, a close or a reduction not done by the next poll); ③ never unprotected > 60 s; ④ no manual intervention; ⑤ costs reported; and no other CANARY failure in this CANARY stint (a decision mismatch, a breaker, a transfer key), not paused, a comparison at most 3 hours old without an unexplained mismatch of a decision known in this stint |
-| FULL | real orders | `risk.sizing.size_contracts` (real equity, conservative 1%), capped at 3 contracts until FULL has run 30 days without a CANARY failure (each one restarts the 30 days; counted on the VPS clock, kept synchronised - a clock stepped forward would lift the cap early) | — |
+| FULL | real orders | `risk.sizing.size_contracts` (real equity, conservative 1%), capped at 3 contracts until FULL has run 30 days without a CANARY failure (each one restarts the 30 days) and with no manual intervention still in force (a foreign order left resting keeps the cap; the 30 days then count from its end); counted on the VPS clock, kept synchronised - a clock stepped forward would lift the cap early | — |
 
 - CANARY may start only when SHADOW passed, the paper runtime's criteria 1, 2 and 4 are met, the trade key is in place and you approve (`--confirm`). FULL needs CANARY passed and **all four** paper criteria (incl. 50 out-of-sample trades) and your approval. Promotions go one stage at a time and need a flat book.
 - In CANARY a CANARY failure (unprotected > 60 s, an unexplained decision mismatch with the paper ledger, a breaker, a transfer-permission key, a foreign order or position - contracts added or removed by hand included -, slow protection, an order failure not resolved in time) pauses entries (`[CANARY 실패]` / `[중대 사건]`) and keeps the CANARY pass gate unmet for the rest of this CANARY stint: `/resume` resumes trading, and once the cause is fixed you may restart the stint with a flat book (`ewbot live stage canary --restart --confirm`, a `STAGE` event `restart`): every CANARY gate then counts from the restart - closed trades, days, failures and the comparison's mismatches - and a pause stays until `/resume`. Without a restart the failed stint keeps FULL closed; no SHADOW is needed again. In FULL the major incidents pause and demote to CANARY - the next entry is sized as CANARY at once, even before the runtime restarts - and any other CANARY failure keeps the 3-contract cap for 30 more days. Pause never stops protection or exits; `/resume` is your decision.
@@ -14540,7 +14781,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 ## Stage transitions
 
 1. **SHADOW** starts with the first deployment (a View key suffices).
-2. **SHADOW → CANARY** (expected around 2026-10-30): check `ewbot live status` (all SHADOW gates `충족`) and the paper runtime's status (criteria 1, 2 and 4 met: `uv run ewbot paper status --ledger-dir <a worktree of the paper branch>` on your laptop, docs/paper-trading.md). Restart the container once during SHADOW (`docker compose -f deploy/live/docker-compose.yml restart live`) for gate ④, between hh:05 and hh:55: a restart across the top of the hour can make that hour's cycle late (gate ②). Then create the View + Trade key (step 4), replace `/etc/ewbot/cdp_api_key.json`, check what no gate can see - in the CDP portal the key's **IP allowlist** holds only the VPS's IPv4 (spec §6.1) - and with the book flat:
+2. **SHADOW → CANARY** (expected around 2026-10-30): check `ewbot live status` (all SHADOW gates `충족`) and the paper runtime's status (criteria 1, 2 and 4 met: `uv run ewbot paper status --ledger-dir <a worktree of the paper branch>` on your laptop, docs/paper-trading.md). Restart the container once during SHADOW (`docker compose -f deploy/live/docker-compose.yml restart live`) for gate ④, at any time except hh:00 to hh:03, while the hour's cycle runs: a restart never rewrites an hour already decided (it only takes up that hour's target again), but one across the top of the hour can make the coming cycle late (gate ②). Then create the View + Trade key (step 4), replace `/etc/ewbot/cdp_api_key.json`, check what no gate can see - in the CDP portal the key's **IP allowlist** holds only the VPS's IPv4 (spec §6.1) - and with the book flat:
 
    ```bash
    docker compose -f deploy/live/docker-compose.yml exec live ewbot live stage canary --confirm
@@ -14549,7 +14790,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    The command prints every gate and refuses while one is unmet or the book is not flat. The running container restarts itself into CANARY within a minute; Telegram shows `[단계 변경]` and a new `[시작] 단계 CANARY`.
 3. **CANARY → FULL**: only after all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades) and the CANARY gates are met, with your approval. Before it, check by hand what no gate can see: re-check the spec §2 Coinbase facts against Coinbase's current documentation (spec §8: the product - 0.01 BTC, $5 tick, whole contracts -, the intraday and overnight margin rates, the order types `market_market_ioc`, `trigger_bracket_gtc`, `close_position` and `orders/preview`, the triggered bracket stop's 5% limit, the rate limits, the fee tier, the session hours and maintenance) and record the result, and that the trade key's IP allowlist still holds only the VPS's IPv4. Then `... exec live ewbot live stage full --confirm`.
 4. **Demotion** (any time): `... exec live ewbot live stage shadow --confirm` (or `canary`). It is written first - the running runtime sizes new entries and adoptions for the lower stage from its next order - and then the command reports whether the book is flat: with a position open the runtime keeps protecting and managing it and restarts into the new stage once flat (`book not flat …`).
-5. **Restarting a CANARY stint** after a CANARY failure, once its cause is fixed: with the book flat, `... exec live ewbot live stage canary --restart --confirm`. Every CANARY gate counts from the restart; `/resume` lifts the pause.
+5. **Restarting a stint**, with the book flat: `... exec live ewbot live stage shadow --restart --confirm` - SHADOW after a fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`: a gate that can no longer pass, such as a late cycle, a failed preview or an unresolved restart) - or `... stage canary --restart --confirm` - CANARY after a CANARY failure, once its cause is fixed. Every gate of the stage counts from the restart; the running runtime restarts into the new stint within a minute; `/resume` lifts a pause.
 
 ## Confirm during CANARY (spec 6.2)
 
@@ -14560,6 +14801,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - That brackets - including a triggered stop resting as a limit - only reduce at fill time: a bracket left after a close cannot open or flip a position (closes are sent with the brackets resting).
 - Whether a sized `close_position` (a reduction) is refused while our brackets cover the position, and with which reason code (add it to `CLOSE_CONFLICTS`).
 - The actual fee tier (`GET /api/v3/brokerage/transaction_summary`).
+- Whether Coinbase accepts or refuses placing and cancelling brackets during the weekly Friday 17:00–18:00 New York halt and the quarterly maintenance, and with which code. Until it is known, a stop move refused while the session is not OPEN is judged by the protection still resting: no CANARY failure while the old bracket covers the position.
 - The limit of the first triggered bracket stop: the Create Order reference says 5% beyond the stop (`STOP_LIMIT_OFFSET`, also the stop-gap watchdog's threshold). If Coinbase uses another offset, change the constant and redeploy with a flat book.
 - Re-record the private-endpoint fixtures in `tests/live/fixtures/coinbase.json` (positions, balance summary, key permissions, orders, the open-orders query with every resting `order_status`, preview) from real responses with personal data removed, and rerun the tests.
 
@@ -14567,7 +14809,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - **Close everything now**: `/flatten`, then `/flatten_confirm`. If Telegram does not answer: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` and, if the runtime is down, close the position and cancel the orders in the Coinbase app (a manual intervention: the runtime alerts it and CANARY gate ④ records it).
 - **Stop trading but keep the protection**: `/pause`, or `docker compose -f deploy/live/docker-compose.yml stop live` (the brackets stay on Coinbase and keep protecting).
-- **An order failure not resolved in time** (`[주문 실패 미해결]`, `ORDER_UNRESOLVED`; in CANARY `[CANARY 실패] ORDER_UNRESOLVED: paused`): a bracket that could not be replaced within 30 s, or a close or a reduction that did not go through by the next poll. Read the order events (`BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED`, `ACTION_ERROR`) and check the position's brackets in the Coinbase app before `/resume`. A failure the runtime resolved in time (`ORDER_RESOLVED`, e.g. one 429 on a stop move replaced at the next poll, or - in an hour without a decision - a bracket seen resting over the whole position at the next poll) is no CANARY failure. An unresolved failure, like a manual intervention, is recorded once per trade until it is resolved, not at every poll.
+- **An order failure not resolved in time** (`[주문 실패 미해결]`, `ORDER_UNRESOLVED`; in CANARY `[CANARY 실패] ORDER_UNRESOLVED: paused`): a bracket that could not be replaced within 30 s, or a close or a reduction that did not go through by the next poll. Read the order events (`BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED`, `ACTION_ERROR`) and check the position's brackets in the Coinbase app before `/resume`. A failure the runtime resolved in time (`ORDER_RESOLVED`, e.g. one 429 on a stop move replaced at the next poll, or - in an hour without a decision - a bracket seen resting over the whole position at the next poll) is no CANARY failure. An unresolved failure, like a manual intervention, is recorded once per episode, not at every poll: the episode ends at the first poll where the trade has no failure left open (a later failure is a new incident, pauses again and in FULL restarts the cap's 30 days), and with a restart or a stage change; while no trade is open every failure is its own episode.
 - **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app. If the alert came with a `/fail` body `텔레그램 사용 불가 - ...`, the runtime was running when it sent it but cannot be reached on Telegram - check that it still runs (`docker compose ... ps`; its pings resume within 30 minutes of the `/fail`, so a check that stays down longer means it stopped) - and then check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
 - **API key leaked or a transfer-permission alert**: delete the key in the CDP portal at once (open brackets stay), create a new View + Trade key bound to the VPS IP, replace the file and restart.
 - **A start refused by the preflight** (fingerprint, lock, key, product): the message names the failing check. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag.
@@ -14605,7 +14847,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `1006 passed, 1 skipped` without a candle cache (`1007 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `1011 passed, 1 skipped` without a candle cache (`1012 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -14640,7 +14882,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `1007 passed` with the real cache (`1006 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `1012 passed` with the real cache (`1011 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
@@ -14701,7 +14943,7 @@ Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account i
 
 - [ ] **Step 6: Run SHADOW for at least 14 days (controller watches, user restarts once)**
 
-Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④ - between hh:05 and hh:55, so no cycle is late (gate ② counts every hour of the stage; a runtime down across a bar close fails it) -: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. Any `[판단 불일치]`, `[판단 불일치: 봉 수정]`, `[판단 불일치 확인 중]` that the next hour does not clear, `[모의매매 대조 실패]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
+Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④ - at any time except hh:00 to hh:03, while that hour's cycle runs (gate ② counts every hour of the stage; a restart never rewrites an hour already decided, but a runtime down across a bar close fails it) -: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. Any `[판단 불일치]`, `[판단 불일치: 봉 수정]`, `[판단 불일치 확인 중]` that the next hour does not clear, `[모의매매 대조 실패]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over: `ewbot live stage shadow --restart --confirm` (flat book) - every SHADOW gate then counts from the restart. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
 
 - [ ] **Step 7: CANARY gate (around 2026-10-30; user approves explicitly)**
 
@@ -14717,4 +14959,4 @@ Expected: the preflight's key line reads `view=True trade=True transfer=False`; 
 
 - [ ] **Step 8: CANARY confirmations (controller records the answers in the project notes)**
 
-During CANARY, confirm the spec §6.2 unknowns from the journal and the Coinbase order history: duplicate `client_order_id` behaviour; whether the brackets survive the Friday 17:00–18:00 New York close; whether `orders/edit` moves a bracket stop (then set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy with a flat book); the limit of the first triggered bracket stop (the reference says 5% beyond the stop: `STOP_LIMIT_OFFSET`, also the stop-gap threshold); the reason codes Coinbase gives for a bracket refused because it would exceed the position and for a close refused while brackets rest (`OVERLAP_REFUSALS`, `CLOSE_CONFLICTS` in `live/executor.py`; the `BRACKET_FAILED` / `CLOSE_FAILED` events carry them: correct the sets and redeploy with a flat book); that brackets - a triggered stop resting as a limit included - only reduce at fill time, so a bracket left after a close cannot open or flip a position (closes are sent with the brackets resting); whether a sized `close_position` (a reduction) is refused while our brackets cover the position, and the code it gives (add it to `CLOSE_CONFLICTS`); the actual fee tier (`GET /api/v3/brokerage/transaction_summary`); the measured costs in the daily summaries vs. the paper cost model. After a CANARY failure (entries paused) the user decides: `/resume`, and, once the cause is fixed and the book flat, `ewbot live stage canary --restart --confirm` to count toward the CANARY pass again from then (without it the failed stint keeps FULL closed). CANARY passes with ≥ 3 closed trades (or 90 days) and every CANARY gate `충족` (`ewbot live status`). FULL is not part of this month's schedule: it needs all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades), the CANARY gates and the user's approval (`ewbot live stage full --confirm`). Two FULL preconditions are not machine-checkable and are recorded in the project notes before it: the spec §2 Coinbase facts re-checked against Coinbase's current documentation (spec §8 `FULL 전에 §2를 다시 확인한다`: product, margin rates, order types, the triggered stop's limit, rate limits, fees, session hours) and the trade key's IP allowlist still holding only the VPS's IPv4 (runbook, Stage transitions).
+During CANARY, confirm the spec §6.2 unknowns from the journal and the Coinbase order history: duplicate `client_order_id` behaviour; whether the brackets survive the Friday 17:00–18:00 New York close; whether `orders/edit` moves a bracket stop (then set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy with a flat book); the limit of the first triggered bracket stop (the reference says 5% beyond the stop: `STOP_LIMIT_OFFSET`, also the stop-gap threshold); the reason codes Coinbase gives for a bracket refused because it would exceed the position and for a close refused while brackets rest (`OVERLAP_REFUSALS`, `CLOSE_CONFLICTS` in `live/executor.py`; the `BRACKET_FAILED` / `CLOSE_FAILED` events carry them: correct the sets and redeploy with a flat book); that brackets - a triggered stop resting as a limit included - only reduce at fill time, so a bracket left after a close cannot open or flip a position (closes are sent with the brackets resting); whether a sized `close_position` (a reduction) is refused while our brackets cover the position, and the code it gives (add it to `CLOSE_CONFLICTS`); the actual fee tier (`GET /api/v3/brokerage/transaction_summary`); whether Coinbase accepts or refuses placing and cancelling brackets during the weekly Friday halt and the quarterly maintenance, and the code it gives (until known, a stop move refused while the session is not OPEN is judged by the protection still resting); the measured costs in the daily summaries vs. the paper cost model. After a CANARY failure (entries paused) the user decides: `/resume`, and, once the cause is fixed and the book flat, `ewbot live stage canary --restart --confirm` to count toward the CANARY pass again from then (without it the failed stint keeps FULL closed). CANARY passes with ≥ 3 closed trades (or 90 days) and every CANARY gate `충족` (`ewbot live status`). FULL is not part of this month's schedule: it needs all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades), the CANARY gates and the user's approval (`ewbot live stage full --confirm`). Two FULL preconditions are not machine-checkable and are recorded in the project notes before it: the spec §2 Coinbase facts re-checked against Coinbase's current documentation (spec §8 `FULL 전에 §2를 다시 확인한다`: product, margin rates, order types, the triggered stop's limit, rate limits, fees, session hours) and the trade key's IP allowlist still holding only the VPS's IPv4 (runbook, Stage transitions).
