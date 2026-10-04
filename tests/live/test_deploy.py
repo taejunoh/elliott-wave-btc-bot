@@ -460,7 +460,7 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "ewbot-backup.timer", "SHADOW", "CANARY", "FULL", "EWBOT_LIVE_EDIT_STOPS",
                    "spec §2 Coinbase facts", "ORDER_UNRESOLVED", "AUDIT_PENDING", "--restart --confirm",
                    "book not flat", "stage shadow --restart --confirm", "except hh:00 to hh:03",
-                   "outside hh:59 to hh:03", "the new stint's first start", "`[종료]`", "`[중단]`",
+                   "hh:59 to hh:06", "the new stint's first start", "`[종료]`", "`[중단]`",
                    "last real stage", "15 minutes", "stop_grace_period",
                    # deploys, recovery and backups
                    "hh:54 to hh:05", "ewbot-live:previous", "deploy.sh --recover", "Recovering from VPS loss",
@@ -469,5 +469,9 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "docker builder prune", "never hold", "View-only key", "/var/lib/ewbot/drill",
                    "EWBOT_LIVE_DIR=/data/drill", "PRAGMA integrity_check",
                    # final fix: manual positions refused at start, outages, a stop waiting for protection, before FULL
-                   "수동 포지션", "60초마다 다시 시작", "STOP_DEFERRED", "## Before FULL", "TP1_SYNC races the TP1 leg"):
+                   "수동 포지션", "60초마다 다시 시작", "STOP_DEFERRED", "## Before FULL", "TP1_SYNC races the TP1 leg",
+                   # final review: money movements, refusal codes, an unreadable account, the cache, the positions reply
+                   "no deposits, withdrawals, spot trades", "## Adding or withdrawing capital", "rebase --confirm",
+                   "EWBOT_CLOSE_CONFLICTS", "[계좌 조회 불가]", "BTC-USD_1h.parquet.bad-", "순서 끊김", "FLAT_UNCONFIRMED",
+                   "cfm/positions", "5–10 s on a 1-vCPU VPS", "at most 15 s"):
         assert needle in text, needle
