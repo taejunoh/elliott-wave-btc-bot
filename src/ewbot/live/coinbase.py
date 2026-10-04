@@ -11,13 +11,20 @@ Retries (spec 5.1): reads and cancels are retried up to 3 times on HTTP 429 / 5x
 their failure is ambiguous (the order may exist) and the executor looks the order up by client_order_id
 before sending it again. Every requests failure other than an HTTP status (a broken or undecodable
 reply after the send, a bad header, ...) is ambiguous too: Unavailable, never a final rejection. When
-`x-ratelimit-remaining` drops to `min_remaining`, the next request waits for the reset.
+`x-ratelimit-remaining` drops to `min_remaining`, the next request waits for the reset. These waits run on the
+runtime's loop, so they are bounded: one call's waits (pacing and retries) add up to at most RETRY_SLEEP_MAX_S - a
+wait that would pass it raises the call's error instead (the loop tries again on its next pass) - and while the last
+429's Retry-After runs a new call raises RateLimited at once and sends nothing. A call so blocks the loop for at most
+RETRY_SLEEP_MAX_S plus its requests' own timeouts (10 s each), and in a 429 storm only the first call of a pass waits.
 
 Only ExchangeError (or ValueError for a side that is not +1/-1, a programming error) leaves this module:
 an unexpected reply shape is an ExchangeError, a reply that is not a JSON object - or an order reply without
 a boolean `success` - is Unavailable. No amount that is not a finite number ("NaN", "inf") leaves it: a
 required one (a size, a balance, a product's increments) is an unexpected shape, an optional one (a fill
-price, a fee, a bracket's prices) reads None. Error messages never carry an exception's text (it may hold
+price, a fee, a bracket's prices) reads None. A positions reply reads flat only in its documented shape (a
+`positions` list of objects with a product_id, the product's one entry absent or at 0 contracts): any other shape
+is an ExchangeError, never "flat" - a flat read closes the trade's record and lets the next entry stack on a real
+position. A book whose bid is above its ask (crossed: stale or one-sided) is Unavailable, never a price. Error messages never carry an exception's text (it may hold
 the JWT): the HTTP status and the start of the reply body, or the exception's type name."""
 
 from __future__ import annotations
@@ -65,6 +72,7 @@ DUPLICATE_ID = "DUPLICATE_CLIENT_ORDER_ID"
 _REASON_FIELDS = ("new_order_failure_reason", "error", "preview_failure_reason")  # most specific first
 CANCEL_DONE = frozenset({"DUPLICATE_CANCEL_REQUEST", "ORDER_IS_FULLY_FILLED"})  # nothing rests any more
 RETRY_AFTER_MAX_S = 10.0  # never wait longer than the pacing cap on one 429
+RETRY_SLEEP_MAX_S = 15.0  # one call's waits (pacing and retries) add up to at most this: then its error is raised
 _PARSE_ERRORS = (KeyError, ValueError, TypeError, AttributeError, IndexError)
 
 
@@ -297,6 +305,7 @@ class CoinbaseExchange:
         self.backoff_s = backoff_s
         self.min_remaining = min_remaining
         self._wait_until = 0.0
+        self._limited_until = 0.0  # the last 429's Retry-After: a new call before it raises at once, sends nothing
 
     @classmethod
     def from_key_file(cls, key_file: Path, futures_id: str = FUTURES_PRODUCT, spot_id: str = SPOT_PRODUCT,
@@ -326,10 +335,19 @@ class CoinbaseExchange:
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               data: dict[str, Any] | None = None, public: bool = False, retry: bool = True) -> dict[str, Any]:
         tries = self.attempts if retry else 1
+        left = self._limited_until - self.clock()
+        if 0 < left <= RETRY_AFTER_MAX_S:  # a 429's Retry-After still runs: nothing sent (a clock step back ignores it)
+            raise RateLimited(f"rate limited: {left:.0f} s left of the last HTTP 429's Retry-After (nothing sent)",
+                              retry_after=left)
+        slept = 0.0
         for attempt in range(tries):
             delay = self._wait_until - self.clock()
             if delay > 0:
+                if slept + delay > RETRY_SLEEP_MAX_S:
+                    raise RateLimited(f"rate limited: the pacing wait of {delay:.0f} s passes the call's "
+                                      f"{RETRY_SLEEP_MAX_S:.0f} s budget (nothing sent)", retry_after=delay)
                 self.sleep(delay)
+                slept += delay
             try:
                 if method == "GET":
                     resp = self.client.get(API + path, params=params, public=public)
@@ -339,11 +357,17 @@ class CoinbaseExchange:
                     raise Unavailable(f"reply is not a JSON object ({type(resp).__name__})")
             except Exception as exc:  # noqa: BLE001 - mapped below
                 err = map_error(exc)
+                if isinstance(err, RateLimited):
+                    self._limited_until = self.clock() + min(err.retry_after, RETRY_AFTER_MAX_S)
                 if not err.retryable or attempt == tries - 1:
                     raise err from None
                 wait = min(err.retry_after, RETRY_AFTER_MAX_S) if isinstance(err, RateLimited) else self.backoff_s * 2**attempt
+                if slept + wait > RETRY_SLEEP_MAX_S:  # the loop tries again on its next pass
+                    raise err from None
                 self.sleep(wait)
+                slept += wait
                 continue
+            self._limited_until = 0.0  # answered: no 429 runs any more
             resp = dict(resp)
             self._pace(resp)
             return resp
@@ -386,23 +410,42 @@ class CoinbaseExchange:
             bid, ask = _opt(bids[0]["price"]), _opt(asks[0]["price"])
             if bid is None or ask is None or bid <= 0 or ask <= 0:
                 raise Unavailable(f"unusable top of book for {product_id}")  # never a price of 0, NaN or inf
+            if bid > ask:  # crossed: a stale or one-sided top of book skews the mid, the levels and the sizing
+                raise Unavailable(f"crossed book for {product_id}: bid {bid} > ask {ask}")
             return Quote(product_id, bid, ask, self.clock())
 
     def position(self) -> Position | None:
-        """The BIP position. Its size and side are required; an average entry price that is missing or not a finite
-        number reads 0.0 (the position stays readable - it is what protection is placed for -, and the executor
-        never takes 0 for an entry price)."""
+        """The BIP position, None only for the documented shape of a flat account: `positions` is a list (empty, or
+        without the product, or with the product at 0 contracts) of objects that each have a product_id. Anything
+        else is an ExchangeError, never flat: no `positions` list, an entry without a product_id, the product's entry
+        without number_of_contracts (a whole number) or - unless it is 0 - without a LONG / SHORT side, or two entries
+        for the product. An average entry price that is missing or not a finite number reads 0.0 (the position stays
+        readable - it is what protection is placed for -, and the executor never takes 0 for an entry price)."""
         reply = self._call("GET", "/cfm/positions")
         with _parsing("positions"):
-            for p in reply.get("positions") or []:
-                if p.get("product_id") != self.futures_id:
-                    continue
-                n = abs(int(_num(p.get("number_of_contracts"))))
-                if n == 0:
-                    return None
-                side = str(p.get("side") or "").removeprefix(POSITION_SIDE_PREFIX)
-                return Position(_side_of(side, _POSITION_SIDES, "position"), n, _opt(p.get("avg_entry_price")) or 0.0)
-            return None
+            positions = reply["positions"]
+            if not isinstance(positions, list):
+                raise TypeError("positions is not a list")
+            mine = []
+            for p in positions:
+                pid = p.get("product_id") if isinstance(p, dict) else None
+                if not isinstance(pid, str) or not pid:
+                    raise TypeError("a position without a product_id")
+                if pid == self.futures_id:
+                    mine.append(p)
+            if len(mine) > 1:
+                raise ValueError("two positions in the product")
+            if not mine:
+                return None
+            p = mine[0]
+            count = _num(p["number_of_contracts"], math.nan)  # missing or empty: NaN, refused below
+            if not math.isfinite(count) or count != int(count):
+                raise ValueError("number_of_contracts is not a whole number")
+            n = abs(int(count))
+            if n == 0:
+                return None
+            side = str(p.get("side") or "").removeprefix(POSITION_SIDE_PREFIX)
+            return Position(_side_of(side, _POSITION_SIDES, "position"), n, _opt(p.get("avg_entry_price")) or 0.0)
 
     def _orders(self, params: dict[str, Any]) -> list[Order]:
         out: list[Order] = []

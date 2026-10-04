@@ -12,6 +12,7 @@ import requests
 from ewbot.live.coinbase import (
     API,
     RETRY_AFTER_MAX_S,
+    RETRY_SLEEP_MAX_S,
     CoinbaseExchange,
     fmt_decimal,
     map_error,
@@ -578,3 +579,73 @@ def test_an_order_reply_without_a_boolean_success_is_ambiguous_not_a_refusal(rep
     with pytest.raises(Unavailable):
         ex.close_position("ewb-x-1-1")
     assert len(client.calls) == 2
+
+
+_LONG = {"product_id": FUT, "side": "LONG", "number_of_contracts": "2", "avg_entry_price": "84000"}
+
+
+@pytest.mark.parametrize("reply", [
+    {},  # no positions key
+    {"cfm_positions": [_LONG]},  # the positions under another key
+    {"positions": None}, {"positions": {"product_id": FUT}}, {"positions": "none"},  # not a list
+    {"positions": [{k: v for k, v in _LONG.items() if k != "product_id"} | {"product": FUT}]},  # product_id renamed
+    {"positions": ["BIP"]},  # an entry that is not an object
+    {"positions": [{k: v for k, v in _LONG.items() if k != "number_of_contracts"} | {"contracts": "2"}]},
+    {"positions": [{**_LONG, "number_of_contracts": ""}]},
+    {"positions": [{**_LONG, "number_of_contracts": "2.5"}]},  # not a whole number of contracts
+    {"positions": [{k: v for k, v in _LONG.items() if k != "side"}]},
+    {"positions": [_LONG, {**_LONG, "side": "SHORT"}]},  # two entries for the product
+])
+def test_a_position_reply_of_another_shape_is_an_error_never_flat(reply):
+    """Final review A-D: a reply without the documented shape never reads as flat (a flat read closes the trade's record,
+    cancels its brackets and lets the next entry stack on the real position): `positions` must be a list, every entry
+    an object with a product_id, the product's one entry needs number_of_contracts (a whole number) and, unless it
+    is 0, its side."""
+    ex, _, _ = make({("GET", "/cfm/positions"): reply})
+    with pytest.raises(ExchangeError) as err:
+        ex.position()
+    assert not err.value.retryable
+
+
+def test_a_flat_position_reads_none_only_from_the_documented_shape():
+    ex, _, _ = make({("GET", "/cfm/positions"): [
+        {"positions": []}, {"positions": [{**_LONG, "product_id": "BIT-31OCT26-CDE"}]},
+        {"positions": [{"product_id": FUT, "number_of_contracts": "0", "side": "UNKNOWN"}]},
+        {"positions": [{"product_id": FUT, "number_of_contracts": "0"}]}]})
+    for _ in range(4):  # no entry, only another product's, the product's at 0 contracts (no side needed)
+        assert ex.position() is None
+
+
+def test_a_crossed_book_is_unavailable_not_a_price():
+    """Final review A minor 3: a bid above the ask (a stale or one-sided top of book) is no price to map levels or
+    size with."""
+    book = {"pricebook": {"bids": [{"price": "84700", "size": "1"}], "asks": [{"price": "84680", "size": "1"}]}}
+    ex, _, _ = make({("GET", "/market/product_book"): [book, "book_bip"]})
+    with pytest.raises(Unavailable, match="crossed"):
+        ex.quote(FUT)
+    assert ex.quote(FUT).bid == 84655.0  # a locked or normal book reads
+
+
+def test_a_call_waits_at_most_its_budget_and_a_429_then_fails_fast():
+    """Final review A minor 5: a call's waits (pacing and retries) add up to at most RETRY_SLEEP_MAX_S, then its error
+    is raised; while the last 429's Retry-After runs, a new call raises at once and sends nothing - so one pass of the
+    loop is never held for tens of seconds by a 429 storm."""
+    now = [1_790_000_000.0]
+    slept: list[float] = []
+
+    def sleep(s: float) -> None:
+        slept.append(s)
+        now[0] += s
+
+    client = RecordedClient({("GET", API + "/cfm/positions"): [
+        http_error(429, "", {"Retry-After": "10"}), http_error(429, "", {"Retry-After": "10"}), "positions"]})
+    ex = CoinbaseExchange(client, FUT, "BTC-USD", sleep=sleep, clock=lambda: now[0])
+    with pytest.raises(RateLimited):
+        ex.position()
+    assert slept == [10.0] and sum(slept) <= RETRY_SLEEP_MAX_S and len(client.calls) == 2
+    with pytest.raises(RateLimited, match="nothing sent"):
+        ex.position()  # the second 429's Retry-After still runs: no request, no wait
+    assert len(client.calls) == 2 and slept == [10.0]
+    now[0] += 10.0
+    assert ex.position().contracts == 3  # it has passed: sent again
+    assert len(client.calls) == 3
