@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import inspect
 from dataclasses import dataclass
@@ -284,3 +285,34 @@ def test_an_inconsistent_replay_raises_a_target_error(lock, ref, monkeypatch):
     monkeypatch.setattr(target_mod, "run_backtest", lambda *a, **k: dataclasses.replace(real(*a, **k), trades=()))
     with pytest.raises(TargetError, match="trade"):
         compute_target(lock, ref.df, signal_bar + 5 * H1)  # the long entered at signal_bar + 1h is open
+
+
+# ---------------------------------------------------------------------------- Final fix
+def test_an_incomplete_holdout_lock_is_refused_like_the_paper_precheck(lock):
+    """paper.runner.precheck_lock also requires the data fingerprint, the last holdout bar and the holdout's trade count:
+    a lock without them is not a completed holdout lock (its digest does not cover them)."""
+    def without(path: tuple[str, ...]) -> dict:
+        d = copy.deepcopy(lock)
+        node = d
+        for k in path[:-1]:
+            node = node[k]
+        del node[path[-1]]
+        return d
+
+    for path in (("data", "last_bar_ts"), ("data", "sha256"), ("first_run", "criteria", "n_trades", "A"), ("data",),
+                 ("first_run",)):
+        with pytest.raises(TargetError, match="not a completed holdout lock"):
+            frozen_config(without(path))
+    with pytest.raises(TargetError):
+        frozen_config(dict(lock, data={**lock["data"], "last_bar_ts": "soon"}))
+
+
+def test_a_decision_the_paper_builder_refuses_is_a_target_error(lock, ref, monkeypatch):
+    """build_decisions raises ValueError for a trace it cannot pair (queued entries vs. signals): an inconsistent replay,
+    a TargetError like the others - the cycle fails as ERROR, never as an unexpected exception."""
+    def refuse(*a, **k):
+        raise ValueError("2 signals but 1 queued entries in the trace")
+
+    monkeypatch.setattr(target_mod, "build_decisions", refuse)
+    with pytest.raises(TargetError, match="decisions"):
+        compute_target(lock, ref.df, ts("2024-03-13 22:00"))

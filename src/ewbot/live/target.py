@@ -109,11 +109,15 @@ class Target:
 def lock_params(lock: Mapping[str, Any]) -> tuple[float, ...]:
     """The params of a completed holdout lock, checked with the paper precheck's semantics
     (paper.runner.precheck_lock) minus its git checks - the image has no git history; preflight pins the
-    committed lock's sha256 instead: the params are a walk-forward grid combo, the holdout start is
-    HOLDOUT_START and sha256 == lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. the
+    committed lock's sha256 instead: the fields a completed holdout recorded are there (its data's last bar and
+    fingerprint, the first run's trade count of A), the params are a walk-forward grid combo, the holdout start
+    is HOLDOUT_START and sha256 == lock_digest(BotConfig(), params, random_runs, code_sha256), i.e. the
     configuration built from them is the one the holdout ran with (conservative, breakers on)."""
     try:
         params = tuple(float(x) for x in lock["params"])
+        int(lock["data"]["last_bar_ts"])
+        str(lock["data"]["sha256"])
+        int(lock["first_run"]["criteria"]["n_trades"]["A"])
         random_runs = int(lock["random_runs"])
         code_sha = str(lock["code_sha256"])
         holdout_start = int(lock["holdout_start"])
@@ -247,9 +251,9 @@ def compute_target(lock: Mapping[str, Any], df1h: pd.DataFrame, bar_ts: int) -> 
             tp1=o.tp1, tp2=o.tp2, risk_mult=sig.risk_mult, contracts=o.contracts, reason=sig.reason,
         )
 
-    try:
+    try:  # build_decisions raises ValueError for a trace it cannot pair (queued entries vs. signals)
         decisions = tuple(d for d in build_decisions(res, trace, list(res.trades)) if d["ts"] <= bar_ts)
-    except (KeyError, StopIteration) as exc:
+    except (KeyError, StopIteration, ValueError) as exc:
         raise inconsistent(f"the decisions cannot be built: {exc!r}") from exc
     close = float(frame["close"].iloc[-1])
     return Target(bar_ts, close, position, exit_reason, entry, decisions, exit_queued_ts, stop_pending_reopen)
