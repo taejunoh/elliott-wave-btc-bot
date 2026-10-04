@@ -99,7 +99,7 @@ def test_an_entry_whose_fill_cannot_be_read_is_rebuilt_not_adopted(env):
     ex.fail_next("get_order", Unavailable("503"), times=25)  # longer than the 10 s fill wait
     assert exe.enter(Enter(entry(), 1), ctx(clock)) is None
     assert ex.position().contracts == 1 and exe.trade() is None and jr.events(kind="ENTRY_UNCONFIRMED")
-    ex._faults.clear()
+    ex.clear_faults()
     acts = plan(target(T0 + 3600, ent=entry()), None, ex.position(), ex.open_orders(), ctx(clock))
     exe.execute(acts, ctx(clock))
     assert exe.trade().trade_id == T0 and len(ex.open_orders()) == 1

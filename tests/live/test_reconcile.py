@@ -187,8 +187,30 @@ def test_after_the_live_tp1_the_single_leg_stops_at_break_even():
     tr = trade(tp1_filled=True)
     legs, stop = desired_legs(tr, 2, 59_000.0, 1.0, 5.0)
     assert stop == 60_020.0 and [(leg.name, leg.size, leg.limit_price) for leg in legs] == [("tp2", 2, 62_000.0)]
+
+
+def test_the_break_even_stop_is_at_least_the_live_entry_while_the_market_allows():
+    """Interpretation 5: after the live TP1 the stop is at least the live entry - a long's rounds up to the tick, a
+    short's down. A stop must rest on the loss side of the market (else the venue refuses it or it fills at once):
+    while the futures price is less than a tick beyond that level, or unknown, it is the tick on the other side of the
+    entry, and once a stop rests at the rounded level an engine move never loosens it."""
+    tr = trade(entry_price=60_012.0, tp1_filled=True)
+    assert desired_legs(tr, 2, 59_000.0, 1.0, 5.0, price=60_500.0)[1] == 60_015.0  # rounded up: >= the live entry
+    assert desired_legs(tr, 2, 59_000.0, 1.0, 5.0, price=60_020.0)[1] == 60_015.0  # a tick below the market
+    assert desired_legs(tr, 2, 59_000.0, 1.0, 5.0, price=60_019.0)[1] == 60_010.0  # within a tick: below the entry
+    assert desired_legs(tr, 2, 59_000.0, 1.0, 5.0)[1] == 60_010.0  # no price: the same
+    held = trade(entry_price=60_012.0, tp1_filled=True, stop_price=60_015.0)  # rests at the rounded-up level
+    assert desired_legs(held, 2, 59_100.0, 1.0, 5.0, price=60_016.0)[1] == 60_015.0
+    assert desired_legs(trade(tp1_filled=True), 2, 59_000.0, 1.0, 5.0, price=60_021.0)[1] == 60_020.0  # on the grid
     short = trade(direction=-1, entry_price=60_002.0, stop_price=61_000.0, stop_spot=61_000.0, tp1_filled=True)
-    assert desired_legs(short, 2, 61_000.0, 1.0, 5.0)[1] == 60_005.0  # short break-even rounds up
+    assert desired_legs(short, 2, 61_000.0, 1.0, 5.0, price=59_500.0)[1] == 60_000.0  # rounded down: <= the entry
+    assert desired_legs(short, 2, 61_000.0, 1.0, 5.0, price=59_996.0)[1] == 60_005.0  # within a tick: above it
+    sync = trade(entry_price=60_012.0)  # the planner uses its context's futures price
+    acts = plan(target(position=tpos(tp1_done=True)), sync, Position(1, 3, 60_012.0), resting(sync),
+                dataclasses.replace(CTX, price=60_500.0))
+    assert acts[0] == Reduce(1, "TP1_SYNC") and acts[1].stop_price == 60_015.0
+    acts = plan(target(position=tpos(tp1_done=True)), sync, Position(1, 3, 60_012.0), resting(sync), CTX)
+    assert acts[1].stop_price == 60_010.0
 
 
 def test_one_contract_trades_use_one_tp1_bracket():

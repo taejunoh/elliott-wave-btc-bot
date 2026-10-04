@@ -42,8 +42,10 @@ the engine's target (live/target.py) and the exchange's position and open orders
          filled, as it will be (the position may still lag behind it);
        - protection: the brackets must equal the desired legs (spec 4.2): two legs (TP1 size + stop,
          rest + TP2 + stop) before TP1, one leg (rest + TP2 + stop) after it, one leg (TP1 + stop) for
-         1 contract; after the live TP1 the stop is at least break-even (live entry price). Legs never
-         exceed the position. A moved engine stop is mapped with the basis ratio at the time; without
+         1 contract; after the live TP1 the stop is at least break-even (the live entry price on the tick:
+         a long's rounded up, a short's down - while the futures price is less than a tick beyond that, or
+         unknown, the entry rounded the other way, as a stop through the market is refused or fills at
+         once). Legs never exceed the position. A moved engine stop is mapped with the basis ratio at the time; without
          quotes the stop in force is kept and the move is planned again once quotes are back.
      Without a target (data late, spec 4.1 step 1) only protection is maintained.
 
@@ -195,6 +197,7 @@ class PlanContext:
     entry_contracts: int = 0  # stage size for target.entry (0: skip)
     entry_block: str | None = None  # why no entry may be sent now (paused, session, margin, stale, size)
     max_contracts: int | None = None  # stage maximum for a position taken over (None: no cap)
+    price: float | None = None  # futures mid now, read with `ratio` (None: quotes unavailable): the break-even stop
 
     def __post_init__(self) -> None:
         if self.max_contracts is not None and self.max_contracts < 1:
@@ -339,18 +342,33 @@ def _leg_sizes(trade: LiveTrade, contracts: int) -> list[tuple[str, int]]:
     return [("tp1", k), ("tp2", contracts - k)]
 
 
-def desired_legs(trade: LiveTrade, contracts: int, stop_spot: float, ratio: float | None, tick: float
-                 ) -> tuple[list[Leg], float]:
+def _break_even(trade: LiveTrade, tick: float, price: float | None) -> float:
+    """The futures stop after the live TP1 (spec 4.2, interpretation 5: at least the live entry price): the entry on
+    the tick toward the profit side - a long's rounded up, a short's down. A stop rests on the loss side of the market
+    (a long's sell stop above the last trade is refused, or triggers at once), so while the futures price is less than
+    a tick beyond that level - or unknown - it is the entry on the tick toward the loss side (at most a tick short of
+    break-even, the nearest the grid allows), moved up once the price allows; a stop resting at or beyond the
+    profit-side level keeps it (never loosened)."""
+    d = trade.direction
+    up = to_tick(trade.entry_price, tick, -d)
+    if d * (trade.stop_price - up) >= 0 or (price is not None and d * (price - up) >= tick):
+        return up
+    return to_tick(trade.entry_price, tick, d)
+
+
+def desired_legs(trade: LiveTrade, contracts: int, stop_spot: float, ratio: float | None, tick: float,
+                 price: float | None = None) -> tuple[list[Leg], float]:
     """The brackets that must rest for `contracts` contracts, and their futures stop. The stored futures
     stop is kept while the engine stop is unchanged (no churn when only the basis moves) or without
-    quotes. Raises ValueError when a TP2 leg is needed and the trade has no TP2."""
+    quotes; after the live TP1 it is at least break-even (`_break_even`, judged against the futures `price`).
+    Raises ValueError when a TP2 leg is needed and the trade has no TP2."""
     d = trade.direction
     if stop_spot == trade.stop_spot or ratio is None:
         stop = trade.stop_price
     else:
         stop = map_level(stop_spot, ratio, tick, d)
     if trade.tp1_filled:
-        be = to_tick(trade.entry_price, tick, d)
+        be = _break_even(trade, tick, price)
         stop = max(stop, be) if d > 0 else min(stop, be)
     legs: list[Leg] = []
     for name, size in _leg_sizes(trade, contracts):
@@ -419,7 +437,7 @@ def _engine_view(target: Target, trade: LiveTrade) -> TargetPosition | str:
 
 def _protection(trade: LiveTrade, orders: list[Order], contracts: int, stop_spot: float,
                 ctx: PlanContext) -> list[Action]:
-    desired, stop = desired_legs(trade, contracts, stop_spot, ctx.ratio, ctx.tick)
+    desired, stop = desired_legs(trade, contracts, stop_spot, ctx.ratio, ctx.tick, ctx.price)
     if not legs_match(trade, orders, desired) or stop_spot != trade.stop_spot:
         return [Protect(tuple(desired), stop_spot, stop)]
     return []

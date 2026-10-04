@@ -1090,7 +1090,8 @@ def test_a_fill_between_the_position_and_the_order_read_is_read_again(tmp_path):
     hs.at(ENTRY_BAR + 45)  # the next poll
     tr = hs.rt.executor.trade()
     assert hs.ex.position().contracts == 2 and tr.tp1_filled and hs.ex.calls.count("place_bracket") == 3
-    assert [(o.size, o.limit_price, o.stop_price) for o in hs.ex.open_orders()] == [(2, 27_610.0, 26_745.0)]
+    # break-even: the live entry 26_747 rounded up to the tick (the market is far above it)
+    assert [(o.size, o.limit_price, o.stop_price) for o in hs.ex.open_orders()] == [(2, 27_610.0, 26_750.0)]
     assert "UNEXPLAINED_REDUCTION" not in hs.alerts.kinds() and "TP1_FILLED" in hs.alerts.kinds()
     hs.journal.close()
 
@@ -1116,7 +1117,7 @@ def test_an_ambiguous_tp1_sync_is_read_from_the_position_not_sold_again(tmp_path
     assert hs.ex.position().contracts == 2 and tr.tp1_filled and tr.pending_reduce is None
     assert [e["data"]["reason"] for e in hs.journal.events(kind="REDUCE_SETTLED")] == ["TP1_SYNC"]
     assert hs.ex.calls.count("close_position") == 1 and "UNEXPLAINED_REDUCTION" not in hs.alerts.kinds()
-    assert [(o.size, o.limit_price, o.stop_price) for o in hs.ex.open_orders()] == [(2, 27_610.0, 26_745.0)]
+    assert [(o.size, o.limit_price, o.stop_price) for o in hs.ex.open_orders()] == [(2, 27_610.0, 26_750.0)]
     assert paused(hs.journal) is None
     hs.journal.close()
 
@@ -1434,7 +1435,7 @@ def test_a_failing_watchdog_close_is_tried_once_per_poll_interval_with_limited_a
     assert kinds.count("STOP_UNPROTECTED") == 1 and kinds.count("CLOSE_FAILED") == 1 and kinds.count("BRACKET_FAILED") == 0
     assert [t for k, t in h.alerts.items if k == "STOP_UNPROTECTED"] == [
         "[손절] 보호 주문 없이 가격 26,580.0이 손절 26,585을 지남: 시장가 청산 실패 - 10초마다 재시도"]
-    h.ex._faults["close_position"] = []  # the venue takes the close again
+    h.ex.clear_faults("close_position")  # the venue takes the close again
     h.at(ENTRY_BAR + 75)
     assert h.ex.position() is not None  # 5 s after the last attempt: not yet
     h.at(ENTRY_BAR + 80)

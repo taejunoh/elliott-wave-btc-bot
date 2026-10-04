@@ -21,9 +21,10 @@ book of the SHADOW stage. It models what the runtime relies on:
     false); an order that already FILLED no longer rests and is not an error (ORDER_IS_FULLY_FILLED);
   - nothing fills while the session is not OPEN; market orders are rejected then;
   - fault injection: `fail_next(method, exc)` raises on the next call(s) of a method (429 / 5xx /
-    outages) and `crash_after_accept(method)` raises SimCrash right AFTER the order was accepted (a
-    process killed between send and journal update); a method that does not honour them (FAULT_METHODS,
-    CRASH_METHODS) is refused with ValueError instead of being silently ignored;
+    outages; `clear_faults()` drops what is still queued) and `crash_after_accept(method)` raises SimCrash
+    right AFTER the order was accepted (a process killed between send and journal update); a method that
+    does not honour them (FAULT_METHODS, CRASH_METHODS) is refused with ValueError instead of being silently
+    ignored;
   - a repeated client_order_id returns the existing order (`duplicate="existing"`) or an error
     (`duplicate="error"`): Coinbase documents both, the real behaviour is confirmed in CANARY."""
 
@@ -151,6 +152,14 @@ class SimExchange:
         if method not in self.FAULT_METHODS:
             raise ValueError(f"fail_next: {method!r} never raises injected faults")
         self._faults.setdefault(method, []).extend([exc] * times)
+
+    def clear_faults(self, method: str | None = None) -> None:
+        """Drop the faults `fail_next` queued and that have not been raised yet: `method`'s, or every method's (the
+        venue answers again)."""
+        if method is None:
+            self._faults.clear()
+        else:
+            self._faults.pop(method, None)
 
     def crash_after_accept(self, method: str, exc: BaseException | None = None) -> None:
         """The next `method` call is accepted, then raises `exc` (default SimCrash: the process dies;

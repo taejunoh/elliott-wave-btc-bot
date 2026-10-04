@@ -134,6 +134,14 @@ def test_injected_faults_raise_once(ex):
         with pytest.raises(Unavailable):
             ex.position()
     assert ex.position().contracts == 1
+    ex.fail_next("quote", Unavailable("503"), times=50)
+    ex.fail_next("balance", Unavailable("503"), times=2)
+    ex.clear_faults("quote")  # the venue answers again: one method's queued faults dropped, the others kept
+    assert ex.quote(ex.futures_id).mid == 60_000.0
+    with pytest.raises(Unavailable):
+        ex.balance()
+    ex.clear_faults()  # every method's
+    assert ex.balance().equity > 0
 
 
 def test_crash_after_accept_leaves_the_order_on_the_exchange(ex):

@@ -395,9 +395,11 @@ class LiveRuntime:
         return stage, full_cap(self.journal, now)
 
     def _ctx(self, now: float) -> PlanContext:
-        ratio = None
+        ratio = price = None
         try:
-            ratio = basis_ratio(self.ex.quote(self.ex.futures_id).mid, self.ex.quote(self.ex.spot_id).mid)
+            fut = self.ex.quote(self.ex.futures_id).mid
+            ratio = basis_ratio(fut, self.ex.quote(self.ex.spot_id).mid)
+            price = fut  # what the break-even stop is judged against (reconcile.desired_legs)
         except (ExchangeError, ValueError):
             pass
         session_open = self.session is not None and self.session.is_open
@@ -406,7 +408,7 @@ class LiveRuntime:
         stage, cap = self._limits(now)
         most = cap if stage == "FULL" else 1  # the stage maximum for a position taken over (a real one in SHADOW too)
         return PlanContext(now=now, ratio=ratio, tick=tick, session_open=session_open, entry_contracts=n,
-                           entry_block=block, max_contracts=most)
+                           entry_block=block, max_contracts=most, price=price)
 
     def _entry_size(self, now: float, ratio: float | None, session_open: bool) -> tuple[int, str | None]:
         t = self.target

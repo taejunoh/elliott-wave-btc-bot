@@ -417,7 +417,7 @@ class Executor:
                              "order_id": order.order_id},
                    f"[진입] {e.setup} {_side(e.direction)} {trade.contracts}계약 @ {trade.entry_price:,.1f} · 손절 "
                    f"{trade.stop_price:,.0f} · TP1 {trade.tp1_price:,.0f} · TP2 {trade.tp2_price or 0:,.0f}")
-        legs, stop = desired_legs(trade, trade.contracts, trade.stop_spot, ctx.ratio, ctx.tick)
+        legs, stop = desired_legs(trade, trade.contracts, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
         self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
         return self.trade()
 
@@ -470,7 +470,7 @@ class Executor:
                 self.event("RECOVERED_ENTRY", {"trade_id": trade.trade_id},
                            f"[복구] 진입 {trade.trade_id} {_side(trade.direction)} {trade.contracts}계약 복원")
                 size = min(expected_contracts(trade), pos.contracts)
-                legs, stop = desired_legs(trade, size, trade.stop_spot, ctx.ratio, ctx.tick)
+                legs, stop = desired_legs(trade, size, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
                 self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
                 return
         n = self._take(pos, ctx, contracts)
@@ -496,7 +496,7 @@ class Executor:
         if approx:
             self._alert_once("LEVELS_APPROX", f"trade {trade.trade_id}: no quotes - protected at the spot levels "
                                               f"(ratio 1.0, approximate) until the quotes are back")
-        legs, stop = desired_legs(trade, n, trade.stop_spot, ratio, ctx.tick)
+        legs, stop = desired_legs(trade, n, trade.stop_spot, ratio, ctx.tick, ctx.price)
         self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
 
     @staticmethod
@@ -529,7 +529,7 @@ class Executor:
                                            "why": "FILL_UNREAD" if fill_unread else "LOOKUP_FAILED"},
                    f"[경고] 진입 {trade_id} 결과 미확인({why}): 포지션 {_side(pos.side)} {pos.contracts}계약 중 "
                    f"{n}계약을 진입 주문의 손절·TP로 임시 보호 - 확인되면 정리")
-        legs, stop = desired_legs(trade, n, trade.stop_spot, ctx.ratio, ctx.tick)
+        legs, stop = desired_legs(trade, n, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
         self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
 
     def _entry_outcome(self, cid: str) -> bool | None:
@@ -785,7 +785,7 @@ class Executor:
             if trade.legs and not any(leg.order_id in resting for leg in trade.legs):
                 trade.legs = []  # none rests: nothing to look up, placed again
                 self.save(trade)
-            legs, stop = desired_legs(trade, pos.contracts, trade.stop_spot, ctx.ratio, ctx.tick)
+            legs, stop = desired_legs(trade, pos.contracts, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
             self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
         except ExchangeError as exc:  # observe sees the gap (UNPROTECTED); the next pass places them
             self.event("ACTION_ERROR", {"action": "Protect", "error": str(exc)[:200]},
@@ -953,7 +953,8 @@ class Executor:
                 self.save(trade)
             else:
                 after = LiveTrade.from_json({**trade.to_json(), **trade.pending_reduce["after"]})
-                legs, stop = desired_legs(after, pos.contracts - size, trade.stop_spot, ctx.ratio, ctx.tick)
+                legs, stop = desired_legs(after, pos.contracts - size, trade.stop_spot, ctx.ratio, ctx.tick,
+                                          ctx.price)
                 self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
             cover = sum(o.size - o.filled for o in self.ex.open_orders()
                         if is_ours(o) and o.kind == "BRACKET" and o.side == -trade.direction)
