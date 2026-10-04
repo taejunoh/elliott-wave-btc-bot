@@ -443,3 +443,28 @@ def test_a_health_check_url_urlsplit_cannot_read_is_a_settings_error(tmp_path):
         with pytest.raises(SettingsError, match="EWBOT_HEALTHCHECK_URL must be an https:// URL") as err:
             load_settings({"EWBOT_SECRETS_FILE": str(path)})
         assert "SECRET" not in str(err.value) and err.value.__cause__ is None
+
+
+@pytest.mark.parametrize("field,value", [("overnight_margin", (0.0, 0.25)), ("overnight_margin", (0.21, float("nan"))),
+                                         ("intraday_margin", (0.1, 0.0)), ("intraday_margin", (-0.1, 0.1)),
+                                         ("overnight_margin", (float("inf"), 0.25))])
+def test_the_product_needs_finite_margin_rates_above_zero(field, value):
+    """Final review A minor 2: a margin rate the reply did not give reads 0, which would silently turn off the 70%
+    entry limit and the 90% reduction: the preflight refuses the product."""
+    c = check_product(dataclasses.replace(BIP_SPEC, **{field: value}), now=NOW)
+    assert not c.ok and "margin" in c.detail
+
+
+def test_extra_refusal_codes_come_from_the_environment_checked():
+    """Final review A-C: a close-conflict or overlap refusal code learned in CANARY is added with a restart
+    (EWBOT_CLOSE_CONFLICTS, EWBOT_OVERLAP_REFUSALS: comma lists of UPPER_SNAKE codes, merged with the built-in
+    sets by the runtime), never a code change."""
+    s = load_settings({"EWBOT_CLOSE_CONFLICTS": " INVALID_CLOSE_POSITION_REQUEST, BRACKETS_REST ,",
+                       "EWBOT_OVERLAP_REFUSALS": "TOO_MANY_BRACKETS"})
+    assert s.close_conflicts == ("BRACKETS_REST", "INVALID_CLOSE_POSITION_REQUEST")
+    assert s.overlap_refusals == ("TOO_MANY_BRACKETS",)
+    assert load_settings({}).close_conflicts == () and load_settings({"EWBOT_CLOSE_CONFLICTS": ""}).close_conflicts == ()
+    for name in ("EWBOT_CLOSE_CONFLICTS", "EWBOT_OVERLAP_REFUSALS"):
+        for bad in ("open_bracket_orders", "OPEN BRACKET", "OPEN-BRACKET", "9CODES", "A,A"):
+            with pytest.raises(SettingsError, match=name):
+                load_settings({name: bad})

@@ -1088,7 +1088,7 @@ def test_a_fill_between_the_position_and_the_order_read_is_read_again(tmp_path):
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)
     assert hs.ex.position().contracts == 3  # TP1 leg 1 @ 27_245, TP2 leg 2 @ 27_610
-    hs.ex.race = lambda: hs.ex.set_prices(27_300.0)  # through the TP1 limit only
+    hs.ex.race = lambda: hs.ex.set_prices(27_300.0, 27_300.0)  # through the TP1 limit only (spot along: basis band)
     hs.at(ENTRY_BAR + 45)  # the next poll
     tr = hs.rt.executor.trade()
     assert hs.ex.position().contracts == 2 and tr.tp1_filled and hs.ex.calls.count("place_bracket") == 3

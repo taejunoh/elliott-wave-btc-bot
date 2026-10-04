@@ -2,7 +2,9 @@
 
 Non-secret values come from the environment (deploy/live/docker-compose.yml): EWBOT_LIVE_DIR (an absolute path,
 default /data), EWBOT_COINBASE_KEY_FILE, EWBOT_SECRETS_FILE, EWBOT_PAPER_REPO (owner/repo), EWBOT_LIVE_EDIT_STOPS
-(0 or 1), EWBOT_EXPIRY and TELEGRAM_CHAT_ID (the secrets file's value wins). The futures product and the signal
+(0 or 1), EWBOT_EXPIRY, TELEGRAM_CHAT_ID (the secrets file's value wins) and EWBOT_CLOSE_CONFLICTS /
+EWBOT_OVERLAP_REFUSALS: Coinbase refusal codes added to the executor's built-in close-conflict and bracket-overlap
+sets (a comma list of UPPER_SNAKE codes, e.g. one learned in CANARY: a restart applies it, no code change). The futures product and the signal
 product are fixed (exchange.FUTURES_PRODUCT, SPOT_PRODUCT; the preflight refuses an exchange set up for any
 other): EWBOT_FUTURES_PRODUCT or EWBOT_SPOT_PRODUCT in the environment is refused.
 
@@ -48,6 +50,7 @@ FIXED_PRODUCTS = ("EWBOT_FUTURES_PRODUCT", "EWBOT_SPOT_PRODUCT")
 MAX_SECRET_FILE_BYTES = 1 << 20
 _KEY = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+\Z")
+_CODE = re.compile(r"[A-Z][A-Z0-9_]*\Z")  # a Coinbase reason code: UPPER_SNAKE
 
 
 class SettingsError(RuntimeError):
@@ -107,6 +110,8 @@ class LiveSettings:
     paper_repo: str | None = None
     edit_stops: bool = False
     expiry: tuple[tuple[str, str], ...] = ()  # (name, ISO day) sorted by name: hashable, immutable
+    close_conflicts: tuple[str, ...] = ()  # refusal codes added to executor.CLOSE_CONFLICTS (sorted)
+    overlap_refusals: tuple[str, ...] = ()  # refusal codes added to executor.OVERLAP_REFUSALS (sorted)
 
     @property
     def journal_path(self) -> Path:
@@ -238,6 +243,19 @@ def _paper_repo(value: str | None) -> str | None:
     return repo
 
 
+def refusal_codes(name: str, value: str | None) -> tuple[str, ...]:
+    """EWBOT_CLOSE_CONFLICTS / EWBOT_OVERLAP_REFUSALS: 'CODE_A, CODE_B' -> the sorted codes (empty items ignored); a
+    code that is not UPPER_SNAKE, or one named twice, is a SettingsError."""
+    codes = [x.strip() for x in (value or "").split(",") if x.strip()]
+    for code in codes:
+        if not _CODE.match(code):
+            raise SettingsError(f"{name} item {code[:40]!r} is not a Coinbase reason code (UPPER_SNAKE, e.g. "
+                                "OPEN_BRACKET_ORDERS)")
+    if len(set(codes)) != len(codes):
+        raise SettingsError(f"{name} names a code twice")
+    return tuple(sorted(codes))
+
+
 def _healthcheck_url(value: str | None) -> Secret | None:
     if not value:
         return None
@@ -279,4 +297,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> LiveSettings:
         paper_repo=_paper_repo(env.get("EWBOT_PAPER_REPO")),
         edit_stops=_edit_stops(env.get("EWBOT_LIVE_EDIT_STOPS")),
         expiry=tuple(sorted(parse_expiry(env.get("EWBOT_EXPIRY", "")).items())),
+        close_conflicts=refusal_codes("EWBOT_CLOSE_CONFLICTS", env.get("EWBOT_CLOSE_CONFLICTS")),
+        overlap_refusals=refusal_codes("EWBOT_OVERLAP_REFUSALS", env.get("EWBOT_OVERLAP_REFUSALS")),
     )

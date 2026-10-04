@@ -7,6 +7,8 @@ import pytest
 
 from ewbot.config import AGGRESSIVE, BotConfig
 from ewbot.live.pricing import (
+    BASIS_BAND,
+    BasisOutOfBand,
     basis_ratio,
     map_level,
     map_levels,
@@ -136,3 +138,13 @@ def test_margin_projection_uses_the_overnight_rate():
         assert max_contracts_for_margin(price, 1, BIP_SPEC, equity) == 0, (price, equity)
     n = max_contracts_for_margin(84_000.0, 1, BIP_SPEC, 1_000.0)
     assert n == 3 and margin_ratio(n, 84_000.0, 1, BIP_SPEC, 1_000.0) <= 0.70 < margin_ratio(n + 1, 84_000.0, 1, BIP_SPEC, 1_000.0)
+
+
+@pytest.mark.parametrize("fut,spot", [(61_300.0, 60_000.0), (58_700.0, 60_000.0), (120_000.0, 60_000.0)])
+def test_a_basis_ratio_outside_its_band_is_refused(fut, spot):
+    """Final review A minor 3: a futures mid more than BASIS_BAND (2%) from the spot mid is a stale or one-sided book,
+    not a basis: no level is mapped and no entry sized with it (BasisOutOfBand, a ValueError)."""
+    with pytest.raises(BasisOutOfBand):
+        basis_ratio(fut, spot)
+    assert BASIS_BAND == 0.02 and issubclass(BasisOutOfBand, ValueError)
+    assert basis_ratio(61_199.0, 60_000.0) == pytest.approx(1.0199833) and basis_ratio(58_801.0, 60_000.0) < 1.0

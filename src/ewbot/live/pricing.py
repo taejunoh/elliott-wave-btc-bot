@@ -2,8 +2,8 @@
 (Plan 3 spec 3.3, 4.3, 4.5).
 
 Signals, stops and targets are computed on spot BTC-USD candles (the paper runtime's input); orders go
-to the BIP future. A level is mapped with the basis ratio at order time (futures mid / spot mid) and
-put on the $5 tick conservatively: long levels round DOWN, short levels round UP. For a stop that is
+to the BIP future. A level is mapped with the basis ratio at order time (futures mid / spot mid; one more than
+BASIS_BAND = 2% from 1 is a stale or one-sided book, not a basis: refused) and put on the $5 tick conservatively: long levels round DOWN, short levels round UP. For a stop that is
 the spec's rule (never triggered earlier than the engine's stop); for a take-profit it moves the
 level toward the entry, so the live limit is reached no later than the engine's strict-cross TP.
 
@@ -28,7 +28,12 @@ FULL_CAP_DAYS = 30
 MARGIN_ENTRY_MAX = 0.70  # spec 4.5: refuse an entry whose overnight projection exceeds 70%
 MARGIN_WARN = 0.80
 MARGIN_REDUCE = 0.90
+BASIS_BAND = 0.02  # a futures mid this far from the spot mid (either way) is no basis: a stale or one-sided book
 _EPS = 1e-9
+
+
+class BasisOutOfBand(ValueError):
+    """The futures and spot mids are more than BASIS_BAND apart: no level is mapped and no entry sized with them."""
 
 
 def to_tick(price: float, tick: float, direction: int) -> float:
@@ -41,9 +46,15 @@ def to_tick(price: float, tick: float, direction: int) -> float:
 
 
 def basis_ratio(fut_mid: float, spot_mid: float) -> float:
+    """futures mid / spot mid; ValueError for a mid that is not a finite number above 0, BasisOutOfBand for a ratio
+    more than BASIS_BAND from 1."""
     if not (math.isfinite(fut_mid) and math.isfinite(spot_mid)) or fut_mid <= 0 or spot_mid <= 0:
         raise ValueError(f"bad mids {fut_mid} / {spot_mid}")
-    return fut_mid / spot_mid
+    ratio = fut_mid / spot_mid
+    if abs(ratio - 1.0) > BASIS_BAND:
+        raise BasisOutOfBand(f"futures mid {fut_mid} / spot mid {spot_mid} = {ratio:.4f}: more than {BASIS_BAND:.0%} "
+                             "apart (a stale or one-sided book)")
+    return ratio
 
 
 def map_level(spot_level: float, ratio: float, tick: float, direction: int) -> float:

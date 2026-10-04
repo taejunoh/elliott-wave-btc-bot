@@ -16,6 +16,8 @@
                that is not one of SHADOW, CANARY, FULL is refused.
   product      the exchange is set up for FUTURES_PRODUCT (BIP-20DEC30-CDE) and SPOT_PRODUCT (BTC-USD), both
                fixed, and the futures product is BIP: contract_size 0.01, price_increment 5, base_increment 1,
+               intraday and overnight margin rates (long and short) that are finite numbers above 0 (a rate the
+               reply did not give reads 0, which would turn the 70% entry limit and the 90% reduction off),
                with a contract expiry (contract_expiry) no earlier than PRODUCT_EXPIRY, the date in its id, and
                more than EXPIRY_MARGIN_DAYS = 90 days away (the earlier of the two). The venue reported
                2089-12-30 for it on 2026-10-03 (contract_expiry_type EXPIRING): neither the venue's date nor the
@@ -169,6 +171,9 @@ def check_product(spec: ProductSpec, expected_id: str = FUTURES_PRODUCT, now: fl
         problems.append(f"price_increment {spec.price_increment} != {PRICE_INCREMENT}")
     if spec.base_increment != BASE_INCREMENT:
         problems.append(f"base_increment {spec.base_increment} != {BASE_INCREMENT}")
+    for name, rates in (("intraday", spec.intraday_margin), ("overnight", spec.overnight_margin)):
+        if not all(isinstance(r, (int, float)) and math.isfinite(r) and r > 0 for r in rates):
+            problems.append(f"{name} margin rates {list(rates)} are not finite numbers above 0 (long, short)")
     named = datetime.fromisoformat(PRODUCT_EXPIRY).replace(tzinfo=UTC).timestamp()
     if spec.expiry is None:
         problems.append("no contract expiry in the product reply (contract_expiry)")
