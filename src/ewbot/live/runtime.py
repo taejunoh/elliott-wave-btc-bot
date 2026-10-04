@@ -8,9 +8,18 @@ is taken before its alert.
   commands  Telegram /status /pause /resume /flatten /flatten_confirm /help (live/control.py); a command sent
             more than 2 minutes before the loop reaches it is ignored with a reply (sent again if wanted),
             and /flatten_confirm counts only when sent within 60 s of its /flatten (the messages' dates)
-  watch     every second while a trade is open: the stop-gap check on the futures price, and an
-            immediate close when no stop rests (refused bracket) and the price is through the stop
-  poll      every 10 s while a trade is open (60 s otherwise, at once after a WebSocket resync): a reduce
+  flatten   a breaker or /flatten_confirm journals a flatten request (reason, origin, time) before anything else,
+            then pauses entries; every pass while it stands and a position exists sends the close (the brackets
+            rest until the venue took it) - deferred while the session is not OPEN (alerted once: closed at the
+            reopen, the position kept protected) - until the account is flat (FLATTENED). A crash before the close
+            went out still flattens after the restart; replies and alerts say what happened (done, deferred, still
+            retried), never "done" before it is
+  watch     every second while a trade is open (or the journal shows one at start): the stop-gap check on the
+            futures price, and a close when no stop rests (refused bracket) and the price is through the stop -
+            at most one close per 10 s per trade, after a pass that observes the account first (a bracket fill
+            is recorded as such), its alert after it and saying whether it closed
+  poll      every 10 s while a trade is open, an intent is pending or a flatten stands (60 s otherwise, at once
+            after a WebSocket resync; the loop's cadence runs on a monotonic clock): a reduce
             with an unknown outcome is resolved by its client order id first; then position and open
             orders are re-read as one state (the position read again after the orders, repeated until
             both reads agree: a fill between the reads never pairs a stale position with a vanished
@@ -19,7 +28,9 @@ is taken before its alert.
             the stage this process runs in and the journal's (a demotion applies at once). After each pass an
             order failure is resolved or recorded unresolved (CANARY gate 2: a bracket not replaced within
             30 s, a close or reduction not done by the next pass - a CANARY failure that pauses), and a manual
-            intervention or an unresolved order failure is one incident per episode, not one per pass
+            intervention or an unresolved order failure is one incident per episode, not one per pass. Bracket
+            fills are journaled for the cost report as they show (a partial one too), each leg read back once it
+            left the book
   minute    journal heartbeat; the Telegram command thread (started again when it died; a dead thread, a
             hung one, 5 failed polls in a row or a conflict with another poller alerted once per episode)
             and the external heartbeat: a success ping while Telegram works - Telegram unusable (10 minutes
@@ -34,18 +45,29 @@ is taken before its alert.
             per outage, and when it is back),
             pending intents resolved (or abandoned after 10 min), the 15:30 New York
             overnight-margin report (its reads retried every minute until 16:00), the daily summary (09:00 New York)
-            with expiry reminders and the daily key-permission check, the paper audit (from minute 50, up
+            with expiry reminders and the daily key-permission check (each marked done for the day only once it
+            succeeded), the paper audit (from minute 50, up
             to the last bar whose cycle ended OK: a revised bar is alerted only, a decision missing on one side
             is pending until the next audit confirms it, a different decision is a major incident at once; a
             failed audit is stored as failed and alerted), and the stage-change restart
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
-            reconcile. Retried every 15 s while the bar is missing; 2 minutes after the close the
-            decision is held and only protection is kept (spec 4.1 step 1). A bar whose cycle ended OK is
-            never decided again into its cycles row: a restart takes the last such bar as done and only
-            refreshes its target (SHADOW gate 2 keeps the on-time row)."""
+            reconcile. Retried every 15 s while the bar is missing or the candles cannot be downloaded; 2 minutes
+            after the close the decision is held and only protection is kept (spec 4.1 step 1). An engine error,
+            or any failure after the replay, ends the bar's cycle as ERROR once (never replayed every tick). A bar
+            whose cycle ended OK is never decided again into its cycles row: a restart takes the last such bar
+            as done and only refreshes its target (SHADOW gate 2 keeps the on-time row; a failed download is
+            retried until the hour ends); a bar held or failed before a restart stays so (only a cycle a crash
+            left RUNNING, or one never started, is run again, under the same deadlines). An entry is never sent
+            later than 5 minutes after its bar's close, checked again right before the send.
+
+Errors in alerts and in the journal go through the settings' redaction; repeating failure alerts (a close, a
+bracket, a loop section that keeps failing) go out at once, then with growing gaps (1 to 30 minutes) while the
+failure lasts. The start reads the product and the session with retries for up to 5 minutes, then refuses
+(StartupRefused: `ewbot live run` waits like a refused preflight)."""
 
 from __future__ import annotations
 
+import math
 import queue
 import sys
 import time
@@ -68,7 +90,19 @@ from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.pricing import MARGIN_ENTRY_MAX, basis_ratio, map_level, margin_ratio, stage_contracts
-from ewbot.live.reconcile import Alert, Close, PlanContext, Protect, is_ours, observe, plan
+from ewbot.live.reconcile import (
+    Action,
+    Adopt,
+    Alert,
+    Close,
+    LiveTrade,
+    PlanContext,
+    Protect,
+    Skip,
+    is_ours,
+    observe,
+    plan,
+)
 from ewbot.live.shadow import ShadowExchange
 from ewbot.live.stage import (
     MAJOR,
@@ -132,6 +166,32 @@ CONFIRM_PASSES = 2  # a bracket fix not confirmed by this many further strict pa
 CONFIRM_MAX_S = 600.0  # ... and this long after it was placed is unresolved: legs placed again, never as wanted
 MANUAL_ALERTS = ("FOREIGN_ORDERS", "UNKNOWN_POSITION", "EXCESS_POSITION")  # planned alerts that are incidents
 MANUAL_CLOSES = ("UNKNOWN_POSITION", "DIRECTION_MISMATCH")  # planned closes of a position changed outside our orders
+FLATTEN_KEY = "flatten"  # a flatten request standing until the account is flat: reason, origin, ts, deferred
+FILLS_KEY = "bracket_fills"  # the journal trade's legs followed for the cost report (fills recorded so far)
+FILL_READ_TRIES = 10  # failed reads of a leg that left the book before its fills are given up
+# repeating failure alerts: the first of an episode at once, then after 1 minute, the gap doubling up to 30 minutes;
+# an episode ends after ALERT_QUIET_S without that failure
+REPEAT_ALERTS = ("CLOSE_FAILED", "CLOSE_UNCONFIRMED", "BRACKET_FAILED", "REDUCE_FAILED", "ACTION_ERROR")
+ALERT_BACKOFF_S = 60.0
+ALERT_BACKOFF_MAX_S = 1800.0
+ALERT_QUIET_S = 600.0
+DAILY_RETRY_S = 600.0  # a daily summary that raised is tried again after this long (marked done only once it went out)
+STARTUP_READ_MAX_S = 300.0  # the start's product and session reads are retried this long, then the start is refused
+STARTUP_RETRY_S = 2.0  # ... the wait doubling up to STARTUP_RETRY_MAX_S
+STARTUP_RETRY_MAX_S = 60.0
+# what a flatten did by the end of its first pass: the /flatten_confirm reply and the breaker alert say it
+FLATTEN_OUTCOME = {
+    "done": "전량 청산 완료",
+    "flat": "포지션 없음 (청산할 것 없음)",
+    "deferred": "장이 열려 있지 않아 청산 대기: 장이 열리면 즉시 청산 (보호 주문 유지)",
+    "retry": "청산 요청 - 아직 청산되지 않음: 매 확인마다 다시 보냄 (완료되면 알림)",
+    "unread": "청산 요청 - 거래소를 읽지 못함: 매 확인마다 다시 시도 (완료되면 알림)",
+}
+
+
+class StartupRefused(RuntimeError):
+    """The product or the session could not be read at start for STARTUP_READ_MAX_S: `ewbot live run` refuses
+    and waits like a refused preflight (no healthchecks.io /fail)."""
 
 
 @dataclass
@@ -144,6 +204,7 @@ class LiveDeps:
     notify: Callable[[str, str], Any] = lambda kind, text: None
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
+    monotonic: Callable[[], float] = time.monotonic  # the loop's cadence (polls, minutes, retries): never steps back
     feed: Any | None = None  # live.feed.TickerFeed
     heartbeat: Any | None = None  # live.health.Heartbeat
     commands: queue.Queue[Command] | None = None
@@ -168,10 +229,13 @@ class LiveRuntime:
         self.journal = deps.journal
         self.ex = deps.exchange
         self.clock = deps.clock
+        self.mono = deps.monotonic
+        self.backoff: dict[str, dict[str, Any]] = {}  # repeating alerts held back (`_limited`)
         self.cfg = frozen_config(deps.lock)  # holdout_config(BotConfig(), lock params), checked
         self.stage, self.stage_since = self.journal.stage()  # the stint this process runs (a restart starts a new one)
-        self.executor = Executor(self.ex, self.journal, clock=deps.clock, sleep=deps.sleep, alert=self.alert,
-                                 tp1_frac=self.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops)
+        self.executor = Executor(self.ex, self.journal, clock=deps.clock, sleep=deps.sleep, alert=self._repeating,
+                                 tp1_frac=self.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops,
+                                 entry_deadline_s=ENTRY_DEADLINE_S)
         self.prices = PriceSource(self.ex, deps.feed, clock=deps.clock)
         self.gap = StopGapWatch()
         self.guard = AccountGuard(self.journal, self.cfg.breakers)
@@ -181,10 +245,16 @@ class LiveRuntime:
         self.product: ProductSpec | None = None
         self.session: SessionInfo | None = None
         self.done_bar: int | None = None
-        self.next_try: float | None = None
-        self.last_poll: float | None = None
-        self.last_minute: float | None = None
-        self.active = False
+        self.next_try: float | None = None  # monotonic: when the cycle of `try_bar` is tried again
+        self.try_bar: int | None = None
+        self.fetch_error: tuple[int, str] | None = None  # (bar, why) of the latest failed candle download
+        self.last_poll: float | None = None  # monotonic
+        self.last_minute: float | None = None  # monotonic
+        self.daily_failed: float | None = None  # monotonic: when the daily summary last raised
+        self.watch_tried: dict[int, float] = {}  # trade id -> monotonic time of the watchdog's last close
+        self._flatten_outcome = "unread"  # what the latest pass did with a standing flatten request
+        self._flatten_own = False  # the pass runs for the request itself (its reply or alert reports the outcome)
+        self._after_pass: list[tuple[str, str]] = []  # a flatten's alerts, queued once the pass's actions ran
         self.flatten_sent: float | None = None  # the Telegram date of a /flatten awaiting its /flatten_confirm
         self.exit_code: int | None = None
         self.bad_equity_reads = 0  # balance reads in a row that were not an observation
@@ -199,10 +269,57 @@ class LiveRuntime:
         raised = self.journal.get(RAISED_KEY) or {}  # the planned manual incidents in force, and their stint
         self.raised = {(str(k), int(t)) for k, t in raised.get("items", [])}
         self.raised_stint, self.raised_ended = raised.get("stint"), raised.get("ended")
+        self.active = self._busy()  # from the journal: a restart polls fast and watches at once
 
     # ------------------------------------------------------------------ helpers
     def alert(self, kind: str, text: str) -> None:
-        self.d.notify(kind, text)  # queued (live/notify.py sends it from its own thread): never waits on Telegram
+        # queued (live/notify.py sends it from its own thread): never waits on Telegram; secrets redacted
+        self.d.notify(kind, self.d.redact(text))
+
+    def _limited(self, key: str) -> int | None:
+        """A repeating failure alert `key`: None to hold this one back, else how many were held back since the last
+        one sent. The first of an episode goes out at once, the next after ALERT_BACKOFF_S, the gap doubling up to
+        ALERT_BACKOFF_MAX_S; an episode ends after ALERT_QUIET_S without the failure (monotonic clock)."""
+        now = self.mono()
+        st = self.backoff.get(key)
+        if st is None or not 0 <= now - st["seen"] <= ALERT_QUIET_S:
+            self.backoff[key] = {"seen": now, "next": now + ALERT_BACKOFF_S, "gap": ALERT_BACKOFF_S, "held": 0}
+            return 0
+        st["seen"] = now
+        if 0 <= st["next"] - now <= st["gap"]:
+            st["held"] += 1
+            return None
+        held, st["held"] = st["held"], 0
+        st["gap"] = min(st["gap"] * 2, ALERT_BACKOFF_MAX_S)
+        st["next"] = now + st["gap"]
+        return held
+
+    def _repeating(self, kind: str, text: str) -> None:
+        """The executor's alerts: an order failure repeated at every pass (REPEAT_ALERTS) is limited per (kind,
+        trade) - its events are all journaled -, every other alert goes out as it is."""
+        if kind in REPEAT_ALERTS:
+            t = self.executor.trade()
+            held = self._limited(f"{kind}:{t.trade_id if t is not None and t.status == 'OPEN' else 0}")
+            if held is None:
+                return
+            if held:
+                text += f" (같은 경보 {held}건 생략)"
+        self.alert(kind, text)
+
+    def _busy(self) -> bool:
+        """Poll fast and watch: a trade is open, an order's outcome is unknown or a flatten stands (journal only)."""
+        t = self.executor.trade()
+        return ((t is not None and t.status == "OPEN") or bool(self.journal.intents(status="PENDING"))
+                or self.journal.get(FLATTEN_KEY) is not None)
+
+    def _loop_error(self, section: str, exc: BaseException, now: float) -> None:
+        """A failing loop section (called inside its `except`): journaled every time, alerted limited, traceback."""
+        why = self.d.redact(f"{type(exc).__name__}: {exc}")
+        self.journal.add_event(now, "LOOP_ERROR", {"section": section, "error": why[:300]})
+        held = self._limited(f"LOOP_ERROR:{section}")
+        if held is not None:
+            self.alert("LOOP_ERROR", f"[루프 오류] {section}: {why[:200]}" + (f" (같은 경보 {held}건 생략)" if held else ""))
+        print(self.d.redact(traceback.format_exc()), file=sys.stderr, end="")
 
     def _once(self, key: str, value: Any = True) -> bool:
         """True when the journal's `key` is not `value` yet (and records it): periodic jobs keep one row
@@ -285,14 +402,31 @@ class LiveRuntime:
         return self.ex.position() is None and not [o for o in self.ex.open_orders() if is_ours(o)]
 
     # ------------------------------------------------------------------ startup
+    def _startup_read(self, what: str, read: Callable[[], Any]) -> Any:
+        """A read the start needs (product, session): retried with a doubling wait for up to STARTUP_READ_MAX_S,
+        then StartupRefused (a passing outage never kills the process with a /fail)."""
+        start, wait = self.mono(), STARTUP_RETRY_S
+        while True:
+            try:
+                return read()
+            except ExchangeError as exc:
+                why = self.d.redact(f"{type(exc).__name__}: {exc}")[:200]
+                if not 0 <= self.mono() - start + wait <= STARTUP_READ_MAX_S:
+                    self.journal.add_event(self.clock(), "STARTUP_REFUSED", {"read": what, "error": why})
+                    raise StartupRefused(f"{what} 조회 실패 ({STARTUP_READ_MAX_S / 60:.0f}분 동안 재시도): {why}") from None
+                self.journal.add_event(self.clock(), "STARTUP_RETRY", {"read": what, "error": why, "wait_s": wait})
+                self.d.sleep(wait)
+                wait = min(wait * 2, STARTUP_RETRY_MAX_S)
+
     def startup(self) -> dict[str, int]:
         now = self.clock()
         if self.journal.stage()[1] is None:
             self.journal.set_stage("SHADOW", "initial", now)
             self.stage, self.stage_since = self.journal.stage()
-        self.product = self.ex.product()
-        self.session = self.ex.session()
-        self.sessions.update(self.session, now)
+        self.product = self._startup_read("product", self.ex.product)
+        self.session = self._startup_read("session", self.ex.session)
+        now = self.clock()
+        notices = self.sessions.update(self.session, now)  # a maintenance within 24 h is announced at start too
         try:  # the first download of the candle history takes minutes: never inside a timed cycle
             self._frame()
         except Exception as exc:  # noqa: BLE001 - the cycle retries the fetch
@@ -305,13 +439,45 @@ class LiveRuntime:
         self.journal.add_event(now, "SESSION", {"text": f"시작 시 장 운영 상태 {self.session.state}",
                                                 "state": self.session.state})
         self.alert("STARTUP", f"[시작] 단계 {self.stage} · 재시작 복구 {out} · {_utc(now)}")
-        decided = self._decided_until()  # never decided again into its row: the restart keeps an on-time cycle
-        if decided:
-            self.done_bar = decided
-            if decided == int(now) // H1 * H1 - H1:  # this hour's bar: its target again, its row untouched
-                self.cycle(decided, now)
-        self.poll(now)
+        for kind, text in notices:
+            self.journal.add_event(now, kind, {"text": text})
+            self.alert(kind, f"[장 상태] {text}")
+        restored = self._breaker_in_force(now)
+        self._flatten_outcome, self._flatten_own = "unread", restored is not None  # the start's passes report it
+        try:
+            bar = int(now) // H1 * H1 - H1
+            row = self._cycle_row(bar)
+            decided = self._decided_until()  # never decided again into its row: the restart keeps an on-time cycle
+            if row is not None and row["status"] in ("HOLD", "ERROR"):
+                self.done_bar = bar  # held or failed before the restart: the hold stands, only protection this hour
+            elif decided and decided == bar:
+                self.done_bar = bar - H1  # this hour's bar: its target again, its row untouched (download retried)
+                self._cycle_due(now)
+            elif decided:
+                self.done_bar = decided  # this hour's bar never started or a crash left it RUNNING: decided as usual
+            self.active = self._busy()
+            self.poll(now)
+        finally:
+            self._flatten_own = False
+        if restored is not None:  # the flatten's first pass ran: the alert says what happened
+            self.alert("BREAKER", f"[실계좌 손실 한도] {restored}: 재시작 때 발동 중 - 일시 정지 · "
+                                  f"{FLATTEN_OUTCOME[self._flatten_outcome]}")
         return out
+
+    def _breaker_in_force(self, now: float) -> str | None:
+        """At start: a breaker still tripped (the daily one for today) while the journal's trade is open and no
+        flatten stands - a crash between the trip and its flatten request - is flattened (requested and paused now,
+        closed by the start's pass). Returns its kind, else None."""
+        g = self.guard.state() or {}
+        kind = ("TOTAL_DD" if g.get("total_tripped") else
+                "DAILY_LOSS" if g.get("daily_tripped") and g.get("day") == ny_date(now) else None)
+        t = self.executor.trade()
+        if kind is None or self.journal.get(FLATTEN_KEY) is not None or t is None or t.status != "OPEN":
+            return None
+        self._request_flatten(f"BREAKER_{kind}", "BREAKER", now, restored=True)
+        if paused(self.journal) is None:
+            pause(self.journal, f"breaker {kind}", now)
+        return kind
 
     # ------------------------------------------------------------------ decision cycle
     def _frame(self) -> pd.DataFrame:
@@ -321,55 +487,93 @@ class LiveRuntime:
         self.frame = fill_gaps(raw)
         return self.frame
 
+    def _cycle_row(self, bar_ts: int) -> dict[str, Any] | None:
+        return next((c for c in self.journal.cycles(since_bar=bar_ts) if int(c["bar_ts"]) == bar_ts), None)
+
     def _cycle_ok(self, bar_ts: int) -> bool:
-        return any(int(c["bar_ts"]) == bar_ts and c["status"] == "OK" for c in self.journal.cycles(since_bar=bar_ts))
+        row = self._cycle_row(bar_ts)
+        return row is not None and row["status"] == "OK"
 
     def cycle(self, bar_ts: int, now: float) -> str:
-        """OK | LATE (bar not there yet) | ERROR. A bar whose cycle already ended OK (before a restart) is decided
-        again for its target, its cycles row untouched."""
-        decided = self._cycle_ok(bar_ts)
-        if self.next_try is None and not decided:
+        """OK | LATE (bar not there yet, or the candles could not be downloaded) | ERROR. A bar whose cycle already
+        ended OK (before a restart) is decided again for its target, its cycles row untouched; a row is started
+        once (a retry or a crash's RUNNING row keeps it)."""
+        row = self._cycle_row(bar_ts)
+        decided = row is not None and row["status"] == "OK"
+        if row is None:
             self.journal.start_cycle(bar_ts, now, self.stage)
         try:
             df = self._frame()
-            if int(df["ts"].iloc[-1]) < bar_ts:
-                return "LATE"
+        except Exception as exc:  # noqa: BLE001 - a failed download is a late bar: retried until the deadline
+            why = self.d.redact(f"{type(exc).__name__}: {exc}")[:300]
+            if self.fetch_error is None or self.fetch_error[0] != bar_ts:  # journaled once per bar
+                self.journal.add_event(now, "FETCH_ERROR", {"bar_ts": bar_ts, "error": why})
+            self.fetch_error = (bar_ts, why)
+            return "LATE"
+        if int(df["ts"].iloc[-1]) < bar_ts:
+            return "LATE"
+        try:
             target = compute_target(self.d.lock, df, bar_ts)
         except Exception as exc:  # noqa: BLE001 - the cycle fails, protection goes on
-            why = self.d.redact(f"{type(exc).__name__}: {exc}")
-            if not decided:
-                self.journal.finish_cycle(bar_ts, self.clock(), "ERROR", why[:300])
-            self.alert("CYCLE_ERROR", f"[사이클 오류] {_utc(bar_ts)} 봉: {why[:200]}")
-            self.target = None
-            return "ERROR"
-        new = self.journal.add_decisions(target.decisions, self.clock())
-        self.target = target
-        self.journal.put("target", target.to_json())
-        note = f"{len(new)} new decisions"
+            return self._cycle_error(bar_ts, decided, exc)
         try:
-            self.reconcile(self.clock())
-        except ExchangeError as exc:  # the next poll reconciles against this target
-            note += f"; reconcile deferred: {exc}"[:200]
+            new = self.journal.add_decisions(target.decisions, self.clock())
+            self.target = target
+            self.journal.put("target", target.to_json())
+            note = f"{len(new)} new decisions"
+            try:
+                self.reconcile(self.clock())
+            except ExchangeError as exc:  # the next poll reconciles against this target
+                note += self.d.redact(f"; reconcile deferred: {exc}")[:200]
+        except Exception as exc:  # noqa: BLE001 - after the replay: the bar fails once, never replayed every tick
+            self.journal.add_event(now, "LOOP_ERROR", {"section": "cycle",
+                                                       "error": self.d.redact(f"{type(exc).__name__}: {exc}")[:300]})
+            print(self.d.redact(traceback.format_exc()), file=sys.stderr, end="")
+            return self._cycle_error(bar_ts, decided, exc)
         if not decided:
             self.journal.finish_cycle(bar_ts, self.clock(), "OK", note)
         return "OK"
+
+    def _cycle_error(self, bar_ts: int, decided: bool, exc: Exception) -> str:
+        why = self.d.redact(f"{type(exc).__name__}: {exc}")
+        if not decided:
+            self.journal.finish_cycle(bar_ts, self.clock(), "ERROR", why[:300])
+        self.alert("CYCLE_ERROR", f"[사이클 오류] {_utc(bar_ts)} 봉: {why[:200]}")
+        self.target = None
+        return "ERROR"
 
     def _cycle_due(self, now: float) -> None:
         bar = int(now) // H1 * H1 - H1
         if self.done_bar is not None and bar <= self.done_bar:
             return
-        if now < bar + H1 + CYCLE_OFFSET_S or (self.next_try is not None and now < self.next_try):
+        mono = self.mono()
+        if now < bar + H1 + CYCLE_OFFSET_S or (self.try_bar == bar and self.next_try is not None
+                                                and 0 < self.next_try - mono <= CYCLE_RETRY_S):
             return
-        status = self.cycle(bar, now)
-        if status == "LATE" and now < bar + H1 + DATA_DEADLINE_S:
-            self.next_try = now + CYCLE_RETRY_S
+        decided = self._cycle_ok(bar)  # decided before a restart: its target is refreshed until the hour ends
+        try:
+            status = self.cycle(bar, now)
+        except Exception:
+            self.done_bar, self.next_try, self.try_bar = bar, None, None  # never run again every tick
+            raise
+        if status == "LATE" and (now < bar + H1 + DATA_DEADLINE_S or decided):
+            self.next_try, self.try_bar = mono + CYCLE_RETRY_S, bar
             return
         if status == "LATE":
-            if not self._cycle_ok(bar):
-                self.journal.finish_cycle(bar, self.clock(), "HOLD", "bar missing 2 min after the close")
-            self.target = None
-            self.alert("DATA_LATE", f"[판단 보류] {_utc(bar)} 봉이 마감 후 2분 안에 오지 않음 (보호 주문 유지)")
-        self.done_bar, self.next_try = bar, None
+            self._hold(bar)
+        self.done_bar, self.next_try, self.try_bar = bar, None, None
+        if isinstance(self.ex, ShadowExchange):
+            self.ex.retry_previews()  # previews the API could not answer: asked again once per cycle
+
+    def _hold(self, bar: int) -> None:
+        """Spec 4.1 step 1: no bar (or no candles) 2 minutes after the close - the decision is held, protection stays."""
+        err = self.fetch_error[1] if self.fetch_error is not None and self.fetch_error[0] == bar else None
+        note = "bar missing 2 min after the close" if err is None else f"candles not fetched 2 min after the close: {err}"
+        if not self._cycle_ok(bar):
+            self.journal.finish_cycle(bar, self.clock(), "HOLD", note[:300])
+        self.target = None
+        why = "봉이 마감 후 2분 안에 오지 않음" if err is None else f"봉을 마감 후 2분 안에 받지 못함 ({err[:120]})"
+        self.alert("DATA_LATE", f"[판단 보류] {_utc(bar)} {why} (보호 주문 유지)")
 
     # ------------------------------------------------------------------ reconcile
     def _snapshot(self) -> tuple[Position | None, list[Order]]:
@@ -384,6 +588,8 @@ class LiveRuntime:
         raise ExchangeError(f"the position changed during {SNAPSHOT_TRIES} reads of the orders")
 
     def reconcile(self, now: float) -> None:
+        self.active = self._busy()  # before the reads: a pass that fails still keeps the fast polls and the watchdog
+        self._after_pass = []
         self.executor.resolve_reduce()  # a reduce with an unknown outcome: looked up by its id, never a second one
         pos, orders = self._snapshot()
         trade = self.executor.trade()
@@ -393,8 +599,7 @@ class LiveRuntime:
                    and pos is not None and pos.side == seen.direction else set())
         if seen is not None and seen != trade:
             self.executor.save(seen)
-        if trade is not None and any(kind in ("CLOSED", "TP1_FILLED") for kind, _ in events):
-            self._bracket_fills(trade, {o.order_id for o in orders if o.is_open}, now)
+        self._record_fills(trade, orders, now)
         for kind, data in events:
             self.journal.add_event(now, kind, data)
             if kind == "CLOSED":
@@ -412,13 +617,21 @@ class LiveRuntime:
                 self.alert(kind, f"[경고] 거래 {data['trade_id']}: 주문 없이 {data['expected']}계약 → "
                                  f"{data['position']}계약 (손절 유지, 남은 수량 보호)")
         ctx = self._ctx(now)
-        actions = plan(self.target, seen, pos, orders, ctx)
+        planned = plan(self.target, seen, pos, orders, ctx)
+        req = self.journal.get(FLATTEN_KEY)
+        actions = planned if req is None else self._flatten_actions(req, planned, pos, ctx, now)
+        closes = [e["id"] for e in self.journal.events(kind="CLOSED")][-1:] if req is not None else []
         self.executor.execute(actions, ctx)
+        if req is not None and pos is not None and ctx.session_open:
+            self._flatten_sent(req, closes[0] if closes else 0, now)
+        for kind, note in self._after_pass:  # the pass's actions first, then the flatten's alerts
+            self.alert(kind, note)
+        self._after_pass = []
         tid = seen.trade_id if seen is not None and seen.status == "OPEN" else 0
         # a manual intervention the planner found: an alert, or the close of a position opened or flipped outside our
         # orders. One incident per (kind, trade) episode - until a pass no longer plans it -, not one per pass
-        raised = ({(a.kind, tid) for a in actions if isinstance(a, Alert) and a.kind in MANUAL_ALERTS}
-                  | {(a.reason, tid) for a in actions if isinstance(a, Close) and a.reason in MANUAL_CLOSES})
+        raised = ({(a.kind, tid) for a in planned if isinstance(a, Alert) and a.kind in MANUAL_ALERTS}
+                  | {(a.reason, tid) for a in planned if isinstance(a, Close) and a.reason in MANUAL_CLOSES})
         stint = self.journal.stage()[1]  # a new stint (a restart or a stage change) starts new episodes
         for kind, _ in sorted(raised - (self.raised if self.raised_stint == stint else set())):
             self._incident(kind, now)
@@ -429,15 +642,85 @@ class LiveRuntime:
         if self.journal.events(kind="ADOPTED", since=now):  # a foreign position: taken over now, or a provisional
             self._incident("ADOPTED", now)  # trade settled as foreign (never our own entry rebuilt from its intent)
         t = self.executor.trade()
-        # poll fast while a trade is open or an order's outcome is still unknown (looked up, then resent)
-        self.active = (t is not None and t.status == "OPEN") or bool(self.journal.intents(status="PENDING"))
+        # poll fast while a trade is open, an order's outcome is still unknown (looked up, then resent) or a flatten
+        # stands
+        self.active = self._busy()
         if (t is not None and t.protected_ts is not None and t.protected_ts - t.opened_ts > PROTECT_MAX_S
                 and self._once(f"slow:{t.trade_id}")):
             self._incident("PROTECT_SLOW", now)
         protecting = {tid} if tid and any(isinstance(a, Protect) for a in actions) else set()
-        self._order_failures(now, ctx, guarded, protecting)
+        # a pass that put a standing flatten before the planner's legs cannot judge them: it shows only the protection
+        self._order_failures(now, ctx, guarded, protecting, judged=actions is planned)
 
-    def _order_failures(self, start: float, ctx: PlanContext, guarded: set[int], protecting: set[int]) -> None:
+    # ------------------------------------------------------------------ flatten (breakers, /flatten_confirm)
+    def _request_flatten(self, reason: str, origin: str, now: float, restored: bool = False) -> None:
+        """Journal a flatten request before anything is sent (the first one stands: its reason is the close's)."""
+        if self.journal.get(FLATTEN_KEY) is not None:
+            return
+        self.journal.put(FLATTEN_KEY, {"reason": reason, "origin": origin, "ts": now, "deferred": False})
+        self.journal.add_event(now, "FLATTEN_REQUESTED", {"reason": reason, "origin": origin, "restored": restored})
+        self.active = True
+
+    def _flatten(self, reason: str, origin: str, why: str, now: float, *, repause: bool = False) -> str:
+        """Flatten the account (a breaker, /flatten_confirm): the request is journaled first, then entries are paused
+        (`why`; again with `repause` even when already paused), then a pass observes the account - a bracket fill
+        since the last poll is recorded as such - and sends the close (`_flatten_actions`). Every later pass sends
+        it again until the account is flat, so a failed close, a closed venue or a crash before the close went out
+        never loses it. Returns what the first pass did (FLATTEN_OUTCOME)."""
+        self._request_flatten(reason, origin, now)
+        if repause or paused(self.journal) is None:
+            pause(self.journal, why, now)
+        self._flatten_outcome, self._flatten_own = "unread", True
+        try:
+            self.poll(now)
+        finally:
+            self._flatten_own = False
+        return self._flatten_outcome
+
+    def _flatten_actions(self, req: dict[str, Any], planned: list[Action], pos: Position | None, ctx: PlanContext,
+                         now: float) -> list[Action]:
+        """A standing flatten request over the planner's actions: flat - the request is done; the session OPEN - the
+        close and nothing that would hold the position (no new legs, no reduce, no entry; the brackets rest until
+        the venue took the close, and a failed close puts the legs back - the executor's close); not OPEN - the
+        close waits for the reopen (alerted once per request) and the position stays protected: the planner's
+        protection and takeover only. Its alerts and skips stay."""
+        if pos is None:
+            self._flattened(req, now, closed=False)
+            return planned
+        keep: list[Action] = [a for a in planned if isinstance(a, (Alert, Skip))]
+        if ctx.session_open:
+            self._flatten_outcome = "retry"
+            return keep + [Close(str(req["reason"]))]
+        self._flatten_outcome = "deferred"
+        if not req.get("deferred"):
+            state = self.session.state if self.session is not None else "UNKNOWN"
+            self.journal.put(FLATTEN_KEY, {**req, "deferred": True})
+            self.journal.add_event(now, "FLATTEN_DEFERRED", {"reason": req["reason"], "state": state})
+            if not self._flatten_own:  # the request's own reply or alert says it
+                self._after_pass.append(("FLATTEN", f"[전량 청산 대기] {req['reason']}: 장 운영 상태 {state} - 장이 열리면 "
+                                                    "즉시 청산 (보호 주문 유지)"))
+        return keep + [a for a in planned if isinstance(a, (Protect, Adopt))]
+
+    def _flatten_sent(self, req: dict[str, Any], before: int, now: float) -> None:
+        """After a pass sent the flatten's close: done once the executor saw the account flat (a CLOSED event of
+        the request's reason after event id `before`)."""
+        if any(e["id"] > before and e["data"].get("reason") == req["reason"] for e in self.journal.events(kind="CLOSED")):
+            self._flattened(req, now, closed=True)
+
+    def _flattened(self, req: dict[str, Any], now: float, closed: bool) -> None:
+        after = now - float(req["ts"])
+        self.journal.put(FLATTEN_KEY, None)
+        self.journal.add_event(now, "FLATTENED", {"reason": req["reason"], "origin": req.get("origin"),
+                                                  "requested_ts": req["ts"], "after_s": round(after, 3),
+                                                  "closed": closed})
+        self._flatten_outcome = "done" if closed else "flat"
+        if not self._flatten_own:
+            took = f"{after:.0f}초" if after < 120 else f"{after / 60:.0f}분"
+            self._after_pass.append(("FLATTEN", f"[전량 청산 완료] {req['reason']} (요청 후 {took})" if closed else
+                                                f"[전량 청산 확인] {req['reason']}: 포지션 없음"))
+
+    def _order_failures(self, start: float, ctx: PlanContext, guarded: set[int], protecting: set[int],
+                        judged: bool = True) -> None:
         """CANARY gate 2 and its pause (spec 6.2), after every completed reconcile pass (begun at `start`; `guarded`: the
         trades it found protected; `protecting`: the trades it planned a Protect for). Each order failure -
         stage.ORDER_FAILURES, or an ACTION_ERROR of a Protect, Close or Reduce - is watched from the pass after it. It
@@ -473,7 +756,8 @@ class LiveRuntime:
                                 "episode": f"t{tid}" if tid else f"e{e['id']}",  # no trade: an episode of its own
                                 "strict": None})  # set below: whether the pass that registers it is strict
         failing = {f["trade_id"] for f in new if f["ts"] >= start}  # trades with an order failure in this pass
-        whole = self.target is not None and ctx.ratio is not None  # the pass saw what the trade should look like
+        # the pass saw what the trade should look like (and planned it: a standing flatten replaces the plan)
+        whole = self.target is not None and ctx.ratio is not None and judged
         strict = whole and ctx.session_open  # ... and could place the legs: they are judged, not just the protection
         reducible = strict and (t is None or t.pending_reduce is None)
         for f in new:
@@ -546,26 +830,57 @@ class LiveRuntime:
             self.alert(ORDER_UNRESOLVED, f"[주문 실패 미해결] 거래 {mine[0]['trade_id']}: {kinds} - 제시간에 해결되지 않음 "
                                          "(CANARY 기준 ② 실패)")
 
-    def _bracket_fills(self, trade: Any, still_open: set[str], now: float) -> None:
-        """Record the fills of the legs that left the book (TP or stop), for the cost report."""
+    def _record_fills(self, trade: LiveTrade | None, orders: list[Order], now: float) -> None:
+        """The bracket fills of the journal's trade for the cost report (BRACKET_FILL, increments: every contract
+        once). Every leg the trade listed is followed until it ended: a resting leg's fills come from the open
+        orders (a partial fill too); a leg that left the book is read back with get_order, and it is done only once
+        that read succeeded on an ended order (FILL_READ_TRIES failed reads give up on it). Kept per trade."""
+        if trade is None:
+            return
+        st = self.journal.get(FILLS_KEY)
+        if not isinstance(st, dict) or st.get("trade_id") != trade.trade_id:
+            st = {"trade_id": trade.trade_id, "legs": {}}
+        legs: dict[str, dict[str, Any]] = st["legs"]
+        changed = False
         for leg in trade.legs:
-            if not leg.order_id or leg.order_id in still_open or not self._once(f"fill:{leg.order_id}"):
+            if leg.order_id and leg.order_id not in legs:
+                legs[leg.order_id] = {"leg": leg.name, "stop": leg.stop_price, "limit": leg.limit_price, "filled": 0,
+                                      "value": 0.0, "fee": 0.0, "done": False, "tries": 0}
+                changed = True
+        resting = {o.order_id: o for o in orders if o.is_open}
+        for oid, rec in legs.items():
+            if rec["done"]:
                 continue
-            try:
-                o = self.ex.get_order(leg.order_id)
-            except ExchangeError:
-                continue
-            if o.filled > 0 and o.avg_fill_price:
+            o = resting.get(oid)
+            if o is None:  # left the book: read back (marked done only once the read succeeded)
+                try:
+                    o = self.ex.get_order(oid)
+                except ExchangeError:
+                    rec["tries"] += 1
+                    rec["done"], changed = rec["tries"] >= FILL_READ_TRIES, True
+                    continue
+                if o.is_terminal:
+                    rec["done"], changed = True, True
+            avg = usable_price(o.avg_fill_price)
+            new = int(o.filled) - int(rec["filled"])
+            if new > 0 and avg is not None:
+                fee = float(o.fee) if o.fee is not None and math.isfinite(float(o.fee)) else float(rec["fee"])
+                value = avg * int(o.filled)
                 self.journal.add_event(now, "BRACKET_FILL", {
-                    "trade_id": trade.trade_id, "leg": leg.name, "side": o.side, "contracts": o.filled,
-                    "price": o.avg_fill_price, "fee": o.fee, "stop": leg.stop_price, "limit": leg.limit_price})
+                    "trade_id": trade.trade_id, "leg": rec["leg"], "side": o.side, "contracts": new,
+                    "price": (value - float(rec["value"])) / new, "fee": fee - float(rec["fee"]), "stop": rec["stop"],
+                    "limit": rec["limit"]})
+                rec.update(filled=int(o.filled), value=value, fee=fee)
+                changed = True
+        if changed:
+            self.journal.put(FILLS_KEY, st)
 
     def poll(self, now: float) -> None:
-        self.last_poll = now
+        self.last_poll = self.mono()
         try:
             self.reconcile(now)
         except ExchangeError as exc:
-            self.journal.add_event(now, "POLL_ERROR", {"error": str(exc)[:200]})
+            self.journal.add_event(now, "POLL_ERROR", {"error": self.d.redact(str(exc))[:200]})
 
     def watch(self, now: float) -> None:
         t = self.executor.trade()
@@ -579,24 +894,49 @@ class LiveRuntime:
             self.ex.set_prices(price)  # the virtual brackets see every price the watchdog sees
         if t.unprotected_since is not None and t.direction * (price - t.stop_price) <= 0:
             # no resting stop (e.g. the venue refused the bracket) and the price is through the stop: close, then alert
-            self.journal.add_event(now, "STOP_UNPROTECTED", {"trade_id": t.trade_id, "price": price, "stop": t.stop_price})
-            try:
-                self.executor.close("STOP_UNPROTECTED", self._ctx(now))
-            finally:
-                self.alert("STOP_UNPROTECTED", f"[손절] 보호 주문 없이 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}을 지남: 시장가 청산")
+            self._watch_close("STOP_UNPROTECTED", t, price, now)
             return
-        if not self.gap.check(t.direction, t.stop_price, price, now):
+        if self.gap.check(t.direction, t.stop_price, price, now):
+            self._watch_close("STOP_GAP", t, price, now)
+
+    def _watch_close(self, kind: str, t: LiveTrade, price: float, now: float) -> None:
+        """The watchdog's market close: at most one attempt per POLL_ACTIVE_S per trade (a failing close is never
+        sent every second), after a pass that observes the account first (a bracket fill since the last poll is
+        recorded as that exit, not as this close; a stop placed again by the pass takes over). Close first, then
+        the alert, which says whether it closed - repeats of a failing one limited per episode."""
+        mono = self.mono()
+        last = self.watch_tried.get(t.trade_id)
+        if last is not None and 0 <= mono - last < POLL_ACTIVE_S:
             return
-        self.journal.add_event(now, "STOP_GAP", {"trade_id": t.trade_id, "price": price, "stop": t.stop_price})
+        self.watch_tried = {t.trade_id: mono}
+        self.journal.add_event(now, kind, {"trade_id": t.trade_id, "price": price, "stop": t.stop_price})
+        self.poll(now)
+        cur = self.executor.trade()
+        if cur is None or cur.trade_id != t.trade_id or cur.status != "OPEN":
+            return  # the pass found it closed (its event and alert say how)
+        if kind == "STOP_UNPROTECTED" and cur.unprotected_since is None:
+            return  # the pass placed the stop again: the bracket and the stop-gap check take over
+        done = False
         try:
-            self.executor.close("STOP_GAP", self._ctx(now))
+            done = self.executor.close(kind, self._ctx(now))
+        except ExchangeError as exc:
+            self.journal.add_event(now, "WATCH_ERROR", {"trade_id": t.trade_id, "kind": kind,
+                                                        "error": self.d.redact(str(exc))[:200]})
+        what = (f"[손절] 보호 주문 없이 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}을 지남" if kind == "STOP_UNPROTECTED" else
+                f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 {STOP_LIMIT_OFFSET:.0%} 지정가를 10초 넘게 지남")
+        if done:
             self.gap.reset()
-        finally:
-            self.alert("STOP_GAP", f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 {STOP_LIMIT_OFFSET:.0%} 지정가를 10초 넘게 지남: 시장가 청산")
+            self.watch_tried.pop(t.trade_id, None)
+            self.alert(kind, f"{what}: 시장가 청산 완료")
+            return
+        held = self._limited(f"{kind}:{t.trade_id}")
+        if held is not None:
+            self.alert(kind, f"{what}: 시장가 청산 실패 - {POLL_ACTIVE_S:.0f}초마다 재시도"
+                             + (f" (같은 경보 {held}건 생략)" if held else ""))
 
     # ------------------------------------------------------------------ every minute
     def minute(self, now: float) -> None:
-        self.last_minute = now
+        self.last_minute = self.mono()
         self.journal.put(HEARTBEAT_KEY, now)
         try:
             self._telegram_health(now)
@@ -613,8 +953,11 @@ class LiveRuntime:
             if self.session.is_open and not was_open:
                 self.poll(now)  # deferred closes run right after the reopen (spec 4.5)
         except ExchangeError as exc:
-            self.journal.add_event(now, "SESSION_ERROR", {"error": str(exc)[:200]})
-        self._money(now)
+            self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
+        try:
+            self._money(now)
+        except Exception as exc:  # noqa: BLE001 - a failing breaker or margin step never skips the rest of the minute
+            self._loop_error("money", exc, now)
         self._feed_health(now)
         if self.journal.intents(status="PENDING"):
             try:
@@ -625,8 +968,8 @@ class LiveRuntime:
         today = local.date().isoformat()
         if (local.hour, local.minute) >= MARGIN_CHECK_NY and local.hour < 16 and self.journal.get("once:margin1530") != today:
             self._overnight_report(now)  # marks the day done once its reads succeed
-        if local.hour >= DAILY_HOUR_NY and self._once("daily", today):
-            self.daily(now)
+        if local.hour >= DAILY_HOUR_NY:
+            self._daily_due(now, today)
         if datetime.fromtimestamp(now, UTC).minute >= AUDIT_MINUTE and self._once("audit", int(now) // H1):
             self.run_audit(now)
         stage, since = self.journal.stage()
@@ -744,15 +1087,16 @@ class LiveRuntime:
                                        "(보호 주문과 청산은 계속, 재개는 /resume)")
             return
         self.bad_equity_reads = 0
-        if trip is not None:  # pause and flatten first, alert second
+        if trip is not None:  # the flatten request, the pause and the first close first, the alert second
             self.journal.add_event(now, "BREAKER", {"kind": trip, "equity": equity})
-            if paused(self.journal) is None:
-                pause(self.journal, f"breaker {trip}", now)
+            outcome = "unread"
             try:
-                self.executor.flatten(f"BREAKER_{trip}", self._ctx(now))
-            finally:
-                self._incident("BREAKER", now)
-                self.alert("BREAKER", f"[실계좌 손실 한도] {trip}: 전량 청산하고 일시 정지 (자산 {equity:,.2f} USD)")
+                outcome = self._flatten(f"BREAKER_{trip}", "BREAKER", f"breaker {trip}", now)
+            except Exception as exc:  # noqa: BLE001 - the request stands (journaled): every later pass closes
+                self._loop_error("money", exc, now)
+            self._incident("BREAKER", now)
+            self.alert("BREAKER", f"[실계좌 손실 한도] {trip}: 일시 정지 · {FLATTEN_OUTCOME[outcome]} "
+                                  f"(자산 {equity:,.2f} USD)")
             return
         t = self.executor.trade()
         try:
@@ -774,13 +1118,34 @@ class LiveRuntime:
         if st.level == "WARN" and self._once("marginwarn", int(now) // H1):
             self.alert("MARGIN", f"[증거금 경고] 오버나이트 기준 {st.ratio:.0%} (80% 이상)")
         elif st.level == "REDUCE" and st.reduce_by > 0:
-            try:
-                if st.reduce_by >= pos.contracts:
-                    self.executor.close("MARGIN", self._ctx(now))
-                else:
-                    self.executor.reduce(st.reduce_by, "MARGIN", self._ctx(now))
-            finally:
-                self.alert("MARGIN", f"[증거금 축소] 오버나이트 기준 {st.ratio:.0%}: {st.reduce_by}계약 축소")
+            self._margin_reduce(equity, price, now)
+
+    def _margin_reduce(self, equity: float, price: float, now: float) -> None:
+        """90% of the account at the overnight rate: back to <= 70% at market, after a pass that observes the account
+        first (a bracket fill since the last poll may have reduced it already). The action first, then the alert,
+        which says whether it was done; a failure is tried again at the next minute's check."""
+        n, ratio, done = 0, 0.0, False
+        try:
+            self.poll(now)
+            t = self.executor.trade()
+            pos = self.ex.position() if t is not None and t.status == "OPEN" else None
+            if pos is None or self.product is None:
+                return
+            st = margin_status(pos.contracts, price, pos.side, self.product, equity)
+            if st.level != "REDUCE" or st.reduce_by <= 0:
+                return
+            n, ratio = st.reduce_by, st.ratio
+            ctx = self._ctx(now)
+            done = self.executor.close("MARGIN", ctx) if n >= pos.contracts else self.executor.reduce(n, "MARGIN", ctx)
+        except ExchangeError as exc:
+            self.journal.add_event(now, "MARGIN_ERROR", {"contracts": n, "error": self.d.redact(str(exc))[:200]})
+        if done:
+            self.alert("MARGIN", f"[증거금 축소] 오버나이트 기준 {ratio:.0%}: {n}계약 축소")
+            return
+        held = self._limited("MARGIN_REDUCE")
+        if held is not None and n:
+            self.alert("MARGIN", f"[증거금 축소 실패] 오버나이트 기준 {ratio:.0%}: {n}계약 축소를 하지 못함 - 1분 뒤 다시 점검"
+                                 + (f" (같은 경보 {held}건 생략)" if held else ""))
 
     def _feed_health(self, now: float) -> None:
         """The watchdog's WebSocket price: no futures tick for FEED_ALERT_S while the session is OPEN - a dead
@@ -823,8 +1188,9 @@ class LiveRuntime:
             balance = self.ex.balance() if pos is not None else None
         except ExchangeError as exc:
             if self._once("margin1530fail", today):
-                self.journal.add_event(now, "MARGIN_1530", {"ratio": None, "error": str(exc)[:200]})
-                self.alert("MARGIN_1530", f"[15:30 증거금 점검] 조회 실패: {str(exc)[:120]} (16시 전까지 매분 다시 시도)")
+                why = self.d.redact(str(exc))
+                self.journal.add_event(now, "MARGIN_1530", {"ratio": None, "error": why[:200]})
+                self.alert("MARGIN_1530", f"[15:30 증거금 점검] 조회 실패: {why[:120]} (16시 전까지 매분 다시 시도)")
             return
         self._once("margin1530", today)
         if pos is None or balance is None or self.product is None:
@@ -920,19 +1286,44 @@ class LiveRuntime:
         """Measured costs since `since`: fills, entry slippage vs. the engine reference, stop slippage vs. the
         stop (positive = worse), fees vs. the paper cost model. Funding is in the balance, not measured here."""
         kinds = ("ENTRY", "CLOSED", "REDUCED", "BRACKET_FILL")
-        fills = [e["data"] for k in kinds for e in self.journal.events(kind=k, since=since) if e["data"].get("price")]
-        entries = [e["data"] for e in self.journal.events(kind="ENTRY", since=since) if e["data"].get("ref")]
+        # only fills with a usable price (finite, above 0: an unread fill price is no fill), only finite fees
+        fills = [e["data"] for k in kinds for e in self.journal.events(kind=k, since=since)
+                 if usable_price(e["data"].get("price")) is not None]
+        entries = [d for d in fills if "ref" in d and usable_price(d.get("ref")) is not None]
         entry_bps = [d["side"] * (d["price"] - d["ref"]) / d["ref"] * 1e4 for d in entries]
-        stops = [d for d in (e["data"] for e in self.journal.events(kind="BRACKET_FILL", since=since))
-                 if abs(d["price"] - d["stop"]) < abs(d["price"] - d["limit"])]
+        stops = [d for d in fills if "stop" in d and usable_price(d.get("stop")) is not None
+                 and usable_price(d.get("limit")) is not None and abs(d["price"] - d["stop"]) < abs(d["price"] - d["limit"])]
         stop_bps = [d["side"] * (d["price"] - d["stop"]) / d["stop"] * 1e4 for d in stops]
-        fees = sum(float(f.get("fee") or 0.0) for f in fills)
+        fees = sum(float(f["fee"]) for f in fills if isinstance(f.get("fee"), (int, float)) and math.isfinite(f["fee"]))
         model = sum(model_fee(float(f["price"]), int(f.get("contracts") or 0), self.cfg.costs) for f in fills)
         return {"fills": len(fills), "slippage_bps": (sum(entry_bps) / len(entry_bps)) if entry_bps else None,
                 "stop_slippage_bps": (sum(stop_bps) / len(stop_bps)) if stop_bps else None, "fees": fees,
                 "model_fees": model}
 
+    def _daily_due(self, now: float, today: str) -> None:
+        """From 09:00 New York: the summary and the key-permission check, each marked done for the day only once it
+        succeeded (a summary that raised is tried again after DAILY_RETRY_S, a key read that failed at the next
+        minute)."""
+        mono = self.mono()
+        if self.journal.get("once:daily") != today and (
+                self.daily_failed is None or not 0 <= mono - self.daily_failed < DAILY_RETRY_S):
+            try:
+                self._summary(now)
+            except Exception as exc:  # noqa: BLE001 - the rest of the minute goes on; tried again later today
+                self.daily_failed = mono
+                self._loop_error("daily", exc, now)
+            else:
+                self.daily_failed = None
+                self.journal.put("once:daily", today)
+        if self.journal.get("once:keycheck") != today and self._key_check(now):
+            self.journal.put("once:keycheck", today)
+
     def daily(self, now: float) -> None:
+        """The daily summary with its reminders, then the key-permission check."""
+        self._summary(now)
+        self._key_check(now)
+
+    def _summary(self, now: float) -> None:
         local = datetime.fromtimestamp(now, NY).date()
         c = self.costs(now - 86_400)
         if c["fills"]:
@@ -956,15 +1347,25 @@ class LiveRuntime:
             lines.append("잔고를 읽지 못함")
         self.alert("DAILY", "\n".join(lines))
         for name, day in sorted(self.d.expiry.items()):
-            left = (datetime.fromisoformat(day).date() - local).days
+            try:
+                left = (datetime.fromisoformat(str(day)).date() - local).days
+            except ValueError:
+                self.alert("EXPIRY", f"[만료 예정] {name}: 날짜 {day!r}를 읽지 못함 - EWBOT_EXPIRY 확인")
+                continue
             if left <= EXPIRY_WARN_DAYS:
                 self.alert("EXPIRY", f"[만료 예정] {name}: {day} ({left}일 남음) - 갱신 필요")
+
+    def _key_check(self, now: float) -> bool:
+        """The daily key-permission check (a transfer permission is a major incident: its pause first); False when
+        the permissions could not be read."""
         try:
-            if self.ex.key_permissions().can_transfer:
-                self._incident("TRANSFER_KEY", now)
-                self.alert("TRANSFER_KEY", "[중대 사건] API 키에 송금 권한이 있음: 즉시 키를 교체")
+            perms = self.ex.key_permissions()
         except ExchangeError:
-            pass
+            return False
+        if perms.can_transfer:
+            self._incident("TRANSFER_KEY", now)
+            self.alert("TRANSFER_KEY", "[중대 사건] API 키에 송금 권한이 있음: 즉시 키를 교체")
+        return True
 
     # ------------------------------------------------------------------ Telegram commands
     def handle(self, cmd: str, now: float, sent: float | None = None) -> str:
@@ -980,6 +1381,8 @@ class LiveRuntime:
         elif cmd == "/resume":
             resume(self.journal, now)
             reply = "재개: 다음 신호부터 진입"
+            if self.journal.get(FLATTEN_KEY) is not None:
+                reply += " · 대기 중인 전량 청산은 계속 (포지션이 없어질 때까지)"
             try:  # only a breaker that tripped is re-based at the current equity
                 rebased: list[str] | None = self.guard.reset(self.ex.balance().equity, now)
             except (ExchangeError, BadEquity):
@@ -996,9 +1399,8 @@ class LiveRuntime:
                 reply = "확인할 /flatten 요청이 없음 (먼저 /flatten)"
             else:
                 self.flatten_sent = None
-                pause(self.journal, "user /flatten", now)
-                ok = self.executor.flatten("USER_FLATTEN", self._ctx(now))
-                reply = "전량 청산 완료, 일시 정지" if ok else "청산 요청을 보냈으나 아직 확인되지 않음 (계속 재시도)"
+                outcome = self._flatten("USER_FLATTEN", "USER", "user /flatten", now, repause=True)
+                reply = f"{FLATTEN_OUTCOME[outcome]}, 일시 정지"
         else:
             reply = "/status · /pause · /resume · /flatten (+ /flatten_confirm 60초 안)"
         self.journal.add_event(now, "COMMAND", {"cmd": cmd, "reply": reply[:200]})
@@ -1016,29 +1418,35 @@ class LiveRuntime:
                 continue
             try:
                 self.handle(cmd.word, now, cmd.sent)
-            except ExchangeError as exc:
-                self.alert("COMMAND", f"{cmd.word} 실패: {str(exc)[:200]} (다시 보내 주세요)")
+            except Exception as exc:  # noqa: BLE001 - one failing command never drops the others
+                why = self.d.redact(f"{type(exc).__name__}: {exc}")
+                self.journal.add_event(now, "COMMAND_ERROR", {"cmd": cmd.word, "error": why[:200]})
+                self.alert("COMMAND", f"{cmd.word} 실패: {why[:200]} (다시 보내 주세요)")
+
+    @staticmethod
+    def _due(last: float | None, interval: float, mono: float) -> bool:
+        """`interval` has passed on the monotonic clock since `last` (a clock that went back counts as due)."""
+        return last is None or not 0 <= mono - last < interval
 
     def tick(self) -> None:
-        now = self.clock()
+        now, mono = self.clock(), self.mono()
         sections: list[tuple[str, Callable[[float], None], bool]] = [
             ("commands", self._commands, self.d.commands is not None),
             ("watch", self.watch, self.active),
-            ("poll", self.poll, self.last_poll is None or now - self.last_poll >= (POLL_ACTIVE_S if self.active else POLL_IDLE_S)
+            ("poll", self.poll, self._due(self.last_poll, POLL_ACTIVE_S if self.active else POLL_IDLE_S, mono)
              or (self.d.feed is not None and self.d.feed.take_resync())),
-            ("minute", self.minute, self.last_minute is None or now - self.last_minute >= 60.0),
+            ("minute", self.minute, self._due(self.last_minute, 60.0, mono)),
             ("cycle", self._cycle_due, True),
         ]
         for name, fn, due in sections:
+            if self.exit_code is not None:
+                return  # the process ends here (a stage change): nothing more this tick, no entry after the decision
             if not due:
                 continue
             try:
                 fn(now)
             except Exception as exc:  # noqa: BLE001 - one failing section must not stop the others
-                why = self.d.redact(f"{type(exc).__name__}: {exc}")
-                self.journal.add_event(now, "LOOP_ERROR", {"section": name, "error": why[:300]})
-                self.alert("LOOP_ERROR", f"[루프 오류] {name}: {why[:200]}")
-                print(self.d.redact(traceback.format_exc()), file=sys.stderr, end="")
+                self._loop_error(name, exc, now)
 
     def run_forever(self, max_ticks: int | None = None) -> int:
         self.startup()
@@ -1060,6 +1468,10 @@ def status_lines(journal: Journal, now: float) -> list[str]:
         cap = " · 상한 해제" if most is None else f" · 상한 {most}계약"
     p = paused(journal)
     lines = [f"단계 {stage}{days}{cap} · {'일시 정지: ' + p['reason'] if p else '운영 중'}"]
+    f = journal.get(FLATTEN_KEY)
+    if f:  # a flatten that has not reached a flat account yet: its close goes out at every pass
+        when = "장이 열리면 즉시 청산" if f.get("deferred") else "매 확인마다 청산 주문"
+        lines.append(f"전량 청산 진행 중: {f['reason']} ({_utc(float(f['ts']))}부터, {when})")
     t = journal.get("trade")
     if t and t.get("status") == "OPEN":
         legs = ", ".join(f"{leg['name']} {leg['size']}@{leg['limit_price']:,.0f}" for leg in t.get("legs", []))

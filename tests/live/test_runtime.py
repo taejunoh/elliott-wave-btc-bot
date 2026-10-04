@@ -27,9 +27,9 @@ from ewbot.live.notify import LiveNotifier
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.journal import Journal
 from ewbot.live.reconcile import PlanContext, pending_position
-from ewbot.live.runtime import audit_from_journal, status_lines
-from ewbot.live.shadow import ShadowExchange
-from ewbot.live.sim import SimExchange
+from ewbot.live.runtime import STARTUP_READ_MAX_S, StartupRefused, audit_from_journal, status_lines
+from ewbot.live.shadow import CALLS_KEPT, FILLS_KEPT, PREVIEW_RETRY_LIMIT, ShadowExchange
+from ewbot.live.sim import SimCrash, SimExchange
 from ewbot.live.stage import canary_gates, full_cap, on_incident, paused, restart_stint, resume, shadow_gates
 from ewbot.live.target import compute_target
 from ewbot.paper.decisions import known_at
@@ -147,15 +147,26 @@ def test_flatten_needs_a_confirmation_within_sixty_seconds(h):
 
 def test_a_failing_command_is_reported_and_the_loop_goes_on(h):
     entered(h)
-    h.ex.fail_next("position", RateLimited("429"))
+    h.ex.fail_next("position", RateLimited("429"), times=2)  # the flatten's pass and this tick's poll cannot read
     h.commands.put(Command("/flatten", ENTRY_BAR + 45))
     h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 48))
     h.at(ENTRY_BAR + 50)
-    assert any("/flatten_confirm 실패" in t for k, t in h.alerts.items if k == "COMMAND")
-    h.commands.put(Command("/flatten", ENTRY_BAR + 55))
-    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 58))
-    h.at(ENTRY_BAR + 60)
-    assert h.ex.position() is None
+    assert [t for k, t in h.alerts.items if k == "COMMAND"][-1].startswith("청산 요청 - 거래소를 읽지 못함")
+    assert h.ex.position() is not None and h.journal.get("flatten")["reason"] == "USER_FLATTEN"  # it stands
+    h.at(ENTRY_BAR + 60)  # the next poll sends the close: no second /flatten needed
+    assert h.ex.position() is None and h.journal.get("flatten") is None
+    assert [t for k, t in h.alerts.items if k == "FLATTEN"] == ["[전량 청산 완료] USER_FLATTEN (요청 후 10초)"]
+
+    def broken(cmd: str, now: float, sent: float | None = None) -> str:
+        raise RuntimeError("status unreadable")
+
+    h.rt.handle = broken  # type: ignore[method-assign]
+    h.commands.put(Command("/status", ENTRY_BAR + 65))
+    h.commands.put(Command("/pause", ENTRY_BAR + 66))
+    h.at(ENTRY_BAR + 70)  # each failing command is answered; neither is dropped
+    assert [t for k, t in h.alerts.items if k == "COMMAND"][-2:] == [
+        "/status 실패: RuntimeError: status unreadable (다시 보내 주세요)",
+        "/pause 실패: RuntimeError: status unreadable (다시 보내 주세요)"]
 
 
 def test_old_commands_are_ignored_and_the_confirmation_is_timed_on_the_messages(h):
@@ -588,8 +599,9 @@ def test_the_audit_stops_at_the_last_decided_bar_and_never_passes_on_a_failed_on
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)  # the cycle of bar SIGNAL
     hs.fetch.fail = 10
-    hs.at(ENTRY_BAR + 3630)  # the cycle of bar ENTRY_BAR fails (no candles): not decided yet
-    assert [c["status"] for c in hs.journal.cycles()][-2:] == ["OK", "ERROR"]
+    hs.at(ENTRY_BAR + 3630)  # the cycle of bar ENTRY_BAR cannot download the candles: retried, then held
+    hs.at(ENTRY_BAR + 3721)
+    assert [c["status"] for c in hs.journal.cycles()][-2:] == ["OK", "HOLD"]
     target = compute_target(hs.lock, hs.df[hs.df["ts"] <= ENTRY_BAR], ENTRY_BAR)  # the paper runtime has the bar
     led = paper_ledger(ENTRY_BAR, [d for d in target.decisions if known_at(d) <= ENTRY_BAR])
     lagging = audit(hs.journal.decisions(), led, now=ENTRY_BAR + 3640)  # without the live bound
@@ -636,9 +648,10 @@ def test_the_audit_stops_at_the_last_decided_bar_and_never_passes_on_a_failed_on
 def test_a_demotion_applies_to_the_next_entry_while_the_process_still_runs(tmp_path):
     sizes = {}
     for demoted in (False, True):
-        hs = Harness(tmp_path / str(demoted), ENTRY_BAR + 30, stage="FULL", stage_days=40)  # the cap is released
+        hs = Harness(tmp_path / str(demoted), ENTRY_BAR, stage="FULL", stage_days=40)  # the cap is released
         hs.price(float(hs.bar(ENTRY_BAR)["open"]))
         hs.rt.startup()
+        hs.at(ENTRY_BAR + 1)  # this minute's stage check is done: the next one would restart the flat runtime
         if demoted:  # a major incident in FULL, then the user's /resume: this process still runs FULL
             assert on_incident(hs.journal, "UNPROTECTED_60S", ENTRY_BAR + 1) == ["paused", "demoted to CANARY"]
             resume(hs.journal, ENTRY_BAR + 2)
@@ -852,15 +865,16 @@ def test_a_shadow_runtime_restarted_mid_hour_keeps_its_cycle_and_restart_gates(t
 def test_a_bracket_failure_in_an_hour_without_a_target_is_resolved_by_the_protection_seen(h):
     entered(h)  # long 1 with its bracket
     h.fetch.fail = 10
-    h.at(ENTRY_BAR + 3630)  # the next cycle has no candles: no target this hour
+    h.at(ENTRY_BAR + 3630)  # the next cycle has no candles: retried until 2 minutes after the close, then held
+    h.at(ENTRY_BAR + 3722)
     assert h.rt.target is None
     h.ex.fail_next("place_bracket", RateLimited("429"))
     h.ex.cancel([o.order_id for o in h.ex.open_orders()])  # the bracket gone
-    h.at(ENTRY_BAR + 3640)  # placing it again at the stop in force fails once
-    h.at(ENTRY_BAR + 3650)  # placed: the planner cannot judge the legs without a target, but
-    h.at(ENTRY_BAR + 3660)  # this pass sees the position covered by the resting stop leg
+    h.at(ENTRY_BAR + 3732)  # placing it again at the stop in force fails once
+    h.at(ENTRY_BAR + 3742)  # placed: the planner cannot judge the legs without a target, but
+    h.at(ENTRY_BAR + 3752)  # this pass sees the position covered by the resting stop leg
     for k in range(3):
-        h.at(ENTRY_BAR + 3670 + 10 * k)
+        h.at(ENTRY_BAR + 3762 + 10 * k)
     assert len(h.journal.events(kind="BRACKET_FAILED")) == 1 and h.journal.events(kind="PROTECTED")
     assert [e["data"]["kind"] for e in h.journal.events(kind="ORDER_RESOLVED")] == ["BRACKET_FAILED"]
     assert paused(h.journal) is None and not h.journal.events(kind="ORDER_UNRESOLVED")
@@ -1009,3 +1023,563 @@ def test_an_ambiguous_tp1_sync_is_read_from_the_position_not_sold_again(tmp_path
     assert [(o.size, o.limit_price, o.stop_price) for o in hs.ex.open_orders()] == [(2, 27_610.0, 26_745.0)]
     assert paused(hs.journal) is None
     hs.journal.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# flatten requests (breakers, /flatten_confirm): journaled first, sent at every pass until flat, outcomes as they are
+
+
+def tripped(h: Harness, t0: float = ENTRY_BAR + 30) -> None:
+    """Three balance reads base the day's reference, then a -4% equity: the next minute's read is the first breach."""
+    h.at(t0 + 60)
+    h.at(t0 + 120)
+    h.ex.cash -= 400.0
+    h.at(t0 + 180)
+
+
+def test_a_breaker_flatten_that_fails_is_sent_again_at_the_next_poll(h):
+    entered(h)
+    tripped(h)
+    h.ex.fail_next("close_position", RateLimited("429"))  # the breaker's close is rate-limited (no order created)
+    seen = alerts_with_positions(h)
+    h.at(ENTRY_BAR + 270)  # the second breaching read: request, pause, one close
+    assert h.ex.position() is not None and paused(h.journal)["reason"] == "breaker DAILY_LOSS"
+    assert h.journal.get("flatten")["reason"] == "BREAKER_DAILY_LOSS"
+    breaker = [t for k, t, _ in seen if k == "BREAKER"]
+    assert len(breaker) == 1 and breaker[0].startswith(
+        "[실계좌 손실 한도] DAILY_LOSS: 일시 정지 · 청산 요청 - 아직 청산되지 않음: 매 확인마다 다시 보냄")  # never "flattened"
+    h.at(ENTRY_BAR + 280)  # the next poll sends the close again
+    assert h.ex.position() is None and h.ex.calls.count("close_position") == 2 and h.journal.get("flatten") is None
+    assert [e["data"]["reason"] for e in h.journal.events(kind="CLOSED")] == ["BREAKER_DAILY_LOSS"]
+    assert [(t, p) for k, t, p in seen if k == "FLATTEN"] == [("[전량 청산 완료] BREAKER_DAILY_LOSS (요청 후 10초)", None)]
+    assert h.journal.events(kind="FLATTENED")[-1]["data"]["closed"] is True
+    assert not h.journal.events(kind="ORDER_UNRESOLVED")  # the failed close was done by the next pass
+    assert [e["kind"] for e in h.journal.events() if e["kind"] in ("FLATTEN_REQUESTED", "PAUSED")] == [
+        "FLATTEN_REQUESTED", "PAUSED"]  # the request is journaled before anything else
+
+
+def test_a_flatten_confirmed_while_the_venue_is_closed_closes_at_the_reopen(h):
+    entered(h)
+    h.ex.set_session("CLOSE")  # e.g. the weekly CFM halt
+    h.at(ENTRY_BAR + 100)  # the minute sees it
+    h.commands.put(Command("/flatten", ENTRY_BAR + 105))
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 108))
+    h.at(ENTRY_BAR + 110)
+    assert [t for k, t in h.alerts.items if k == "COMMAND"][-1].startswith(
+        "장이 열려 있지 않아 청산 대기: 장이 열리면 즉시 청산 (보호 주문 유지), 일시 정지")
+    for k in range(1, 5):  # polls while closed: the close waits, the bracket keeps protecting
+        h.at(ENTRY_BAR + 110 + 10 * k)
+        assert h.ex.position() is not None and len(h.ex.open_orders()) == 1
+    assert "close_position" not in h.ex.calls and "FLATTEN" not in h.alerts.kinds()  # the reply said it already
+    assert "전량 청산 진행 중: USER_FLATTEN (2024-03-13 23:01 UTC부터, 장이 열리면 즉시 청산)" in h.rt.handle(
+        "/status", ENTRY_BAR + 155)
+    h.ex.set_session("OPEN")
+    seen = alerts_with_positions(h)
+    h.at(ENTRY_BAR + 160)  # the minute sees OPEN and polls at once: the close goes out
+    assert h.ex.position() is None and h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "USER_FLATTEN"
+    assert [(t, p) for k, t, p in seen if k == "FLATTEN"] == [("[전량 청산 완료] USER_FLATTEN (요청 후 50초)", None)]
+    assert paused(h.journal)["reason"] == "user /flatten" and "전량 청산 진행 중" not in h.rt.handle("/status", ENTRY_BAR + 170)
+    assert [e["data"]["state"] for e in h.journal.events(kind="FLATTEN_DEFERRED")] == ["CLOSE"]
+
+
+@pytest.mark.parametrize("crash", ["before the request", "before the close"])
+def test_a_crash_before_the_breaker_close_went_out_still_flattens_after_the_restart(tmp_path, crash):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    tripped(hs)
+
+    def killed(*args: Any, **kw: Any) -> Any:
+        raise SimCrash("killed")
+
+    if crash == "before the request":  # between the breaker's trip (journaled by the guard) and the flatten request
+        hs.rt._request_flatten = killed  # type: ignore[method-assign]
+    else:  # after the request and the pause, before the close reached the venue
+        hs.ex.close_position = killed  # type: ignore[method-assign]
+    with pytest.raises(SimCrash):
+        hs.at(ENTRY_BAR + 270)
+    assert hs.ex.position() is not None
+    if crash == "before the close":
+        del hs.ex.close_position
+        assert paused(hs.journal)["reason"] == "breaker DAILY_LOSS" and hs.journal.get("flatten") is not None
+    hs.journal.close()
+    hs.journal = Journal(tmp_path / "journal.sqlite")
+    hs.clock.now = ENTRY_BAR + 300
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()  # the request stands (or the guard's trip is still in force): the start's pass closes
+    assert hs.ex.position() is None and paused(hs.journal)["reason"] == "breaker DAILY_LOSS"
+    assert [e["data"]["reason"] for e in hs.journal.events(kind="CLOSED")] == ["BREAKER_DAILY_LOSS"]
+    assert hs.journal.get("flatten") is None
+    if crash == "before the request":  # no breaker alert went out before the crash: the restart's says it all
+        assert [t for k, t in hs.alerts.items if k == "BREAKER"] == [
+            "[실계좌 손실 한도] DAILY_LOSS: 재시작 때 발동 중 - 일시 정지 · 전량 청산 완료"]
+    else:
+        assert hs.alerts.items[-1] == ("FLATTEN", "[전량 청산 완료] BREAKER_DAILY_LOSS (요청 후 30초)")
+    hs.journal.close()
+
+
+def test_a_flatten_after_an_unseen_bracket_fill_records_the_bracket_exit(h):
+    entered(h)
+    h.ex.set_prices(27_300.0)  # the TP1 bracket fills on the venue (1-contract CANARY trade: flat) before a poll sees it
+    h.rt.handle("/flatten", ENTRY_BAR + 33)
+    assert h.rt.handle("/flatten_confirm", ENTRY_BAR + 35) == "포지션 없음 (청산할 것 없음), 일시 정지"
+    t = h.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET") and "close_position" not in h.ex.calls
+    assert [(e["data"]["leg"], e["data"]["price"]) for e in h.journal.events(kind="BRACKET_FILL")] == [("tp1", 27_245.0)]
+    gates = {g.name: g for g in canary_gates(h.journal, ENTRY_BAR + 100, None)}
+    assert gates["완결 거래 3건 이상 또는 90일"].detail.startswith("1건")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the decision cycle: a failed download is a late bar, a failure after the replay ends the bar once, restarts
+
+
+def test_a_failed_candle_download_is_retried_like_a_late_bar(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="SHADOW", stage_days=0.001)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.fetch.fail = 1  # one connection error at hh:00:30; the next download works
+    hs.at(ENTRY_BAR + 30)
+    assert hs.rt.next_try == ENTRY_BAR + 45 and hs.journal.cycles()[-1]["status"] == "RUNNING"
+    hs.at(ENTRY_BAR + 45)
+    c = hs.journal.cycles()[-1]
+    assert (c["bar_ts"], c["status"]) == (SIGNAL, "OK") and hs.ex.position() is not None  # decided and entered in time
+    gates = {g.name: g for g in shadow_gates(hs.journal, ENTRY_BAR + 3600, None)}
+    assert gates["② 모든 사이클이 마감 후 2분 안에 끝남"].met
+    assert [e["data"]["error"] for e in hs.journal.events(kind="FETCH_ERROR")] == ["ConnectionError: coinbase down"]
+    hs.fetch.fail = 100  # a download that keeps failing: held 2 minutes after the close, with its reason
+    for dt in (30, 45, 60, 75, 90, 105, 121):
+        hs.at(ENTRY_BAR + 3600 + dt)
+    c = hs.journal.cycles()[-1]
+    assert (c["status"], c["note"]) == ("HOLD", "candles not fetched 2 min after the close: ConnectionError: coinbase down")
+    assert hs.rt.target is None and [t for k, t in hs.alerts.items if k == "DATA_LATE"] == [
+        "[판단 보류] 2024-03-13 23:00 UTC 봉을 마감 후 2분 안에 받지 못함 (ConnectionError: coinbase down) (보호 주문 유지)"]
+    hs.journal.close()
+
+
+def test_a_restart_retries_the_target_of_an_hour_already_decided(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    decided = [(c["bar_ts"], c["status"], c["finished_ts"]) for c in hs.journal.cycles()]
+    hs.journal.close()
+    hs.journal = Journal(tmp_path / "journal.sqlite")
+    hs.clock.now = ENTRY_BAR + 1800
+    hs.fetch.fail = 2  # the start's download and the target's refresh fail
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    assert hs.rt.target is None and hs.rt.next_try == ENTRY_BAR + 1815  # retried, not given up for the hour
+    hs.at(ENTRY_BAR + 1815)
+    assert hs.rt.target is not None and hs.rt.done_bar == SIGNAL
+    assert [(c["bar_ts"], c["status"], c["finished_ts"]) for c in hs.journal.cycles()] == decided  # its row untouched
+    hs.journal.close()
+
+
+def test_a_failure_after_the_replay_ends_the_cycle_once(h):
+    def broken(now: float) -> None:
+        raise KeyError("a planner bug on this state")
+
+    h.rt.reconcile = broken  # type: ignore[method-assign]
+    fetched = h.fetch.calls
+    for k in range(30):  # 30 one-second ticks after hh:00:30
+        h.at(ENTRY_BAR + 30 + k)
+    c = h.journal.cycles()[-1]
+    assert (c["status"], c["note"], h.rt.done_bar) == ("ERROR", "KeyError: 'a planner bug on this state'", SIGNAL)
+    assert h.fetch.calls - fetched == 1 and h.rt.target is None  # one download and one replay, not one per tick
+    assert [e["data"]["section"] for e in h.journal.events(kind="LOOP_ERROR")] == ["cycle"]
+    assert h.alerts.kinds().count("CYCLE_ERROR") == 1
+
+
+def test_a_held_hour_stays_held_after_a_restart_and_a_crashed_cycle_runs_again(tmp_path, monkeypatch):
+    hs = Harness(tmp_path / "held", ENTRY_BAR + 30)
+    full = hs.df
+    hs.fetch.source = full[full["ts"] < SIGNAL]  # the SIGNAL bar does not arrive in time
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    for dt in (30, 45, 60, 75, 90, 105, 121):
+        hs.at(ENTRY_BAR + dt)
+    assert hs.journal.cycles()[-1]["status"] == "HOLD"
+    hs.fetch.source = full  # it arrives; the runtime restarts within the entry's 5 minutes
+    hs.journal.close()
+    hs.journal = Journal(tmp_path / "held" / "journal.sqlite")
+    hs.clock.now = ENTRY_BAR + 200
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 210)
+    assert hs.journal.cycles()[-1]["status"] == "HOLD" and hs.rt.done_bar == SIGNAL  # the hold stands, as without one
+    assert hs.ex.position() is None and hs.rt.target is None
+    hs.journal.close()
+    # a cycle a crash left RUNNING runs again, under the usual deadlines
+    hs = Harness(tmp_path / "crashed", ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+
+    def killed(*args: Any, **kw: Any) -> Any:
+        raise SimCrash("killed")
+
+    monkeypatch.setattr("ewbot.live.runtime.compute_target", killed)
+    with pytest.raises(SimCrash):
+        hs.at(ENTRY_BAR + 30)
+    monkeypatch.undo()
+    assert hs.journal.cycles()[-1]["status"] == "RUNNING"
+    hs.journal.close()
+    hs.journal = Journal(tmp_path / "crashed" / "journal.sqlite")
+    hs.clock.now = ENTRY_BAR + 60
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 61)
+    c = hs.journal.cycles()[-1]
+    assert (c["bar_ts"], c["status"], c["started_ts"]) == (SIGNAL, "OK", ENTRY_BAR + 30) and hs.ex.position() is not None
+    hs.journal.close()
+
+
+def test_a_stage_change_ends_the_tick_before_the_cycle_can_enter(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 20, stage="SHADOW")
+    real = hs.ex
+    hs.ex = ShadowExchange(real, hs.journal, clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    real.set_prices(float(hs.bar(ENTRY_BAR)["open"]), float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.journal.set_stage("CANARY", "promotion (flat book)", ENTRY_BAR + 25)  # `ewbot live stage canary --confirm`
+    hs.at(ENTRY_BAR + 30)  # the minute sees the new stage while flat: the process ends, this hour's cycle never runs
+    assert hs.rt.exit_code == 0 and hs.ex.position() is None and hs.journal.cycles() == []
+    assert hs.rt.executor.trade() is None and not hs.journal.events(kind="ENTRY")
+    hs.journal.close()
+
+
+def test_an_entry_is_not_sent_after_its_deadline_even_when_the_pass_began_in_time(h):
+    attempts: list[float] = []
+    placed = h.ex.place_market
+
+    def busy(cid: str, side: int, size: int) -> PlaceResult:  # the venue rate-limits the entry for minutes
+        attempts.append(h.clock())
+        if h.clock() < ENTRY_BAR + 290:
+            raise RateLimited("429")
+        return placed(cid, side, size)
+
+    h.ex.place_market = busy  # type: ignore[method-assign]
+    h.at(ENTRY_BAR + 30)
+    assert h.journal.intent(f"ewb-e-{SIGNAL}-L")["status"] == "PENDING"
+    balance = h.ex.balance
+
+    def slow() -> Balance:  # the pass's own reads take 5 s: it began at +298, the send would be at +303
+        h.clock.now += 5.0
+        return balance()
+
+    h.ex.balance = slow  # type: ignore[method-assign]
+    h.at(ENTRY_BAR + 298)
+    assert len(attempts) == 1 and h.ex.position() is None
+    assert h.journal.events(kind="SKIP")[-1]["data"]["reason"] == "봉 마감 후 5분이 지나 진입하지 않음"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# restarts, the loop's clock, the watchdog, the minute
+
+
+def test_a_restart_polls_fast_and_watches_from_the_journal_even_when_its_first_reads_fail(h):
+    entered(h)
+    h.rt = h.make_runtime()  # a restart in the middle of the hour; the venue answers 503 to the first position reads
+    h.clock.now = ENTRY_BAR + 600
+    h.ex.fail_next("position", Unavailable("503"), times=3)
+    h.rt.startup()
+    assert h.rt.active  # from the journal's open trade, before any read succeeded
+    h.price(25_000.0)  # gapped far beyond the stop's 5% limit (25_255.75)
+    for k in range(1, 13):
+        h.at(ENTRY_BAR + 600 + k)
+    assert h.ex.position() is None and h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_GAP"
+
+
+def test_an_entry_accepted_right_before_a_crash_is_protected_at_the_first_fast_poll(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.ex.crash_after_accept("place_market")
+    with pytest.raises(SimCrash):
+        hs.at(ENTRY_BAR + 30)
+    hs.journal.close()
+    hs.journal = Journal(tmp_path / "journal.sqlite")
+    hs.clock.now = ENTRY_BAR + 45  # restarted 15 s later; the venue answers 503 for a few reads
+    hs.rt = hs.make_runtime()
+    hs.ex.fail_next("find_order", Unavailable("503"), times=3)
+    hs.ex.fail_next("position", Unavailable("503"), times=2)
+    hs.rt.startup()
+    assert hs.rt.active  # the PENDING entry: 10 s polls from the start
+    k = next(k for k in range(1, 61) if hs.at(ENTRY_BAR + 45 + k) or hs.ex.open_orders())
+    assert k <= 10 and not hs.journal.events(kind="INCIDENT")  # no PROTECT_SLOW: protected within 30 s of the entry
+    hs.journal.close()
+
+
+def test_the_loop_runs_on_a_monotonic_clock_through_a_backward_wall_clock_step(h):
+    entered(h)
+    mono = Clock(1_000.0)
+    h.rt = h.make_runtime(monotonic=mono)
+    h.rt.startup()
+    polls, minutes = h.ex.calls.count("open_orders"), h.ex.calls.count("session")
+    for k in range(1, 301):  # the wall clock stepped back 10 minutes and runs on for 5 minutes
+        mono.now += 1.0
+        h.at(ENTRY_BAR + 30 - 600 + k)
+    assert 29 <= h.ex.calls.count("open_orders") - polls <= 31  # a poll every 10 s (a trade is open)
+    assert h.ex.calls.count("session") - minutes == 5 and h.journal.get("heartbeat") == ENTRY_BAR + 30 - 600 + 241
+
+
+def test_a_failing_watchdog_close_is_tried_once_per_poll_interval_with_limited_alerts(h):
+    h.ex.fail_next("place_bracket", ExchangeError("INVALID_STOP_PRICE"), times=500)  # no stop rests
+    h.at(ENTRY_BAR + 30)
+    h.at(ENTRY_BAR + 40)
+    h.price(26_580.0)  # through the 26_585 stop
+    h.ex.fail_next("close_position", RateLimited("429"), times=500)
+    n0, c0 = len(h.alerts.items), h.ex.calls.count("close_position")
+    for k in range(1, 31):
+        h.at(ENTRY_BAR + 40 + k)
+    kinds = [k for k, _ in h.alerts.items[n0:]]
+    assert h.ex.calls.count("close_position") - c0 == 3  # at +50, +60, +70 (the REST price is read every 10 s)
+    assert kinds.count("STOP_UNPROTECTED") == 1 and kinds.count("CLOSE_FAILED") == 1 and kinds.count("BRACKET_FAILED") == 0
+    assert [t for k, t in h.alerts.items if k == "STOP_UNPROTECTED"] == [
+        "[손절] 보호 주문 없이 가격 26,580.0이 손절 26,585을 지남: 시장가 청산 실패 - 10초마다 재시도"]
+    h.ex._faults["close_position"] = []  # the venue takes the close again
+    h.at(ENTRY_BAR + 75)
+    assert h.ex.position() is not None  # 5 s after the last attempt: not yet
+    h.at(ENTRY_BAR + 80)
+    assert h.ex.position() is None and h.alerts.items[-1] == (
+        "STOP_UNPROTECTED", "[손절] 보호 주문 없이 가격 26,580.0이 손절 26,585을 지남: 시장가 청산 완료")
+
+
+def test_a_failing_margin_step_never_skips_the_rest_of_the_minute(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", equity=400.0)
+    hs.price(26_744.5)
+    hs.rt.startup()
+    hs.rt.guard.params = dataclasses.replace(hs.rt.guard.params, daily_loss=1.0, total_dd=1.0)  # tested on their own
+    hs.ex.place_market("ewb-e-1-L", 1, 3)
+    hs.rt.executor.adopt(position(signal_ts=SIGNAL, stop=26_000.0, tp1=27_500.0, tp2=28_000.0), hs.rt._ctx(hs.clock()))
+    hs.ex.cash = 170.0  # ~99%: a reduce
+
+    def down(size: int, reason: str, ctx: PlanContext) -> bool:
+        raise Unavailable("503")
+
+    hs.rt.executor.reduce = down  # type: ignore[method-assign]
+    hs.at(ENTRY_BAR + 100)
+    assert hs.ex.position().contracts == 3 and hs.journal.events(kind="MARGIN_ERROR")
+    assert [t for k, t in hs.alerts.items if k == "MARGIN"] == [
+        "[증거금 축소 실패] 오버나이트 기준 99%: 1계약 축소를 하지 못함 - 1분 뒤 다시 점검"]
+    assert hs.journal.get("once:daily") == "2024-03-13"  # the rest of the minute ran (the daily summary)
+    del hs.rt.executor.reduce
+    hs.at(ENTRY_BAR + 160)
+    assert hs.ex.position().contracts == 2 and [t for k, t in hs.alerts.items if k == "MARGIN"][-1] == (
+        "[증거금 축소] 오버나이트 기준 99%: 1계약 축소")
+
+    def broken(equity: float, now: float) -> str | None:
+        raise RuntimeError("guard state unreadable")
+
+    hs.rt.guard.update = broken  # type: ignore[method-assign]
+    hs.at(ENTRY_BAR + 220)
+    assert hs.journal.events(kind="LOOP_ERROR")[-1]["data"] == {"section": "money",
+                                                                 "error": "RuntimeError: guard state unreadable"}
+    assert hs.journal.get("audit") is None and hs.journal.get("heartbeat") == ENTRY_BAR + 220
+    hs.journal.close()
+
+
+def test_the_daily_summary_and_key_check_are_done_for_the_day_only_once_they_succeed(h):
+    entered(h)
+    day2 = ts("2024-03-14 13:01")  # 09:01 New York the next day
+    h.journal.add_event(day2 - 600, "ENTRY", {"trade_id": 7, "side": 1, "contracts": 1, "price": 0.0, "ref": 26_744.5,
+                                              "fee": 0.0})  # a fill price the adapter could not read
+    h.rt.d.expiry = {"coinbase": "2024-04-01", "github": "not-a-date"}
+    costs = h.rt.costs
+
+    def broken(since: float) -> dict[str, Any]:
+        raise RuntimeError("cost report bug")
+
+    h.rt.costs = broken  # type: ignore[method-assign]
+    h.ex.fail_next("key_permissions", Unavailable("503"))
+    h.clock.now = day2
+    h.rt.minute(day2)
+    assert h.journal.get("once:daily") == "2024-03-13" and h.journal.get("once:keycheck") != "2024-03-14"
+    h.rt.costs = costs  # type: ignore[method-assign]
+    h.clock.now = day2 + 60
+    h.rt.minute(day2 + 60)  # the key check is read again at once; the summary waits DAILY_RETRY_S
+    assert h.journal.get("once:keycheck") == "2024-03-14" and h.journal.get("once:daily") == "2024-03-13"
+    h.clock.now = day2 + 660
+    h.rt.minute(day2 + 660)
+    assert h.journal.get("once:daily") == "2024-03-14"
+    daily = [t for k, t in h.alerts.items if k == "DAILY"][-1]
+    assert daily.startswith("[일일 요약] 2024-03-14") and "체결 24시간: 1건 · 진입 슬리피지 +0.9 bps" in daily
+    assert [t for k, t in h.alerts.items if k == "EXPIRY"][-2:] == [
+        "[만료 예정] coinbase: 2024-04-01 (18일 남음) - 갱신 필요",
+        "[만료 예정] github: 날짜 'not-a-date'를 읽지 못함 - EWBOT_EXPIRY 확인"]
+
+
+def test_bracket_fills_are_read_back_until_the_read_succeeds_and_partial_fills_count(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)  # 3 contracts: TP1 leg 1 @ 27_245, TP2 leg 2 @ 27_610
+    hs.ex.bracket_fill_cap = 1  # one contract per leg and price
+    hs.price(27_620.0)  # the TP1 leg fills, the TP2 leg only one of its two
+    hs.ex.fail_next("get_order", Unavailable("503"))  # the TP1 leg's read back fails once
+    hs.at(ENTRY_BAR + 45)
+
+    def fills() -> list[tuple[str, int, float]]:
+        return [(e["data"]["leg"], e["data"]["contracts"], e["data"]["price"]) for e in hs.journal.events(kind="BRACKET_FILL")]
+
+    assert fills() == [("tp2", 1, 27_610.0)]  # the partial fill of the resting leg, from the open orders
+    hs.at(ENTRY_BAR + 55)
+    assert fills()[:2] == [("tp2", 1, 27_610.0), ("tp1", 1, 27_245.0)]  # read back at the next pass
+    hs.ex.bracket_fill_cap = None
+    for k in range(3):
+        hs.at(ENTRY_BAR + 65 + 10 * k)
+    assert hs.ex.position() is None and sum(n for _, n, _ in fills()) == 3  # every contract once
+    assert hs.rt.costs(ENTRY_BAR)["fills"] == 1 + len(fills())
+    hs.journal.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# start, SHADOW, redaction
+
+
+def test_a_start_that_cannot_read_the_venue_retries_then_refuses(tmp_path):
+    hs = Harness(tmp_path / "blip", ENTRY_BAR + 30)
+    hs.price(26_700.0)
+    hs.ex.fail_next("session", Unavailable("503"), times=2)
+    hs.rt.startup()  # two failed reads, then it starts
+    assert [e["data"]["wait_s"] for e in hs.journal.events(kind="STARTUP_RETRY")] == [2.0, 4.0]
+    assert "STARTUP" in hs.alerts.kinds()
+    hs.journal.close()
+    hs = Harness(tmp_path / "down", ENTRY_BAR + 30)
+    hs.ex.fail_next("product", Unavailable("503"), times=100)
+    with pytest.raises(StartupRefused, match="product 조회 실패"):
+        hs.rt.startup()
+    assert 0 < hs.clock() - (ENTRY_BAR + 30) <= STARTUP_READ_MAX_S
+    assert not hs.journal.events(kind="STARTUP") and hs.journal.events(kind="STARTUP_REFUSED")
+    hs.journal.close()
+
+
+def test_a_maintenance_within_a_day_is_announced_at_start(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.ex.maintenance = (ENTRY_BAR + 6 * 3600, ENTRY_BAR + 9 * 3600)  # the quarterly maintenance in 6 hours
+    hs.rt.startup()
+    for k in range(3):
+        hs.at(ENTRY_BAR + 100 + 60 * k)
+    assert [t for k, t in hs.alerts.items if k == "MAINTENANCE"] == [
+        "[장 상태] 정기 점검 예정 2024-03-14 01:00 ~ 04:00 (뉴욕)"]
+    assert len(hs.journal.events(kind="MAINTENANCE")) == 1
+    hs.journal.close()
+
+
+def test_a_shadow_restart_without_a_quote_triggers_nothing_and_never_reuses_an_order_id(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="SHADOW")
+    real = hs.ex
+    hs.ex = ShadowExchange(real, hs.journal, clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    opening = float(hs.bar(ENTRY_BAR)["open"])
+    real.set_prices(opening, opening)
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    first = set(hs.ex.orders)
+    hs.ex = ShadowExchange(real, hs.journal, clock=hs.clock)  # restart: a new, empty virtual book
+    hs.rt = hs.make_runtime()
+    hs.clock.now = ENTRY_BAR + 600
+    real.fail_next("quote", Unavailable("503"), times=2)  # the real quote fails during the start
+    hs.rt.startup()
+    assert hs.ex.position().contracts == 1 and [o.triggered for o in hs.ex.orders.values()] == [False]
+    assert not first & set(hs.ex.orders) and all(oid.startswith("v2-") for oid in hs.ex.orders)
+    hs.at(ENTRY_BAR + 610)  # the real price (above the 26_585 stop) is back
+    assert hs.ex.position().contracts == 1 and not hs.journal.events(kind="CLOSED")
+    hs.journal.close()
+
+
+def test_a_preview_the_api_could_not_answer_is_asked_again_and_only_a_refusal_fails(tmp_path):
+    clock = Clock(1_000.0)
+    real = SimExchange(clock=clock)
+    real.set_prices(60_000.0, 60_010.0)
+    jr = journal(tmp_path)
+    alerts: list[tuple[str, str]] = []
+    sh = ShadowExchange(real, jr, clock=clock, alert=lambda k, t: alerts.append((k, t)))
+    real.fail_next("preview_market", Unavailable("503"), times=2)  # both tries
+    assert sh.place_market("ewb-e-1-L", 1, 1).ok  # the virtual order goes on
+    assert not jr.events(kind="PREVIEW") and [k for k, _ in alerts] == ["PREVIEW_UNVERIFIED"]
+    real.fail_next("preview_market", RateLimited("429"))  # a passing error: tried again at once
+    assert sh.close_position("ewb-x-1-1").ok
+
+    def previews() -> list[tuple[str, bool, bool]]:
+        return [(e["data"]["client_order_id"], e["data"]["ok"], bool(e["data"].get("retried")))
+                for e in jr.events(kind="PREVIEW")]
+
+    assert previews() == [("ewb-x-1-1", True, False)]
+    assert sh.retry_previews() == 0  # the next cycle asks again: answered, verified
+    assert previews()[-1] == ("ewb-e-1-L", True, True)
+    real.fail_next("preview_market", Unavailable("503"), times=2 + PREVIEW_RETRY_LIMIT)
+    sh.place_market("ewb-e-2-L", 1, 1)
+    for _ in range(PREVIEW_RETRY_LIMIT - 1):
+        assert sh.retry_previews() == 1
+    assert sh.retry_previews() == 0 and previews()[-1] == ("ewb-e-2-L", False, True)  # never answered: failed
+    real.preview_errors = ("PREVIEW_INSUFFICIENT_FUND",)  # a refusal fails at once
+    sh.close_position("ewb-x-2-1")
+    assert previews()[-1] == ("ewb-x-2-1", False, False) and alerts[-1][0] == "PREVIEW_FAILED"
+    jr.close()
+
+
+def test_a_shadow_cycle_asks_again_for_an_unanswered_entry_preview(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="SHADOW")
+    real = hs.ex
+    hs.ex = ShadowExchange(real, hs.journal, clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    opening = float(hs.bar(ENTRY_BAR)["open"])
+    real.set_prices(opening, opening)
+    hs.rt.startup()
+    real.fail_next("preview_market", Unavailable("503"), times=3)  # the entry's two tries and the cycle's retry
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position().contracts == 1 and hs.journal.events(kind="PREVIEW_UNVERIFIED")
+    assert [e["data"]["kind"] for e in hs.journal.events(kind="PREVIEW")] == ["BRACKET"]
+    hs.at(ENTRY_BAR + 3630)  # the next cycle
+    assert [(e["data"]["kind"], e["data"]["ok"]) for e in hs.journal.events(kind="PREVIEW")][-1] == ("MARKET", True)
+    gates = {g.name: g for g in shadow_gates(hs.journal, ENTRY_BAR + 3640, None)}
+    assert gates["③ 냈을 주문 전부 preview 통과"].met
+    hs.journal.close()
+
+
+def test_the_shadow_book_stays_bounded(tmp_path):
+    clock = Clock(1_000.0)
+    real = SimExchange(clock=clock)
+    real.set_prices(60_000.0, 60_010.0)
+    jr = journal(tmp_path)
+    sh = ShadowExchange(real, jr, clock=clock)
+    for i in range(600):  # 1200 virtual fills over 10 hours
+        sh.place_market(f"ewb-e-{i}-L", 1, 1)
+        sh.close_position(f"ewb-x-{i}-1")
+        clock.now += 60.0
+    assert len(sh.fills) <= FILLS_KEPT + 1 and len(sh.orders) == 1200  # an ended order is dropped a day later
+    clock.now += 86_400.0 + 1
+    sh.place_market("ewb-e-late-L", 1, 1)
+    clock.now += 86_400.0 + 1
+    sh.place_market("ewb-e-later-L", 1, 1)
+    assert len(sh.orders) <= 3
+    for _ in range(2500):
+        sh.position()
+    assert len(sh.calls) <= 2 * CALLS_KEPT
+    jr.close()
+
+
+def test_error_texts_in_alerts_and_the_journal_are_redacted(h):
+    h.rt = h.make_runtime(redact=lambda text: text.replace("SECRET", "<secret>"))
+    h.rt.startup()
+    h.ex.fail_next("place_market", ExchangeError("refused for botSECRET"))  # the entry refused, the reason has a secret
+    h.at(ENTRY_BAR + 30)
+    h.ex.fail_next("position", RateLimited("429 at botSECRET"))
+    h.at(ENTRY_BAR + 100)
+    h.ex.fail_next("session", Unavailable("503 at botSECRET"))
+    h.at(ENTRY_BAR + 160)
+
+    def broken(cmd: str, now: float, sent: float | None = None) -> str:
+        raise RuntimeError("botSECRET")
+
+    h.rt.handle = broken  # type: ignore[method-assign]
+    h.commands.put(Command("/status", ENTRY_BAR + 165))
+    h.at(ENTRY_BAR + 170)
+    assert not [t for _, t in h.alerts.items if "SECRET" in t] and "ENTRY_FAILED" in h.alerts.kinds()
+    runtime_events = ("POLL_ERROR", "SESSION_ERROR", "COMMAND_ERROR")
+    assert all("<secret>" in json.dumps(e["data"]) and "SECRET" not in json.dumps(e["data"]).replace("<secret>", "")
+               for k in runtime_events for e in h.journal.events(kind=k)) and all(
+        h.journal.events(kind=k) for k in runtime_events)

@@ -40,7 +40,8 @@ known to have filled. A reduce the venue refuses while our brackets cover what i
 (`CLOSE_CONFLICTS`) first makes room - TP1_SYNC cancels the TP1 leg (the contracts it sells), EXCESS / MARGIN
 resize the legs to the size after it (placed first) - and goes out again under a new reduce id; when that does
 not fill, the legs go back for the whole position. Market orders wait for an OPEN session; a deferred close is retried on every pass
-(spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`). An entry skipped once is never sent later (never chase).
+(spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`). An entry skipped once is never sent later (never chase), and
+with `entry_deadline_s` none goes out later than that after its bar's close (checked right before the send).
 Client order ids are never reused: a trade rebuilt or taken over under the id of an earlier one goes on
 from the journal's highest bracket generation and close number. A position whose entry outcome is still
 unknown (our entry PENDING and its lookup failing) or whose fill cannot be read (our entry ACCEPTED, get_order
@@ -155,6 +156,7 @@ class Executor:
         poll_s: float = POLL_S,
         overlap_refusals: Iterable[str] = OVERLAP_REFUSALS,
         close_conflicts: Iterable[str] = CLOSE_CONFLICTS,
+        entry_deadline_s: float | None = None,
     ) -> None:
         self.ex = exchange
         self.journal = journal
@@ -168,6 +170,7 @@ class Executor:
         self.poll_s = poll_s
         self.overlap_refusals = frozenset(overlap_refusals)
         self.close_conflicts = frozenset(close_conflicts)
+        self.entry_deadline_s = entry_deadline_s  # an entry goes out at most this long after its bar's close
 
     # ------------------------------------------------------------------ state
     def trade(self) -> LiveTrade | None:
@@ -384,6 +387,10 @@ class Executor:
             return None  # skipped once (paused, a flip's close not confirmed, no quotes...): never sent later
         if ctx.ratio is None:
             self._skip(Skip(e.signal_ts, "no futures/spot quotes"))
+            return None
+        if self.entry_deadline_s is not None and self.clock() > e.signal_ts + 3600 + self.entry_deadline_s:
+            # checked right before the send: a flip's close and the brackets' wait come after the pass's own check
+            self._skip(Skip(e.signal_ts, f"봉 마감 후 {self.entry_deadline_s / 60:.0f}분이 지나 진입하지 않음"))
             return None
         lv = map_levels(e.direction, e.stop, e.tp1, e.tp2, ctx.ratio, ctx.tick)
         payload = {"signal_ts": e.signal_ts, "setup": e.setup, "direction": e.direction, "contracts": a.contracts,

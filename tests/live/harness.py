@@ -42,10 +42,12 @@ class Harness:
         self.rt = self.make_runtime()
 
     def make_runtime(self, **kw) -> LiveRuntime:
-        deps = LiveDeps(journal=self.journal, exchange=self.ex, lock=self.lock, fetch=self.fetch,
-                        cache_dir=self.tmp / "cache", notify=self.alerts, clock=self.clock, sleep=self.clock.sleep,
-                        commands=self.commands, **kw)
-        return LiveRuntime(deps)
+        """A runtime on this harness; the test clock drives the wall clock and the loop's cadence (`monotonic`,
+        replaceable through `kw` like every other dependency)."""
+        deps = {"journal": self.journal, "exchange": self.ex, "lock": self.lock, "fetch": self.fetch,
+                "cache_dir": self.tmp / "cache", "notify": self.alerts, "clock": self.clock, "sleep": self.clock.sleep,
+                "monotonic": self.clock, "commands": self.commands, **kw}
+        return LiveRuntime(LiveDeps(**deps))
 
     def price(self, spot: float) -> None:
         self.ex.set_prices(spot * self.ratio, spot)
