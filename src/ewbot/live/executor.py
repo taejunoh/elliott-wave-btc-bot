@@ -29,9 +29,12 @@ again below the market would sell at once what the leg already sold) - the next 
 
 Closes never cancel protection before the venue took the close: close_position goes out with the brackets
 resting (both only reduce); only a known close-conflict refusal (`CLOSE_CONFLICTS`: the venue refuses a
-close while brackets rest) cancels them - after a session read, deferring while it is not OPEN - and the
-close is sent again at once. The flat position is awaited (30 s; at once over when the IOC close ended
-without closing everything). After every close that did not go flat - failed or unconfirmed, this pass or a
+close while brackets rest; the watchdog's closes - a gapped stop, no resting stop - take any refusal for one:
+`any_refusal`) cancels them - after a session read, deferring while it is not OPEN - and the close is sent again
+once no bracket of ours rests (waiting up to CLEAR_TIMEOUT_S: a venue that queues cancels refuses a close sent
+beside them; still resting then, the close waits for the next pass - no resend, no new legs). The flat position is
+awaited (30 s; at once over when the IOC close ended without closing everything: then the trade no longer names
+that close as its exit). After every close that did not go flat - failed or unconfirmed, this pass or a
 later one - the legs are made the ones for the position left (resized, or placed again when none rests), so
 a failing close never leaves the position unprotected; an entry after a close (a flip) or a cancel waits
 until no bracket of ours rests, else it is skipped. Reductions (close_position
@@ -50,7 +53,8 @@ Client order ids are never reused: a trade rebuilt or taken over under the id of
 from the journal's highest bracket generation and close number. A position whose entry outcome is still
 unknown (our entry PENDING and its lookup failing) or whose fill cannot be read (our entry ACCEPTED, get_order
 failing) is protected at once with a provisional trade built from the entry's intent, settled as ours or
-foreign once the outcome is known; a foreign position without quotes
+foreign once the outcome is known - with a target, or without one (`unsettled_entry`: the planner takes a position
+on its side over from it); a foreign position without quotes
 is protected at the spot levels (ratio 1.0, approximate) and re-mapped at the first pass with quotes. At
 restart the trade's resting brackets are its legs again (no false UNPROTECTED).
 
@@ -98,6 +102,7 @@ FLAT_TIMEOUT_S = 30.0
 POLL_S = 0.5
 LOOKUP_WINDOW_S = 300.0  # find_order searches orders created up to 5 min before the intent
 ABANDON_AFTER_S = 600.0  # a PENDING intent not found on the exchange after 10 min was never sent
+UNSETTLED_ENTRY_MAX_S = 7200.0  # an accepted entry no trade records stops counting as unsettled this long after it
 LEG_SETTLE_S = 30.0  # a leg that left the book with fills is not placed again for this long (the position catches up)
 CLEAR_TIMEOUT_S = 5.0  # an entry after a close or a cancel waits this long for our brackets to leave the book
 TRADE_KEY = "trade"
@@ -234,6 +239,28 @@ class Executor:
                 closes = max(closes, int(tail))
         return gen, closes
 
+    def unsettled_entry(self, now: float) -> dict[str, Any] | None:
+        """Our latest entry (by when its intent was recorded) while its outcome or fill is still unknown and no trade
+        records it: PENDING, or ACCEPTED with no trade of its id recorded and its order not known to have ended with
+        nothing filled (ENTRY_UNFILLED `terminal`) - for at most UNSETTLED_ENTRY_MAX_S after it was sent. The runtime
+        polls fast and keeps the watchdog on while there is one, and without a target a position on its side is
+        taken over from it (`PlanContext.own_entry`). None otherwise."""
+        rows = self.journal.intents(kind="ENTRY")
+        if not rows:
+            return None
+        row = rows[-1]
+        if row["status"] == "PENDING":
+            return row
+        if row["status"] != "ACCEPTED" or not 0 <= now - float(row["created_ts"]) <= UNSETTLED_ENTRY_MAX_S:
+            return None
+        sig = int(row["payload"]["signal_ts"])
+        if self._recorded(sig):
+            return None
+        if any(int(e["data"].get("signal_ts") or 0) == sig and e["data"].get("terminal")
+               for e in self.journal.events(kind="ENTRY_UNFILLED", since=float(row["created_ts"]))):
+            return None
+        return row
+
     def _recorded(self, trade_id: int) -> bool:
         """A trade with this id was recorded once: it is the journal's trade, or it sent orders of its own."""
         t = self.trade()
@@ -308,22 +335,22 @@ class Executor:
         except ExchangeError as exc:
             self.event("CANCEL_FAILED", {"trade_id": trade_id, "order_ids": order_ids, "error": str(exc)[:200]})
 
-    def _await_flat(self, order_id: str | None) -> bool:
-        """True once the position is flat. False at the deadline - or at once when the IOC close ended without
-        filling all it was sent for (the venue cancelled the rest: the position stays). Read errors are retried
-        until the deadline."""
+    def _await_flat(self, order_id: str | None) -> str:
+        """FLAT once the position is flat; ENDED at once when the IOC close ended without filling all it was sent for
+        (the venue cancelled the rest: the position stays); TIMEOUT at the deadline (the close may still fill). Read
+        errors are retried until the deadline."""
         deadline = self.clock() + self.flat_timeout
         while True:
             try:
                 if self.ex.position() is None:
-                    return True
+                    return "FLAT"
                 o = self.ex.get_order(order_id) if order_id else None
                 if o is not None and o.is_terminal and o.filled < o.size:
-                    return False
+                    return "ENDED"
             except ExchangeError:
                 pass
             if self.clock() >= deadline:
-                return False
+                return "TIMEOUT"
             self.sleep(self.poll_s)
 
     # ------------------------------------------------------------------ actions
@@ -431,8 +458,10 @@ class Executor:
             self.event("ENTRY_UNCONFIRMED", {"signal_ts": e.signal_ts, "error": str(exc)[:200]},
                        f"[진입 미확인] {e.setup} {_side(e.direction)} {a.contracts}계약: 체결 조회 실패 - 다음 확인에서 보호")
             return None
-        if order.filled == 0:
-            self.event("ENTRY_UNFILLED", {"signal_ts": e.signal_ts}, f"[진입 미체결] {e.setup} {_side(e.direction)}")
+        if order.filled == 0:  # an order that has not ended may still fill: unsettled until it does (unsettled_entry)
+            self.event("ENTRY_UNFILLED", {"signal_ts": e.signal_ts, "order_id": order.order_id,
+                                          "terminal": order.is_terminal},
+                       f"[진입 미체결] {e.setup} {_side(e.direction)}")
             return None
         trade = self._trade_from(payload, order)
         self.save(trade)
@@ -845,7 +874,10 @@ class Executor:
                        f"[주문 오류] Protect: {str(exc)[:200]}")
 
     # exits -------------------------------------------------------------------
-    def close(self, reason: str, ctx: PlanContext) -> bool:
+    def close(self, reason: str, ctx: PlanContext, any_refusal: bool = False) -> bool:
+        """Close the whole position (module docstring). `any_refusal`: the watchdog's close (a gapped stop, no resting
+        stop) - any refusal is taken for a close conflict, since the resting brackets protect nothing any more: their
+        stop has triggered and gapped, or there is none."""
         trade = self.trade()
         if self.ex.position() is None:
             if trade is not None and trade.status == "OPEN":
@@ -864,7 +896,8 @@ class Executor:
         open_trade = trade if trade is not None and trade.status == "OPEN" else None
         tid = open_trade.trade_id if open_trade is not None else 0
         sent = self._send_close(open_trade, reason)  # the brackets keep protecting until the venue took the close
-        if _code(sent) in self.close_conflicts:  # refused while brackets rest: cancel them, then close at once
+        conflict = _code(sent) in self.close_conflicts or (any_refusal and sent.status == "REJECTED")
+        if conflict:  # refused while brackets rest: cancel them, then close once they left the book
             if not self._session_open():
                 self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
                 return False
@@ -872,6 +905,12 @@ class Executor:
             self.event("CLOSE_CONFLICT", {"trade_id": tid, "reason": reason, "error": sent.error, "cancel": ours})
             if ours:
                 self._cancel_quietly(ours, tid)
+            if not self._brackets_clear():  # a cancel still queued: a close sent now is refused again
+                self.event("CLOSE_FAILED", {"trade_id": tid, "reason": reason, "status": "WAITING",
+                                            "error": "our brackets still rest after their cancel: the close goes out "
+                                                     "again on the next pass"},
+                           f"[청산 대기 - 재시도 중] {reason}: 보호 주문 취소가 아직 끝나지 않음 (다음 확인에서 다시 청산)")
+                return False
             sent = self._send_close(open_trade, reason)
         if sent.status != "ACCEPTED":
             self.event("CLOSE_FAILED", {"trade_id": tid, "reason": reason, "status": sent.status, "error": sent.error},
@@ -882,8 +921,14 @@ class Executor:
             open_trade = self.trade() or open_trade
             open_trade.exit_reason = reason
             self.save(open_trade)
-        if not self._await_flat(sent.order_id):
-            self.event("CLOSE_UNCONFIRMED", {"trade_id": tid, "reason": reason}, f"[청산 미확인 - 재시도 중] {reason}")
+        state = self._await_flat(sent.order_id)
+        if state != "FLAT":
+            if state == "ENDED" and open_trade is not None:  # this close is over: a later flat is not its doing
+                current = self.trade() or open_trade
+                current.exit_reason = None
+                self.save(current)
+            self.event("CLOSE_UNCONFIRMED", {"trade_id": tid, "reason": reason, "order": state},
+                       f"[청산 미확인 - 재시도 중] {reason}")
             self._protect_left(ctx)
             return False
         if open_trade is not None:
@@ -959,7 +1004,10 @@ class Executor:
                          lambda: self.ex.close_position(cid, size))
         if _code(sent) in self.close_conflicts and self._session_open():
             return self._reduce_with_room(size, reason, sent, ctx)
-        return self._reduce_outcome(trade, sent, first=True)
+        filled = self._reduce_outcome(trade, sent, first=True)
+        if not filled and reason in ("EXCESS", "MARGIN"):  # the legs cover the whole position while the excess stays
+            self._protect_left(ctx)
+        return filled
 
     def _reduce_with_room(self, size: int, reason: str, refused: Sent, ctx: PlanContext) -> bool:
         """The venue refused the reduce because our brackets cover what it would close (its id sold nothing): make
@@ -1147,9 +1195,19 @@ class Executor:
                                            "after_entry_s": round(trade.protected_ts - trade.opened_ts, 3)})
         self.save(trade)
 
+    def _in_flight(self, trade_id: int, row: dict[str, Any]) -> bool:
+        """The accepted close `row` was still going when the process stopped: no outcome of a close of the trade
+        (CLOSE_UNCONFIRMED, CLOSE_FAILED, CLOSED) was recorded after it."""
+        since = float(row["created_ts"])
+        return not any(int(e["data"].get("trade_id") or 0) == trade_id
+                       for kind in ("CLOSE_UNCONFIRMED", "CLOSE_FAILED", "CLOSED")
+                       for e in self.journal.events(kind=kind, since=since))
+
     def recover(self) -> dict[str, int]:
         """At startup: resolve PENDING intents, record a close accepted right before a crash (the journal's open
-        trade, a flat position and an ACCEPTED close of that trade - its reason, not a bracket exit), rebuild the
+        trade, a flat position and an ACCEPTED close of that trade still in flight - nothing recorded after it -: its
+        reason, not a bracket exit; an earlier close that did not take the position flat is not what did: the flat
+        is then recorded as observe records it, the trade no longer naming that close), rebuild the
         trade from an accepted entry the journal did not get to record (only when no trade with that id was
         recorded), and take the open trade's resting brackets back as its legs (`_claim_legs`: a bracket accepted
         right before a crash). A read that fails is recorded (RECOVERY_ERROR, counted unknown) and the recovery
@@ -1164,12 +1222,15 @@ class Executor:
                 self._recovery_error(out, "position", exc)
             else:
                 mine = self.journal.intents(status="ACCEPTED", kind="CLOSE", trade_id=trade.trade_id)
-                if pos is None and mine:  # killed after our close was accepted: record it with its reason
-                    row = mine[-1]
+                if pos is None and mine and self._in_flight(trade.trade_id, mine[-1]):  # killed after our close was
+                    row = mine[-1]  # accepted: record it with its reason
                     trade.status, trade.exit_reason = "CLOSED", str(row["payload"].get("reason"))
                     self.save(trade)
                     self.event("CLOSED", {"trade_id": trade.trade_id, "reason": trade.exit_reason, "recovered": True,
                                           "order_id": row["order_id"], **self._fill_of(row["order_id"])})
+                elif pos is None and trade.exit_reason is not None:  # flat, but not by a close of ours in flight
+                    trade.exit_reason = None
+                    self.save(trade)
                 elif pos is not None:
                     self._claim_legs(trade, pos, orders)
         trade = self.trade()

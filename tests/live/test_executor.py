@@ -6,7 +6,7 @@ import math
 import pytest
 
 from ewbot.live.exchange import Order, PlaceResult, Position, RateLimited, Unavailable
-from ewbot.live.executor import Executor
+from ewbot.live.executor import CLOSE_CONFLICTS, UNSETTLED_ENTRY_MAX_S, Executor
 from ewbot.live.reconcile import (
     Adopt,
     Alert,
@@ -1134,3 +1134,179 @@ def test_a_tp1_sync_never_cancels_the_tp1_leg_when_that_would_not_make_the_room(
     assert "cancel" not in ex.calls and ex.position().contracts == 3
     assert [(n, tp) for n, tp, _ in resting(ex) if n] == [(1, 61_000.0), (1, 62_000.0), (2, 62_000.0)]
     assert jr.events(kind="REDUCE_CONFLICT") and not exe.trade().tp1_filled
+
+
+def unknown_conflict(ex, code: str = "INVALID_CLOSE_POSITION_REQUEST") -> None:
+    """The venue refuses close_position while a bracket of ours rests, with a code CLOSE_CONFLICTS does not know."""
+    real = ex.close_position
+
+    def call(cid, size=None):
+        if any(o.kind == "BRACKET" for o in ex.open_orders()):
+            ex.calls.append("close_position")
+            return PlaceResult(cid, None, False, f"{code}: brackets rest")
+        return real(cid, size)
+
+    ex.close_position = call
+
+
+def test_a_watchdog_close_takes_any_refusal_for_a_conflict(env):
+    """Final review A-C: a gapped stop's close refused with a code the executor does not know would be retried every
+    10 s forever while the triggered stop's limit never fills. A watchdog close (`any_refusal`) reads the session,
+    cancels our brackets and sends the close again; a planned close keeps its brackets on such a refusal."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    unknown_conflict(ex)
+    assert exe.close("TIME", ctx(clock)) is False and "cancel" not in ex.calls  # not a known conflict: kept
+    assert exe.close("STOP_GAP", ctx(clock), any_refusal=True) is True and ex.position() is None
+    conflict = jr.events(kind="CLOSE_CONFLICT")[0]["data"]
+    assert conflict["reason"] == "STOP_GAP" and conflict["error"].startswith("INVALID_CLOSE_POSITION_REQUEST")
+    assert exe.trade().exit_reason == "STOP_GAP"
+
+
+def test_the_extra_refusal_codes_are_merged_with_the_built_in_ones(tmp_path):
+    clock = Clock()
+    ex = sim(clock)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep, close_conflicts=CLOSE_CONFLICTS | {"BRACKETS_REST"})
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    unknown_conflict(ex, "BRACKETS_REST")
+    assert exe.close("TIME", ctx(clock)) is True and ex.position() is None
+    assert "OPEN_BRACKET_ORDERS" in exe.close_conflicts
+    jr.close()
+
+
+def queued_cancels(ex, clock: Clock, delay: float) -> None:
+    """Cancels are queued: a cancelled order still rests (CANCEL_QUEUED) for `delay` seconds, then it is gone."""
+    real_cancel, real_open, leaving = ex.cancel, ex.open_orders, {}
+
+    def cancel(order_ids):
+        ex.calls.append("cancel")
+        for oid in order_ids:
+            leaving.setdefault(oid, clock())
+
+    def open_orders():
+        out = []
+        for o in real_open():
+            since = leaving.get(o.order_id)
+            if since is None:
+                out.append(o)
+            elif clock() - since < delay:
+                out.append(dataclasses.replace(o, status="CANCEL_QUEUED"))
+            else:
+                real_cancel([o.order_id])
+        return out
+
+    ex.cancel, ex.open_orders = cancel, open_orders
+
+
+def test_after_a_conflict_cancel_the_close_waits_for_the_brackets_to_leave(env):
+    """Final review A minor 4: on a venue that queues cancels the close was sent again at once, refused again, and the
+    legs placed again - every pass, the exit never done. The close now goes out again only once no bracket of ours
+    rests (waiting up to CLEAR_TIMEOUT_S); still resting then: no resend and no new legs this pass (the next pass
+    closes)."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    bracket_conflict(ex)
+    queued_cancels(ex, clock, delay=3.0)
+    assert exe.close("TIME", ctx(clock)) is True and ex.position() is None
+    assert ex.calls.count("close_position") == 2 and ex.calls.count("place_bracket") == 1
+
+
+def test_brackets_that_have_not_left_by_the_deadline_hold_the_close_until_the_next_pass(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    bracket_conflict(ex)
+    queued_cancels(ex, clock, delay=8.0)
+    assert exe.close("TIME", ctx(clock)) is False
+    assert ex.calls.count("close_position") == 1 and ex.calls.count("place_bracket") == 1  # no resend, no new legs
+    failed = jr.events(kind="CLOSE_FAILED")[-1]["data"]
+    assert failed["status"] == "WAITING" and "still rest" in failed["error"]
+    clock.now += 10
+    assert exe.close("TIME", ctx(clock)) is True and ex.position() is None
+
+
+def test_a_failed_excess_reduce_leaves_the_whole_position_covered(env):
+    """Final review A minor 1: contracts bought by hand are reduced at market; while that reduce is refused (a code
+    that is no close conflict) the legs cover the whole position - brackets only reduce - not only the trade's."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    ex.place_market("manual-1", 1, 1)
+    real = ex.close_position
+
+    def refuse_sized(cid, size=None):
+        if size is not None:
+            ex.calls.append("close_position")
+            return PlaceResult(cid, None, False, "INVALID_CLOSE_SIZE")
+        return real(cid, size)
+
+    ex.close_position = refuse_sized
+    for _ in range(3):
+        clock.now += 10
+        poll(exe, ex, clock, target(T0 + 3600, position()))
+        assert ex.position().contracts == 2 and sum(o.size - o.filled for o in ex.open_orders()) == 2
+    assert len(jr.events(kind="REDUCE_FAILED")) == 3 and exe.trade().contracts == 1
+
+
+def test_recovery_records_the_close_only_when_it_was_still_in_flight(tmp_path):
+    """Final review A minor 6: a close accepted earlier that did not take the position flat (CLOSE_UNCONFIRMED after it)
+    is not what flattened it when the restart finds it flat - a later bracket exit was. Only the close in flight at the
+    crash (no outcome recorded after it) is recorded with its reason."""
+    clock = Clock()
+    ex = sim(clock)
+    jr = journal(tmp_path)
+    exe = Executor(ex, jr, clock=clock, sleep=clock.sleep)
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    cid = f"ewb-x-{T0}-1"
+    jr.record_intent(cid, "CLOSE", T0, {"reason": "TIME"}, clock())
+    jr.update_intent(cid, "ACCEPTED", clock(), order_id="sim-gone")
+    tr = exe.trade()
+    tr.exit_reason, tr.closes = "TIME", 1
+    exe.save(tr)
+    jr.add_event(clock() + 1, "CLOSE_UNCONFIRMED", {"trade_id": T0, "reason": "TIME"})
+    clock.now += 600
+    ex.set_prices(58_000.0)  # later the stop fills: flat
+    assert ex.position() is None
+    jr.close()
+    jr2 = journal(tmp_path)
+    exe2 = Executor(ex, jr2, clock=clock, sleep=clock.sleep)
+    exe2.recover()
+    seen, events = observe(exe2.trade(), ex.position(), ex.open_orders(), clock())
+    assert (seen.status, seen.exit_reason) == ("CLOSED", "BRACKET") and events[0][0] == "CLOSED"
+    jr2.close()
+
+
+def test_a_close_whose_order_ended_unfilled_is_no_exit_reason_for_later(env):
+    """The IOC close ended without closing the position (CLOSE_UNCONFIRMED): the position going flat later is not
+    that close - the trade's recorded exit reason is cleared, so observe records the bracket exit."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    ex.market_fill_ratio = 0.0
+    assert exe.close("TIME", ctx(clock)) is False and jr.events(kind="CLOSE_UNCONFIRMED")
+    assert exe.trade().exit_reason is None and ex.position() is not None
+    ex.set_prices(58_000.0)
+    seen, _ = observe(exe.trade(), ex.position(), ex.open_orders(), clock())
+    assert (seen.status, seen.exit_reason) == ("CLOSED", "BRACKET")
+
+
+def test_an_accepted_entry_without_a_trade_stays_unsettled_until_its_outcome_is_known(env):
+    """Final review A-B: our entry accepted and its fill unread (ENTRY_UNCONFIRMED) - or not filled while its order
+    still rests - is unsettled: the runtime polls fast and, without a target, protects a position on its side from it.
+    It is settled once a trade records it, once its order ended with nothing filled, or UNSETTLED_ENTRY_MAX_S after it
+    was sent."""
+    clock, ex, jr, _, exe = env
+    ex.fail_next("get_order", Unavailable("503"), times=40)
+    assert exe.enter(Enter(entry(), 1), ctx(clock)) is None and jr.events(kind="ENTRY_UNCONFIRMED")
+    row = exe.unsettled_entry(clock())
+    assert row is not None and row["client_order_id"] == f"ewb-e-{T0}-L" and row["status"] == "ACCEPTED"
+    assert exe.unsettled_entry(row["created_ts"] + UNSETTLED_ENTRY_MAX_S + 1) is None
+    clock.now += 10
+    poll(exe, ex, clock, target(T0 + 3600, ent=entry()))  # protected (provisional): a trade records it
+    assert exe.trade().trade_id == T0 and exe.unsettled_entry(clock()) is None
+
+
+def test_an_entry_that_ended_unfilled_is_settled(env):
+    clock, ex, jr, _, exe = env
+    ex.market_fill_ratio = 0.0
+    assert exe.enter(Enter(entry(), 1), ctx(clock)) is None
+    assert jr.events(kind="ENTRY_UNFILLED")[0]["data"]["terminal"] is True
+    assert exe.unsettled_entry(clock()) is None

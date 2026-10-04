@@ -3,7 +3,10 @@
 State of the one live trade (`LiveTrade`, persisted by the executor in the journal) is compared with
 the engine's target (live/target.py) and the exchange's position and open orders:
 
-  1. `observe` folds exchange facts into the trade: flat -> CLOSED; a reduce of ours that the executor
+  1. `observe` folds exchange facts into the trade: flat -> CLOSED (but a flat read while every leg of the trade
+     still rests with all the trade holds - nothing of them filled, so no bracket explains it - is unconfirmed,
+     FLAT_UNCONFIRMED: the trade stays OPEN, nothing is cancelled or entered, and the next read decides: flat again
+     -> CLOSED, the position again -> it was a wrong read); a reduce of ours that the executor
      recorded before sending it (`pending_reduce`, intent before state) and that now shows in the position
      is ours whatever its answer was (REDUCE_SETTLED: TP1_SYNC -> the live TP1, MARGIN -> a smaller trade;
      a filled reduce the position still does not show after REDUCE_SETTLE_S yields to the position,
@@ -17,10 +20,14 @@ the engine's target (live/target.py) and the exchange's position and open orders
   2. `plan` returns the actions, in order:
        - a position the journal does not know: adopt it when the engine holds the same direction (at
          most the stage maximum `ctx.max_contracts`, the rest is reduced: EXCESS), else close it
-         (spec 4.4: the actual position always follows the target);
+         (spec 4.4: the actual position always follows the target); without a target it is alerted and - on the
+         side of our latest entry whose outcome or fill is still unknown and no trade records (`ctx.own_entry`, the
+         engine position its intent opens: `entry_position`) - taken over from that entry at once (the executor
+         settles it as ours or foreign), never left unprotected until a target comes;
        - within the hour after an entry the replay still shows it as queued (`target.entry`): the live
          trade of that signal is the engine position (`pending_position`), never a reason to close;
-       - flat: cancel our leftover orders; enter when the engine queued an entry at the last close
+       - flat: nothing while the trade is still OPEN (its flat read is unconfirmed: observe); else cancel our
+         leftover orders; enter when the engine queued an entry at the last close
          (never a signal the live trade already traded: closed early by its bracket, it is not
          re-entered);
        - engine flat / another trade / exit queued (TIME, LINEAGE, BREAKER, FLIP, ...): close, then
@@ -123,6 +130,7 @@ class LiveTrade:
     # "reason", "before" (position contracts when sent), "ts", "after" (`after_reduce`: the trade's size fields
     # once done), "filled" (contracts the venue reported filled; None while the outcome is unknown)}
     pending_reduce: dict[str, Any] | None = None
+    flat_seen: float | None = None  # a flat read that its resting legs contradict (observe): the next read decides
 
     def to_json(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -198,6 +206,10 @@ class PlanContext:
     entry_block: str | None = None  # why no entry may be sent now (paused, session, margin, stale, size)
     max_contracts: int | None = None  # stage maximum for a position taken over (None: no cap)
     price: float | None = None  # futures mid now, read with `ratio` (None: quotes unavailable): the break-even stop
+    # our latest entry whose outcome or fill is still unknown and that no trade records, as the engine position its
+    # intent opens (`entry_position`; the runtime: Executor.unsettled_entry): without a target a position on its side
+    # is taken over from it
+    own_entry: TargetPosition | None = None
 
     def __post_init__(self) -> None:
         if self.max_contracts is not None and self.max_contracts < 1:
@@ -284,6 +296,14 @@ def _fold_reduction(t: LiveTrade, n: int, orders: list[Order]) -> tuple[str, dic
     return "UNEXPLAINED_REDUCTION", {"trade_id": t.trade_id, "expected": expected, "position": n}
 
 
+def _legs_whole(trade: LiveTrade, orders: list[Order]) -> bool:
+    """Every leg of the trade still rests, and together they still hold all the trade holds: nothing of them filled
+    (a flat position is then explained by no bracket of ours)."""
+    resting = _open_legs(trade, orders)
+    return (bool(trade.legs) and len(resting) == len(trade.legs)
+            and sum(o.size - o.filled for _, o in resting) >= expected_contracts(trade))
+
+
 def observe(trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float
             ) -> tuple[LiveTrade | None, list[tuple[str, dict[str, Any]]]]:
     """Fold exchange facts into the trade (a modified copy) and return the events they raise."""
@@ -292,11 +312,16 @@ def observe(trade: LiveTrade | None, position: Position | None, orders: list[Ord
     t = LiveTrade.from_json(trade.to_json())
     events: list[tuple[str, dict[str, Any]]] = []
     if position is None:
+        if t.flat_seen is None and _legs_whole(t, orders):  # one flat read the legs contradict: the next decides
+            t.flat_seen = now
+            events.append(("FLAT_UNCONFIRMED", {"trade_id": t.trade_id}))
+            return t, events
         t.status = "CLOSED"
         t.exit_reason = t.exit_reason or "BRACKET"
         t.unprotected_since = None
         events.append(("CLOSED", {"trade_id": t.trade_id, "reason": t.exit_reason}))
         return t, events
+    t.flat_seen = None  # the position is there: an earlier flat read was wrong
     if position.side != t.direction:
         return t, events  # plan() closes a position on the wrong side
     pr = t.pending_reduce
@@ -408,6 +433,20 @@ def pending_position(e: TargetEntry) -> TargetPosition:
                           contracts=e.contracts, remaining=e.contracts)
 
 
+def entry_position(payload: dict[str, Any]) -> TargetPosition:
+    """The engine position an entry intent of ours opens (its payload, executor.enter: the engine's spot levels, the
+    size sent, the reference mapped with `ratio`): what a position on its side is taken over from while its outcome is
+    unknown and no target says more (`PlanContext.own_entry`)."""
+    sig, ratio = int(payload["signal_ts"]), float(payload.get("ratio") or 1.0)
+    n = int(payload["contracts"])
+    ref = float(payload.get("ref") or payload["stop"])
+    stop = float(payload["stop_spot"])
+    return TargetPosition(trade_key=sig + 3600, signal_ts=sig, setup=str(payload["setup"]),
+                          direction=int(payload["direction"]), entry_price=ref / ratio, stop=stop, stop0=stop,
+                          tp1=float(payload["tp1_spot"]), tp2=None if payload.get("tp2_spot") is None
+                          else float(payload["tp2_spot"]), tp1_done=False, contracts=n, remaining=n)
+
+
 def engine_position(target: Target) -> TargetPosition | None:
     """The engine's position for the hour after the target bar: the open one, unless an exit is queued or
     the halt bar crossed its stop, else the one a queued entry opens."""
@@ -465,6 +504,8 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
         return [Enter(e, ctx.entry_contracts)]
 
     if position is None:
+        if open_trade is not None:  # its flat read is unconfirmed (observe): nothing cancelled or entered until the next
+            return acts
         if ours:
             acts.append(Cancel(tuple(o.order_id for o in ours), "FLAT"))
         return acts + entry_actions()
@@ -472,8 +513,14 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
     n = position.contracts
     if open_trade is None:  # a position the journal does not know
         if target is None:
-            return acts + [Alert("UNKNOWN_POSITION", f"{position.side:+d} x{n}: waiting for a target")]
-        held = engine_position(target)
+            own = ctx.own_entry
+            if own is None or own.direction != position.side:
+                return acts + [Alert("UNKNOWN_POSITION", f"{position.side:+d} x{n}: waiting for a target")]
+            acts.append(Alert("UNKNOWN_POSITION", f"{position.side:+d} x{n}: no target - protected from our entry "
+                                                  f"{own.signal_ts} until its outcome is known"))
+            held: TargetPosition | None = own
+        else:
+            held = engine_position(target)
         if held is None or held.direction != position.side:
             return acts + [Close("UNKNOWN_POSITION")]
         take = n if ctx.max_contracts is None else min(n, ctx.max_contracts)

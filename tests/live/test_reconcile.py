@@ -24,6 +24,7 @@ from ewbot.live.reconcile import (
     desired_legs,
     engine_position,
     entry_cid,
+    entry_position,
     expected_contracts,
     observe,
     plan,
@@ -474,3 +475,55 @@ def test_a_vanished_tp1_leg_is_never_synced_at_market():
     assert plan(eng, tr, stale, half, CTX)[0] == Reduce(1, "TP1_SYNC")  # only what the leg has left
     later, ev = observe(seen, Position(1, 3, 60_020.0), gone, now=110.0)  # the fill shows: the live TP1
     assert [k for k, _ in ev] == ["TP1_FILLED", "PROTECTED"] and expected_contracts(later) == 3
+
+
+def own_entry(**kw) -> TargetPosition:
+    """Our entry intent's payload as the engine position it would be (the runtime: Executor.unsettled_entry)."""
+    payload = {"signal_ts": T, "setup": "W3", "direction": 1, "contracts": 1, "stop_spot": 59_000.0, "tp1_spot": 61_000.0,
+               "tp2_spot": 62_000.0, "stop": 59_025.0, "tp1": 61_030.0, "tp2": 62_030.0, "ratio": 1.0005,
+               "ref": 60_040.0, **kw}
+    return entry_position(payload)
+
+
+def test_an_entry_intent_reads_as_the_engine_position_it_opens():
+    p = own_entry()
+    assert (p.signal_ts, p.trade_key, p.setup, p.direction, p.stop, p.stop0, p.tp1, p.tp2) == (
+        T, T + 3600, "W3", 1, 59_000.0, 59_000.0, 61_000.0, 62_000.0)
+    assert p.entry_price == pytest.approx(60_040.0 / 1.0005) and (p.contracts, p.remaining, p.tp1_done) == (1, 1, False)
+
+
+def test_without_a_target_a_position_on_the_side_of_our_unsettled_entry_is_protected_from_it():
+    """Final review A-A: killed after the venue took our entry, restarted while the hour has no target (the candles
+    cannot be had): the position is taken over from the entry's own intent at once (the executor settles it as ours
+    or foreign) - still alerted as an unknown position - instead of waiting up to an hour unprotected."""
+    own = own_entry()
+    pos = Position(1, 1, 60_000.0)
+    with_own = dataclasses.replace(CTX, own_entry=own)
+    acts = plan(None, None, pos, [], with_own)
+    assert acts == [Alert("UNKNOWN_POSITION", "+1 x1: no target - protected from our entry "
+                                              f"{T} until its outcome is known"), Adopt(own, 1)]
+    waiting = [Alert("UNKNOWN_POSITION", "+1 x1: waiting for a target")]
+    assert plan(None, None, pos, [], CTX) == waiting  # no unsettled entry of ours
+    assert plan(None, None, Position(-1, 1, 60_000.0), [], with_own) == [
+        Alert("UNKNOWN_POSITION", "-1 x1: waiting for a target")]  # the other side: not our entry
+    capped = dataclasses.replace(with_own, max_contracts=1)
+    acts = plan(None, None, Position(1, 3, 60_000.0), [], capped)
+    assert acts[-2:] == [Adopt(own, 1), Reduce(2, "EXCESS")] and acts[1].kind == "EXCESS_POSITION"
+    assert plan(target(position=tpos(direction=-1)), None, pos, [], with_own) == [Close("UNKNOWN_POSITION")]  # a target rules
+
+
+def test_a_flat_read_while_the_legs_still_rest_whole_needs_a_second_read():
+    """Final review A-D: the position reads flat while every leg of the trade still rests with all the trade holds
+    - nothing of them filled. No bracket explains that: one wrong read must not close the trade's record, cancel its
+    brackets or open the next entry on top of a real position. The next read decides (flat again: CLOSED)."""
+    tr = trade()
+    t1, ev = observe(tr, None, resting(tr), now=100.0)
+    assert (t1.status, t1.flat_seen) == ("OPEN", 100.0) and ev == [("FLAT_UNCONFIRMED", {"trade_id": T})]
+    assert plan(target(position=tpos(), entry=tentry()), t1, None, resting(tr), CTX) == []  # no cancel, no entry
+    t2, ev = observe(t1, None, resting(tr), now=110.0)
+    assert (t2.status, t2.exit_reason) == ("CLOSED", "BRACKET") and ev[0][0] == "CLOSED"
+    t3, ev = observe(t1, Position(1, 3, 60_020.0), resting(tr), now=110.0)  # the position again: a wrong read
+    assert (t3.status, t3.flat_seen) == ("OPEN", None) and ev == []
+    for orders in (resting(tr, tp1={"filled": 1}), resting(tr)[1:], []):  # a leg filled or gone: flat at once
+        t4, ev = observe(tr, None, orders, now=100.0)
+        assert t4.status == "CLOSED" and ev[0][0] == "CLOSED"
