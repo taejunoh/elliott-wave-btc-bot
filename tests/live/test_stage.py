@@ -15,6 +15,7 @@ from ewbot.live.pricing import stage_contracts
 from ewbot.live.stage import (
     CANARY_FAIL,
     ORDER_FAILURES,
+    RAISED_KEY,
     Gate,
     StageError,
     canary_entry_gates,
@@ -25,7 +26,7 @@ from ewbot.live.stage import (
     on_incident,
     pause,
     paused,
-    restart_canary,
+    restart_stint,
     resume,
     shadow_gates,
     transition,
@@ -137,10 +138,12 @@ def test_a_ledger_that_is_not_a_valid_paper_ledger_is_an_audit_error():
     }
     live = [dec("TRAIL", 10800, 7200, 3.0)]
     for name, bad in cases.items():
-        with pytest.raises(AuditError):
+        with pytest.raises(AuditError, match="paper ledger"):
             audit(live, bad, now=NOW)
             pytest.fail(name)
     assert audit(live, good_ledger, now=NOW).ok
+    with pytest.raises(AuditError, match="live journal"):  # our own journal is malformed: said so
+        audit([{k: v for k, v in live[0].items() if k != "levels"}], good_ledger, now=NOW)
 
 
 class Resp:
@@ -270,6 +273,28 @@ def test_the_signal_and_cycle_gates_count_the_stage_itself(tmp_path):
     last = int(now) - H1  # closes at `now`
     jr.start_cycle(last, now + 30, "SHADOW")
     assert gate(CYCLE_GATE, now + 60).met and not gate(CYCLE_GATE, now + 200).met
+    jr.close()
+
+
+def test_a_closure_excuses_only_missing_cycles_and_ends_at_the_next_record(tmp_path):
+    jr = journal(tmp_path)
+    jr.set_stage("SHADOW", "initial", S0)
+    now = S0 + 2 * DAY
+
+    def gate() -> tuple[bool, str]:
+        g = {g.name: g for g in shadow_gates(jr, now, good(now))}[CYCLE_GATE]
+        return g.met, g.detail
+
+    down = range(int(S0) + 10 * H1, int(S0) + 40 * H1, H1)  # 30 hours without a cycle
+    hourly(jr, S0, now, skip=tuple(down))
+    jr.add_event(S0 + 10 * H1 + 60, "SESSION", {"text": "장 운영 상태 OPEN → CLOSE", "state": "CLOSE"})
+    assert gate() == (False, "18/44봉 (장 휴장 제외 4봉)")  # its reopen was never recorded: at most 4 h
+    jr.add_event(S0 + 11 * H1 + 600, "STARTUP", {"stage": "SHADOW"})  # a start ends it as well
+    assert gate() == (False, "18/47봉 (장 휴장 제외 1봉)")
+    bar = int(S0) + 10 * H1  # a cycle that ran during the closure and failed is no excuse
+    jr.start_cycle(bar, bar + H1 + 30, "SHADOW")
+    jr.finish_cycle(bar, bar + H1 + 40, "ERROR")
+    assert gate() == (False, "18/48봉")
     jr.close()
 
 
@@ -414,8 +439,8 @@ def test_a_failed_canary_stint_can_be_restarted_and_its_gates_count_from_then(tm
     assert not all(g.met for g in full_entry_gates(jr, now, audit_now, PAPER_ALL, KEY))  # without a restart: blocked
     for kw in ({"confirm": False, "flat": True}, {"confirm": True, "flat": False}):
         with pytest.raises(StageError):
-            restart_canary(jr, now, **kw)
-    restart_canary(jr, now, confirm=True, flat=True)
+            restart_stint(jr, "CANARY", now, **kw)
+    restart_stint(jr, "CANARY", now, confirm=True, flat=True)
     assert jr.stage() == ("CANARY", now) and jr.events(kind="STAGE")[-1]["data"] == {
         "from": "CANARY", "to": "CANARY", "reason": "restart"}
     resume(jr, now + 1)  # the pause is the user's to lift, as always
@@ -434,8 +459,40 @@ def test_a_failed_canary_stint_can_be_restarted_and_its_gates_count_from_then(tm
     audit_bad = dataclasses.replace(audit_later, mismatches=(before, after))
     assert not all(g.met for g in full_entry_gates(jr, later, audit_bad, PAPER_ALL, KEY))
     jr.set_stage("FULL", "test", later)
-    with pytest.raises(StageError, match="only a CANARY stint"):
-        restart_canary(jr, later + 1, confirm=True, flat=True)
+    with pytest.raises(StageError, match="only the current stage"):
+        restart_stint(jr, "CANARY", later + 1, confirm=True, flat=True)
+    with pytest.raises(StageError, match="only a SHADOW or CANARY stint"):
+        restart_stint(jr, "FULL", later + 1, confirm=True, flat=True)
+    jr.close()
+
+
+def test_a_failed_shadow_stint_can_be_restarted_and_its_gates_count_from_then(tmp_path):
+    jr, now = shadow_journal(tmp_path)
+    jr.add_event(S0 + 9000, "PREVIEW", {"ok": False, "errors": ["PREVIEW_INSUFFICIENT_FUND"]})
+    before = {"id": f"TRAIL:{int(S0) + 3600}:3600", "type": "DIFFERENT", "cause": "UNEXPLAINED",
+              "known_at": int(S0) + 3600}
+
+    def mismatched(at: float) -> AuditResult:
+        return AuditResult((0, int(at) // H1 * H1 - 2 * H1), 30, 29, (before,), at - 600)
+
+    met = {g.name: g.met for g in shadow_gates(jr, now, mismatched(now))}
+    assert not met[AUDIT_GATE] and not met["③ 냈을 주문 전부 preview 통과"]  # this stint cannot pass any more
+    with pytest.raises(StageError, match="flat"):
+        restart_stint(jr, "SHADOW", now, confirm=True, flat=False)
+    with pytest.raises(StageError, match="only the current stage"):
+        restart_stint(jr, "CANARY", now, confirm=True, flat=True)
+    restart_stint(jr, "SHADOW", now, confirm=True, flat=True)  # spec 6.2: fix, then SHADOW again
+    assert jr.stage() == ("SHADOW", now) and jr.events(kind="STAGE")[-1]["data"] == {
+        "from": "SHADOW", "to": "SHADOW", "reason": "restart"}
+    later = now + 15 * DAY  # the new stint's own 14 days, signal, cycles, previews and restarts
+    hourly(jr, now, later)
+    jr.add_event(now + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    jr.add_event(now + 5 * DAY, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    jr.add_decisions([dec("SIGNAL", int(now) + 7200, int(now) + 7200)], now=now + 10_900)
+    jr.add_event(now + 10_900, "PREVIEW", {"ok": True, "errors": []})
+    gates = shadow_gates(jr, later, mismatched(later))
+    assert all(g.met for g in gates), gate_lines(gates)  # the old stint's mismatch and preview are not counted
+    assert "단계 시작 전 불일치 1건 제외" in {g.name: g.detail for g in gates}[AUDIT_GATE]
     jr.close()
 
 
@@ -459,11 +516,17 @@ def test_the_cap_is_the_journal_stages_and_lifts_only_after_30_clean_days_of_ful
     assert full_cap(jr, S0 + 84 * DAY) == 3 and full_cap(jr, S0 + 85 * DAY) is None
     kw = dict(equity=200_000.0, entry=60_000.0, stop=59_400.0, direction=1, risk_mult=1.0, cfg=BotConfig())
     assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY), **kw)[0] == 303  # released: uncapped
+    # a manual intervention the runtime still finds (a foreign order left resting) keeps the cap while it lasts,
+    # and the 30 clean days count from its end
+    jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "ended": None, "stint": S0 + 5})
+    assert full_cap(jr, S0 + 150 * DAY) == 3
+    jr.put(RAISED_KEY, {"items": [], "ended": S0 + 151 * DAY, "stint": S0 + 5})
+    assert full_cap(jr, S0 + 180 * DAY) == 3 and full_cap(jr, S0 + 181 * DAY) is None
     # a major incident demotes in the journal while the FULL process still runs: the cap is CANARY's at once
-    assert on_incident(jr, "UNPROTECTED_60S", S0 + 86 * DAY) == ["paused", "demoted to CANARY"]
-    resume(jr, S0 + 86 * DAY + 1)
-    assert full_cap(jr, S0 + 86 * DAY + 2) == 1
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY + 2), **kw)[0] == 1
+    assert on_incident(jr, "UNPROTECTED_60S", S0 + 186 * DAY) == ["paused", "demoted to CANARY"]
+    resume(jr, S0 + 186 * DAY + 1)
+    assert full_cap(jr, S0 + 186 * DAY + 2) == 1
+    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 186 * DAY + 2), **kw)[0] == 1
     assert jr.events(kind="STAGE")[-1]["data"] == {"from": "FULL", "to": "CANARY",
                                                    "reason": "major incident UNPROTECTED_60S"}
     jr.close()

@@ -15,9 +15,10 @@ resolved in time is no CANARY failure). In CANARY each one pauses entries (`on_i
 FULL entry gates are unmet after any of them in the current CANARY stint, while the runtime is paused and
 without a current passing audit. In FULL the major incidents pause and demote to CANARY, and every CANARY
 failure restarts the 30-day clean window of the 3-contract cap (spec 6.2 FULL `이상이 없으면 상한을 해제`).
-After a CANARY failure the user may restart the CANARY stint (`restart_canary`: flat, --confirm; spec 6.2
-`재개는 사용자가 결정한다`) instead of going back to SHADOW: every CANARY gate then counts from the restart - trades,
-days, failures and the audit's mismatches; without it the failed stint keeps FULL closed.
+A failed stint is started again with `restart_stint` (flat, --confirm, a STAGE event `restart`): SHADOW after a
+fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY after a CANARY failure (spec 6.2 `재개는 사용자가 결정한다`,
+no SHADOW again). Every gate of that stage then counts from the restart - days, signals, cycles, previews,
+restarts, trades, failures and the audit's mismatches; without a restart a failed stint keeps the promotion closed.
 
 Gates (spec 6.2), all computed from the journal. Times are the journal's (the VPS clock, NTP-synchronised): a
 clock step moves every window with it.
@@ -25,9 +26,10 @@ clock step moves every window with it.
                 audit from at or before the stage's start to at most AUDIT_MAX_AGE_S ago, with no mismatch the
                 data do not explain: a DATA_REVISION is shown, not counted);
                 (2) every hourly bar that closed in the stage has a cycle that ended OK within 2 min of the
-                close (a bar while the futures session was recorded closed is excused when it has none; a
-                cycle not yet past its deadline is not due); (3) every would-be order passed preview; (4)
-                restart test: at least one restart recovered with no unresolved intent.
+                close (a bar with no cycle row at all while the futures session was recorded closed is excused:
+                a span from a SESSION event whose state is not OPEN to the next SESSION or STARTUP event, at most
+                SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due); (3) every would-be order
+                passed preview; (4) restart test: at least one restart recovered with no unresolved intent.
   CANARY start  SHADOW pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission.
   CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
                 closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
@@ -58,7 +60,13 @@ CANARY_MIN_TRADES = 3
 CANARY_MAX_DAYS = 90
 PROTECT_MAX_S = 30.0
 AUDIT_MAX_AGE_S = 3 * 3600  # a gate's audit must reach a bar that closed at most this long ago
+# the longest closure spec 2 documents (the quarterly 3-hour maintenance; the weekly CFM halt is 1 hour) plus 1 hour:
+# a closure whose reopen was never recorded excuses no more than this
+SESSION_CLOSED_MAX_S = 4 * 3600
 PAUSE_KEY = "paused"
+# the manual interventions the runtime's planner still finds, one per (kind, trade id) episode (live/runtime.py):
+# {"items": [[kind, trade id], ...], "ended": when the last of them ended (None: never), "stint": their stage row}
+RAISED_KEY = "incidents_raised"
 MAJOR = ("UNPROTECTED_60S", "AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY")  # spec 6.2 중대 사건
 # the position changed outside our orders: a foreign order or position, more contracts than the trade holds,
 # fewer than its legs explain (reconcile.observe), the trade's position on the other side (brackets and closes only
@@ -152,13 +160,18 @@ def canary_failures(journal: Journal, since: float) -> dict[str, tuple[int, floa
 def full_cap(journal: Journal, now: float) -> int | None:
     """The most contracts the journal's current stage allows - never more than the stage that is in force:
     SHADOW 0 (no real order), CANARY 1, FULL FULL_CAP_CONTRACTS until it has run FULL_CAP_DAYS without a CANARY
-    failure (each one restarts the window, counted from the journal's event times), None (uncapped) only then."""
+    failure (each one restarts the window, counted from the journal's event times) and with no manual intervention
+    still in force (RAISED_KEY; the window then counts from its end), None (uncapped) only then."""
     stage, since = journal.stage()
     if stage == "CANARY":
         return 1
     if stage != "FULL" or since is None:
         return 0
-    clean_from = max([float(since)] + [last for _, last in canary_failures(journal, float(since)).values()])
+    raised = journal.get(RAISED_KEY) or {}
+    if raised.get("items"):
+        return FULL_CAP_CONTRACTS
+    ended = [float(raised["ended"])] if raised.get("ended") is not None and float(raised["ended"]) >= float(since) else []
+    clean_from = max([float(since)] + ended + [last for _, last in canary_failures(journal, float(since)).values()])
     return None if now - clean_from >= FULL_CAP_DAYS * DAY else FULL_CAP_CONTRACTS
 
 
@@ -189,6 +202,12 @@ def _since(journal: Journal, stage: str) -> float | None:
     return float(hist[-1]["ts"])
 
 
+def _restarted(journal: Journal) -> bool:
+    """The current stint began with `restart_stint`."""
+    hist = journal.stage_history()
+    return bool(hist) and hist[-1]["reason"] == "restart"
+
+
 def audit_gate(name: str, res: AuditResult | None, since: float, now: float, after: float | None = None) -> Gate:
     """An audit that covers the stage - its window starts at or before `since` and reaches a bar that closed at most
     AUDIT_MAX_AGE_S ago - with something compared and no unexplained mismatch (a DATA_REVISION is shown in the
@@ -215,21 +234,23 @@ def audit_gate(name: str, res: AuditResult | None, since: float, now: float, aft
 
 
 def _closed_spans(journal: Journal, since: float, now: float) -> list[tuple[float, float]]:
-    """Spans in which the futures session was recorded not OPEN: from a SESSION event whose `state` is not OPEN to
-    the next SESSION event that is OPEN, or to now (live/runtime.py records the state with each SESSION event)."""
+    """Spans in which the futures session was recorded not OPEN: from a SESSION event whose `state` is not OPEN
+    (live/runtime.py records the state with every change and at every start) to the next SESSION event of any state
+    or the next STARTUP - a reopen while the runtime was down is never recorded - and never longer than
+    SESSION_CLOSED_MAX_S."""
+    marks = sorted(journal.events(kind="SESSION", since=since) + journal.events(kind="STARTUP", since=since),
+                   key=lambda e: e["id"])
     spans: list[tuple[float, float]] = []
     start: float | None = None
-    for e in journal.events(kind="SESSION", since=since):
-        state = e["data"].get("state")
-        if state is None:
-            continue
-        if state != SESSION_OPEN and start is None:
-            start = float(e["ts"])
-        elif state == SESSION_OPEN and start is not None:
-            spans.append((start, float(e["ts"])))
+    for e in marks:
+        if start is not None:
+            spans.append((start, min(float(e["ts"]), start + SESSION_CLOSED_MAX_S)))
             start = None
+        state = e["data"].get("state") if e["kind"] == "SESSION" else None
+        if state is not None and state != SESSION_OPEN:
+            start = float(e["ts"])
     if start is not None:
-        spans.append((start, now))
+        spans.append((start, min(now, start + SESSION_CLOSED_MAX_S)))
     return spans
 
 
@@ -245,8 +266,8 @@ def _cycle_gate(journal: Journal, since: float, now: float) -> Gate:
         if (c is not None and c["status"] == "OK" and c["finished_ts"] is not None
                 and c["finished_ts"] - close <= CYCLE_DEADLINE_S):
             on_time += 1
-        elif any(s <= close + CYCLE_DEADLINE_S and close <= e for s, e in closed):
-            excused += 1
+        elif c is None and any(s <= close + CYCLE_DEADLINE_S and close <= e for s, e in closed):
+            excused += 1  # no cycle at all while the session was closed; a cycle that ran and failed counts
             continue
         due += 1
     detail = f"{on_time}/{due}봉" + (f" (장 휴장 제외 {excused}봉)" if excused else "")
@@ -266,7 +287,8 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     return [
         Gate(G_DAYS, days >= SHADOW_MIN_DAYS, f"{days:.1f}/{SHADOW_MIN_DAYS}일"),
         Gate(G_SIGNAL, len(signals) >= 1, f"단계 중 알게 된 신호 {len(signals)}건"),
-        audit_gate(G_AUDIT, audit_result, since, now),
+        # the first SHADOW audits the whole epoch; a restarted one counts the mismatches of its own decisions
+        audit_gate(G_AUDIT, audit_result, since, now, after=since if _restarted(journal) else None),
         _cycle_gate(journal, since, now),
         Gate(G_PREVIEW, bool(previews) and not failed, f"{len(previews) - len(failed)}/{len(previews)}"),
         Gate(G_RESTART, len(recoveries) >= 2 and len(clean) == len(recoveries),
@@ -370,16 +392,20 @@ def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, 
     journal.add_event(now, "STAGE", {"from": cur, "to": to, "reason": reason})
 
 
-def restart_canary(journal: Journal, now: float, *, confirm: bool, flat: bool) -> None:
-    """Start a new CANARY stint after a CANARY failure, instead of going back to SHADOW (spec 6.2 `재개는 사용자가
-    결정한다`): only from CANARY, with --confirm and a flat book. Every CANARY gate then counts from now (trades,
-    days, failures, the audit's mismatches); the pause stays until /resume."""
+def restart_stint(journal: Journal, stage: str, now: float, *, confirm: bool, flat: bool) -> None:
+    """Start a new stint of the current stage: SHADOW after a fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY
+    after a CANARY failure instead of going back to SHADOW (spec 6.2 `재개는 사용자가 결정한다`). Only for the current
+    stage, with --confirm and a flat book. Every gate of the stage then counts from now (days, signals, cycles,
+    previews, restarts, trades, failures, the audit's mismatches); a pause stays until /resume, and a running runtime
+    restarts into the new stint once flat."""
+    if stage not in ("SHADOW", "CANARY"):
+        raise StageError(f"only a SHADOW or CANARY stint can be restarted (not {stage})")
     cur, _ = journal.stage()
-    if cur != "CANARY":
-        raise StageError(f"only a CANARY stint can be restarted (stage {cur})")
+    if cur != stage:
+        raise StageError(f"only the current stage's stint can be restarted (stage {cur}, not {stage})")
     if not confirm:
         raise StageError("a restart needs --confirm (the user's explicit approval)")
     if not flat:
         raise StageError("a restart needs a flat book (no live or virtual position, no resting order)")
-    journal.set_stage("CANARY", "restart", now)
-    journal.add_event(now, "STAGE", {"from": "CANARY", "to": "CANARY", "reason": "restart"})
+    journal.set_stage(stage, "restart", now)
+    journal.add_event(now, "STAGE", {"from": stage, "to": stage, "reason": "restart"})

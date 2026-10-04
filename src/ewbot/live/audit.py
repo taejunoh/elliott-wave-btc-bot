@@ -24,7 +24,8 @@ explained, as paper criterion 4 ignores explained causes: it is reported (and al
 (`AuditResult.ok`, `unexplained`); every other mismatch does.
 
 A ledger that is not a schema-1 paper ledger (`paper.ledger.Ledger.from_dict`) or whose epochs or decisions
-are malformed is an AuditError, like a failed fetch: never a passing audit.
+are malformed is an AuditError, like a failed fetch: never a passing audit; so is a malformed decision of the live
+journal (its message names the live journal).
 
 The ledger is read with the GitHub contents API (`EWBOT_PAPER_REPO`, fine-grained token with
 Contents: read on that repository only, `EWBOT_GITHUB_TOKEN`), raw media type (up to 100 MB)."""
@@ -46,6 +47,7 @@ CONTENTS_API = "https://api.github.com/repos/{repo}/contents/ledger.json"
 FETCH_TIMEOUT = (5.0, 20.0)  # connect, each read
 FETCH_DEADLINE_S = 30.0  # the whole fetch, body included: it runs on the protective main loop
 CHUNK = 1 << 16
+DECISION_KEYS = ("id", "kind", "ts", "price", "contracts", "reason", "trade_key", "levels", "setup", "direction")
 
 
 class AuditError(RuntimeError):
@@ -151,6 +153,18 @@ def audit(live: Sequence[dict[str, Any]], ledger: dict[str, Any], baseline_finge
         raise AuditError(f"paper ledger malformed: {type(exc).__name__}: {exc}"[:300]) from None
 
 
+def _live(live: Sequence[dict[str, Any]], inside: Callable[[dict[str, Any]], bool]) -> dict[str, dict[str, Any]]:
+    """The live journal's decisions in the window, each checked for the fields the comparison reads."""
+    try:
+        for d in live:
+            missing = [k for k in DECISION_KEYS if k not in d]
+            if missing or not isinstance(d["levels"], list):
+                raise KeyError(f"{d.get('id')}: {missing or 'levels'}")
+        return {d["id"]: d for d in live if inside(d)}
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
+        raise AuditError(f"live journal decision malformed: {type(exc).__name__}: {exc}"[:300]) from None
+
+
 def _audit(live: Sequence[dict[str, Any]], led: Ledger, baseline: str | None, since: int | None, until: int | None,
            now: float, data_hash: Callable[[int], str | None] | None) -> AuditResult:
     if not isinstance(led.epochs, list) or not led.epochs or not isinstance(led.decisions, list):
@@ -163,8 +177,8 @@ def _audit(live: Sequence[dict[str, Any]], led: Ledger, baseline: str | None, si
     def inside(d: dict[str, Any]) -> bool:
         return lo < known_at(d) <= hi
 
+    mine = _live(live, inside)
     paper = {d["id"]: d for d in led.decisions if inside(d)}
-    mine = {d["id"]: d for d in live if inside(d)}
     runs = sorted((int(r["last_bar_ts"]), str(r["data_sha256"])) for r in led.runs
                   if isinstance(r, dict) and r.get("status") == "ok" and r.get("data_sha256"))
     run_bars = [b for b, _ in runs]
