@@ -1,0 +1,43 @@
+# ewbot live runtime on the VPS (docs/live-trading.md). deploy/live/deploy.sh builds ewbot-live:<tag>,
+# checks it, tags it ewbot-live:current and runs `docker compose -f deploy/live/docker-compose.yml up -d`
+# (with EWBOT_IMAGE pinned to ewbot-live:current). Host paths: /var/lib/ewbot (journal, candle cache, backups;
+# owned by uid 1000) and /etc/ewbot (secrets, mode 700 dir / 600 files, owned by uid 1000), mounted read-only.
+# deploy/live/.env (not committed: deploy/live/.gitignore) only fills the ${...} settings below - EWBOT_EXPIRY,
+# EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO, EWBOT_CLOSE_CONFLICTS / EWBOT_OVERLAP_REFUSALS (refusal codes learned in
+# CANARY) -; anything else written there, a secret included, never reaches the
+# runtime (and would sit in a plain file: never put one there). A secret or a product added to `environment:`
+# below is refused at start (ewbot.live.settings): secrets live only in /etc/ewbot, the products are fixed.
+name: ewbot-live
+services:
+  live:
+    image: ${EWBOT_IMAGE:-ewbot-live:current}
+    restart: unless-stopped
+    init: true  # PID 1 is an init that hands SIGTERM to ewbot (python as PID 1 would not get it by default)
+    user: "1000:1000"
+    environment:
+      EWBOT_LIVE_DIR: /data
+      EWBOT_SECRETS_FILE: /run/ewbot/live.env
+      EWBOT_COINBASE_KEY_FILE: /run/ewbot/cdp_api_key.json
+      EWBOT_PAPER_REPO: ${EWBOT_PAPER_REPO:-taejunoh/elliott-wave-btc-bot}
+      EWBOT_LIVE_EDIT_STOPS: ${EWBOT_LIVE_EDIT_STOPS:-0}
+      EWBOT_EXPIRY: ${EWBOT_EXPIRY:-}
+      EWBOT_CLOSE_CONFLICTS: ${EWBOT_CLOSE_CONFLICTS:-}
+      EWBOT_OVERLAP_REFUSALS: ${EWBOT_OVERLAP_REFUSALS:-}
+      TZ: UTC
+    volumes:
+      - /var/lib/ewbot:/data
+      - /etc/ewbot:/run/ewbot:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 150s  # a stop finishes the current tick (at worst ~100 s: candle retries, a fill wait) + 10 s flush
+    # The systemd journal keeps the log of every container, also the ones a deploy or a restart replaced
+    # (`journalctl -t ewbot-live`; `docker compose ... logs live` shows the running one's); journald rotates it.
+    logging:
+      driver: journald
+      options:
+        tag: ewbot-live

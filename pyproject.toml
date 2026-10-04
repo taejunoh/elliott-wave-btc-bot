@@ -24,6 +24,10 @@ dev = [
     "pytest>=8",
     "hypothesis>=6.100",
 ]
+live = [
+    "coinbase-advanced-py==1.8.4",
+    "websockets==13.1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ewbot"]

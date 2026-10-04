@@ -1,4 +1,4 @@
-"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout | paper.
+"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout | paper | live.
 
 Holdout isolation: every research command (backtest, compare, walkforward) cuts the candle
 frame to ts < HOLDOUT_START (2024-01-01) right after loading it, before any engine run, benchmark or
@@ -6,7 +6,8 @@ report candle sees it, and an explicit --start at/after HOLDOUT_START or --end a
 (exit 2). runner.run_backtest and runner.compare refuse the holdout on their own as well (defence in
 depth). `holdout` is the one-shot evaluation. `paper run` (Plan 2) works on the period AFTER the
 holdout: it reads the params from the committed holdout.lock only and has no strategy or config
-options (ewbot.paper.runner)."""
+options (ewbot.paper.runner). `live run | preflight | status | stage | rebase | backup` (Plan 3) runs and
+inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options."""
 
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from typing import Any, NoReturn, Sequence
 
 import pandas as pd
 
-from ewbot.backtest.holdout import HoldoutError, run_holdout
+from ewbot.backtest.holdout import DEFAULT_LOCK_PATH, HoldoutError, run_holdout
 from ewbot.backtest.metrics import compute_metrics, reliability_by_q
 from ewbot.backtest.report import BENCHMARKS, to_jsonable, write_report
 from ewbot.backtest.runner import breakdowns, compare, equity_pairs, run_backtest, utc_ts
@@ -30,6 +31,25 @@ from ewbot.backtest.walkforward import GRID, HOLDOUT_START, MIN_TRAIN_TRADES, WF
 from ewbot.config import AGGRESSIVE, CONSERVATIVE, BotConfig, load_config, with_overrides
 from ewbot.data.candles import aggregate_4h, check_integrity, fill_gaps, load_1h
 from ewbot.data.coinbase_history import update_cache
+from ewbot.live import app as live_app
+from ewbot.live import runtime as live_runtime
+from ewbot.live.exchange import Exchange, ExchangeError
+from ewbot.live.journal import Journal
+from ewbot.live.preflight import LOCK_FILE_SHA256, LOCK_SHA256, Check, check_alerts, run_preflight
+from ewbot.live.settings import LiveSettings, SettingsError, load_settings
+from ewbot.live.stage import (
+    STAGES,
+    Gate,
+    StageError,
+    canary_entry_gates,
+    canary_gates,
+    full_entry_gates,
+    gate_lines,
+    restart_stint,
+    shadow_gates,
+    transition,
+)
+from ewbot.live.watchdog import AccountGuard
 from ewbot.paper.criteria import golive_status, status_lines
 from ewbot.paper.ledger import LedgerError, current_epoch, load_ledger
 from ewbot.paper.notify import deliver, failure_text, make_event, position_line, sender_from_env
@@ -76,6 +96,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--cache-dir", type=Path, default=Path("data/cache"), help="candle cache directory")
     p_status = paper_sub.add_parser("status", help="print the ledger's go-live status (read-only, no network)")
     p_status.add_argument("--ledger-dir", type=Path, required=True)
+
+    p_live = sub.add_parser("live", help="live-trading runtime (Plan 3): Coinbase CFM BIP, SHADOW -> CANARY -> FULL")
+    live_sub = p_live.add_subparsers(dest="live_cmd", required=True)
+    live_sub.add_parser("run", help="run the live runtime (settings and secrets from the environment)")
+    p_pre = live_sub.add_parser("preflight", help="startup checks: fingerprint, holdout.lock, alerts, key permissions, "
+                                "product")
+    p_pre.add_argument("--offline", action="store_true", help="fingerprint, lock and alerts only (no Coinbase request)")
+    p_ls = live_sub.add_parser("status", help="journal status and the current stage's gates (read-only)")
+    p_ls.add_argument("--json", action="store_true", help="machine-readable (deploy/live/deploy.sh)")
+    p_ls.add_argument("--max-age", type=float, default=None, help="exit 1 when the loop heartbeat is older (seconds)")
+    p_ls.add_argument("--exchange", action="store_true", help="also read the Coinbase position and open orders")
+    p_ls.add_argument("--require-flat", action="store_true",
+                      help="exit 3 unless the journal holds no open trade, no order of unknown outcome and no standing "
+                      "flatten and (with --exchange) the account has no position and no resting order (deploy.sh)")
+    p_stage = live_sub.add_parser("stage", help="change the operating stage (promotions need every gate met)")
+    p_stage.add_argument("to", choices=("shadow", "canary", "full"))
+    p_stage.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
+    p_stage.add_argument("--restart", action="store_true",
+                         help="shadow or canary, the current stage: start a new stint of it (flat book)")
+    p_rb = live_sub.add_parser("rebase", help="after a deliberate deposit or withdrawal: re-base the account loss "
+                               "breakers (the running runtime applies it at its next minute)")
+    p_rb.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
+    p_bk = live_sub.add_parser("backup", help="consistent copy of the journal (SQLite online backup)")
+    p_bk.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -439,6 +483,383 @@ def cmd_paper(args: argparse.Namespace) -> int:
     return _paper_status(args) if args.paper_cmd == "status" else _paper_run(args)
 
 
+LIVE_REFUSAL_WAIT_S = 600.0  # a refused start waits before exiting: Docker restarts it, alerts stay sparse
+# (a start refused because Coinbase could not be read - an outage - waits live_app.OUTAGE_WAIT_S instead)
+ALERTS_GATE = "알림 설정 (Telegram 알림·명령, 헬스체크)"  # a promotion to CANARY or FULL needs them (preflight `alerts`)
+CYCLE_WINDOW = (59, 6)  # promotions and stint restarts are refused from hh:59 to hh:06 UTC (the hour's cycle, entries)
+
+
+def _in_cycle_window(now: float) -> bool:
+    """`now` falls from hh:59 to hh:06 UTC: the runtime's hourly cycle (hh:00:30) and its entries (until hh:05) may
+    open a trade between a promotion's flat check and its stage write."""
+    minute = int(now) // 60 % 60
+    return minute >= CYCLE_WINDOW[0] or minute < CYCLE_WINDOW[1]
+
+
+def _live_settings() -> LiveSettings:
+    """Production settings from the environment and the secrets files (tests replace this function)."""
+    return load_settings()
+
+
+def _live_lock() -> tuple[Path, str, str]:
+    """The committed holdout lock, its pinned sha256 field and the pinned sha256 of the file's bytes (tests replace
+    this function)."""
+    return DEFAULT_LOCK_PATH, LOCK_SHA256, LOCK_FILE_SHA256
+
+
+def _print_checks(checks: list[Check]) -> bool:
+    for c in checks:
+        print(f"preflight {c.name}: {'ok' if c.ok else 'FAILED'} - {c.detail}")
+    return all(c.ok for c in checks)
+
+
+def _exchange(s: LiveSettings) -> Exchange:
+    """The real exchange: anything that fails to set it up is a SettingsError (a refusal, never a traceback)."""
+    try:
+        return live_app.real_exchange(s)
+    except SettingsError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - e.g. the SDK's bare Exception for a malformed key file
+        raise SettingsError(live_app.redact(f"Coinbase: {type(exc).__name__}: {exc}", s)) from None
+
+
+def _live_run(s: LiveSettings) -> int:
+    """`ewbot live run`: the preflight for the process's stage (`live_app.process_stage`: a demoted journal with
+    something real left runs its last real stage), then the runtime until a stage change (exit 0, Docker starts it
+    again), a stop (SIGTERM / Ctrl-C: after the current tick, exit 0), a refusal (exit 2 after LIVE_REFUSAL_WAIT_S - or,
+    when only Coinbase could not be read, an outage, after live_app.OUTAGE_WAIT_S, alerted once an hour) or a fatal
+    error (exit 1, after a back-off when it repeats). The wiring is closed - the Telegram poller and the feed stopped,
+    the queued messages flushed - before any wait, and on every exit."""
+    stop = live_app.StopRequest()
+    notify = live_app.notifier(s)
+    journal: Journal | None = None
+    wired: live_app.Wired | None = None
+    closed = False
+
+    def close() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        if wired is not None:
+            wired.close()
+        else:
+            notify.flush(10.0)
+            notify.stop()
+
+    def refuse(why: str, outage: bool = False) -> int:
+        print(f"refusing: {why}", file=sys.stderr)
+        if live_app.outage_alert(journal, time.time()) if outage else live_app.refusal_alert(journal, why, time.time()):
+            again = (f" (Coinbase를 읽지 못함: {live_app.OUTAGE_WAIT_S:.0f}초마다 다시 시작, 알림은 1시간에 한 번)" if outage
+                     else f" ({LIVE_REFUSAL_WAIT_S / 60:.0f}분마다 다시 시작, 같은 이유의 알림은 1시간에 한 번)")
+            notify("PREFLIGHT", f"[시작 거부] {why}{again}")
+        close()  # nothing keeps polling Telegram or the feed during the wait: a command sent now is answered later
+        stop.wait(live_app.OUTAGE_WAIT_S if outage else LIVE_REFUSAL_WAIT_S)
+        return 2
+
+    def fatal(exc: Exception) -> int:
+        kind = type(exc).__name__
+        wait, alert = live_app.fatal_backoff(journal, kind, time.time())
+        if alert:  # healthchecks.io is a third party: the type name only, never the text
+            (wired.heartbeat if wired is not None else live_app.heartbeat(s)).fail(f"[LIVE] 중단: {kind}")
+            again = (f" ({live_app.FATAL_REPEAT_S / 60:.0f}분 안에 반복: {wait / 60:.0f}분 뒤 종료, Docker가 다시 시작)"
+                     if wait else "")
+            notify("FATAL", f"[중단] {kind}: {live_app.redact(str(exc), s)[:300]}{again}")
+        print(live_app.fatal_report(exc, s), file=sys.stderr, end="")  # re-raised, Python would print it unredacted
+        close()
+        stop.wait(wait)
+        return 1
+
+    with stop.installed():
+        try:
+            journal = Journal(s.journal_path)
+            try:
+                real = _exchange(s)
+            except SettingsError as exc:
+                return refuse(str(exc))
+            try:
+                stage, why = live_app.process_stage(journal, real)
+            except live_app.RealExposure as exc:
+                return refuse(str(exc), outage=isinstance(exc, live_app.AccountUnreadable))
+            if why is not None:
+                print(f"stage {stage}: {why} (journal stage {journal.stage()[0]})", file=sys.stderr)
+            path, sha, file_sha = _live_lock()
+            checks, lock = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
+            if not _print_checks(checks) or lock is None:
+                failed = [c for c in checks if not c.ok]
+                return refuse("시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in failed),
+                              outage=bool(failed) and all(c.retry for c in failed))
+            wired = live_app.build(s, lock, real, journal, stage, notify)
+            stop.attach(wired.runtime)
+            return 0 if stop.requested else wired.runtime.run_forever()
+        except live_runtime.StartupRefused as exc:  # Coinbase unreadable for minutes at start: an outage, no /fail
+            return refuse(str(exc), outage=True)
+        except KeyboardInterrupt:  # a deliberate stop where no handler could be installed
+            return 0
+        except Exception as exc:  # noqa: BLE001 - every other failure, the wiring's included, is fatal
+            return fatal(exc)
+        finally:
+            close()  # stops the Telegram poller and the feed, lets the queued messages go out
+            if journal is not None:
+                journal.close()
+
+
+def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
+    """The checks `live run` makes, for the stage it would run (`live_app.process_stage`: a demoted journal with
+    something real left checks its last real stage; --offline reads the journal only)."""
+    real = None
+    if not args.offline:
+        try:
+            real = _exchange(s)
+        except SettingsError as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+    stage = "SHADOW"
+    if s.journal_path.exists():
+        journal = Journal(s.journal_path, read_only=True)  # a candidate image's probe never writes the live journal
+        try:
+            stage, why = live_app.process_stage(journal, real)
+        except live_app.RealExposure as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            journal.close()
+        if why is not None:
+            print(f"stage {stage}: {why}", file=sys.stderr)
+    path, sha, file_sha = _live_lock()
+    checks, _ = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
+    return 0 if _print_checks(checks) else 2
+
+
+def _live_gates(journal: Journal, stage: str, now: float) -> list[Gate]:
+    audit = live_runtime.audit_from_journal(journal)  # the runtime's last audit, a failed one included
+    if stage == "SHADOW":
+        return shadow_gates(journal, now, audit)
+    if stage == "CANARY":
+        return canary_gates(journal, now, audit)
+    return []
+
+
+def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
+    """Journal status (no journal yet: --json still answers, stage null). Exit 1 when --max-age is exceeded
+    (Docker HEALTHCHECK), 2 when --exchange cannot read Coinbase, 3 when --require-flat finds what the running
+    runtime still manages (its flat book, `LiveRuntime.flat`): an open trade, an order of unknown outcome (a PENDING
+    intent) or a standing flatten in the journal, or - with --exchange - a position or any resting order."""
+    if not s.journal_path.exists() and not args.json:
+        print(f"no journal at {s.journal_path}", file=sys.stderr)
+        return 1
+    # read-only: a candidate image's probe (deploy.sh) or the health check never writes or migrates the live journal
+    journal = Journal(s.journal_path, read_only=True) if s.journal_path.exists() else None
+    try:
+        now = time.time()
+        stage, since = journal.stage() if journal is not None else (None, None)
+        hb = journal.get("heartbeat") if journal is not None else None
+        age = None if hb is None else now - float(hb)
+        trade = journal.get("trade") if journal is not None else None
+        out: dict[str, Any] = {"stage": stage, "since": since, "heartbeat_age": age,
+                               "paused": journal.get("paused") if journal is not None else None,
+                               "trade": trade if trade and trade.get("status") == "OPEN" else None,
+                               "pending_intents": len(journal.intents(status="PENDING")) if journal is not None else 0,
+                               "flatten": journal.get(live_runtime.FLATTEN_KEY) if journal is not None else None}
+        if args.exchange:
+            try:
+                real = _exchange(s)
+                pos = real.position()
+                out["exchange_position"] = None if pos is None else {"side": pos.side, "contracts": pos.contracts}
+                out["exchange_open_orders"] = len(real.open_orders())
+            except (SettingsError, ExchangeError) as exc:
+                print(f"exchange unreadable: {exc}", file=sys.stderr)
+                return 2
+        if args.json:
+            print(json.dumps(out, sort_keys=True))
+        elif journal is not None:
+            assert stage is not None
+            for line in live_runtime.status_lines(journal, now) + gate_lines(_live_gates(journal, stage, now)):
+                print(line)
+            if args.exchange:
+                print(f"exchange position: {out['exchange_position']}, open orders: {out['exchange_open_orders']}")
+        held = _held(out["trade"] is not None, out["pending_intents"], out["flatten"] is not None,
+                     out.get("exchange_position") is not None, out.get("exchange_open_orders", 0))
+        if args.require_flat and held:
+            print(f"not flat: {', '.join(held)} (flatten first: /flatten, or wait until the runtime is done)",
+                  file=sys.stderr)
+            return 3
+        return 1 if args.max_age is not None and (age is None or age > args.max_age) else 0
+    finally:
+        if journal is not None:
+            journal.close()
+
+
+def _held(trade: bool, pending: int, flatten: bool, position: bool, orders: int) -> list[str]:
+    """What keeps a book from flat - the running runtime's flat (LiveRuntime.flat): an open trade, an order of unknown
+    outcome (a PENDING intent) or a standing flatten in the journal, a position or a resting order on the account."""
+    return [what for what, there in (
+        ("an open trade", trade), (f"{pending} order(s) of unknown outcome (PENDING)", pending > 0),
+        ("a standing flatten", flatten), ("a position", position), (f"{orders} resting order(s)", orders > 0)) if there]
+
+
+def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
+    """(the book is flat as the running runtime sees it - `_held`: the journal's trade, orders of unknown outcome and
+    standing flatten, Coinbase's position and resting orders -, the real exchange); what holds it is printed."""
+    trade = journal.get("trade")
+    real = _exchange(s)
+    held = _held(bool(trade and trade.get("status") == "OPEN"), len(journal.intents(status="PENDING")),
+                 journal.get(live_runtime.FLATTEN_KEY) is not None, real.position() is not None, len(real.open_orders()))
+    if held:
+        print(f"not flat: {', '.join(held)}", file=sys.stderr)
+    return not held, real
+
+
+def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
+    """A promotion (one stage up, every gate met, the alerts of the new stage configured) and a restart of the
+    current SHADOW or CANARY stint (--restart) need --confirm and a flat book (journal and Coinbase) before anything
+    is written. A demotion needs only --confirm: it is written first - a running runtime sizes new entries for it at
+    once - and then the command reports whether the book is flat (the runtime keeps protecting and managing an open
+    position - after a restart too - and restarts into the new stage once flat). Without a journal nothing is
+    written (exit 1)."""
+    if not s.journal_path.exists():
+        print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
+        return 1
+    journal = Journal(s.journal_path)
+    try:
+        now = time.time()
+        to = args.to.upper()
+        cur, _ = journal.stage()
+        if not args.restart and STAGES.index(to) < STAGES.index(cur):
+            try:
+                transition(journal, to, now, [], confirm=args.confirm, flat=False)
+            except StageError as exc:
+                print(f"refusing: {exc}", file=sys.stderr)
+                return 2
+            print(f"stage {cur} -> {to} recorded: the running runtime sizes new entries for {to} at once")
+            try:
+                flat, _ = _flat_book(s, journal)
+            except (SettingsError, ExchangeError) as exc:
+                print(f"book: the account could not be read ({exc}) - check it with ewbot live status --exchange")
+                return 0
+            print("book flat: the runtime restarts into the new stage within a minute" if flat else
+                  "book not flat: the runtime keeps protecting and managing the open position and restarts into the "
+                  "new stage once flat")
+            return 0
+        if _in_cycle_window(now):  # the hour's cycle may open a trade between the flat check and the write
+            print("refusing: promotions and stint restarts are refused from hh:59 to hh:06 UTC (the hourly cycle and "
+                  "its entries) - try again after hh:06", file=sys.stderr)
+            return 2
+        try:  # the real account must be flat too
+            flat, real = _flat_book(s, journal)
+        except (SettingsError, ExchangeError) as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+        if args.restart:
+            try:
+                restart_stint(journal, to, now, confirm=args.confirm, flat=flat)
+            except StageError as exc:
+                print(f"refusing: {exc}", file=sys.stderr)
+                return 2
+            print(f"{to} stint restarted: every {to} gate counts from now; the running runtime restarts into it "
+                  "within a minute (a pause stays until /resume)")
+            return 0
+        try:  # the trade key is a CANARY / FULL gate
+            perms = real.key_permissions()
+        except ExchangeError as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+        gates: list[Gate] = []
+        audit = live_runtime.audit_from_journal(journal)
+        if (cur, to) == ("SHADOW", "CANARY"):
+            gates = canary_entry_gates(journal, now, audit, live_app.paper_status(s, now), perms)
+        elif (cur, to) == ("CANARY", "FULL"):
+            gates = full_entry_gates(journal, now, audit, live_app.paper_status(s, now), perms)
+        alerts = check_alerts(s, to)  # the new stage refuses to start without them: never written without them
+        gates.append(Gate(ALERTS_GATE, alerts.ok, alerts.detail))
+        for line in gate_lines(gates):
+            print(line)
+        try:
+            transition(journal, to, now, gates, confirm=args.confirm, flat=flat)
+        except StageError as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+        print(f"stage {cur} -> {to} recorded; the running runtime restarts into it once flat")
+        return 0
+    finally:
+        journal.close()
+
+
+def _usd(x: Any) -> str:
+    return "-" if x is None else f"{float(x):,.2f}"
+
+
+def _live_rebase(s: LiveSettings, args: argparse.Namespace) -> int:
+    """`ewbot live rebase [--confirm]`: after a deliberate deposit or withdrawal (docs/live-trading.md) the account loss
+    breakers' references - the day's and the peak - are based again. The CLI only asks (REBASE_KEY, a REBASE_REQUESTED
+    event): the running runtime, the breakers' one writer, applies it at its next minute with its own balance reads
+    (the median of three; alerted). Prints the references before and the equity now; needs --confirm and a flat book as
+    the running runtime sees it (`_held`: an open trade's unrealized P&L would be folded into both references; an order
+    of unknown outcome, a standing flatten, a position or a resting order - the latter two when Coinbase can be read)."""
+    if not s.journal_path.exists():
+        print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
+        return 1
+    journal = Journal(s.journal_path)
+    try:
+        now = time.time()
+        g = journal.get(AccountGuard.KEY) or {}
+        print(f"before: day {g.get('day') or '-'} reference {_usd(g.get('day_ref'))} USD, peak {_usd(g.get('peak'))} USD")
+        position, orders = False, 0
+        try:
+            real = _exchange(s)
+            equity = f"equity now {_usd(real.balance().equity)} USD"
+            position, orders = real.position() is not None, len(real.open_orders())
+        except (SettingsError, ExchangeError) as exc:
+            equity = f"equity now unreadable ({exc})"
+        print(f"after: both references based again from the runtime's next balance read and the two after it (their "
+              f"median) - {equity}")
+        trade = journal.get("trade")
+        held = _held(bool(trade and trade.get("status") == "OPEN"), len(journal.intents(status="PENDING")),
+                     journal.get(live_runtime.FLATTEN_KEY) is not None, position, orders)
+        if held:
+            print(f"refusing: not flat: {', '.join(held)} - rebase with a flat book (/flatten, or wait until the runtime "
+                  "is done)", file=sys.stderr)
+            return 2
+        if not args.confirm:
+            print("refusing: a rebase needs --confirm (the user's explicit approval)", file=sys.stderr)
+            return 2
+        journal.put(live_runtime.REBASE_KEY, {"ts": now})
+        journal.add_event(now, "REBASE_REQUESTED", {"day_ref": g.get("day_ref"), "peak": g.get("peak")})
+        print("rebase requested: the running runtime applies it at its next minute ([손실 한도 기준 재설정] alert)")
+        return 0
+    finally:
+        journal.close()
+
+
+def _live_backup(s: LiveSettings, args: argparse.Namespace) -> int:
+    if not s.journal_path.exists():  # never an empty journal created and copied as if it were the real one
+        print(f"no journal at {s.journal_path}", file=sys.stderr)
+        return 1
+    journal = Journal(s.journal_path)
+    try:
+        print(f"journal backup: {journal.backup(args.out)}")
+    finally:
+        journal.close()
+    return 0
+
+
+def cmd_live(args: argparse.Namespace) -> int:
+    try:
+        s = _live_settings()
+    except SettingsError as exc:
+        print(f"refusing: {exc}", file=sys.stderr)
+        if args.live_cmd == "run":  # no Telegram without settings: Docker's restarts sparse; a stop ends the wait
+            stop = live_app.StopRequest()
+            with stop.installed():
+                stop.wait(LIVE_REFUSAL_WAIT_S)
+        return 2
+    if args.live_cmd == "run":
+        return _live_run(s)
+    handlers = {"preflight": _live_preflight, "status": _live_status, "stage": _live_stage, "rebase": _live_rebase,
+                "backup": _live_backup}
+    return handlers[args.live_cmd](s, args)
+
+
 _COMMANDS = {
     "fetch": cmd_fetch,
     "backtest": cmd_backtest,
@@ -446,6 +867,7 @@ _COMMANDS = {
     "walkforward": cmd_walkforward,
     "holdout": cmd_holdout,
     "paper": cmd_paper,
+    "live": cmd_live,
 }
 
 

@@ -1,0 +1,430 @@
+{
+ "_comment": "product_bip, book_bip and book_btc are trimmed real public responses recorded 2026-10-03 (GET /market/products/BIP-20DEC30-CDE, /market/product_book?limit=1). The private-endpoint entries follow the Advanced Trade API reference shapes; re-record them in SHADOW (docs/live-trading.md). positions_bip_long, create_failed_new_reason, create_duplicate_new_reason, http400_duplicate_*_body and cancel_done_or_refused (Fix round 1) follow the reference's enums: FCMPositionSide LONG/SHORT, NewOrderErrorResponse.new_order_failure_reason (error and preview_failure_reason are deprecated), CancelOrderFailureReason.",
+ "product_bip": {
+  "product_id": "BIP-20DEC30-CDE",
+  "price": "84675",
+  "base_increment": "1",
+  "quote_increment": "0.01",
+  "base_min_size": "1",
+  "base_max_size": "5000",
+  "product_type": "FUTURE",
+  "fcm_trading_session_details": {
+   "is_session_open": true,
+   "open_time": "2026-10-02T22:00:00Z",
+   "close_time": "2026-10-05T21:00:00Z",
+   "session_state": "FCM_TRADING_SESSION_STATE_OPEN",
+   "after_hours_order_entry_disabled": false,
+   "closed_reason": "FCM_TRADING_SESSION_CLOSED_REASON_UNDEFINED",
+   "maintenance": {
+    "start_time": "2026-10-24T10:00:00Z",
+    "end_time": "2026-10-24T19:00:00Z"
+   }
+  },
+  "mid_market_price": "84665",
+  "price_increment": "5",
+  "display_name": "BTC PERP",
+  "product_venue": "FCM",
+  "future_product_details": {
+   "venue": "cde",
+   "contract_code": "BIP",
+   "contract_expiry": "2089-12-30T16:00:00Z",
+   "contract_size": "0.01",
+   "contract_root_unit": "BTC",
+   "group_description": "nano BTC Perp Futures",
+   "contract_expiry_type": "EXPIRING",
+   "twenty_four_by_seven": true,
+   "funding_interval": "3600s",
+   "funding_rate": "0.000003",
+   "funding_time": "2026-10-03T12:00:00Z",
+   "display_name": "Bitcoin Perpetual",
+   "intraday_margin_rate": {
+    "long_margin_rate": "0.100079",
+    "short_margin_rate": "0.0999811"
+   },
+   "overnight_margin_rate": {
+    "long_margin_rate": "0.21025",
+    "short_margin_rate": "0.256625"
+   },
+   "index_price": "84671.649272"
+  }
+ },
+ "book_bip": {
+  "pricebook": {
+   "product_id": "BIP-20DEC30-CDE",
+   "bids": [
+    {
+     "price": "84655",
+     "size": "549"
+    }
+   ],
+   "asks": [
+    {
+     "price": "84680",
+     "size": "170"
+    }
+   ],
+   "time": "2026-10-03T12:10:36.533304Z"
+  },
+  "last": "84667.5",
+  "mid_market": "84667.5",
+  "spread_bps": "2.952290977799",
+  "spread_absolute": "25"
+ },
+ "book_btc": {
+  "pricebook": {
+   "product_id": "BTC-USD",
+   "bids": [
+    {
+     "price": "84671.26",
+     "size": "0.64791945"
+    }
+   ],
+   "asks": [
+    {
+     "price": "84671.27",
+     "size": "0.05143921"
+    }
+   ],
+   "time": "2026-10-03T12:10:36.869175Z"
+  },
+  "last": "84671.265",
+  "mid_market": "84671.265",
+  "spread_bps": "0.001181038149",
+  "spread_absolute": "0.01"
+ },
+ "positions": {
+  "positions": [
+   {
+    "product_id": "BIT-31OCT26-CDE",
+    "expiration_time": "2026-10-31T16:00:00Z",
+    "side": "LONG",
+    "number_of_contracts": "2",
+    "current_price": "84700",
+    "avg_entry_price": "84000",
+    "unrealized_pnl": "14",
+    "daily_realized_pnl": "0"
+   },
+   {
+    "product_id": "BIP-20DEC30-CDE",
+    "expiration_time": "2030-12-20T16:00:00Z",
+    "side": "SHORT",
+    "number_of_contracts": "3",
+    "current_price": "84665",
+    "avg_entry_price": "85100",
+    "unrealized_pnl": "13.05",
+    "daily_realized_pnl": "0"
+   }
+  ]
+ },
+ "positions_flat": {
+  "positions": []
+ },
+ "positions_bip_long": {
+  "positions": [
+   {
+    "product_id": "BIP-20DEC30-CDE",
+    "expiration_time": "2030-12-20T16:00:00Z",
+    "side": "LONG",
+    "number_of_contracts": "2",
+    "current_price": "84665",
+    "avg_entry_price": "84000",
+    "unrealized_pnl": "13.30",
+    "daily_realized_pnl": "0"
+   }
+  ]
+ },
+ "balance_summary": {
+  "balance_summary": {
+   "futures_buying_power": {
+    "value": "4210.55",
+    "currency": "USD"
+   },
+   "total_usd_balance": {
+    "value": "5000.00",
+    "currency": "USD"
+   },
+   "cbi_usd_balance": {
+    "value": "3500.00",
+    "currency": "USD"
+   },
+   "cfm_usd_balance": {
+    "value": "1500.00",
+    "currency": "USD"
+   },
+   "total_open_orders_hold_amount": {
+    "value": "0",
+    "currency": "USD"
+   },
+   "unrealized_pnl": {
+    "value": "13.05",
+    "currency": "USD"
+   },
+   "daily_realized_pnl": {
+    "value": "0",
+    "currency": "USD"
+   },
+   "initial_margin": {
+    "value": "651.80",
+    "currency": "USD"
+   },
+   "available_margin": {
+    "value": "4361.25",
+    "currency": "USD"
+   },
+   "liquidation_threshold": {
+    "value": "325.90",
+    "currency": "USD"
+   },
+   "liquidation_buffer_amount": {
+    "value": "4687.15",
+    "currency": "USD"
+   },
+   "liquidation_buffer_percentage": "1438"
+  }
+ },
+ "key_permissions": {
+  "can_view": true,
+  "can_trade": true,
+  "can_transfer": false,
+  "portfolio_uuid": "8e1b3f9a-0000-4000-8000-000000000001",
+  "portfolio_type": "DEFAULT"
+ },
+ "orders_open_page1": {
+  "orders": [
+   {
+    "order_id": "11111111-aaaa-4000-8000-000000000001",
+    "product_id": "BIP-20DEC30-CDE",
+    "side": "BUY",
+    "client_order_id": "ewb-b-1790942400-tp1-1",
+    "status": "OPEN",
+    "time_in_force": "GOOD_UNTIL_CANCELLED",
+    "created_time": "2026-10-03T12:00:41.120000Z",
+    "completion_percentage": "0",
+    "filled_size": "0",
+    "average_filled_price": "0",
+    "order_type": "BRACKET",
+    "product_type": "FUTURE",
+    "order_configuration": {
+     "trigger_bracket_gtc": {
+      "base_size": "1",
+      "limit_price": "83500",
+      "stop_trigger_price": "85900"
+     }
+    }
+   }
+  ],
+  "sequence": "0",
+  "has_next": true,
+  "cursor": "c-2"
+ },
+ "orders_open_page2": {
+  "orders": [
+   {
+    "order_id": "11111111-aaaa-4000-8000-000000000002",
+    "product_id": "BIP-20DEC30-CDE",
+    "side": "BUY",
+    "client_order_id": "ewb-b-1790942400-tp2-1",
+    "status": "CANCEL_QUEUED",
+    "time_in_force": "GOOD_UNTIL_CANCELLED",
+    "created_time": "2026-10-03T12:00:41.320000Z",
+    "completion_percentage": "0",
+    "filled_size": "0",
+    "average_filled_price": "0",
+    "order_type": "BRACKET",
+    "product_type": "FUTURE",
+    "order_configuration": {
+     "trigger_bracket_gtc": {
+      "base_size": "2",
+      "limit_price": "82000",
+      "stop_trigger_price": "85900"
+     }
+    }
+   }
+  ],
+  "sequence": "0",
+  "has_next": false,
+  "cursor": ""
+ },
+ "orders_history": {
+  "orders": [
+   {
+    "order_id": "22222222-bbbb-4000-8000-000000000001",
+    "product_id": "BIP-20DEC30-CDE",
+    "side": "SELL",
+    "client_order_id": "ewb-e-1790942400-S",
+    "status": "FILLED",
+    "time_in_force": "IMMEDIATE_OR_CANCEL",
+    "created_time": "2026-10-03T12:00:31.004000Z",
+    "completion_percentage": "100",
+    "filled_size": "3",
+    "average_filled_price": "85100",
+    "order_type": "MARKET",
+    "product_type": "FUTURE",
+    "order_configuration": {
+     "market_market_ioc": {
+      "base_size": "3"
+     }
+    },
+    "total_fees": "0.45"
+   }
+  ],
+  "has_next": false,
+  "cursor": ""
+ },
+ "order_get": {
+  "order": {
+   "order_id": "22222222-bbbb-4000-8000-000000000001",
+   "product_id": "BIP-20DEC30-CDE",
+   "side": "SELL",
+   "client_order_id": "ewb-e-1790942400-S",
+   "status": "FILLED",
+   "created_time": "2026-10-03T12:00:31.004000Z",
+   "filled_size": "3",
+   "average_filled_price": "85100",
+   "order_type": "MARKET",
+   "order_configuration": {
+    "market_market_ioc": {
+     "base_size": "3"
+    }
+   },
+   "total_fees": "0.45"
+  }
+ },
+ "create_ok": {
+  "success": true,
+  "success_response": {
+   "order_id": "33333333-cccc-4000-8000-000000000001",
+   "product_id": "BIP-20DEC30-CDE",
+   "side": "SELL",
+   "client_order_id": "ewb-e-1790942400-S"
+  },
+  "order_configuration": {
+   "market_market_ioc": {
+    "base_size": "3"
+   }
+  }
+ },
+ "create_insufficient": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "INSUFFICIENT_FUND",
+   "message": "Insufficient balance in source account",
+   "error_details": "",
+   "preview_failure_reason": "PREVIEW_INSUFFICIENT_FUND"
+  }
+ },
+ "create_duplicate": {
+  "success": false,
+  "error_response": {
+   "error": "DUPLICATE_CLIENT_ORDER_ID",
+   "message": "client_order_id has already been used",
+   "error_details": ""
+  }
+ },
+ "create_failed_new_reason": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "Invalid bracket prices",
+   "error_details": "stop_trigger_price must be below limit_price for a sell bracket",
+   "preview_failure_reason": "UNKNOWN_PREVIEW_FAILURE_REASON",
+   "new_order_failure_reason": "INVALID_BRACKET_PRICES"
+  }
+ },
+ "create_duplicate_new_reason": {
+  "success": false,
+  "failure_reason": "UNKNOWN_FAILURE_REASON",
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "client_order_id has already been used",
+   "error_details": "",
+   "preview_failure_reason": "UNKNOWN_PREVIEW_FAILURE_REASON",
+   "new_order_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"
+  }
+ },
+ "http400_duplicate_order_body": {
+  "success": false,
+  "error_response": {
+   "error": "UNKNOWN_FAILURE_REASON",
+   "message": "client_order_id has already been used",
+   "error_details": "",
+   "new_order_failure_reason": "DUPLICATE_CLIENT_ORDER_ID"
+  }
+ },
+ "http400_duplicate_gateway_body": {
+  "error": "INVALID_ARGUMENT",
+  "code": 3,
+  "message": "DUPLICATE_CLIENT_ORDER_ID",
+  "details": []
+ },
+ "close_ok": {
+  "success": true,
+  "success_response": {
+   "order_id": "44444444-dddd-4000-8000-000000000001",
+   "product_id": "BIP-20DEC30-CDE",
+   "side": "BUY",
+   "client_order_id": "ewb-x-1790942400-1"
+  }
+ },
+ "preview_ok": {
+  "order_total": "851.65",
+  "commission_total": "0.15",
+  "errs": [],
+  "warning": [],
+  "preview_id": "p-1",
+  "current_liquidation_buffer": "1438",
+  "projected_liquidation_buffer": "1201",
+  "base_size": "1",
+  "quote_size": "846.65"
+ },
+ "preview_err": {
+  "order_total": "0",
+  "commission_total": "0",
+  "errs": [
+   "PREVIEW_INSUFFICIENT_FUNDS_FOR_FUTURES"
+  ],
+  "warning": [
+   "UNKNOWN"
+  ],
+  "preview_id": ""
+ },
+ "cancel_ok": {
+  "results": [
+   {
+    "success": true,
+    "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON",
+    "order_id": "11111111-aaaa-4000-8000-000000000001"
+   }
+  ]
+ },
+ "cancel_done_or_refused": {
+  "results": [
+   {
+    "success": true,
+    "failure_reason": "UNKNOWN_CANCEL_FAILURE_REASON",
+    "order_id": "o-ok"
+   },
+   {
+    "success": false,
+    "failure_reason": "DUPLICATE_CANCEL_REQUEST",
+    "order_id": "o-queued"
+   },
+   {
+    "success": false,
+    "failure_reason": "ORDER_IS_FULLY_FILLED",
+    "order_id": "o-filled"
+   },
+   {
+    "success": false,
+    "failure_reason": "UNKNOWN_CANCEL_ORDER",
+    "order_id": "o-refused"
+   }
+  ]
+ },
+ "edit_ok": {
+  "success": true,
+  "errors": []
+ }
+}

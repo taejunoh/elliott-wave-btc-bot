@@ -1,0 +1,11 @@
+# /etc/systemd/system/ewbot-backup.timer (docs/live-trading.md, "Backups")
+[Unit]
+Description=Daily ewbot live journal backup
+
+[Timer]
+OnCalendar=*-*-* 06:15:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
