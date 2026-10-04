@@ -23,10 +23,11 @@ names the file, the line and the key, never a value.
 
 TELEGRAM_CHAT_ID must be a positive number: the user's private chat with the bot (its id is the user's own id),
 the only chat Telegram commands are taken from (live/control.py); a group or channel id (negative) or an @name
-is refused. EWBOT_HEALTHCHECK_URL must be an https:// URL. The settings hold every secret as a `Secret`: its
-repr and str are redacted (so is `dataclasses.asdict` of the settings, which copies it), `.reveal()` gives the
-value where it is used; a LiveSettings repr shows neither a secret nor the key file's path, and settings are
-hashable (EWBOT_EXPIRY is kept as sorted (name, day) pairs)."""
+is refused. EWBOT_HEALTHCHECK_URL must be an https:// URL (one urlsplit cannot read is refused the same way). The
+settings hold every secret as a `Secret`: never empty (an unset secret is None), its repr and str are redacted (so
+is `dataclasses.asdict` of the settings: a copy is the same Secret), it is never pickled (that would write the value
+out in clear), `.reveal()` gives the value where it is used; a LiveSettings repr shows neither a secret nor the key
+file's path, and settings are hashable (EWBOT_EXPIRY is kept as sorted (name, day) pairs)."""
 
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ import stat
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, NoReturn
 from urllib.parse import urlsplit
 
 from ewbot.live.exchange import FUTURES_PRODUCT, SPOT_PRODUCT
@@ -54,12 +55,16 @@ class SettingsError(RuntimeError):
 
 
 class Secret:
-    """A secret value: repr and str show `<redacted>`; `.reveal()` returns it where it is used."""
+    """A secret value: repr and str show `<redacted>`; `.reveal()` returns it where it is used. Never empty: an unset
+    secret is None, so `if s.telegram_token` means it is set."""
 
     __slots__ = ("_value",)
 
     def __init__(self, value: str) -> None:
-        object.__setattr__(self, "_value", str(value))
+        text = str(value)
+        if not text:
+            raise ValueError("a Secret is never empty (an unset secret is None)")
+        object.__setattr__(self, "_value", text)
 
     def reveal(self) -> str:
         return self._value
@@ -81,8 +86,14 @@ class Secret:
     def __delattr__(self, name: str) -> None:
         raise AttributeError("a Secret is immutable")
 
-    def __reduce__(self) -> tuple[Any, ...]:  # copy / deepcopy (dataclasses.asdict) build a new Secret
-        return (Secret, (self._value,))
+    def __copy__(self) -> Secret:  # immutable: copy and deepcopy (dataclasses.asdict) give the same Secret
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Secret:
+        return self
+
+    def __reduce__(self) -> NoReturn:  # pickle (and anything built on it) would write the value out in clear
+        raise TypeError("a Secret is never pickled")
 
 
 @dataclass(frozen=True)
@@ -230,8 +241,12 @@ def _paper_repo(value: str | None) -> str | None:
 def _healthcheck_url(value: str | None) -> Secret | None:
     if not value:
         return None
-    parts = urlsplit(value)
-    if parts.scheme != "https" or not parts.hostname:
+    try:
+        parts = urlsplit(value)
+        https = parts.scheme == "https" and bool(parts.hostname)
+    except ValueError:  # e.g. an unclosed IPv6 bracket: never a traceback (it would carry the URL)
+        https = False
+    if not https:
         raise SettingsError("EWBOT_HEALTHCHECK_URL must be an https:// URL (the healthchecks.io ping URL)")
     return Secret(value)
 

@@ -57,6 +57,7 @@ class Check:
     name: str
     ok: bool
     detail: str
+    retry: bool = False  # failed only because Coinbase could not be read just now (429, 5xx, timeout): an outage
 
 
 class PreflightError(RuntimeError):
@@ -184,10 +185,12 @@ def check_product(spec: ProductSpec, expected_id: str = FUTURES_PRODUCT, now: fl
 
 def run_preflight(exchange: Exchange | None, stage: str, lock_path: Path = DEFAULT_LOCK_PATH,
                   files: Mapping[str, bytes] | None = None, expected_lock: str = LOCK_SHA256,
-                  expected_lock_file: str = LOCK_FILE_SHA256, settings: LiveSettings | None = None,
+                  expected_lock_file: str = LOCK_FILE_SHA256, *, settings: LiveSettings | None,
                   now: float | None = None) -> tuple[list[Check], dict[str, Any] | None]:
-    """All checks in this order: fingerprint, lock, alerts (only with `settings`), key and product (only with an
-    `exchange`; `exchange=None` runs the offline ones)."""
+    """All checks in this order: fingerprint, lock, alerts, key and product (only with an `exchange`; `exchange=None`
+    runs the offline ones). `settings` must be given - every start passes its own, so the alerts check runs; None
+    (unit checks of the other ones only) skips it. A key or product read that failed for an outage (a retryable error)
+    is a failing check marked `retry`."""
     lock_check, lock = check_lock(lock_path, expected_lock, expected_lock_file)
     checks = [check_fingerprint(files), lock_check]
     if settings is not None:
@@ -196,7 +199,7 @@ def run_preflight(exchange: Exchange | None, stage: str, lock_path: Path = DEFAU
         try:
             checks.append(check_key(exchange.key_permissions(), stage))
         except ExchangeError as exc:
-            checks.append(Check("key", False, f"key_permissions failed: {exc}"))
+            checks.append(Check("key", False, f"key_permissions failed: {exc}", retry=exc.retryable))
         if (exchange.futures_id, exchange.spot_id) != (FUTURES_PRODUCT, SPOT_PRODUCT):
             checks.append(Check("product", False, f"the exchange is set up for {exchange.futures_id} and "
                                                   f"{exchange.spot_id}, not {FUTURES_PRODUCT} and {SPOT_PRODUCT}: "
@@ -205,7 +208,7 @@ def run_preflight(exchange: Exchange | None, stage: str, lock_path: Path = DEFAU
             try:
                 checks.append(check_product(exchange.product(), FUTURES_PRODUCT, now))
             except ExchangeError as exc:
-                checks.append(Check("product", False, f"product failed: {exc}"))
+                checks.append(Check("product", False, f"product failed: {exc}", retry=exc.retryable))
     return checks, lock
 
 

@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import pickle
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -187,7 +188,7 @@ def test_the_contract_expiry_is_checked():
 
 def test_run_preflight_online_offline_and_exchange_errors(lock_file):
     path, lock = lock_file
-    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW}
+    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW, "settings": None}
     ex = sim(Clock())
     checks, parsed = run_preflight(ex, "CANARY", path, **pins)
     assert [c.name for c in checks] == ["fingerprint", "lock", "key", "product"] and all(c.ok for c in checks)
@@ -205,7 +206,7 @@ def test_run_preflight_online_offline_and_exchange_errors(lock_file):
 
 def test_the_products_are_fixed(lock_file):
     path, lock = lock_file
-    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW}
+    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW, "settings": None}
     # an exchange set up for another future (same specs) or another signal product is refused
     for ex in (sim(Clock(), product=dataclasses.replace(BIP_SPEC, product_id="BIT-30OCT26-CDE")),
                sim(Clock(), spot_id="ETH-USD")):
@@ -398,3 +399,47 @@ def test_telegram_commands_come_only_from_a_private_chat(tmp_path):
             load_settings(env)
     secrets.write_text("TELEGRAM_CHAT_ID=0042\n", encoding="utf-8")
     assert load_settings(env).telegram_chat == "42"  # as Telegram writes the chat id
+
+
+# ---------------------------------------------------------------------------- Final fix
+def test_run_preflight_needs_the_settings_and_marks_outage_failures(lock_file):
+    """Final fix (Task 11 N4): every caller passes its settings - the alerts check is never skipped by omission. A key or
+    product read that failed for an outage (429, 5xx, timeout) is marked `retry`: the start is tried again soon (Task 13),
+    a refusal for a configuration reason is not."""
+    path, lock = lock_file
+    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW}
+    with pytest.raises(TypeError, match="settings"):
+        run_preflight(None, "SHADOW", path, **pins)  # type: ignore[call-arg]
+    ex = sim(Clock())
+    ex.fail_next("key_permissions", Unavailable("503"))
+    ex.fail_next("product", Unavailable("503"))
+    checks, _ = run_preflight(ex, "SHADOW", path, settings=LiveSettings(), **pins)
+    assert [(c.name, c.ok, c.retry) for c in checks] == [
+        ("fingerprint", True, False), ("lock", True, False), ("alerts", True, False), ("key", False, True),
+        ("product", False, True)]
+    transfer = sim(Clock(), permissions=KeyPermissions(True, True, True))
+    checks, _ = run_preflight(transfer, "SHADOW", path, settings=LiveSettings(), **pins)
+    assert [(c.name, c.retry) for c in checks if not c.ok] == [("key", False)]
+
+
+def test_a_secret_is_never_empty_never_pickled_and_copied_as_itself():
+    """Final fix (Task 11 N2): pickle would write the value out in clear; copy and deepcopy (dataclasses.asdict) keep
+    the one immutable Secret; an empty one is refused (an unset secret is None, so `if s.telegram_token` is honest)."""
+    s = Secret("123:SECRET")
+    for dump in (lambda: pickle.dumps(s), lambda: pickle.dumps(LiveSettings(telegram_token=s))):
+        with pytest.raises(TypeError, match="never pickled"):
+            dump()
+    assert copy.copy(s) is s and copy.deepcopy(s) is s
+    assert dataclasses.asdict(LiveSettings(telegram_token=s))["telegram_token"] is s
+    with pytest.raises(ValueError, match="never empty"):
+        Secret("")
+
+
+def test_a_health_check_url_urlsplit_cannot_read_is_a_settings_error(tmp_path):
+    """Final fix (Task 11 N1): urlsplit raises ValueError for e.g. an unclosed IPv6 bracket - a refusal by name, never a
+    traceback that would carry the URL."""
+    for i, url in enumerate(("https://[::1/SECRET", "https://[SECRET]/x")):
+        path = private_file(tmp_path / f"v{i}.env", f"EWBOT_HEALTHCHECK_URL={url}\n")
+        with pytest.raises(SettingsError, match="EWBOT_HEALTHCHECK_URL must be an https:// URL") as err:
+            load_settings({"EWBOT_SECRETS_FILE": str(path)})
+        assert "SECRET" not in str(err.value) and err.value.__cause__ is None
