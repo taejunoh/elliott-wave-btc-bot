@@ -467,5 +467,7 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "journal.sqlite-wal", "install -m 600 -o 1000 -g 1000 /dev/stdin", "no_check_bucket = true",
                    "EWBOT_BACKUP_PING_URL", "restore drill", "journalctl -t ewbot-live", "unhealthy",
                    "docker builder prune", "never hold", "View-only key", "/var/lib/ewbot/drill",
-                   "EWBOT_LIVE_DIR=/data/drill", "PRAGMA integrity_check"):
+                   "EWBOT_LIVE_DIR=/data/drill", "PRAGMA integrity_check",
+                   # final fix: manual positions refused at start, outages, a stop waiting for protection, before FULL
+                   "수동 포지션", "60초마다 다시 시작", "STOP_DEFERRED", "## Before FULL", "TP1_SYNC races the TP1 leg"):
         assert needle in text, needle
