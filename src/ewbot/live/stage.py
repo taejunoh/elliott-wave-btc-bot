@@ -345,6 +345,9 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     unprotected_ok, unprotected = _counted(found, ("UNPROTECTED_60S",))
     manual_ok, manual = _counted(found, MANUAL)
     major_ok, major = _counted(found, ("AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY"))
+    rebased = len(journal.events(kind="REBASED", since=since))  # a rebase clears the breach flags: shown, never hidden
+    if rebased:
+        major += f" · 손실 한도 기준 재설정 {rebased}회"
     slow_ok = not slow and "PROTECT_SLOW" not in found
     return [
         Gate(G_TRADES, n_closed >= CANARY_MIN_TRADES or days >= CANARY_MAX_DAYS, f"{n_closed}건, {days:.1f}일"),

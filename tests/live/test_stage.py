@@ -547,3 +547,16 @@ def test_pause_resume_and_incidents_by_stage(tmp_path):
     assert [e["data"]["kind"] for e in jr.events(kind="INCIDENT")] == [
         "UNPROTECTED_60S", "FOREIGN_ORDERS", "BAD_EQUITY", "BREAKER"]
     jr.close()
+
+
+def test_rebases_are_shown_in_the_canary_gate_details(tmp_path):
+    """Final re-review B: a rebase clears the breach flags (a loss already under way is absorbed): every one in the stint
+    is listed in the CANARY gates' detail, never hidden - it fails no gate."""
+    jr = canary_journal(tmp_path)
+    now = S0 + 20 * DAY
+    jr.add_event(now - DAY, "REBASED", {"before": {"day_ref": 500.0, "peak": 520.0}, "after": {"day_ref": 400.0,
+                                                                                                 "peak": 400.0}})
+    gates = {g.name: g for g in canary_gates(jr, now, good(now))}
+    assert all(g.met for g in gates.values())
+    assert "손실 한도 기준 재설정 1회" in gates["중대 사건 없음 (판단 불일치, 손실 한도, 송금 권한 키)"].detail
+    jr.close()
