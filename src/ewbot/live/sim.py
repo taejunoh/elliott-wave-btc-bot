@@ -51,7 +51,8 @@ from ewbot.live.exchange import (
     SessionInfo,
 )
 
-BIP_SPEC = ProductSpec(FUTURES_PRODUCT, 0.01, 5.0, 1.0, (0.100079, 0.0999811), (0.21025, 0.256625))
+# as recorded 2026-10-03; the venue's contract_expiry is 2089-12-30T16:00:00Z although the id says 20 Dec 2030
+BIP_SPEC = ProductSpec(FUTURES_PRODUCT, 0.01, 5.0, 1.0, (0.100079, 0.0999811), (0.21025, 0.256625), expiry=3786796800)
 VIEW_TRADE = KeyPermissions(True, True, False, "DEFAULT")  # what the live key must look like
 
 

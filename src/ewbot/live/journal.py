@@ -18,6 +18,7 @@ from typing import Any, Iterable
 
 INTENT_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "ABANDONED")
 DEFAULT_STAGE = "SHADOW"
+KNOWN_STAGES = ("SHADOW", "CANARY", "FULL")  # = live.stage.STAGES (the stage module builds on this one)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS intents (
@@ -154,6 +155,9 @@ class Journal:
 
     # ------------------------------------------------------------------ stages
     def set_stage(self, stage: str, reason: str, now: float) -> None:
+        """Record a stage; any other value than KNOWN_STAGES is a ValueError (never read back as a stage)."""
+        if stage not in KNOWN_STAGES:
+            raise ValueError(f"unknown stage {stage!r} (one of {', '.join(KNOWN_STAGES)})")
         self._exec("INSERT INTO stages (ts, stage, reason) VALUES (?, ?, ?)", (float(now), stage, reason))
 
     def stage(self) -> tuple[str, float | None]:

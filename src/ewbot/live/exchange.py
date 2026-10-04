@@ -33,6 +33,7 @@ class ProductSpec:
     base_increment: float
     intraday_margin: tuple[float, float]  # (long, short) initial margin rates
     overnight_margin: tuple[float, float]  # (long, short): from 16:00 New York
+    expiry: int | None = None  # future_product_details.contract_expiry (epoch s) as the venue reports it; None: unknown
 
     def margin_rate(self, side: int, overnight: bool = True) -> float:
         rates = self.overnight_margin if overnight else self.intraday_margin

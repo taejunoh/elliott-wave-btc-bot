@@ -72,6 +72,12 @@ def test_product_spec_and_session_from_the_recorded_product():
     spec = ex.product()
     assert (spec.product_id, spec.contract_size, spec.price_increment, spec.base_increment) == (FUT, 0.01, 5.0, 1.0)
     assert spec.overnight_margin == (0.21025, 0.256625) and spec.intraday_margin == (0.100079, 0.0999811)
+    # contract_expiry as recorded: 2089-12-30T16:00:00Z (the id says 20 Dec 2030; the preflight checks both)
+    assert spec.expiry == 3786796800
+    for odd in (None, "", "soon", 20301220):  # missing or not a timestamp: None (the preflight refuses it)
+        reply = copy.deepcopy(FIXTURES["product_bip"])
+        reply["future_product_details"]["contract_expiry"] = odd
+        assert make({("GET", f"/products/{FUT}"): reply})[0].product().expiry is None
     s = ex.session()
     assert s.state == "OPEN" and s.is_open
     assert (s.maintenance_start, s.maintenance_end) == (1792836000, 1792868400)  # 2026-10-24 10:00-19:00 UTC

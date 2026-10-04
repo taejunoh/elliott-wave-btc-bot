@@ -65,6 +65,10 @@ def test_cycles_and_stages(jr):
     jr.set_stage("SHADOW", "initial", now=1.0)
     jr.set_stage("CANARY", "user approved", now=2.0)
     assert jr.stage() == ("CANARY", 2.0) and [s["stage"] for s in jr.stage_history()] == ["SHADOW", "CANARY"]
+    for bad in ("canary", "", "LIVE"):  # a typo is never written: the runtime would read it as a real-money stage
+        with pytest.raises(ValueError, match="unknown stage"):
+            jr.set_stage(bad, "typo", now=3.0)
+    assert jr.stage() == ("CANARY", 2.0)
     jr.start_cycle(3600, now=7230.0, stage="SHADOW")
     jr.finish_cycle(3600, now=7260.0, status="OK", note="flat")
     jr.start_cycle(7200, now=10830.0, stage="SHADOW")

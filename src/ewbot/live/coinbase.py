@@ -120,6 +120,18 @@ def iso_ts(text: str | None) -> int | None:
     return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
 
 
+def contract_expiry(text: Any) -> int | None:
+    """future_product_details.contract_expiry (RFC 3339 with a zone) as epoch s; None when it is missing or not
+    such a timestamp - the product still reads (increments, margins) and the preflight refuses an unknown expiry."""
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp()) if dt.tzinfo is not None else None
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -330,6 +342,7 @@ class CoinbaseExchange:
                 base_increment=_num(p.get("base_increment")),
                 intraday_margin=(_num(im.get("long_margin_rate")), _num(im.get("short_margin_rate"))),
                 overnight_margin=(_num(om.get("long_margin_rate")), _num(om.get("short_margin_rate"))),
+                expiry=contract_expiry(fpd.get("contract_expiry")),
             )
 
     def session(self) -> SessionInfo:
