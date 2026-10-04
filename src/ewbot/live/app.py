@@ -12,11 +12,15 @@ never traded at start: the start is refused (RealExposure), as is a journal neve
 account that cannot be read (AccountUnreadable). `StopRequest` turns SIGTERM (`docker stop`) and SIGINT into a
 graceful stop; `fatal_backoff` keeps a crash loop's restarts and alerts sparse - and short while the journal
 shows something real to manage; a start refused for a Coinbase outage is tried again soon (OUTAGE_WAIT_S), its
-alert sent once an hour (`outage_alert`)."""
+alert sent once an hour (`outage_alert`), and any other refusal's alert once an hour per reason (`refusal_alert`).
+`candle_fetch` is the runtime's candle download: a cache it cannot read (a kill in the middle of its non-atomic
+write) is set aside and the history downloaded again."""
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import os
 import queue
 import re
 import signal
@@ -29,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import quote, quote_plus, urlsplit
 
+from ewbot.data.candles import load_1h
 from ewbot.data.coinbase_history import update_cache
 from ewbot.live.audit import fetch_paper_ledger
 from ewbot.live.coinbase import CoinbaseExchange
@@ -58,6 +63,9 @@ FATAL_EXPOSED_WAIT_S = 120.0  # ... but never longer than this while the journal
 OUTAGE_KEY = "outage_refusal"  # journal: when a start refused for a Coinbase outage was last alerted
 OUTAGE_WAIT_S = 60.0  # a start refused because Coinbase could not be read is tried again after this (not 10 minutes)
 OUTAGE_ALERT_S = 3600.0  # ... and its [시작 거부] alert goes out at most once in this time, across restarts
+REFUSAL_KEY = "start_refusals"  # journal: when each other refusal reason (by digest) was last alerted
+REFUSAL_ALERT_S = 3600.0  # ... at most once in this time per reason, across restarts (one every LIVE_REFUSAL_WAIT_S)
+CACHE_FILE = f"{SPOT_PRODUCT}_1h.parquet"  # data.coinbase_history.update_cache's file in the cache directory
 
 
 class RealExposure(RuntimeError):
@@ -250,6 +258,51 @@ def outage_alert(journal: Journal | None, now: float) -> bool:
     return True
 
 
+def refusal_alert(journal: Journal | None, why: str, now: float) -> bool:
+    """Whether a start refused for `why` (a configuration refusal, not an outage) is alerted now: once per
+    REFUSAL_ALERT_S per reason across restarts (the journal keeps a digest of each reason and its time) - such a start
+    is tried again every LIVE_REFUSAL_WAIT_S, about 144 times a day; a new reason at once. Without a usable journal:
+    alerted."""
+    try:
+        if journal is None:
+            return True
+        key = hashlib.sha256(why.encode("utf-8")).hexdigest()[:16]
+        seen = {k: float(v) for k, v in (journal.get(REFUSAL_KEY) or {}).items() if 0 <= now - float(v) < REFUSAL_ALERT_S}
+        if key in seen:
+            return False
+        seen[key] = now
+        journal.put(REFUSAL_KEY, seen)
+    except Exception:  # noqa: BLE001 - never at the cost of the refusal itself
+        return True
+    return True
+
+
+def candle_fetch(alert: Callable[[str, str], Any] | None = None, journal: Journal | None = None,
+                 clock: Callable[[], float] = time.time) -> Callable[[Path], Path]:
+    """The runtime's candle download (LiveDeps.fetch, on its worker thread): update_cache for SPOT_PRODUCT, after
+    reading the cache it extends. The hourly write is not atomic (and data/coinbase_history.py is not changed here): a
+    kill in the middle of it leaves a cache no later download can read, and every hour would be held. Such a cache is
+    moved aside to <file>.bad-<epoch s> (CACHE_SET_ASIDE event, a [캔들 캐시 손상] alert) and the history downloaded again
+    from scratch (minutes: the cycle meanwhile is late, then held)."""
+
+    def fetch(cache_dir: Path) -> Path:
+        path = Path(cache_dir) / CACHE_FILE
+        if path.exists():
+            try:
+                load_1h(path)
+            except Exception as exc:  # noqa: BLE001 - any unreadable cache (a truncated parquet, bad dtypes, ...)
+                bad = path.with_name(f"{path.name}.bad-{int(clock())}")
+                os.replace(path, bad)
+                if journal is not None:
+                    journal.add_event(clock(), "CACHE_SET_ASIDE", {"path": str(bad), "error": type(exc).__name__})
+                if alert is not None:
+                    alert("CACHE", f"[캔들 캐시 손상] {path.name}을 읽지 못해 ({type(exc).__name__}) {bad.name}(으)로 옮기고 "
+                                   "처음부터 다시 받음 - 몇 분 걸리는 동안 판단 보류")
+        return update_cache(SPOT_PRODUCT, Path(cache_dir))
+
+    return fetch
+
+
 def paper_fetcher(s: LiveSettings) -> Callable[[], dict[str, Any]] | None:
     if not (s.paper_repo and s.github_token):
         return None
@@ -348,8 +401,9 @@ class Wired:
 def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journal, stage: str,
           notify: LiveNotifier | None = None) -> Wired:
     """The runtime for `stage` - the preflight's, from `process_stage` (read once): the real exchange in CANARY and
-    FULL, ShadowExchange otherwise - with the preflight-checked lock, the expiry reminders (the settings' and the
-    contract's), the Telegram control, the heartbeat and the redaction; the feed and the Telegram threads started."""
+    FULL, ShadowExchange otherwise - with the preflight-checked lock, the candle download (`candle_fetch`), the expiry
+    reminders (the settings' and the contract's), the refusal codes the settings add, the Telegram control, the
+    heartbeat and the redaction; the feed and the Telegram threads started."""
     notify = notifier(s) if notify is None else notify
     ex = stage_exchange(real, journal, stage, notify)
     feed = price_feed(s)
@@ -358,11 +412,11 @@ def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journa
                if s.telegram_token and s.telegram_chat else None)
     beat = heartbeat(s)
     deps = LiveDeps(
-        journal=journal, exchange=ex, lock=lock,
-        fetch=lambda cache_dir: update_cache(SPOT_PRODUCT, Path(cache_dir)), cache_dir=s.cache_dir, notify=notify,
-        clock=time.time, sleep=time.sleep, feed=feed, heartbeat=beat, commands=commands, control=control,
+        journal=journal, exchange=ex, lock=lock, fetch=candle_fetch(notify, journal), cache_dir=s.cache_dir,
+        notify=notify, clock=time.time, sleep=time.sleep, feed=feed, heartbeat=beat, commands=commands, control=control,
         paper_ledger=paper_fetcher(s), edit_stops=s.edit_stops, expiry={**dict(s.expiry), **contract_reminders()},
-        redact=lambda text: redact(text, s), stage=stage,
+        redact=lambda text: redact(text, s), stage=stage, close_conflicts=s.close_conflicts,
+        overlap_refusals=s.overlap_refusals,
     )
     rt = LiveRuntime(deps)
     if feed is not None:

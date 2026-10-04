@@ -6,8 +6,8 @@ report candle sees it, and an explicit --start at/after HOLDOUT_START or --end a
 (exit 2). runner.run_backtest and runner.compare refuse the holdout on their own as well (defence in
 depth). `holdout` is the one-shot evaluation. `paper run` (Plan 2) works on the period AFTER the
 holdout: it reads the params from the committed holdout.lock only and has no strategy or config
-options (ewbot.paper.runner). `live run | preflight | status | stage | backup` (Plan 3) runs and inspects
-the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options."""
+options (ewbot.paper.runner). `live run | preflight | status | stage | rebase | backup` (Plan 3) runs and
+inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options."""
 
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ from ewbot.live.stage import (
     shadow_gates,
     transition,
 )
+from ewbot.live.watchdog import AccountGuard, ny_date
 from ewbot.paper.criteria import golive_status, status_lines
 from ewbot.paper.ledger import LedgerError, current_epoch, load_ledger
 from ewbot.paper.notify import deliver, failure_text, make_event, position_line, sender_from_env
@@ -114,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
     p_stage.add_argument("--restart", action="store_true",
                          help="shadow or canary, the current stage: start a new stint of it (flat book)")
+    p_rb = live_sub.add_parser("rebase", help="after a deliberate deposit or withdrawal: re-base the account loss "
+                               "breakers (the running runtime applies it at its next minute)")
+    p_rb.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
     p_bk = live_sub.add_parser("backup", help="consistent copy of the journal (SQLite online backup)")
     p_bk.add_argument("--out", type=Path, required=True)
     return parser
@@ -482,6 +486,14 @@ def cmd_paper(args: argparse.Namespace) -> int:
 LIVE_REFUSAL_WAIT_S = 600.0  # a refused start waits before exiting: Docker restarts it, alerts stay sparse
 # (a start refused because Coinbase could not be read - an outage - waits live_app.OUTAGE_WAIT_S instead)
 ALERTS_GATE = "알림 설정 (Telegram 알림·명령, 헬스체크)"  # a promotion to CANARY or FULL needs them (preflight `alerts`)
+CYCLE_WINDOW = (59, 6)  # promotions and stint restarts are refused from hh:59 to hh:06 UTC (the hour's cycle, entries)
+
+
+def _in_cycle_window(now: float) -> bool:
+    """`now` falls from hh:59 to hh:06 UTC: the runtime's hourly cycle (hh:00:30) and its entries (until hh:05) may
+    open a trade between a promotion's flat check and its stage write."""
+    minute = int(now) // 60 % 60
+    return minute >= CYCLE_WINDOW[0] or minute < CYCLE_WINDOW[1]
 
 
 def _live_settings() -> LiveSettings:
@@ -537,8 +549,9 @@ def _live_run(s: LiveSettings) -> int:
 
     def refuse(why: str, outage: bool = False) -> int:
         print(f"refusing: {why}", file=sys.stderr)
-        if not outage or live_app.outage_alert(journal, time.time()):
-            again = f" (Coinbase를 읽지 못함: {live_app.OUTAGE_WAIT_S:.0f}초마다 다시 시작, 알림은 1시간에 한 번)" if outage else ""
+        if live_app.outage_alert(journal, time.time()) if outage else live_app.refusal_alert(journal, why, time.time()):
+            again = (f" (Coinbase를 읽지 못함: {live_app.OUTAGE_WAIT_S:.0f}초마다 다시 시작, 알림은 1시간에 한 번)" if outage
+                     else f" ({LIVE_REFUSAL_WAIT_S / 60:.0f}분마다 다시 시작, 같은 이유의 알림은 1시간에 한 번)")
             notify("PREFLIGHT", f"[시작 거부] {why}{again}")
         close()  # nothing keeps polling Telegram or the feed during the wait: a command sent now is answered later
         stop.wait(live_app.OUTAGE_WAIT_S if outage else LIVE_REFUSAL_WAIT_S)
@@ -603,7 +616,7 @@ def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
             return 2
     stage = "SHADOW"
     if s.journal_path.exists():
-        journal = Journal(s.journal_path)
+        journal = Journal(s.journal_path, read_only=True)  # a candidate image's probe never writes the live journal
         try:
             stage, why = live_app.process_stage(journal, real)
         except live_app.RealExposure as exc:
@@ -635,7 +648,8 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
     if not s.journal_path.exists() and not args.json:
         print(f"no journal at {s.journal_path}", file=sys.stderr)
         return 1
-    journal = Journal(s.journal_path) if s.journal_path.exists() else None
+    # read-only: a candidate image's probe (deploy.sh) or the health check never writes or migrates the live journal
+    journal = Journal(s.journal_path, read_only=True) if s.journal_path.exists() else None
     try:
         now = time.time()
         stage, since = journal.stage() if journal is not None else (None, None)
@@ -664,12 +678,8 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
                 print(line)
             if args.exchange:
                 print(f"exchange position: {out['exchange_position']}, open orders: {out['exchange_open_orders']}")
-        held = [what for what, there in (
-            ("an open trade", out["trade"] is not None),
-            (f"{out['pending_intents']} order(s) of unknown outcome (PENDING)", out["pending_intents"] > 0),
-            ("a standing flatten", out["flatten"] is not None),
-            ("a position", out.get("exchange_position") is not None),
-            (f"{out.get('exchange_open_orders', 0)} resting order(s)", out.get("exchange_open_orders", 0) > 0)) if there]
+        held = _held(out["trade"] is not None, out["pending_intents"], out["flatten"] is not None,
+                     out.get("exchange_position") is not None, out.get("exchange_open_orders", 0))
         if args.require_flat and held:
             print(f"not flat: {', '.join(held)} (flatten first: /flatten, or wait until the runtime is done)",
                   file=sys.stderr)
@@ -680,12 +690,24 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
             journal.close()
 
 
+def _held(trade: bool, pending: int, flatten: bool, position: bool, orders: int) -> list[str]:
+    """What keeps a book from flat - the running runtime's flat (LiveRuntime.flat): an open trade, an order of unknown
+    outcome (a PENDING intent) or a standing flatten in the journal, a position or a resting order on the account."""
+    return [what for what, there in (
+        ("an open trade", trade), (f"{pending} order(s) of unknown outcome (PENDING)", pending > 0),
+        ("a standing flatten", flatten), ("a position", position), (f"{orders} resting order(s)", orders > 0)) if there]
+
+
 def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
-    """(no open trade in the journal and no position or resting order on Coinbase, the real exchange)."""
+    """(the book is flat as the running runtime sees it - `_held`: the journal's trade, orders of unknown outcome and
+    standing flatten, Coinbase's position and resting orders -, the real exchange); what holds it is printed."""
     trade = journal.get("trade")
     real = _exchange(s)
-    flat = not (trade and trade.get("status") == "OPEN") and real.position() is None and not real.open_orders()
-    return flat, real
+    held = _held(bool(trade and trade.get("status") == "OPEN"), len(journal.intents(status="PENDING")),
+                 journal.get(live_runtime.FLATTEN_KEY) is not None, real.position() is not None, len(real.open_orders()))
+    if held:
+        print(f"not flat: {', '.join(held)}", file=sys.stderr)
+    return not held, real
 
 
 def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
@@ -719,6 +741,10 @@ def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
                   "book not flat: the runtime keeps protecting and managing the open position and restarts into the "
                   "new stage once flat")
             return 0
+        if _in_cycle_window(now):  # the hour's cycle may open a trade between the flat check and the write
+            print("refusing: promotions and stint restarts are refused from hh:59 to hh:06 UTC (the hourly cycle and "
+                  "its entries) - try again after hh:06", file=sys.stderr)
+            return 2
         try:  # the real account must be flat too
             flat, real = _flat_book(s, journal)
         except (SettingsError, ExchangeError) as exc:
@@ -759,6 +785,50 @@ def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
         journal.close()
 
 
+def _usd(x: Any) -> str:
+    return "-" if x is None else f"{float(x):,.2f}"
+
+
+def _live_rebase(s: LiveSettings, args: argparse.Namespace) -> int:
+    """`ewbot live rebase [--confirm]`: after a deliberate deposit or withdrawal (docs/live-trading.md) the account loss
+    breakers' references - the day's and the peak - are based again. The CLI only asks (REBASE_KEY, a REBASE_REQUESTED
+    event): the running runtime, the breakers' one writer, applies it at its next minute with its own balance reads
+    (the median of three; alerted). Prints the references before and the equity now; needs --confirm; refused while a
+    flatten stands or a tripped breaker's flatten has not gone out yet (an open trade while tripped)."""
+    if not s.journal_path.exists():
+        print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
+        return 1
+    journal = Journal(s.journal_path)
+    try:
+        now = time.time()
+        g = journal.get(AccountGuard.KEY) or {}
+        print(f"before: day {g.get('day') or '-'} reference {_usd(g.get('day_ref'))} USD, peak {_usd(g.get('peak'))} USD")
+        try:
+            equity = f"equity now {_usd(_exchange(s).balance().equity)} USD"
+        except (SettingsError, ExchangeError) as exc:
+            equity = f"equity now unreadable ({exc})"
+        print(f"after: both references based again from the runtime's next balance read and the two after it (their "
+              f"median) - {equity}")
+        trade = journal.get("trade")
+        tripped = g.get("total_tripped") or (g.get("daily_tripped") and g.get("day") == ny_date(now))
+        if journal.get(live_runtime.FLATTEN_KEY) is not None:
+            print("refusing: a flatten stands - let it finish (the account flat), then rebase", file=sys.stderr)
+            return 2
+        if tripped and trade and trade.get("status") == "OPEN":
+            print("refusing: a breaker tripped and its flatten has not gone out yet - the runtime flattens at its start; "
+                  "rebase once flat", file=sys.stderr)
+            return 2
+        if not args.confirm:
+            print("refusing: a rebase needs --confirm (the user's explicit approval)", file=sys.stderr)
+            return 2
+        journal.put(live_runtime.REBASE_KEY, {"ts": now})
+        journal.add_event(now, "REBASE_REQUESTED", {"day_ref": g.get("day_ref"), "peak": g.get("peak")})
+        print("rebase requested: the running runtime applies it at its next minute ([손실 한도 기준 재설정] alert)")
+        return 0
+    finally:
+        journal.close()
+
+
 def _live_backup(s: LiveSettings, args: argparse.Namespace) -> int:
     if not s.journal_path.exists():  # never an empty journal created and copied as if it were the real one
         print(f"no journal at {s.journal_path}", file=sys.stderr)
@@ -783,7 +853,8 @@ def cmd_live(args: argparse.Namespace) -> int:
         return 2
     if args.live_cmd == "run":
         return _live_run(s)
-    handlers = {"preflight": _live_preflight, "status": _live_status, "stage": _live_stage, "backup": _live_backup}
+    handlers = {"preflight": _live_preflight, "status": _live_status, "stage": _live_stage, "rebase": _live_rebase,
+                "backup": _live_backup}
     return handlers[args.live_cmd](s, args)
 
 

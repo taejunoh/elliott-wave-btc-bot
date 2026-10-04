@@ -5,14 +5,17 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from ewbot import cli
 from ewbot.cli import build_parser, main
 from ewbot.live import app as live_app
+from ewbot.live import runtime as live_runtime_mod
 from ewbot.live.audit import AuditResult
 from ewbot.live.exchange import ExchangeError, KeyPermissions, Unavailable
 from ewbot.live.health import Heartbeat
@@ -29,6 +32,7 @@ from tests.live.helpers import Clock
 from tests.paper.helpers import FakeFetch, FakeSender, make_lock, synth_frame, ts
 
 NOW = ts("2024-03-13 23:00") + 30
+IN_CYCLE_WINDOW = cli._in_cycle_window  # the live_env fixture opens the window; its own test puts it back
 ENTRY_BAR = ts("2024-03-13 23:00")  # the synthetic C_END long's entry bar (signal 22:00)
 ALERTS = {"telegram_token": Secret("123456:SECRET-TOKEN"), "telegram_chat": "42",
           "healthcheck_url": Secret("https://hc-ping.com/u1")}
@@ -54,6 +58,7 @@ def live_env(tmp_path, monkeypatch):
     monkeypatch.setattr(live_app, "update_cache", lambda product, cache_dir: FakeFetch(df, clock)(cache_dir))
     monkeypatch.setattr("ewbot.live.preflight.time", SimpleNamespace(time=lambda: NOW))  # the contract's 90 days
     monkeypatch.setattr(cli, "LIVE_REFUSAL_WAIT_S", 0.0)
+    monkeypatch.setattr(cli, "_in_cycle_window", lambda now: False)  # promotions at any minute of the wall clock
     return settings, ex, lock
 
 
@@ -726,3 +731,157 @@ def test_a_settings_refusal_waits_under_the_stop_handler(live_env, monkeypatch, 
 
     monkeypatch.setattr(cli, "_live_settings", refused)
     assert main(["live", "run"]) == 2 and slept == [1.0, 1.0] and signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_promotion_or_restart_needs_the_runtimes_flat_book_and_a_quiet_minute(live_env, monkeypatch, capsys):
+    """Final review B minor 4: a promotion's flat book is the running runtime's (LiveRuntime.flat): an order of unknown
+    outcome or a standing flatten keeps it open, like an open trade, a position or a resting order; and promotions and
+    stint restarts are refused from hh:59 to hh:06 UTC, when the hour's cycle may open a (virtual) trade between the
+    check and the write. Demotions are never refused."""
+    settings, ex, _ = live_env
+    jr = Journal(settings.journal_path)
+    jr.set_stage("SHADOW", "initial", NOW - 86_400)
+    jr.record_intent("ewb-e-1700000000-L", "ENTRY", 1_700_000_000, {"side": 1, "contracts": 1}, NOW)
+    jr.close()
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 2
+    err = capsys.readouterr().err
+    assert "not flat" in err and "unknown outcome" in err
+    jr = Journal(settings.journal_path)
+    jr.update_intent("ewb-e-1700000000-L", "ABANDONED", NOW + 600)
+    jr.put(FLATTEN_KEY, {"reason": "USER_FLATTEN", "origin": "USER", "ts": NOW, "deferred": False})
+    jr.close()
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 2 and "a standing flatten" in capsys.readouterr().err
+    jr = Journal(settings.journal_path)
+    jr.put(FLATTEN_KEY, None)
+    jr.close()
+    monkeypatch.setattr(cli, "_in_cycle_window", IN_CYCLE_WINDOW)
+    for minute, quiet in ((58, False), (59, True), (0, True), (5, True), (6, False)):
+        assert IN_CYCLE_WINDOW(ts("2024-03-14 10:00") + 60 * minute + 30) is quiet
+    monkeypatch.setattr("ewbot.cli.time.time", lambda: ts("2024-03-14 10:02"))
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 2
+    assert "hh:59" in capsys.readouterr().err
+    assert main(["live", "stage", "canary", "--confirm"]) == 2 and "hh:59" in capsys.readouterr().err
+    monkeypatch.setattr("ewbot.cli.time.time", lambda: ts("2024-03-14 10:20"))
+    assert main(["live", "stage", "shadow", "--restart", "--confirm"]) == 0
+
+
+def test_a_rebase_is_requested_with_confirm_and_refused_while_a_flatten_stands(live_env, monkeypatch, capsys):
+    """Final review B-2: after a deliberate deposit or withdrawal, `ewbot live rebase --confirm` asks the runtime (the
+    breakers' one writer) to re-base both references at its next minute; it prints before and after, needs --confirm,
+    and is refused while a flatten stands or a tripped breaker still waits for its flatten."""
+    settings, ex, _ = live_env
+    monkeypatch.setattr("ewbot.cli.time.time", lambda: NOW)  # New York 2024-03-13
+    assert main(["live", "rebase", "--confirm"]) == 1  # no journal
+    jr = Journal(settings.journal_path)
+    jr.put("account_guard", {"day": "2024-03-13", "day_ref": 10_000.0, "peak": 10_500.0, "daily_tripped": False,
+                             "total_tripped": False})
+    jr.close()
+    assert main(["live", "rebase"]) == 2
+    res = capsys.readouterr()
+    assert "10,000.00" in res.out and "10,500.00" in res.out and "equity now 10,000.00" in res.out
+    assert "--confirm" in res.err
+    jr = Journal(settings.journal_path)
+    assert jr.get(live_runtime_mod.REBASE_KEY) is None
+    jr.put(FLATTEN_KEY, {"reason": "BREAKER_DAILY_LOSS", "origin": "BREAKER", "ts": NOW, "deferred": False})
+    jr.close()
+    assert main(["live", "rebase", "--confirm"]) == 2 and "flatten" in capsys.readouterr().err
+    jr = Journal(settings.journal_path)
+    jr.put(FLATTEN_KEY, None)
+    jr.put("account_guard", {"day": "2024-03-13", "day_ref": 10_000.0, "peak": 10_500.0, "daily_tripped": True,
+                             "total_tripped": False})
+    jr.put("trade", {"status": "OPEN", "trade_id": 1})
+    jr.close()
+    assert main(["live", "rebase", "--confirm"]) == 2 and "breaker" in capsys.readouterr().err
+    jr = Journal(settings.journal_path)
+    jr.put("trade", None)
+    jr.close()
+    assert main(["live", "rebase", "--confirm"]) == 0 and "requested" in capsys.readouterr().out
+    jr = Journal(settings.journal_path)
+    assert jr.get(live_runtime_mod.REBASE_KEY)["ts"] > 0 and jr.events(kind="REBASE_REQUESTED")
+    jr.close()
+
+
+def test_status_and_preflight_open_the_journal_read_only(live_env, capsys):
+    """Final review B minor 12: a candidate image's probes (`live status`, `live preflight`) never write, migrate or
+    create the live journal (a newer schema would make the running image refuse it on a rollback)."""
+    settings, ex, _ = live_env
+    jr = Journal(settings.journal_path)
+    jr.set_stage("SHADOW", "initial", NOW - 3600)
+    jr.close()
+    raw = sqlite3.connect(settings.journal_path)
+    raw.execute("PRAGMA user_version = 0")
+    raw.close()
+    before = settings.journal_path.read_bytes()
+    assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 0
+    assert main(["live", "status"]) == 0 and main(["live", "preflight", "--offline"]) == 0
+    assert main(["live", "preflight"]) == 0
+    capsys.readouterr()
+    assert settings.journal_path.read_bytes() == before
+    raw = sqlite3.connect(settings.journal_path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 0
+    raw.close()
+
+
+def test_an_unreadable_candle_cache_is_set_aside_and_downloaded_again(tmp_path, monkeypatch):
+    """Final review B minor 6: the hourly cache write is not atomic (and data/coinbase_history.py is protected): a kill
+    in the middle of it left a cache no later download could read - every hour held. The live download moves an
+    unreadable cache aside (<name>.bad-<ts>), journals and alerts it, and downloads the history again."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "BTC-USD_1h.parquet").write_bytes(b"PAR1 half a file")
+    df = synth_frame()
+    clock = Clock(NOW)
+    calls: list[Any] = []
+
+    def update(product, cache_dir):
+        calls.append((product, cache_dir))
+        return FakeFetch(df, clock)(cache_dir)
+
+    monkeypatch.setattr(live_app, "update_cache", update)
+    alerts: list[tuple[str, str]] = []
+    jr = Journal(tmp_path / "journal.sqlite")
+    fetch = live_app.candle_fetch(lambda kind, text: alerts.append((kind, text)), jr, clock=clock)
+    path = fetch(cache)
+    assert (cache / f"BTC-USD_1h.parquet.bad-{int(NOW)}").read_bytes() == b"PAR1 half a file"
+    assert path == cache / "BTC-USD_1h.parquet" and calls == [("BTC-USD", cache)] and len(pd.read_parquet(path)) > 0
+    assert alerts[0][0] == "CACHE" and "BTC-USD_1h.parquet" in alerts[0][1]
+    assert jr.events(kind="CACHE_SET_ASIDE")[0]["data"]["error"]
+    fetch(cache)  # a readable cache is extended in place
+    assert len(alerts) == 1 and len(list(cache.glob("*.bad-*"))) == 1
+    jr.close()
+
+
+def test_a_refusal_is_alerted_once_an_hour_per_reason(alerting, monkeypatch, capsys):
+    """Final review B minor 8: a start refused for a configuration reason waits 10 minutes and Docker starts it again -
+    its [시작 거부] went out every time (about 144 a day). Once an hour per reason now (the journal keeps the times),
+    a new reason at once."""
+    s, sender, posts = alerting
+    monkeypatch.setattr("ewbot.cli.time.sleep", lambda seconds: None)
+    clock = [NOW]
+    monkeypatch.setattr("ewbot.cli.time.time", lambda: clock[0])
+    transfer = SimExchange(permissions=KeyPermissions(True, True, True))
+    monkeypatch.setattr(live_app, "real_exchange", lambda _s: transfer)
+    for _ in range(3):
+        assert main(["live", "run"]) == 2
+        clock[0] += 610
+    assert len([t for t in sender.texts if "[시작 거부]" in t]) == 1
+    clock[0] += 3_600
+    assert main(["live", "run"]) == 2 and len([t for t in sender.texts if "[시작 거부]" in t]) == 2
+    viewer = SimExchange(permissions=KeyPermissions(True, False, False))  # another reason: alerted at once
+    jr = Journal(s.journal_path)
+    jr.set_stage("CANARY", "test", clock[0])
+    jr.close()
+    monkeypatch.setattr(live_app, "real_exchange", lambda _s: viewer)
+    assert main(["live", "run"]) == 2 and len([t for t in sender.texts if "[시작 거부]" in t]) == 3
+    capsys.readouterr()
+
+
+def test_the_extra_refusal_codes_reach_the_runtime(live_env):
+    settings, ex, lock = live_env
+    s = dataclasses.replace(settings, close_conflicts=("BRACKETS_REST",), overlap_refusals=("TOO_MANY",))
+    jr = Journal(s.journal_path)
+    notify = live_app.notifier(s)
+    wired = live_app.build(s, lock, ex, jr, "CANARY", notify)
+    assert "BRACKETS_REST" in wired.runtime.executor.close_conflicts and "TOO_MANY" in wired.runtime.executor.overlap_refusals
+    notify.stop()
+    jr.close()
