@@ -55,8 +55,8 @@ is taken before its alert.
             stored as failed and alerted), and the stage-change restart (a new stage or stint once flat: no open
             trade, no order of unknown outcome, no standing flatten, no position or order of ours)
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
-            reconcile. The candle download runs on a worker thread, waited for at most 5 s per try (a hung request
-            never stops the loop); retried every 15 s - at once when a running download ends - while the bar is
+            reconcile. The candle download runs on a worker thread, waited for at most 5 s when it starts (a hung
+            request never stops the loop); retried every 15 s - at once when a running download ends - while the bar is
             missing or the candles cannot be downloaded; 2 minutes after the close the decision is held and only
             protection is kept (spec 4.1 step 1). An engine error, or any failure after the replay, ends the bar's
             cycle as ERROR once (never replayed every tick; a failure in the reconcile keeps the target). A bar
@@ -572,19 +572,21 @@ class LiveRuntime:
         return self.frame
 
     def _download(self, bar_ts: int) -> pd.DataFrame | None:
-        """The cycle's candles. The download (`LiveDeps.fetch`: 15 s timeouts, retries) runs on a worker thread and the
-        loop waits for it at most FETCH_WAIT_S - a hung request never stops the watchdog, the polls or the commands.
-        One still running is left to finish (None: the cycle is late and tried again; `_cycle_due` tries at once
-        when it ends); one at a time - never two writers of the cache. A download that ended after its own cycle
-        gave up on it is not this bar's: a new one starts. Its error is raised here (a failed download)."""
+        """The cycle's candles. The download (`LiveDeps.fetch`: 15 s timeouts, retries) runs on a worker thread; the
+        loop waits for a download it just started at most FETCH_WAIT_S (a normal one is done by then) and never for one
+        already running - a hung request never stops the watchdog, the polls or the commands. One still running is
+        left to finish (None: the cycle is late and tried again; `_cycle_due` tries at once when it ends); one at a
+        time - never two writers of the cache. A download that ended after its own cycle gave up on it is not this
+        bar's: a new one starts. Its error is raised here (a failed download)."""
         job = self.candle_job
         if job is not None and job.done() and job.bar != bar_ts:
             job = self.candle_job = None  # an earlier bar's download that ended since: stale
+        started = job is None
         if job is None:
             fetch, cache = self.d.fetch, Path(self.d.cache_dir)
             job = self.candle_job = _Fetch(lambda: fetch(cache), self.mono(), "ewbot-candles", "candle download",
                                            bar=bar_ts)
-        job.thread.join(FETCH_WAIT_S)
+        job.thread.join(FETCH_WAIT_S if started else 0)
         if not job.done() or job.bar != bar_ts:
             return None  # still downloading (this bar's, or an earlier bar's: one at a time)
         self.candle_job = None

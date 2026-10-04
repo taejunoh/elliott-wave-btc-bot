@@ -1712,25 +1712,26 @@ def test_a_fill_price_the_venue_reports_as_nan_never_leaves_the_entry_unprotecte
 
 def test_a_hung_candle_download_never_stops_the_loop(h, monkeypatch):
     """Final fix (Task 12): the download (15 s timeouts, retries) ran on the loop - the watchdog and the polls stopped
-    while it hung. It runs on a worker thread now, waited for at most FETCH_WAIT_S per try, and the cycle runs at the
-    first tick after it ended."""
-    monkeypatch.setattr(runtime_mod, "FETCH_WAIT_S", 0.05)
+    while it hung. It runs on a worker thread now: waited for at most FETCH_WAIT_S when it starts, never again while it
+    runs (the 15 s retries only look), and the cycle runs at the first tick after it ended."""
+    monkeypatch.setattr(runtime_mod, "FETCH_WAIT_S", 0.5)
     release = threading.Event()
     real = h.rt.d.fetch
 
     def hung(cache_dir):
-        release.wait(3)
+        release.wait(5)
         return real(cache_dir)
 
     h.rt.d.fetch = hung
     begun = time.monotonic()
-    h.at(ENTRY_BAR + 30)  # the cycle starts the download and the tick goes on
+    h.at(ENTRY_BAR + 30)  # the cycle starts the download, waits 0.5 s for it and the tick goes on
     h.at(ENTRY_BAR + 31)
-    assert time.monotonic() - begun < 1.0 and h.rt.done_bar != SIGNAL and h.ex.position() is None
+    h.at(ENTRY_BAR + 46)  # the 15 s retry: the download still runs - looked at, not waited for
+    assert time.monotonic() - begun < 0.9 and h.rt.done_bar != SIGNAL and h.ex.position() is None
     assert h.journal.cycles()[-1]["status"] == "RUNNING"
     release.set()
     h.rt.candle_job.thread.join(5)
-    h.at(ENTRY_BAR + 32)  # the download ended: decided at this tick, not at the next 15 s retry
+    h.at(ENTRY_BAR + 47)  # the download ended: decided at this tick, not at the next 15 s retry
     assert h.rt.done_bar == SIGNAL and h.ex.position() is not None and h.journal.cycles()[-1]["status"] == "OK"
     assert h.rt.d.fetch is hung and h.rt.candle_job is None
 
