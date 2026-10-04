@@ -245,12 +245,17 @@ def _paper_repo(value: str | None) -> str | None:
 
 def refusal_codes(name: str, value: str | None) -> tuple[str, ...]:
     """EWBOT_CLOSE_CONFLICTS / EWBOT_OVERLAP_REFUSALS: 'CODE_A, CODE_B' -> the sorted codes (empty items ignored); a
-    code that is not UPPER_SNAKE, or one named twice, is a SettingsError."""
+    code that is not UPPER_SNAKE, an UNKNOWN_* code (the adapter's stand-in for a refusal Coinbase did not explain,
+    UNKNOWN_FAILURE_REASON: it would take every unexplained refusal for a conflict) or one named twice is a
+    SettingsError."""
     codes = [x.strip() for x in (value or "").split(",") if x.strip()]
     for code in codes:
         if not _CODE.match(code):
             raise SettingsError(f"{name} item {code[:40]!r} is not a Coinbase reason code (UPPER_SNAKE, e.g. "
                                 "OPEN_BRACKET_ORDERS)")
+        if code.startswith("UNKNOWN_"):
+            raise SettingsError(f"{name} item {code[:40]!r} names no reason (UNKNOWN_*: an unexplained refusal), so it "
+                                "cannot mark a conflict")
     if len(set(codes)) != len(codes):
         raise SettingsError(f"{name} names a code twice")
     return tuple(sorted(codes))

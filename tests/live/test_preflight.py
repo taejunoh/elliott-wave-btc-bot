@@ -465,6 +465,7 @@ def test_extra_refusal_codes_come_from_the_environment_checked():
     assert s.overlap_refusals == ("TOO_MANY_BRACKETS",)
     assert load_settings({}).close_conflicts == () and load_settings({"EWBOT_CLOSE_CONFLICTS": ""}).close_conflicts == ()
     for name in ("EWBOT_CLOSE_CONFLICTS", "EWBOT_OVERLAP_REFUSALS"):
-        for bad in ("open_bracket_orders", "OPEN BRACKET", "OPEN-BRACKET", "9CODES", "A,A"):
+        for bad in ("open_bracket_orders", "OPEN BRACKET", "OPEN-BRACKET", "9CODES", "A,A",
+                    "UNKNOWN_FAILURE_REASON", "UNKNOWN_CANCEL_ORDER"):  # the parser's fallback: every refusal
             with pytest.raises(SettingsError, match=name):
                 load_settings({name: bad})
