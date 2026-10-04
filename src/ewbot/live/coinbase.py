@@ -14,7 +14,9 @@ reply after the send, a bad header, ...) is ambiguous too: Unavailable, never a 
 `x-ratelimit-remaining` drops to `min_remaining`, the next request waits for the reset. These waits run on the
 runtime's loop, so they are bounded: one call's waits (pacing and retries) add up to at most RETRY_SLEEP_MAX_S - a
 wait that would pass it raises the call's error instead (the loop tries again on its next pass) - and while the last
-429's Retry-After runs a new call raises RateLimited at once and sends nothing. A call so blocks the loop for at most
+429's Retry-After runs a new call raises RateLimited at once and sends nothing. Coinbase limits the public market
+data and the private account and order endpoints apart: their pacing and their 429 windows are kept apart too, so a
+429 on a quote never holds back a close. A call so blocks the loop for at most
 RETRY_SLEEP_MAX_S plus its requests' own timeouts (10 s each), and in a 429 storm only the first call of a pass waits.
 
 Only ExchangeError (or ValueError for a side that is not +1/-1, a programming error) leaves this module:
@@ -304,8 +306,9 @@ class CoinbaseExchange:
         self.attempts = attempts
         self.backoff_s = backoff_s
         self.min_remaining = min_remaining
-        self._wait_until = 0.0
-        self._limited_until = 0.0  # the last 429's Retry-After: a new call before it raises at once, sends nothing
+        # per kind of endpoint (public: True, private: False) - the venue limits them apart
+        self._wait_until = {True: 0.0, False: 0.0}  # the pacing headers' reset
+        self._limited_until = {True: 0.0, False: 0.0}  # the last 429's Retry-After: a new call raises at once, sends nothing
 
     @classmethod
     def from_key_file(cls, key_file: Path, futures_id: str = FUTURES_PRODUCT, spot_id: str = SPOT_PRODUCT,
@@ -316,7 +319,7 @@ class CoinbaseExchange:
         return cls(RESTClient(key_file=str(key_file), timeout=timeout, rate_limit_headers=True), futures_id, spot_id, **kw)
 
     # ------------------------------------------------------------------ transport
-    def _pace(self, resp: dict[str, Any]) -> None:
+    def _pace(self, resp: dict[str, Any], public: bool = False) -> None:
         """Rate-limit headers (merged into the reply by the SDK); unreadable values are ignored."""
         remaining = resp.pop("x-ratelimit-remaining", None)
         reset = resp.pop("x-ratelimit-reset", None)
@@ -330,18 +333,18 @@ class CoinbaseExchange:
         if not math.isfinite(r):
             return
         wait = r - self.clock() if r > 1e9 else r  # epoch seconds or seconds-to-reset
-        self._wait_until = self.clock() + min(max(wait, 0.0), RETRY_AFTER_MAX_S)
+        self._wait_until[public] = self.clock() + min(max(wait, 0.0), RETRY_AFTER_MAX_S)
 
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               data: dict[str, Any] | None = None, public: bool = False, retry: bool = True) -> dict[str, Any]:
         tries = self.attempts if retry else 1
-        left = self._limited_until - self.clock()
+        left = self._limited_until[public] - self.clock()
         if 0 < left <= RETRY_AFTER_MAX_S:  # a 429's Retry-After still runs: nothing sent (a clock step back ignores it)
             raise RateLimited(f"rate limited: {left:.0f} s left of the last HTTP 429's Retry-After (nothing sent)",
                               retry_after=left)
         slept = 0.0
         for attempt in range(tries):
-            delay = self._wait_until - self.clock()
+            delay = self._wait_until[public] - self.clock()
             if delay > 0:
                 if slept + delay > RETRY_SLEEP_MAX_S:
                     raise RateLimited(f"rate limited: the pacing wait of {delay:.0f} s passes the call's "
@@ -358,7 +361,7 @@ class CoinbaseExchange:
             except Exception as exc:  # noqa: BLE001 - mapped below
                 err = map_error(exc)
                 if isinstance(err, RateLimited):
-                    self._limited_until = self.clock() + min(err.retry_after, RETRY_AFTER_MAX_S)
+                    self._limited_until[public] = self.clock() + min(err.retry_after, RETRY_AFTER_MAX_S)
                 if not err.retryable or attempt == tries - 1:
                     raise err from None
                 wait = min(err.retry_after, RETRY_AFTER_MAX_S) if isinstance(err, RateLimited) else self.backoff_s * 2**attempt
@@ -367,9 +370,9 @@ class CoinbaseExchange:
                 self.sleep(wait)
                 slept += wait
                 continue
-            self._limited_until = 0.0  # answered: no 429 runs any more
+            self._limited_until[public] = 0.0  # answered: no 429 runs any more
             resp = dict(resp)
-            self._pace(resp)
+            self._pace(resp, public)
             return resp
         raise ExchangeError("unreachable")  # pragma: no cover
 

@@ -649,3 +649,24 @@ def test_a_call_waits_at_most_its_budget_and_a_429_then_fails_fast():
     now[0] += 10.0
     assert ex.position().contracts == 3  # it has passed: sent again
     assert len(client.calls) == 3
+
+
+def test_a_429_on_public_market_data_never_holds_a_private_request():
+    """Final review A minor (probe pH): the public order book and the private account and order endpoints are limited
+    apart; a 429 on a quote opens the fail-fast window of public requests only - a close sent right after it goes out
+    (and a private 429 never holds a quote)."""
+    now = [1_790_000_000.0]
+    client = RecordedClient({("GET", API + "/market/product_book"): [http_error(429, "", {"Retry-After": "5"})] * 3,
+                             ("POST", API + "/orders/close_position"): ["close_ok"],
+                             ("GET", API + "/cfm/positions"): [http_error(429, "", {"Retry-After": "5"})] * 3 + ["positions"]})
+    ex = CoinbaseExchange(client, FUT, "BTC-USD", sleep=lambda s: None, clock=lambda: now[0], attempts=1)
+    with pytest.raises(RateLimited):
+        ex.quote(FUT)
+    assert ex.close_position("ewb-x-1-1").ok  # sent: the public window does not cover it
+    with pytest.raises(RateLimited, match="nothing sent"):
+        ex.quote(FUT)
+    with pytest.raises(RateLimited):
+        ex.position()
+    client.routes[("GET", API + "/market/product_book")] = ["book_bip"]
+    now[0] += 6
+    assert ex.quote(FUT).bid == 84655.0
