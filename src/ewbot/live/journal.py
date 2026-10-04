@@ -6,7 +6,11 @@ Intent-before-send: every order is first recorded as an intent keyed by its dete
 client_order_id (status PENDING) and committed; only then is it sent. After a crash, a PENDING intent
 means "outcome unknown": it is looked up on the exchange by client_order_id before anything is sent
 again (live/executor.py). The connection is in autocommit mode with WAL and synchronous=FULL, so a
-committed row survives a kill or power loss, and `ewbot live status` can read while the runtime writes."""
+committed row survives a kill or power loss, and `ewbot live status` can read while the runtime writes: a
+database that does not take WAL is refused (JournalError), as is one whose schema version (`PRAGMA
+user_version`, SCHEMA_VERSION) is newer than this runtime's - a rollback never writes into a journal it does not
+know. Every statement and its fetch run under one lock (the Telegram thread writes too), and an update of an
+intent or a cycle that does not exist raises KeyError (never a silent no-op)."""
 
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
+SCHEMA_VERSION = 1  # PRAGMA user_version of the journal this module writes
 INTENT_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "ABANDONED")
 DEFAULT_STAGE = "SHADOW"
 KNOWN_STAGES = ("SHADOW", "CANARY", "FULL")  # = live.stage.STAGES (the stage module builds on this one)
@@ -42,6 +47,10 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+class JournalError(RuntimeError):
+    """The file cannot be this runtime's journal: no WAL, or a schema version newer than SCHEMA_VERSION."""
+
+
 class Journal:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -49,9 +58,22 @@ class Journal:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False, timeout=30.0)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.executescript(_SCHEMA)
+        try:
+            mode = str(self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            if mode.lower() != "wal":  # the pragma answers the mode in force: refused (e.g. no shared memory)
+                raise JournalError(f"{self.path}: journal_mode is {mode!r}, not WAL - a committed row might not "
+                                   "survive a crash")
+            version = int(self._db.execute("PRAGMA user_version").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise JournalError(f"{self.path}: journal schema version {version} is newer than this runtime's "
+                                   f"{SCHEMA_VERSION} (deploy the release that wrote it)")
+            self._db.execute("PRAGMA synchronous=FULL")
+            self._db.executescript(_SCHEMA)
+            if version < SCHEMA_VERSION:  # a new journal, or one written before the version was recorded
+                self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except BaseException:
+            self._db.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -60,6 +82,14 @@ class Journal:
     def _exec(self, sql: str, args: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._db.execute(sql, tuple(args))
+
+    def _one(self, sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
+        with self._lock:  # the fetch under the lock as well: another thread's statement never interleaves
+            return self._db.execute(sql, tuple(args)).fetchone()
+
+    def _all(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._db.execute(sql, tuple(args)).fetchall()
 
     # ------------------------------------------------------------------ intents
     @staticmethod
@@ -84,18 +114,20 @@ class Journal:
         return row, cur.rowcount == 1
 
     def intent(self, client_order_id: str) -> dict[str, Any] | None:
-        return self._intent(self._exec("SELECT * FROM intents WHERE client_order_id = ?", (client_order_id,)).fetchone())
+        return self._intent(self._one("SELECT * FROM intents WHERE client_order_id = ?", (client_order_id,)))
 
     def update_intent(
         self, client_order_id: str, status: str, now: float, order_id: str | None = None, note: str | None = None
     ) -> None:
         if status not in INTENT_STATUSES:
             raise ValueError(f"unknown intent status {status}")
-        self._exec(
+        cur = self._exec(
             "UPDATE intents SET status = ?, order_id = COALESCE(?, order_id), note = COALESCE(?, note), "
             "updated_ts = ? WHERE client_order_id = ?",
             (status, order_id, note, float(now), client_order_id),
         )
+        if cur.rowcount != 1:
+            raise KeyError(f"no intent {client_order_id!r} to update")
 
     def intents(self, status: str | None = None, trade_id: int | None = None, kind: str | None = None) -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM intents WHERE 1 = 1", []
@@ -103,7 +135,7 @@ class Journal:
             if val is not None:
                 sql += f" AND {col} = ?"
                 args.append(val)
-        rows = self._exec(sql + " ORDER BY created_ts, client_order_id", args).fetchall()
+        rows = self._all(sql + " ORDER BY created_ts, client_order_id", args)
         return [self._intent(r) for r in rows]  # type: ignore[misc]
 
     # ------------------------------------------------------------------ events
@@ -119,7 +151,7 @@ class Journal:
         if since is not None:
             sql += " AND ts >= ?"
             args.append(float(since))
-        rows = self._exec(sql + " ORDER BY id", args).fetchall()
+        rows = self._all(sql + " ORDER BY id", args)
         return [{"id": r["id"], "ts": r["ts"], "kind": r["kind"], "data": json.loads(r["data"])} for r in rows]
 
     # ------------------------------------------------------------------ engine decisions (paper format)
@@ -135,7 +167,7 @@ class Journal:
         return new
 
     def decisions(self) -> list[dict[str, Any]]:
-        rows = self._exec("SELECT data, recorded_ts FROM decisions ORDER BY ts, id").fetchall()
+        rows = self._all("SELECT data, recorded_ts FROM decisions ORDER BY ts, id")
         return [{**json.loads(r["data"]), "recorded_ts": r["recorded_ts"]} for r in rows]
 
     # ------------------------------------------------------------------ cycles
@@ -143,15 +175,17 @@ class Journal:
         self._exec("INSERT OR REPLACE INTO cycles VALUES (?, ?, NULL, 'RUNNING', ?, NULL)", (int(bar_ts), float(now), stage))
 
     def finish_cycle(self, bar_ts: int, now: float, status: str, note: str | None = None) -> None:
-        self._exec("UPDATE cycles SET finished_ts = ?, status = ?, note = ? WHERE bar_ts = ?",
-                   (float(now), status, note, int(bar_ts)))
+        cur = self._exec("UPDATE cycles SET finished_ts = ?, status = ?, note = ? WHERE bar_ts = ?",
+                         (float(now), status, note, int(bar_ts)))
+        if cur.rowcount != 1:
+            raise KeyError(f"no cycle of bar {int(bar_ts)} to finish")
 
     def cycles(self, since_bar: int | None = None) -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM cycles", []
         if since_bar is not None:
             sql += " WHERE bar_ts >= ?"
             args.append(int(since_bar))
-        return [dict(r) for r in self._exec(sql + " ORDER BY bar_ts", args).fetchall()]
+        return [dict(r) for r in self._all(sql + " ORDER BY bar_ts", args)]
 
     # ------------------------------------------------------------------ stages
     def set_stage(self, stage: str, reason: str, now: float) -> None:
@@ -162,15 +196,15 @@ class Journal:
 
     def stage(self) -> tuple[str, float | None]:
         """(current stage, since). SHADOW with since None until the first set_stage."""
-        row = self._exec("SELECT stage, ts FROM stages ORDER BY id DESC LIMIT 1").fetchone()
+        row = self._one("SELECT stage, ts FROM stages ORDER BY id DESC LIMIT 1")
         return (DEFAULT_STAGE, None) if row is None else (row["stage"], row["ts"])
 
     def stage_history(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self._exec("SELECT * FROM stages ORDER BY id").fetchall()]
+        return [dict(r) for r in self._all("SELECT * FROM stages ORDER BY id")]
 
     # ------------------------------------------------------------------ key / value
     def get(self, key: str, default: Any = None) -> Any:
-        row = self._exec("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        row = self._one("SELECT value FROM kv WHERE key = ?", (key,))
         return default if row is None else json.loads(row["value"])
 
     def put(self, key: str, value: Any) -> None:

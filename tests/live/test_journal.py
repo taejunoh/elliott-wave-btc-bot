@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from ewbot.live.journal import Journal
+from ewbot.live.journal import SCHEMA_VERSION, Journal, JournalError
 
 
 @pytest.fixture
@@ -92,3 +95,42 @@ def test_backup_is_a_consistent_copy(jr, tmp_path):
     con = sqlite3.connect(str(out))
     assert con.execute("SELECT client_order_id FROM intents").fetchall() == [("a",)]
     con.close()
+
+
+# ---------------------------------------------------------------------------- Final fix
+def test_an_update_of_an_unknown_intent_or_cycle_raises(jr):
+    """A silent no-op would lose an order's outcome (ACCEPTED, REJECTED) or a cycle's status without a trace."""
+    with pytest.raises(KeyError, match="ewb-e-1-L"):
+        jr.update_intent("ewb-e-1-L", "ACCEPTED", now=1.0, order_id="o-1")
+    with pytest.raises(KeyError, match="3600"):
+        jr.finish_cycle(3600, now=2.0, status="OK")
+    assert jr.intents() == [] and jr.cycles() == []
+
+
+def test_the_journal_is_wal_and_carries_its_schema_version(tmp_path):
+    path = tmp_path / "j.sqlite"
+    Journal(path).close()
+    con = sqlite3.connect(str(path))
+    assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1
+    con.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")  # written by a newer runtime (a rollback)
+    con.close()
+    with pytest.raises(JournalError, match="schema version 2"):
+        Journal(path)
+    with pytest.raises(JournalError, match="WAL"):  # no WAL (here: an in-memory database): no crash-safe journal
+        Journal(Path(":memory:"))
+
+
+def test_committed_rows_survive_a_killed_process(tmp_path):
+    """Intent-before-send relies on it: a row committed right before a SIGKILL (no close, no checkpoint) is there after."""
+    path = tmp_path / "j.sqlite"
+    code = (f"import os, signal; from pathlib import Path; from ewbot.live.journal import Journal\n"
+            f"j = Journal(Path({str(path)!r}))\n"
+            f"j.record_intent('ewb-e-7-L', 'ENTRY', 7, {{'size': 1}}, 1.0)\n"
+            f"j.put('trade', {{'trade_id': 7}})\n"
+            f"os.kill(os.getpid(), signal.SIGKILL)\n")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=60)
+    assert done.returncode == -9, done.stderr
+    j = Journal(path)
+    assert j.intent("ewb-e-7-L")["status"] == "PENDING" and j.get("trade") == {"trade_id": 7}
+    j.close()
