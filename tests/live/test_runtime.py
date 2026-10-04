@@ -24,7 +24,7 @@ from ewbot.live.exchange import (
     RateLimited,
     Unavailable,
 )
-from ewbot.live.feed import TickerFeed
+from ewbot.live.feed import Tick, TickerFeed
 from ewbot.live.health import Heartbeat
 from ewbot.live.notify import LiveNotifier
 from ewbot.live.preflight import BASELINE_FINGERPRINT
@@ -1840,7 +1840,8 @@ def crashed_after_entry(tmp_path) -> Harness:
 def test_a_restart_without_a_target_protects_our_unsettled_entry_at_once(tmp_path):
     """Final review A-A (probe pA): killed right after the venue took our entry, restarted in the same hour while the
     lookups fail and no candles can be had (no target all hour). The start's own pass takes the position over from the
-    entry's intent (provisional, its levels) - it was left unprotected for the hour - and still alerts it."""
+    entry's intent (provisional, its levels) - it was left unprotected for the hour -, alerted as such
+    (ADOPTED_PROVISIONAL) but no manual-intervention incident: it is our own entry (re-review A)."""
     hs = crashed_after_entry(tmp_path)
     hs.clock.now = ENTRY_BAR + 70
 
@@ -1854,7 +1855,9 @@ def test_a_restart_without_a_target_protects_our_unsettled_entry_at_once(tmp_pat
     hs.rt.startup()
     assert hs.rt.target is None and covered(hs) and hs.rt.active
     assert hs.journal.events(kind="ADOPTED_PROVISIONAL")[0]["data"]["why"] == "LOOKUP_FAILED"
-    assert "UNKNOWN_POSITION" in hs.alerts.kinds()  # still alerted (and an incident) as an unknown position
+    assert "ADOPTED_PROVISIONAL" in hs.alerts.kinds() and "UNKNOWN_POSITION" not in hs.alerts.kinds()
+    # no manual-intervention incident (the 40 s the crash left it unprotected is still measured: PROTECT_SLOW)
+    assert [e["data"]["kind"] for e in hs.journal.events(kind="INCIDENT")] == ["PROTECT_SLOW"]
     tr = hs.rt.executor.trade()
     assert (tr.trade_id, tr.stop_price) == (SIGNAL, hs.journal.intent(f"ewb-e-{SIGNAL}-L")["payload"]["stop"])
     hs.journal.close()
@@ -2015,6 +2018,9 @@ def test_a_rebase_request_rebases_both_breakers_at_the_next_minute(h):
     h.journal.put(runtime_mod.REBASE_KEY, {"ts": ENTRY_BAR + 500})
     h.rt.minute(ENTRY_BAR + 520)
     assert h.journal.events(kind="REBASE_REFUSED") and h.journal.get(runtime_mod.REBASE_KEY) is None
+    h.rt.daily(ENTRY_BAR + 600)  # re-review B: a rebase absorbs what the breach flags held - it stays visible
+    daily = [t for k, t in h.alerts.items if k == "DAILY"][-1]
+    assert "손실 한도 기준 재설정 24시간: 1회" in daily
 
 
 class GappyFeed:
@@ -2108,4 +2114,175 @@ def test_an_unreadable_account_without_exposure_is_alerted_after_fifteen_minutes
     hs.at(t0 + 60 * 19)
     assert [t for k, t in hs.alerts.items if k == "ACCOUNT"][-1].startswith("[계좌 조회 복구]")
     assert hs.journal.events(kind="ACCOUNT_READABLE")
+    hs.journal.close()
+
+
+# ----------------------------------------------------------------------------- final small round (re-reviews)
+
+
+def test_the_feed_check_judges_a_tick_with_its_own_clock(tmp_path):
+    """Re-review B (probe probe_feed_fresh): the feed check ran with the tick's `now`, read before the minute's earlier
+    steps (a ping, the session and balance reads); a futures tick that arrived during those seconds looked "from the
+    future" and the healthy feed was called down. It reads the clock itself."""
+    hs = Harness(tmp_path, ENTRY_BAR + 1000)
+
+    class LiveFeed:  # always a fresh futures price: one that arrived 0.2 s before it is read
+        failures, last_error, gaps, connects = 0, None, 0, 1
+
+        def latest(self, product_id):
+            return Tick(60_000.0, hs.clock() - 0.2)
+
+        def take_resync(self):
+            return False
+
+    hs.rt = hs.make_runtime(feed=LiveFeed())
+    hs.price(26_700.0)
+    hs.rt.startup()
+    real = hs.ex.balance
+
+    def slow():  # the minute's REST reads take 2 s of wall time
+        hs.clock.now += 2.0
+        return real()
+
+    hs.ex.balance = slow
+    t = ENTRY_BAR + 1060
+    for _ in range(8):
+        hs.clock.now = t
+        hs.rt.minute(t)
+        t += 60
+    assert hs.rt.session.is_open and "FEED" not in hs.alerts.kinds()
+    hs.journal.close()
+
+
+class BlindReads(SimExchange):
+    """The next `blind` position reads say flat."""
+
+    blind = 0
+
+    def position(self):
+        p = super().position()
+        if self.blind > 0:
+            self.blind -= 1
+            return None
+        return p
+
+
+def test_a_trade_closed_on_flat_reads_keeps_the_fast_polls_for_five_minutes(tmp_path):
+    """Re-review A (probe pF 5b): two wrong flat snapshots in a row close the trade (the documented limit). The runtime
+    then polled once a minute and the position stayed without its cancelled brackets for about 60 s; it keeps the
+    10 s polls for OBSERVED_CLOSE_FAST_S after a close only the reads showed, so a wrong one is corrected at once."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.ex = BlindReads(clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    hs.ex.blind = 4  # two snapshots (two position reads each) say flat
+    hs.at(ENTRY_BAR + 45)
+    hs.at(ENTRY_BAR + 55)
+    assert hs.rt.executor.trade().status == "CLOSED" and hs.rt.active
+    s = next(s for s in range(1, 120) if hs.at(ENTRY_BAR + 55 + s) or hs.ex.open_orders())
+    assert s <= 11 and covered(hs)
+    hs.journal.close()
+
+
+class RefusesNewOrders(SimExchange):
+    """Order entry disabled while the session reads OPEN; `frozen`: the venue triggers nothing (matching paused)."""
+
+    entry_disabled = False
+    frozen = False
+
+    def place_bracket(self, cid, side, size, limit_price, stop_price):
+        if self.entry_disabled:
+            self.calls.append("place_bracket")
+            return PlaceResult(cid, None, False, "ORDER_ENTRY_DISABLED")
+        return super().place_bracket(cid, side, size, limit_price, stop_price)
+
+    def close_position(self, cid, size=None):
+        if self.entry_disabled:
+            self.calls.append("close_position")
+            return PlaceResult(cid, None, False, "ORDER_ENTRY_DISABLED")
+        return super().close_position(cid, size)
+
+    def _match(self):
+        return [] if self.frozen else super()._match()
+
+
+def test_a_watchdog_close_never_cancels_a_leg_that_still_protects(tmp_path):
+    """Re-review A (probe pG): FULL, 3 contracts, the TP2 leg gone and order entry disabled; the price through the stop
+    the venue has not triggered yet. The any-refusal close applies to a gapped stop and to a trade with no leg resting
+    only: here the TP1 leg still protects a contract and is kept."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs.ex = RefusesNewOrders(clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    t = hs.rt.executor.trade()
+    legs = {leg.name: leg.order_id for leg in t.legs}
+    hs.ex.entry_disabled = True
+    hs.ex.cancel([legs["tp2"]])
+    hs.at(ENTRY_BAR + 45)
+    assert hs.rt.executor.trade().unprotected_since is not None
+    hs.ex.frozen = True
+    hs.price(t.stop_price - 10)
+    for k in range(4):
+        hs.at(ENTRY_BAR + 60 + k)
+    assert [o.order_id for o in hs.ex.open_orders()] == [legs["tp1"]] and hs.journal.events(kind="STOP_UNPROTECTED")
+    assert not hs.journal.events(kind="CLOSE_CONFLICT")
+    hs.journal.close()
+
+
+class SlowCancels(SimExchange):
+    """Cancels take `delay` seconds (CANCEL_QUEUED meanwhile); a close is refused while a bracket of ours rests."""
+
+    delay = 8.0
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.leaving: dict[str, float] = {}
+
+    def cancel(self, order_ids):
+        self.calls.append("cancel")
+        for oid in order_ids:
+            self.leaving.setdefault(oid, self.clock())
+
+    def open_orders(self):
+        out = []
+        for o in super().open_orders():
+            since = self.leaving.get(o.order_id)
+            if since is None:
+                out.append(o)
+            elif self.clock() - since < self.delay:
+                out.append(dataclasses.replace(o, status="CANCEL_QUEUED"))
+            else:
+                SimExchange.cancel(self, [o.order_id])
+        return out
+
+    def close_position(self, client_order_id, size=None):
+        if any(o.kind == "BRACKET" for o in self.open_orders()):
+            self.calls.append("close_position")
+            return PlaceResult(client_order_id, None, False, "OPEN_BRACKET_ORDERS")
+        return super().close_position(client_order_id, size)
+
+
+def test_a_gapped_stops_close_ends_when_cancels_take_longer_than_the_wait(tmp_path):
+    """Re-review A (watchdog path): with cancels that take 8 s the close waited 5 s, the observing pass of the next
+    attempt placed the cancelled legs again, the close was refused again - a loop that never closed. The legs the
+    waiting close cancelled are not placed again before its next attempt: the position is closed."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.ex = SlowCancels(clock=hs.clock)
+    hs.rt = hs.make_runtime()
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    t = hs.rt.executor.trade()
+    placed = hs.ex.calls.count("place_bracket")
+    for k in range(60):
+        hs.price(t.stop_price * 0.93)  # past the stop's 5% limit
+        hs.at(ENTRY_BAR + 60 + k)
+        if hs.ex.position() is None:
+            break
+    assert hs.ex.position() is None and hs.ex.calls.count("place_bracket") == placed
+    assert hs.rt.executor.trade().exit_reason in ("STOP_GAP", "STOP_UNPROTECTED")
     hs.journal.close()

@@ -19,10 +19,12 @@ is taken before its alert.
             futures price, and a close when no stop rests (refused bracket) and the price is through the stop -
             at most one close per 10 s per trade, after a pass that observes the account first (a bracket fill
             is recorded as such), its alert after it and saying whether it closed; any refusal of such a close is
-            taken for a close conflict (the brackets protect nothing there: executor `any_refusal`)
+            taken for a close conflict (executor `any_refusal`) only where the brackets protect nothing - a gapped
+            stop, or no leg resting at all: a leg that still covers contracts is never cancelled for it
   poll      every 10 s while a trade is open, an intent is pending, our latest entry is unsettled (accepted, no trade
-            records it: Executor.unsettled_entry) or a flatten stands (60 s otherwise; after a WebSocket resync at
-            once, but a resync poll at most once per 10 s; the loop's cadence runs on a monotonic clock): a reduce
+            records it: Executor.unsettled_entry) or a flatten stands, and for 5 minutes after a close only the reads
+            showed (60 s otherwise; after a WebSocket resync at once, but a resync poll at most once per 10 s; the
+            loop's cadence runs on a monotonic clock): a reduce
             with an unknown outcome is resolved by its client order id first; then position and open
             orders are re-read as one state (the position read again after the orders, repeated until
             both reads agree: a fill between the reads never pairs a stale position with a vanished
@@ -107,7 +109,7 @@ from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
 from ewbot.live.control import Command
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, Order, Position, ProductSpec, SessionInfo
-from ewbot.live.executor import CLOSE_CONFLICTS, OVERLAP_REFUSALS, Executor
+from ewbot.live.executor import CANCEL_QUEUED, CLOSE_CONFLICTS, OVERLAP_REFUSALS, Executor
 from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
@@ -211,6 +213,7 @@ UNREADABLE_ALERT_S = 180.0  # an account read failing this long while there is s
 UNREADABLE_IDLE_ALERT_S = 900.0  # ... this long otherwise
 UNREADABLE_FAIL_S = 1800.0  # ... and with something to manage this long healthchecks.io gets a /fail as well
 READS = {"positions": "포지션·주문", "session": "장 상태", "balance": "잔고"}  # the account reads that are watched
+OBSERVED_CLOSE_FAST_S = 300.0  # after a close only the reads showed, the 10 s polls go on this long (a wrong read)
 # what a flatten did by the end of its first pass: the /flatten_confirm reply and the breaker alert say it
 FLATTEN_OUTCOME = {
     "done": "전량 청산 완료",
@@ -359,10 +362,11 @@ class LiveRuntime:
         self.resync_wanted = False  # the feed asked for a resync poll (run at most once per POLL_ACTIVE_S)
         self.resync_polls = 0
         self.feed_marks: tuple[int, int, int] = (0, 0, 0)  # the feed's gaps, connects and the resync polls at the last summary
+        self.observed_close: float | None = None  # monotonic: a trade closed by observation (not by our own close)
         raised = self.journal.get(RAISED_KEY) or {}  # the planned manual incidents in force, and their stint
         self.raised = {(str(k), int(t)) for k, t in raised.get("items", [])}
         self.raised_stint, self.raised_ended = raised.get("stint"), raised.get("ended")
-        self.active = self._busy()  # from the journal: a restart polls fast and watches at once
+        self.active = self._fast()  # from the journal: a restart polls fast and watches at once
 
     # ------------------------------------------------------------------ helpers
     def alert(self, kind: str, text: str) -> None:
@@ -406,6 +410,12 @@ class LiveRuntime:
         return ((t is not None and t.status == "OPEN") or bool(self.journal.intents(status="PENDING"))
                 or self.journal.get(FLATTEN_KEY) is not None
                 or self.executor.unsettled_entry(self.clock()) is not None)
+
+    def _fast(self) -> bool:
+        """Poll every 10 s and watch: `_busy`, or within OBSERVED_CLOSE_FAST_S of a trade closed by observation - the
+        reads showed it flat, not a close of ours -, so a wrong pair of flat reads is corrected at the next poll."""
+        recent = self.observed_close is not None and 0 <= self.mono() - self.observed_close < OBSERVED_CLOSE_FAST_S
+        return recent or self._busy()
 
     def _loop_error(self, section: str, exc: BaseException, now: float) -> None:
         """A failing loop section (called inside its `except`): journaled every time, alerted limited, traceback."""
@@ -578,7 +588,7 @@ class LiveRuntime:
                 self.target = self._stored_target(bar)  # meanwhile the decision taken before the restart
             elif decided:
                 self.done_bar = decided  # this hour's bar never started or a crash left it RUNNING: decided as usual
-            self.active = self._busy()
+            self.active = self._fast()
             self.poll(now)  # protection first: before the candle download
         finally:
             self._flatten_own = False
@@ -764,7 +774,7 @@ class LiveRuntime:
         raise ExchangeError(f"the position changed during {SNAPSHOT_TRIES} reads of the orders")
 
     def reconcile(self, now: float) -> None:
-        self.active = self._busy()  # before the reads: a pass that fails still keeps the fast polls and the watchdog
+        self.active = self._fast()  # before the reads: a pass that fails still keeps the fast polls and the watchdog
         self._after_pass = []
         self.executor.resolve_reduce()  # a reduce with an unknown outcome: looked up by its id, never a second one
         pos, orders = self._snapshot()
@@ -779,7 +789,8 @@ class LiveRuntime:
         self._record_fills(trade, orders, now)
         for kind, data in events:
             self.journal.add_event(now, kind, data)
-            if kind == "CLOSED":
+            if kind == "CLOSED":  # closed by observation (our own closes record it themselves): polled fast a while
+                self.observed_close = self.mono()
                 self.alert(kind, f"[청산 확인] 거래 {data['trade_id']} · {data['reason']}")
             elif kind == "TP1_FILLED":
                 self.alert(kind, f"[TP1 체결] 거래 {data['trade_id']} · 잔여 {data['contracts']}계약 · 손절 본전으로")
@@ -827,8 +838,8 @@ class LiveRuntime:
             self._incident("ADOPTED", now)  # trade settled as foreign (never our own entry rebuilt from its intent)
         t = self.executor.trade()
         # poll fast while a trade is open, an order's outcome is still unknown (looked up, then resent) or a flatten
-        # stands
-        self.active = self._busy()
+        # stands - and a while after a close only the reads showed
+        self.active = self._fast()
         if (t is not None and t.protected_ts is not None and t.protected_ts - t.opened_ts > PROTECT_MAX_S
                 and self._once(f"slow:{t.trade_id}")):
             self._incident("PROTECT_SLOW", now)
@@ -1119,8 +1130,11 @@ class LiveRuntime:
         if kind == "STOP_UNPROTECTED" and cur.unprotected_since is None:
             return  # the pass placed the stop again: the bracket and the stop-gap check take over
         done = False
-        try:  # the brackets protect nothing here (gapped, or no stop): any refusal is taken for a close conflict
-            done = self.executor.close(kind, self._ctx(now), any_refusal=True)
+        # any refusal is taken for a close conflict only where the brackets protect nothing: a gapped stop, or no leg
+        # resting at all - a leg that still covers contracts is never cancelled for a close that may not go out
+        any_refusal = kind == "STOP_GAP" or not self._legs_rest()
+        try:
+            done = self.executor.close(kind, self._ctx(now), any_refusal=any_refusal)
         except ExchangeError as exc:
             self.journal.add_event(now, "WATCH_ERROR", {"trade_id": t.trade_id, "kind": kind,
                                                         "error": self.d.redact(str(exc))[:200]})
@@ -1137,6 +1151,14 @@ class LiveRuntime:
         if held is not None:
             self.alert(kind, f"{what}: 시장가 청산 실패 - {POLL_ACTIVE_S:.0f}초마다 재시도"
                              + (f" (같은 경보 {held}건 생략)" if held else ""))
+
+    def _legs_rest(self) -> bool:
+        """A bracket of ours rests (one whose cancel is queued is leaving: not counted); an unreadable book counts as
+        resting (nothing is cancelled on a guess)."""
+        try:
+            return any(is_ours(o) and o.kind == "BRACKET" and o.status != CANCEL_QUEUED for o in self.ex.open_orders())
+        except ExchangeError:
+            return True
 
     # ------------------------------------------------------------------ every minute
     def minute(self, now: float) -> None:
@@ -1473,10 +1495,12 @@ class LiveRuntime:
         """The watchdog's WebSocket price: no futures tick for FEED_ALERT_S while the session is OPEN - a dead
         connection, or a refused subscription while the heartbeats still flow - is alerted once per outage
         (prices come from REST meanwhile), and once more when futures ticks are back. A closed or halted venue
-        has no trades: that is no outage."""
+        has no trades: that is no outage. Judged on its own read of the clock, not the tick's `now`: a futures tick
+        that came during the minute's earlier steps is fresh, never "from the future"."""
         feed = self.d.feed
         if feed is None:
             return
+        now = self.clock()  # its own read: the minute's earlier steps take seconds, and a tick may have come meanwhile
         tick = feed.latest(self.ex.futures_id)
         if tick is not None and fresh(now - tick.ts, WS_STALE_S):
             if self.feed_alerted:
@@ -1695,6 +1719,15 @@ class LiveRuntime:
                     lines.append(f"오버나이트 증거금 {margin_ratio(pos.contracts, price, pos.side, self.product, equity):.0%}")
         except ExchangeError:
             lines.append("잔고를 읽지 못함")
+        rebased = self.journal.events(kind="REBASED", since=now - 86_400)  # a rebase clears the breach flags: shown
+        if rebased:
+            last = rebased[-1]["data"]
+
+            def usd(x: Any) -> str:
+                return "-" if x is None else f"{float(x):,.2f}"
+
+            lines.append(f"손실 한도 기준 재설정 24시간: {len(rebased)}회 (마지막 {_utc(rebased[-1]['ts'])}: 일 기준 "
+                         f"{usd(last['before'].get('day_ref'))} → {usd(last['after'].get('day_ref'))} USD)")
         feed, marks = self.d.feed, self.feed_marks
         if feed is not None:  # the feed's sequence gaps since the last summary (a SHADOW week-1 check: Task 16)
             now_marks = (int(feed.gaps), int(feed.connects), self.resync_polls)
