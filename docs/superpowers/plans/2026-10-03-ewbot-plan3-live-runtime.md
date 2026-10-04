@@ -48,7 +48,7 @@
 11. **Gates operationalised.** SHADOW `신호 1건 이상` = a signal first known in the stage (`known_at` after its start: the first cycle records every decision since 2024). SHADOW ① = a passing audit (no mismatch the data do not explain: a `DATA_REVISION` is shown in the detail, not counted - as paper criterion 4 ignores explained causes) whose window starts at or before the stage's start and reaches a bar that closed at most 3 hours ago; a failed audit is stored and unmet, never the last good one. SHADOW ② (`모든 사이클`) = every hourly bar that closed in the stage has a cycle that ended OK within 2 minutes of the close - a runtime that was down misses bars; a bar whose deadline is still ahead is not due, and one with no cycle row at all while the futures session was recorded closed is excused: from a `SESSION` event whose `state` is not OPEN (the runtime records the state at every start and every change) to the next `SESSION` or `STARTUP` event, at most 4 hours (spec §2: the longest closure is the quarterly 3-hour maintenance). A restart never rewrites a bar whose cycle ended OK: it takes that bar as done and only refreshes its target (a failed download retried until the hour ends); a bar held or failed before a restart is not decided again, and a cycle a crash left RUNNING (or one never started) runs under the usual deadlines. SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `ORDER_UNRESOLVED`: the runtime watches every `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` and `ACTION_ERROR` of a Protect, Close or Reduce until it is resolved - its trade closed, or a later pass that saw a target and quotes had no order failure for that trade (a close needs the close itself). A bracket's 30 s are judged at the strict pass (a target, quotes, the session OPEN) that placed its wanted legs - it planned a Protect for the trade and had no failure for it -, and a later strict pass that plans nothing for the trade and has no failure confirms it whenever it runs (one that fails or plans again leaves it open; still unconfirmed after 2 further strict passes and 10 minutes, it is unresolved - never in an outage without strict passes); a strict pass that finds the legs as wanted within the 30 s resolves it at once. A pass without a target, quotes or an OPEN session (a data-late hour; a venue refusing order entry while closed) shows only the protection - the trade's resting stop legs covering its position -: that resolves a failure first seen in such a pass, and is provisional for one first seen in a strict pass until the next strict pass confirms it - within 30 s for a bracket and by the next pass for a close or a reduction (the cancel-first fallback on a venue that refuses overlapping brackets writes `LEG_GAP` only: the designed path, not a failure; so do `CLOSE_CONFLICT` / `REDUCE_CONFLICT`, refusals answered by making room); CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The CANARY pass and FULL entry gates also need no other CANARY failure in the stint (audit mismatch, breaker, transfer key), the runtime not paused and a current audit without an unexplained mismatch of a decision known in the stint. `transition` refuses a promotion unless every gate of that promotion (`stage.REQUIRED_GATES`) is among those given and all are met. The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
 12. **Audit** (spec §3.5): the journal stores the engine decisions in the paper ledger's format; hourly (from minute 50) they are compared with the paper ledger's current epoch (known_at in (its recording floor - the previous epoch's through_ts for a later epoch -, min(epoch through_ts, the last bar whose live cycle ended OK)]: a held or failed cycle is never a mismatch). Every mismatch has a cause like the paper runtime's: `DATA_REVISION` (the candles the two runtimes decided on differ at the decision's bar although they were equal at the paper's previous run) is alerted only and explained (it fails no audit gate); a decision missing on one side is `AUDIT_PENDING` and a major incident (`AUDIT_MISMATCH`, in CANARY/FULL) only if the next audit still finds it; a different decision or a paper fingerprint change is one at once. A ledger that is not a valid schema-1 paper ledger, like a failed fetch, is a failed audit: stored as failed, alerted once per episode.
 13. **Costs in the daily summary**: entry slippage against the engine's reference (spot `entry_ref` × ratio), stop slippage of bracket stop fills against the stop price (every leg's fills - a partial one too - are journaled as `BRACKET_FILL` as they show: from the open orders while it rests, read back with `get_order` once it left the book and recorded only once that read succeeded), measured fees vs. the paper cost model (`execution.costs.fee`); funding is not measured separately (Coinbase books it into the balance) — the summary says so.
-14. **Deployment** (spec §5.2): only tags on `origin/master`, from a clean checkout (no local change, no untracked file under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`); the new image's offline preflight runs first, with the service's real configuration (a compose `run` of the new image: the journal's stage, the secrets and key files, the user, the read-only root); then only with a flat book - what the running runtime calls flat (`LiveRuntime.flat`, `status --require-flat`): no open trade, no PENDING intent, no standing flatten, no position, no resting order - and never from hh:58 to hh:05 UTC (the hour's cycle and its entries). The running image is kept as `ewbot-live:previous` and the new one becomes `ewbot-live:current`; it must journal a loop heartbeat newer than the swap within 3 minutes (10 on a first deployment: the candle history is downloaded first), else the previous image is started again (rollback by hand = deploy the previous tag). `deploy.sh --recover <tag>` skips only the flat-book check, after a typed confirmation, and never rolls back: the one exception to the flat-book rule, to bring the runtime back while a position is open (a release that crash-loops, a new VPS after a VPS loss; runbook). Backups are watched by a healthchecks.io check of their own; a restore removes the journal's `-wal` and `-shm` files first.
+14. **Deployment** (spec §5.2): only tags on `origin/master`, from a clean checkout (no local change, no untracked file under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`); the new image's offline preflight runs first, with the service's real configuration (a compose `run` of the new image: the journal's stage, the secrets and key files, the user, the read-only root); then only with a flat book - what the running runtime calls flat (`LiveRuntime.flat`, `status --require-flat`): no open trade, no PENDING intent, no standing flatten, no position, no resting order - and never from hh:54 to hh:05 UTC (a swap, its wait and a rollback with its own wait end before the hour's cycle; nothing is swapped while its entries may go out). The running image is kept as `ewbot-live:previous` and the new one becomes `ewbot-live:current`; a container of the new image must journal a loop heartbeat newer than the swap within 3 minutes (10 on a first deployment: the candle history is downloaded first) - a failed `up -d`, or only the old container heartbeating, is a failed start -, else the previous image is started again, but only onto a book it still finds flat (rollback by hand = deploy the previous tag). `deploy.sh --recover <tag>` skips only the flat-book check, after a typed confirmation, and never rolls back: the one exception to the flat-book rule, to bring the runtime back while a position is open (a release that crash-loops, a new VPS after a VPS loss; runbook). Backups are watched by a healthchecks.io check of their own; a restore removes the journal's `-wal` and `-shm` files first, and the restore drill checks a backup under `/var/lib/ewbot/drill/`, never over the live journal.
 
 ## File Map
 
@@ -101,10 +101,10 @@
 | 12 | `ShadowExchange` and the runtime loop | 72 |
 | 13 | CLI `ewbot live …` and production wiring | 21 |
 | 14 | Parity and chaos integration tests | 29 |
-| 15 | Docker image, compose, deploy and backup scripts, runbook | 46 |
+| 15 | Docker image, compose, deploy and backup scripts, runbook | 51 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 486 more tests, `1106 passed, 1 skipped` (`1107 passed` with the cache; two more skipped without `shellcheck`), about 100 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 491 more tests, `1111 passed, 1 skipped` (`1112 passed` with the cache; two more skipped without `shellcheck`), about 100 s.
 
 ---
 
@@ -17137,7 +17137,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot live run | preflight --offline | status --json [--exchange] [--require-flat] [--max-age S] | backup --out` (Task 13; `--require-flat` is the running runtime's flat book).
-- Produces: the image `ewbot-live:<tag>` (Python 3.12.13 slim + uv 0.12.13, both pinned by digest; editable install at `/app` with `--no-dev --group live` and no uv cache left in it (`UV_NO_CACHE`); `/app/src` byte-compiled at build time - the root is read-only at run time, the fingerprint hashes `*.py` only -; user uid 1000; `HEALTHCHECK ewbot live status --json --max-age 180` (the journal's loop heartbeat only); `STOPSIGNAL SIGTERM`, `ENTRYPOINT ["ewbot", "live"]`, `CMD ["run"]`); the compose service `live` (`restart: unless-stopped`, `init: true` - an init as PID 1 hands `docker stop`'s SIGTERM to the runtime, which finishes its tick and exits 0 -, `stop_grace_period: 150s` for that tick and the 10 s Telegram flush, read-only root, `/var/lib/ewbot:/data`, `/etc/ewbot:/run/ewbot:ro`, the `journald` log driver with the tag `ewbot-live` - the log outlives a container a deploy or a restart replaces -, no secret value and no product in the file, its defaults valid settings; `deploy/live/.env` only fills its `${…}` settings and is never committed: `deploy/live/.gitignore`); `deploy.sh [--recover [--i-understand]] <tag>` (exit 2, nothing changed and the checkout moved back: no such tag, a tag off `origin/master`, local changes or a failing `git status`, untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's real configuration - `EWBOT_IMAGE=<new> docker compose … run --rm --no-deps -T live preflight --offline`: the journal's stage, the secrets and key files, the user, the read-only root -, the UTC minutes 58 to 05, a flat-book check that could not read Coinbase or the journal, `--recover` not confirmed; exit 3 when not flat; then the running image is kept as `ewbot-live:previous`, the new one tagged `ewbot-live:current` and started with `EWBOT_IMAGE` pinned, and deploy.sh waits for a loop heartbeat newer than the swap - `exec -T live ewbot live status --json --max-age <seconds since the swap - 1>` every 10 s for 180 s, 600 s on a first deployment: an older heartbeat is the old runtime's -: exit 0; exit 4 once `ewbot-live:previous` runs again, started with the previous checkout; exit 5 when that does not come up either or when nothing is rolled back - `--recover`, a first deployment; `--recover` skips only the flat-book check, prints the book and needs `recover <tag>` typed on stdin, or `--i-understand`); `backup.sh` + systemd timer (daily, age-encrypted, rclone to R2; made in the running container, or in a one-off container of the image while the service is stopped; the healthchecks.io check `EWBOT_BACKUP_PING_URL` pinged at `/start`, at the end and at `/fail` with the exit code - a SIGTERM included -; `TimeoutStartSec=30min`; its settings in the root-only `/etc/ewbot/backup.env`); the runbook (setup, stages, emergencies, restoring the journal - the WAL-safe sequence and a restore drill -, recovering from VPS loss, deploys).
+- Produces: the image `ewbot-live:<tag>` (Python 3.12.13 slim + uv 0.12.13, both pinned by digest; editable install at `/app` with `--no-dev --group live` and no uv cache left in it (`UV_NO_CACHE`); `/app/src` byte-compiled at build time - the root is read-only at run time, the fingerprint hashes `*.py` only -; user uid 1000; `HEALTHCHECK ewbot live status --json --max-age 180` (the journal's loop heartbeat only); `STOPSIGNAL SIGTERM`, `ENTRYPOINT ["ewbot", "live"]`, `CMD ["run"]`); the compose service `live` (`restart: unless-stopped`, `init: true` - an init as PID 1 hands `docker stop`'s SIGTERM to the runtime, which finishes its tick and exits 0 -, `stop_grace_period: 150s` for that tick and the 10 s Telegram flush, read-only root, `/var/lib/ewbot:/data`, `/etc/ewbot:/run/ewbot:ro`, the `journald` log driver with the tag `ewbot-live` - the log outlives a container a deploy or a restart replaces -, no secret value and no product in the file, its defaults valid settings; `deploy/live/.env` only fills its `${…}` settings and is never committed: `deploy/live/.gitignore`); `deploy.sh [--recover [--i-understand]] <tag>` (exit 2, nothing changed and the checkout moved back: no such tag, a tag off `origin/master`, local changes or a failing `git status`, untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's real configuration - `EWBOT_IMAGE=<new> docker compose … run --rm --no-deps -T live preflight --offline`: the journal's stage, the secrets and key files, the user, the read-only root -, the UTC minutes 54 to 05 (a swap, its wait and a rollback with its own wait end before the hour's cycle), a flat-book check that could not read Coinbase or the journal, `--recover` not confirmed; exit 3 when not flat; then the running image is kept as `ewbot-live:previous`, the new one tagged `ewbot-live:current` and started with `EWBOT_IMAGE` pinned, and deploy.sh waits for a loop heartbeat newer than the swap from a container of the new image - every 10 s for 180 s, 600 s on a first deployment, `docker inspect -f '{{.Image}}'` of every `compose ps -q live` container must equal `docker image inspect -f '{{.Id}}' ewbot-live:current` (an old container left running by a failed recreate keeps heartbeating) and `exec -T live ewbot live status --json --max-age <seconds since the swap - 1>` succeed (an older heartbeat is the old runtime's) -: exit 0; a non-zero `up -d` or no such heartbeat is a failed start: with the previous checkout back, `EWBOT_IMAGE=ewbot-live:previous … run … status --json --exchange --require-flat` must pass (the new runtime may have traded), then `ewbot-live:previous` is started again and awaited the same way: exit 4 once it is up; exit 5 when it does not come up either, or when nothing is rolled back - `--recover`, a first deployment, a book the previous image did not find flat or could not read (the checkout then back on the new tag); `--recover` skips only the flat-book check, prints the book and needs `recover <tag>` typed on stdin, or `--i-understand`); `backup.sh` + systemd timer (daily, age-encrypted, rclone to R2; made in the running container, or in a one-off container of the image while the service is stopped; the healthchecks.io check `EWBOT_BACKUP_PING_URL` pinged at `/start`, at the end and at `/fail` with the exit code - a SIGTERM included -; `TimeoutStartSec=30min`; every run first removes the plaintext `journal-*.sqlite` copies a killed run left in `/var/lib/ewbot/backup`; its settings in the root-only `/etc/ewbot/backup.env`); the runbook (setup, stages, emergencies, restoring the journal - the WAL-safe sequence, and a restore drill that never touches the live journal: the backup under `/var/lib/ewbot/drill/`, `PRAGMA integrity_check` and `status` with `EWBOT_LIVE_DIR=/data/drill` through the image -, recovering from VPS loss, deploys).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -17249,14 +17249,23 @@ def _stub(bin_dir: Path, name: str, body: str) -> None:
 
 def run_deploy(tmp_path: Path, *args: str, on_master: bool = True, has_tag: bool = True, changes: str = "",
                untracked: str = "", status_rc: int = 0, build_rc: int = 0, preflight_rc: int = 0, flat_rc: int = 0,
-               minute: str = "30", current: bool = True, health: tuple[str, ...] = ("ok",), answer: str | None = None):
-    """deploy.sh with stubs. `health`: per `up -d` (the swap, then a rollback) whether `status --max-age` succeeds.
-    The clock starts at 1 000 000 s and moves only with `sleep`."""
-    bin_dir = tmp_path / "bin"
+               rollback_flat_rc: int = 0, minute: str = "30", current: bool = True, new_ok: bool = True,
+               old_ok: bool = True, up_rc: tuple[int, ...] = (0, 0), first_up_recreates: bool = True,
+               answer: str | None = None):
+    """deploy.sh with stubs. The docker stub keeps the image id of every tag and the image the service's container
+    runs (`sha256:old` before the deploy, none on a first deployment): `up -d` exits `up_rc[n]` and, when it succeeds
+    (and `first_up_recreates` for the first one), runs ewbot-live:current. Its runtime journals fresh heartbeats when
+    `new_ok` / `old_ok` - an old container that keeps running keeps heartbeating. `rollback_flat_rc`: the flat-book
+    check of ewbot-live:previous before a rollback. The clock starts at 1 000 000 s and moves only with `sleep`."""
+    bin_dir, st = tmp_path / "bin", tmp_path / "state"
     bin_dir.mkdir(exist_ok=True)
-    log, clock, ups = tmp_path / "calls.log", tmp_path / "clock", tmp_path / "ups"
+    st.mkdir(exist_ok=True)
+    log, clock = tmp_path / "calls.log", tmp_path / "clock"
     clock.write_text("1000000")
-    ups.write_text("0")
+    (st / "ups").write_text("0")
+    if current:
+        (st / "tag_ewbot-live_current").write_text("sha256:old\n")
+        (st / "container").write_text("sha256:old\n")
     _stub(bin_dir, "git", f"""echo "git $*" >> "{log}"
 case "$*" in
   "rev-parse --show-toplevel") echo "{ROOT}" ;;
@@ -17269,22 +17278,41 @@ case "$*" in
 esac
 exit 0
 """)
-    health_case = "\n".join(f"    {i + 1}) exit {0 if h == 'ok' else 1} ;;" for i, h in enumerate(health))
-    _stub(bin_dir, "docker", f"""echo "docker $*${{EWBOT_IMAGE+ [EWBOT_IMAGE=$EWBOT_IMAGE]}}" >> "{log}"
+    ups = "\n".join(f"      {i + 1}) rc={rc} ;;" for i, rc in enumerate(up_rc))
+    docker = """echo "docker $*${EWBOT_IMAGE+ [EWBOT_IMAGE=$EWBOT_IMAGE]}" >> "@LOG@"
+st="@ST@"
+tagf() { echo "$st/tag_$(echo "$1" | tr ':/' '__')"; }
 case "$*" in
-  build*) exit {build_rc} ;;
-  *"preflight --offline"*) exit {preflight_rc} ;;
-  *"--require-flat"*) exit {flat_rc} ;;
-  "image inspect ewbot-live:current") exit {0 if current else 1} ;;
-  *"up -d"*) echo $(( $(cat "{ups}") + 1 )) > "{ups}" ;;
+  build*) [ @BUILD_RC@ -eq 0 ] || exit @BUILD_RC@; echo sha256:new > "$(tagf "${*: -2:1}")"; exit 0 ;;
+  *"preflight --offline"*) exit @PREFLIGHT_RC@ ;;
+  *"--require-flat"*) if [ "${EWBOT_IMAGE:-}" = ewbot-live:previous ]; then exit @ROLLBACK_FLAT_RC@; fi; exit @FLAT_RC@ ;;
+  "image inspect -f {{.Id}} "*) cat "$(tagf "$5")"; exit $? ;;
+  "image inspect "*) [ -f "$(tagf "$3")" ]; exit $? ;;
+  "image tag "*) cp "$(tagf "$3")" "$(tagf "$4")"; exit $? ;;
+  *"up -d"*)
+    n=$(( $(cat "$st/ups") + 1 )); echo "$n" > "$st/ups"; rc=0
+    case "$n" in
+@UPS@
+    esac
+    if [ "$rc" -eq 0 ] && { [ "$n" -gt 1 ] || [ @RECREATES@ -eq 1 ]; }; then cp "$(tagf ewbot-live:current)" "$st/container"; fi
+    exit "$rc" ;;
+  *" ps -q live") if [ -f "$st/container" ]; then echo 0123cid; fi; exit 0 ;;
+  "inspect -f {{.Image}} 0123cid") cat "$st/container"; exit $? ;;
   *"exec -T live ewbot live status"*)
-    case "$(cat "{ups}")" in
-{health_case}
+    case "$(cat "$st/container" 2>/dev/null)" in
+      sha256:new) exit @NEW_RC@ ;;
+      sha256:old) exit @OLD_RC@ ;;
     esac
     exit 1 ;;
 esac
 exit 0
-""")
+"""
+    for key, value in {"@LOG@": log, "@ST@": st, "@BUILD_RC@": build_rc, "@PREFLIGHT_RC@": preflight_rc,
+                       "@ROLLBACK_FLAT_RC@": rollback_flat_rc, "@FLAT_RC@": flat_rc, "@UPS@": ups,
+                       "@RECREATES@": int(first_up_recreates), "@NEW_RC@": 0 if new_ok else 1,
+                       "@OLD_RC@": 0 if old_ok else 1}.items():
+        docker = docker.replace(key, str(value))
+    _stub(bin_dir, "docker", docker)
     _stub(bin_dir, "date", f"""case "$*" in
   "-u +%M") echo "{minute}" ;;
   "+%s") cat "{clock}" ;;
@@ -17310,10 +17338,29 @@ def health_polls(calls: list[str]) -> list[str]:
     return [c for c in calls if "exec -T live ewbot live status" in c]
 
 
+def image_checks(calls: list[str]) -> list[str]:
+    return [c for c in calls if c == "docker inspect -f {{.Image}} 0123cid"]
+
+
+def ups(calls: list[str]) -> list[int]:
+    return [i for i, c in enumerate(calls) if " up -d " in c]
+
+
 SWAP = [
     "docker image inspect ewbot-live:current",
     "docker image tag ewbot-live:current ewbot-live:previous",
     "docker image tag ewbot-live:v3.0.0 ewbot-live:current",
+    "docker image inspect -f {{.Id}} ewbot-live:current",
+    f"{COMPOSE} up -d --force-recreate [EWBOT_IMAGE=ewbot-live:current]",
+]
+# one poll: the service's container runs the image of ewbot-live:current, and it journaled a heartbeat since the swap
+POLL = [f"{COMPOSE} ps -q live", "docker inspect -f {{.Image}} 0123cid",
+        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9"]
+ROLLBACK = [
+    f"git checkout --quiet --detach {PREV_SHA}",  # the previous release's compose file and scripts first
+    f"{COMPOSE} run --rm --no-deps -T live status --json --exchange --require-flat [EWBOT_IMAGE=ewbot-live:previous]",
+    "docker image tag ewbot-live:previous ewbot-live:current",
+    "docker image inspect -f {{.Id}} ewbot-live:current",
     f"{COMPOSE} up -d --force-recreate [EWBOT_IMAGE=ewbot-live:current]",
 ]
 
@@ -17327,10 +17374,10 @@ def test_deploy_happy_path_checks_the_image_with_the_service_config_then_swaps_a
         f"{COMPOSE} run --rm --no-deps -T live preflight --offline [EWBOT_IMAGE=ewbot-live:v3.0.0]",
         f"{COMPOSE} run --rm --no-deps -T live status --json --exchange --require-flat [EWBOT_IMAGE=ewbot-live:v3.0.0]",
         *SWAP,
-        # only a heartbeat younger than the time since the swap counts: never the old runtime's
-        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9",
+        # only a container of the new image counts, and only a heartbeat younger than the time since the swap
+        *POLL,
     ]
-    assert "git checkout --quiet --detach v3.0.0" in calls
+    assert "git checkout --quiet --detach v3.0.0" in calls and "deployed ewbot-live:v3.0.0" in r.stdout
     assert f"git checkout --quiet --detach {PREV_SHA}" not in calls  # the checkout stays at the deployed tag
 
 
@@ -17360,14 +17407,14 @@ def test_deploy_refuses_untracked_files_in_the_build_context(tmp_path):
 
 def test_deploy_refuses_while_not_flat_and_moves_the_checkout_back(tmp_path):
     r, calls = run_deploy(tmp_path, flat_rc=3)
-    assert r.returncode == 3 and "/flatten" in r.stderr and not any("up -d" in c for c in calls)
+    assert r.returncode == 3 and "/flatten" in r.stderr and not ups(calls)
     assert calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
 
 
 def test_deploy_refuses_when_the_flat_check_cannot_read_the_account(tmp_path):
     r, calls = run_deploy(tmp_path, flat_rc=2)  # Coinbase or the journal unreadable: not "send /flatten"
     assert r.returncode == 2 and "could not check" in r.stderr and "/flatten" not in r.stderr
-    assert not any("up -d" in c for c in calls) and calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
+    assert not ups(calls) and calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
 
 
 @pytest.mark.parametrize("build_rc, preflight_rc", [(1, 0), (0, 2)])
@@ -17377,13 +17424,14 @@ def test_deploy_refuses_an_image_that_does_not_build_or_fails_its_preflight(tmp_
     assert calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
 
 
-@pytest.mark.parametrize("minute, refused", [("57", False), ("58", True), ("59", True), ("00", True), ("05", True),
-                                             ("06", False)])
-def test_deploy_never_swaps_from_hh58_to_hh05(tmp_path, minute, refused):
+@pytest.mark.parametrize("minute, refused", [("53", False), ("54", True), ("57", True), ("59", True), ("00", True),
+                                             ("05", True), ("06", False)])
+def test_deploy_never_swaps_from_hh54_to_hh05(tmp_path, minute, refused):
+    """A swap at hh:53 with its 3-minute wait, a rollback and the rollback's own wait ends before hh:00:30."""
     r, calls = run_deploy(tmp_path, minute=minute)
     if refused:
-        assert r.returncode == 2 and "hh:58 to hh:05" in r.stderr
-        assert not any("--require-flat" in c or "up -d" in c for c in calls)
+        assert r.returncode == 2 and "hh:54 to hh:05" in r.stderr
+        assert not any("--require-flat" in c for c in calls) and not ups(calls)
     else:
         assert r.returncode == 0, r.stderr
 
@@ -17391,7 +17439,7 @@ def test_deploy_never_swaps_from_hh58_to_hh05(tmp_path, minute, refused):
 @pytest.mark.parametrize("answer", [None, "", "yes\n", "recover v2.9.0\n"])
 def test_deploy_recover_needs_the_typed_confirmation(tmp_path, answer):
     r, calls = run_deploy(tmp_path, "--recover", "v3.0.0", answer=answer)
-    assert r.returncode == 2 and "--recover not confirmed" in r.stderr and not any("up -d" in c for c in calls)
+    assert r.returncode == 2 and "--recover not confirmed" in r.stderr and not ups(calls)
     assert calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
 
 
@@ -17405,15 +17453,15 @@ def test_deploy_recover_skips_only_the_flat_check(tmp_path, args, answer):
         f"{COMPOSE} run --rm --no-deps -T live preflight --offline [EWBOT_IMAGE=ewbot-live:v3.0.0]",
         f"{COMPOSE} run --rm --no-deps -T live status --json --exchange [EWBOT_IMAGE=ewbot-live:v3.0.0]",  # shown only
         *SWAP,
-        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9",
+        *POLL,
     ]
 
 
 def test_deploy_recover_still_keeps_the_time_window_and_the_preflight(tmp_path):
     r, calls = run_deploy(tmp_path, "--recover", "--i-understand", "v3.0.0", minute="00")
-    assert r.returncode == 2 and "hh:58 to hh:05" in r.stderr and not any("up -d" in c for c in calls)
+    assert r.returncode == 2 and "hh:54 to hh:05" in r.stderr and not ups(calls)
     r, calls = run_deploy(tmp_path, "--recover", "--i-understand", "v3.0.0", preflight_rc=2)
-    assert r.returncode == 2 and not any("up -d" in c for c in calls)
+    assert r.returncode == 2 and not ups(calls)
 
 
 @pytest.mark.parametrize("args", [(), ("--i-understand", "v3.0.0"), ("v3.0.0", "v3.0.1"), ("--force", "v3.0.0")])
@@ -17423,31 +17471,54 @@ def test_deploy_refuses_bad_arguments(tmp_path, args):
 
 
 def test_deploy_rolls_back_when_the_new_runtime_writes_no_heartbeat(tmp_path):
-    r, calls = run_deploy(tmp_path, health=("fail", "ok"))
-    assert r.returncode == 4 and "rolled back" in r.stderr
+    r, calls = run_deploy(tmp_path, new_ok=False)
+    assert r.returncode == 4 and "rolled back" in r.stderr and "deployed" not in r.stdout
     polls = health_polls(calls)
     assert len(polls) == 19 and polls[17].endswith("--max-age 179")  # 3 minutes of polls, then the rollback's first
-    after = calls[calls.index(polls[17]) + 1:]
-    assert after == [
-        f"git checkout --quiet --detach {PREV_SHA}",  # the previous release's compose file and scripts first
-        "docker image tag ewbot-live:previous ewbot-live:current",
-        f"{COMPOSE} up -d --force-recreate [EWBOT_IMAGE=ewbot-live:current]",
-        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9",
-    ]
+    first_up, second_up = ups(calls)
+    assert calls[calls.index(polls[17]) + 1:second_up + 1] == ROLLBACK
+    assert calls[second_up + 1:] == POLL
+
+
+def test_deploy_never_reports_a_failed_up_as_deployed_while_the_old_container_keeps_heartbeating(tmp_path):
+    """`up -d` fails and the old container keeps running and heartbeating: a failed start, never a deploy."""
+    r, calls = run_deploy(tmp_path, up_rc=(1, 0))
+    assert r.returncode == 4 and "up -d failed (exit 1)" in r.stderr and "deployed" not in r.stdout
+    first_up, second_up = ups(calls)
+    assert calls[first_up + 1:second_up + 1] == ROLLBACK  # no wait: straight to the rollback
+    assert calls[second_up + 1:] == POLL
+
+
+def test_deploy_waits_for_a_container_of_the_new_image_not_any_heartbeat(tmp_path):
+    """`up -d` succeeds but the old container is still the one running (and heartbeating): never up."""
+    r, calls = run_deploy(tmp_path, first_up_recreates=False)
+    assert r.returncode == 4 and "no loop heartbeat from a container of it" in r.stderr and "deployed" not in r.stdout
+    first_up, second_up = ups(calls)
+    assert len(image_checks(calls[first_up:second_up])) == 18 and not health_polls(calls[first_up:second_up])
+    assert calls[second_up + 1:] == POLL
+
+
+@pytest.mark.parametrize("rollback_flat_rc, why", [(3, "not flat any more"), (2, "could not be checked (exit 2)")])
+def test_deploy_never_rolls_back_onto_a_book_the_previous_image_does_not_find_flat(tmp_path, rollback_flat_rc, why):
+    r, calls = run_deploy(tmp_path, new_ok=False, rollback_flat_rc=rollback_flat_rc)
+    assert r.returncode == 5 and "not rolled back" in r.stderr and why in r.stderr
+    assert len(ups(calls)) == 1 and not any("ewbot-live:previous ewbot-live:current" in c for c in calls)
+    assert calls[-2:] == [ROLLBACK[1], "git checkout --quiet --detach v3.0.0"]  # the checkout of what still runs
 
 
 def test_deploy_reports_a_rollback_that_does_not_come_up_either(tmp_path):
-    r, calls = run_deploy(tmp_path, health=("fail", "fail"))
+    r, calls = run_deploy(tmp_path, new_ok=False, old_ok=False)
     assert r.returncode == 5 and "not up either" in r.stderr and len(health_polls(calls)) == 36
 
 
 @pytest.mark.parametrize("args, current, polls", [(("--recover", "--i-understand", "v3.0.0"), True, 18),
                                                   (("v3.0.0",), False, 60)])  # a first deployment waits 10 minutes
 def test_deploy_never_rolls_back_a_recovery_or_a_first_deployment(tmp_path, args, current, polls):
-    r, calls = run_deploy(tmp_path, *args, current=current, health=("fail",))
+    r, calls = run_deploy(tmp_path, *args, current=current, new_ok=False)
     assert r.returncode == 5 and "not rolled back" in r.stderr
-    assert len(health_polls(calls)) == polls and not any("ewbot-live:previous" in c for c in calls[-polls - 2:])
-    assert sum("up -d" in c for c in calls) == 1 and f"git checkout --quiet --detach {PREV_SHA}" not in calls
+    assert len(health_polls(calls)) == polls and len(ups(calls)) == 1
+    assert not any("ewbot-live:previous" in c for c in calls[ups(calls)[0]:])
+    assert f"git checkout --quiet --detach {PREV_SHA}" not in calls
     if not current:
         assert "docker image tag ewbot-live:current ewbot-live:previous" not in calls
 
@@ -17493,6 +17564,9 @@ def pings(calls: list[str]) -> list[str]:
 
 
 def test_backup_from_the_running_service_is_encrypted_uploaded_and_reported(tmp_path):
+    stale = tmp_path / "data" / "backup" / "journal-20261003T061500Z.sqlite"  # a killed run's plaintext copy
+    stale.parent.mkdir(parents=True)
+    stale.write_text("plain")
     r, calls, left = run_backup(tmp_path)
     assert r.returncode == 0, r.stderr
     names = [c for c in calls if c.startswith(("docker", "age", "rclone"))]
@@ -17501,7 +17575,7 @@ def test_backup_from_the_running_service_is_encrypted_uploaded_and_reported(tmp_
     assert names[2].startswith("age -r age1examplerecipient -o ") and names[3].startswith("rclone copy ")
     assert names[3].endswith(".sqlite.age r2:ewbot-backups/")
     assert pings(calls) == [" https://hc-ping.com/backup-uuid/start", " https://hc-ping.com/backup-uuid"]
-    assert left == []  # the plaintext copy is gone
+    assert left == []  # this run's plaintext copy and the stale one are gone
 
 
 def test_backup_with_the_service_stopped_uses_a_one_off_container(tmp_path):
@@ -17535,10 +17609,11 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "outside hh:59 to hh:03", "the new stint's first start", "`[종료]`", "`[중단]`",
                    "last real stage", "15 minutes", "stop_grace_period",
                    # deploys, recovery and backups
-                   "hh:58 to hh:05", "ewbot-live:previous", "deploy.sh --recover", "Recovering from VPS loss",
+                   "hh:54 to hh:05", "ewbot-live:previous", "deploy.sh --recover", "Recovering from VPS loss",
                    "journal.sqlite-wal", "install -m 600 -o 1000 -g 1000 /dev/stdin", "no_check_bucket = true",
                    "EWBOT_BACKUP_PING_URL", "restore drill", "journalctl -t ewbot-live", "unhealthy",
-                   "docker builder prune", "never hold", "View-only key"):
+                   "docker builder prune", "never hold", "View-only key", "/var/lib/ewbot/drill",
+                   "EWBOT_LIVE_DIR=/data/drill", "PRAGMA integrity_check"):
         assert needle in text, needle
 ```
 
@@ -17548,7 +17623,7 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
 uv run --group live pytest tests/live/test_deploy.py -q
 ```
 
-Expected: `46 failed` (`44 failed, 2 skipped` without `shellcheck`): `deploy/live/…` and `docs/live-trading.md` do not exist yet (`FileNotFoundError`; the stubbed runs of the scripts end with bash's `No such file or directory`).
+Expected: `51 failed` (`49 failed, 2 skipped` without `shellcheck`): `deploy/live/…` and `docs/live-trading.md` do not exist yet (`FileNotFoundError`; the stubbed runs of the scripts end with bash's `No such file or directory`).
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -17680,19 +17755,22 @@ services:
 #                                                 (--i-understand instead: no question)
 # Before the running runtime is touched, the new image runs its offline preflight with the service's real
 # configuration (the journal's stage, the secrets and key files, the read-only root, no capabilities). The swap
-# happens only outside the minutes hh:58-hh:05 UTC (the hour's cycle and its entries), keeps the running image as
-# ewbot-live:previous and waits for the new runtime's loop heartbeat: 3 minutes (10 on the VPS's first deployment,
-# which downloads the candle history first), else the previous image is started again (only after a flat-book check).
+# happens only outside the minutes hh:54-hh:05 UTC (a swap, its wait and a rollback with its own wait end before the
+# hour's cycle at hh:00:30; entries go out until hh:05), keeps the running image as ewbot-live:previous and waits for a
+# loop heartbeat from a container of the new image: 3 minutes (10 on the VPS's first deployment, which downloads the
+# candle history first). A failed `up -d` or no such heartbeat is a failed start: the previous image is started
+# again - only when it still finds the book flat.
 # Exit codes:
 #   0  deployed, the new runtime is up
 #   2  refused, nothing changed: no such tag, a tag off origin/master, local changes or untracked files (src, deploy,
 #      pyproject.toml, uv.lock, holdout.lock), an image that does not build or fails its preflight, the minutes
-#      hh:58-hh:05 UTC, a book that could not be checked, --recover not confirmed
+#      hh:54-hh:05 UTC, a book that could not be checked, --recover not confirmed
 #   3  refused, nothing changed: not flat (an open trade, an order of unknown outcome, a standing flatten, a position or
 #      a resting order)
 #   4  the new runtime did not come up: rolled back, the previous image runs again and is up
-#   5  the new runtime did not come up and was left running (--recover, a first deployment), or the rolled-back
-#      previous image did not come up either: act now (runbook, "Deploying a new version")
+#   5  the new runtime did not come up and nothing was rolled back (--recover, a first deployment, or a book the
+#      previous image did not find flat), or the rolled-back previous image did not come up either: act now (runbook,
+#      "Deploying a new version")
 # The checkout is moved to <tag> for the build and moved back on every refusal and on a rollback.
 set -euo pipefail
 
@@ -17729,15 +17807,31 @@ on_exit() {
   fi
 }
 
-wait_up() {  # $1: seconds. 0 once a runtime started after this call has journaled its loop heartbeat
-  local limit="$1" since now elapsed
+runs_image() {  # $1: an image id. 0 when the service has a container and every one runs that image
+  local want="$1" cids cid have
+  cids="$("${COMPOSE[@]}" ps -q live </dev/null 2>/dev/null)" || return 1
+  if [ -z "$cids" ]; then
+    return 1
+  fi
+  for cid in $cids; do
+    have="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null)" || return 1
+    if [ "$have" != "$want" ]; then
+      return 1
+    fi
+  done
+}
+
+wait_up() {  # $1: seconds, $2: the image id. 0 once a container of that image journaled a loop heartbeat after this call
+  local limit="$1" want="$2" since now elapsed
   since="$(date +%s)"
   while :; do
     sleep 10
     now="$(date +%s)"
     elapsed=$((now - since))
-    # --max-age below the time since the swap: only the new runtime's heartbeat counts, never the old one's
-    if "${COMPOSE[@]}" exec -T live ewbot live status --json --max-age "$((elapsed - 1))" </dev/null >/dev/null 2>&1; then
+    # the container must be the new image's (a failed recreate leaves the old one running - and heartbeating), and
+    # --max-age below the time since the swap: only a heartbeat journaled after it counts
+    if runs_image "$want" \
+      && "${COMPOSE[@]}" exec -T live ewbot live status --json --max-age "$((elapsed - 1))" </dev/null >/dev/null 2>&1; then
       return 0
     fi
     if [ "$elapsed" -ge "$limit" ]; then
@@ -17747,7 +17841,7 @@ wait_up() {  # $1: seconds. 0 once a runtime started after this call has journal
 }
 
 main() {
-  local recover=0 confirmed=0 tag="" arg root changes untracked image minute rc answer first wait_s why
+  local recover=0 confirmed=0 tag="" arg root changes untracked image minute rc answer first wait_s why want up
   for arg in "$@"; do
     case "$arg" in
       --recover) recover=1 ;;
@@ -17801,10 +17895,11 @@ main() {
     fi
   fi
 
-  # Last check before the swap: never across the hour's cycle (hh:00:30) and its entries (sent until hh:05:00).
+  # Last check before the swap: the swap, its wait and a rollback with its own wait end before the hour's cycle
+  # (hh:00:30), and nothing is swapped while that cycle's entries may go out (until hh:05:00).
   minute="$(date -u +%M)"
-  if [ "$((10#$minute))" -ge 58 ] || [ "$((10#$minute))" -le 5 ]; then
-    refuse "it is hh:$minute UTC: no swap from hh:58 to hh:05 (the hour's cycle and its entries) - run it again from hh:06"
+  if [ "$((10#$minute))" -ge 54 ] || [ "$((10#$minute))" -le 5 ]; then
+    refuse "it is hh:$minute UTC: no swap from hh:54 to hh:05 (the hour's cycle and its entries) - run it again from hh:06"
   fi
 
   if [ "$recover" -eq 0 ]; then
@@ -17825,18 +17920,24 @@ main() {
     first=0
   fi
   docker image tag "$image" ewbot-live:current
+  want="$(docker image inspect -f '{{.Id}}' ewbot-live:current)"
   # EWBOT_IMAGE pinned: an EWBOT_IMAGE in deploy/live/.env never decides what runs
-  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || echo "warning: up -d failed" >&2
+  up=0
+  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || up=$?
   wait_s="$UP_WAIT_S"
   if [ "$first" -eq 1 ]; then
     wait_s="$FIRST_UP_WAIT_S"
   fi
-  if wait_up "$wait_s"; then
+  if [ "$up" -eq 0 ] && wait_up "$wait_s" "$want"; then
     MOVED=0
     echo "deployed $image (tagged ewbot-live:current; the one before is ewbot-live:previous); follow it with: ${COMPOSE[*]} logs -f live"
     return 0
   fi
-  echo "$image: no loop heartbeat ${wait_s}s after the start - read ${COMPOSE[*]} logs live" >&2
+  if [ "$up" -ne 0 ]; then
+    echo "$image: up -d failed (exit $up) - a failed start" >&2
+  else
+    echo "$image: no loop heartbeat from a container of it ${wait_s}s after the start - read ${COMPOSE[*]} logs live" >&2
+  fi
   if [ "$recover" -eq 1 ] || [ "$first" -eq 1 ]; then
     MOVED=0
     why="no previous image"
@@ -17847,9 +17948,24 @@ main() {
     exit 5
   fi
   restore_checkout
+  # The new runtime may have traded meanwhile: roll back only to a book the previous image still finds flat.
+  rc=0
+  EWBOT_IMAGE=ewbot-live:previous "${COMPOSE[@]}" run --rm --no-deps -T live status --json --exchange --require-flat \
+    </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    git checkout --quiet --detach "$tag" || echo "warning: could not check out $tag again" >&2
+    why="the book is not flat any more"
+    if [ "$rc" -ne 3 ]; then
+      why="the book could not be checked (exit $rc)"
+    fi
+    echo "not rolled back: $why - $image keeps starting: /status, the logs, then act now (runbook, Deploying a new version)" >&2
+    exit 5
+  fi
   docker image tag ewbot-live:previous ewbot-live:current
-  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || echo "warning: up -d failed" >&2
-  if wait_up "$UP_WAIT_S"; then
+  want="$(docker image inspect -f '{{.Id}}' ewbot-live:current)"
+  up=0
+  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || up=$?
+  if [ "$up" -eq 0 ] && wait_up "$UP_WAIT_S" "$want"; then
     echo "rolled back: ewbot-live:current is the previous image again and it is up ($image kept for a look)" >&2
     exit 4
   fi
@@ -17869,8 +17985,9 @@ main "$@"
 # in a one-off container of it when the service is stopped), encrypted with age to EWBOT_BACKUP_AGE_RECIPIENT (the
 # private key stays off the VPS) and copied with rclone to EWBOT_BACKUP_REMOTE (default r2:ewbot-backups, a
 # Cloudflare R2 bucket). Every run pings its own healthchecks.io check EWBOT_BACKUP_PING_URL - /start, then success
-# or /fail with the exit code -, so a backup that fails, hangs or never runs is alerted. Settings: the root-only file
-# /etc/ewbot/backup.env (systemd's EnvironmentFile; never in the repository).
+# or /fail with the exit code -, so a backup that fails, hangs or never runs is alerted, and first removes the
+# plaintext copies an earlier run could not (killed). Settings: the root-only file /etc/ewbot/backup.env (systemd's
+# EnvironmentFile; never in the repository).
 set -euo pipefail
 
 PING="${EWBOT_BACKUP_PING_URL:-}"
@@ -17903,6 +18020,8 @@ if [ -z "$PING" ]; then
   echo "warning: EWBOT_BACKUP_PING_URL is not set in /etc/ewbot/backup.env - a failed backup alerts nobody" >&2
 fi
 ping_check /start
+# plaintext copies a killed run (SIGKILL, power loss) left behind: never kept on the VPS
+rm -f -- "$DATA"/backup/journal-*.sqlite
 if [ -z "${EWBOT_BACKUP_AGE_RECIPIENT:-}" ]; then
   echo "set EWBOT_BACKUP_AGE_RECIPIENT (an age1... public key) in /etc/ewbot/backup.env" >&2
   exit 1
@@ -18109,7 +18228,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     sudo systemctl start ewbot-backup.service && journalctl -u ewbot-backup.service -n 20
     ```
 
-    The log ends with `backup uploaded: r2:ewbot-backups/journal-….sqlite.age` and the `ewbot-backup` check turns up. A backup is made inside the running container, or in a one-off container of the same image while the service is stopped; a run that hangs is stopped after 30 minutes (`TimeoutStartSec`) and reported as failed. Restoring: see "Restoring the journal" - do it once during SHADOW (the restore drill).
+    The log ends with `backup uploaded: r2:ewbot-backups/journal-….sqlite.age` and the `ewbot-backup` check turns up. A backup is made inside the running container, or in a one-off container of the same image while the service is stopped; a run that hangs is stopped after 30 minutes (`TimeoutStartSec`) and reported as failed, and every run first removes the plaintext copies a killed run left in `/var/lib/ewbot/backup`. Restoring: see "Restoring the journal" - try it once during SHADOW (the restore drill).
 
 ## Daily operation
 
@@ -18197,7 +18316,23 @@ The journal holds the open trade, the order intents, the stage history and the g
    On a new VPS there is no container yet: skip the stop and the start, `deploy.sh --recover` starts it ("Recovering from VPS loss").
 4. Check `[시작]` in Telegram and `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status`. What happened after the backup is not in the restored journal: a trade opened since is a position the journal does not know (adopted when the engine holds it - in CANARY a failure that pauses entries: check, then `/resume` - or closed), a trade that closed since is found closed, and the hours since the backup have no cycle (SHADOW ② fails: restart the stint, `ewbot live stage shadow --restart --confirm`).
 
-**Restore drill** (once during SHADOW, with the book flat, outside hh:59 to hh:03): take a backup (`sudo systemctl start ewbot-backup.service`), restore it by steps 1–4 and check that `ewbot live status` shows the same stage, cycles and gates as before. It proves the age key, the R2 copy and this sequence before they are needed (and counts as a restart for SHADOW ④).
+**Restore drill** (once during SHADOW; it never touches the live journal or the running runtime): take a backup (`sudo systemctl start ewbot-backup.service`), download and decrypt it on the laptop (step 1) and send it into a drill directory - never over the live journal:
+
+```bash
+ssh <admin>@<vps> 'sudo install -d -m 700 -o 1000 -g 1000 /var/lib/ewbot/drill && sudo install -m 600 -o 1000 -g 1000 /dev/stdin /var/lib/ewbot/drill/journal.sqlite' < journal.sqlite
+```
+
+Then on the VPS, as `ewbot`, check it with the image - a sound SQLite file (`ok`) that reads like the live journal (the same stage, cycles and gates as the live status, up to the backup's time) - and remove it:
+
+```bash
+cd ~/elliott-wave-btc-bot
+docker compose -f deploy/live/docker-compose.yml run --rm --no-deps -T --entrypoint python live -c "import sqlite3; print(sqlite3.connect('/data/drill/journal.sqlite').execute('PRAGMA integrity_check').fetchone()[0])"
+docker compose -f deploy/live/docker-compose.yml run --rm --no-deps -T -e EWBOT_LIVE_DIR=/data/drill live status
+docker compose -f deploy/live/docker-compose.yml exec live ewbot live status
+rm -rf /var/lib/ewbot/drill
+```
+
+It proves the age key, the R2 copy and the transfer before they are needed. The restart for SHADOW ④ stays a step of its own (Stage transitions, step 2).
 
 ## Recovering from VPS loss
 
@@ -18214,14 +18349,14 @@ The brackets on Coinbase keep protecting an open position while the VPS is gone 
    cd ~/elliott-wave-btc-bot && bash deploy/live/deploy.sh --recover <the tag that ran before>
    ```
 
-   Type `recover <tag>` when asked. It still checks the tag, the checkout and the preflight and keeps out of hh:58 to hh:05; the first start downloads the candle history, so it waits up to 10 minutes for the heartbeat.
+   Type `recover <tag>` when asked. It still checks the tag, the checkout and the preflight and keeps out of hh:54 to hh:05; the first start downloads the candle history, so it waits up to 10 minutes for the heartbeat.
 7. Verify: `[시작]` in Telegram, `/status` answered, `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status --exchange` (the position and the open orders as in the Coinbase app), the healthchecks.io checks up again; then "Restoring the journal", step 4.
 
 ## Deploying a new version
 
 - The image verifies Coinbase's TLS certificates with the base image's CA store (`ca-certificates`, part of `python:3.12.13-slim-bookworm`); the build stops if `/etc/ssl/certs/ca-certificates.crt` is missing (a new base image without it): keep the pinned base, or install `ca-certificates` in the Dockerfile.
-- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` (as `ewbot`, in the checkout). Nothing changes and the checkout goes back where it was when it refuses (exit 2) a missing tag or one off `master`, local changes or untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's own configuration (a one-off container of the new image with the service's mounts, secrets file, key file, user and read-only root: fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`, the settings, the alerts the journal's stage needs), the minutes hh:58 to hh:05 UTC (the hour's cycle at hh:00:30 and its entries until hh:05: run it again from hh:06) or a book it could not check; or (exit 3) any open trade, order of unknown outcome, standing flatten, position or resting order.
-- The swap keeps the running image as `ewbot-live:previous`, tags the new one `ewbot-live:current`, recreates the container and waits up to 3 minutes (10 on a first deployment) for the new runtime's loop heartbeat. Without one it starts `ewbot-live:previous` again with the previous checkout: exit 4 when that one is up again - read the failed release's log (`journalctl -t ewbot-live`) before the next try -, exit 5 when it is not either (act now: the logs, "Emergency procedures"). Rollback by hand = deploy the previous tag.
+- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` (as `ewbot`, in the checkout). Nothing changes and the checkout goes back where it was when it refuses (exit 2) a missing tag or one off `master`, local changes or untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's own configuration (a one-off container of the new image with the service's mounts, secrets file, key file, user and read-only root: fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`, the settings, the alerts the journal's stage needs), the minutes hh:54 to hh:05 UTC (a swap, its wait and a rollback with its own wait end before the hour's cycle at hh:00:30, and nothing is swapped while its entries may go out, until hh:05: run it again from hh:06) or a book it could not check; or (exit 3) any open trade, order of unknown outcome, standing flatten, position or resting order.
+- The swap keeps the running image as `ewbot-live:previous`, tags the new one `ewbot-live:current`, recreates the container and waits up to 3 minutes (10 on a first deployment) for a loop heartbeat journaled after the swap by a container of the new image (an old container still running after a failed recreate heartbeats too: it never counts). A failed `up -d` or no such heartbeat is a failed start: deploy.sh checks the book with `ewbot-live:previous` and the previous checkout - the new runtime may have traded meanwhile - and only if it is flat starts `ewbot-live:previous` again: exit 4 when that one is up again - read the failed release's log (`journalctl -t ewbot-live`) before the next try -, exit 5 when it is not either, or when the book was not flat (or could not be read) and nothing was rolled back (act now: `/status`, the logs, "Emergency procedures"). Rollback by hand = deploy the previous tag.
 - `deploy.sh --recover <tag>` deploys while a position is open, for two cases only: a release that crash-loops while it holds a position (`[중단]` again and again, `/flatten` not acted on) and a new VPS after a VPS loss. It skips only the flat-book check (it prints the book instead), asks you to type `recover <tag>` (`--i-understand` skips the question) and never rolls back by itself (exit 5 when the new runtime does not come up); the new runtime takes over the position and its brackets through the restart recovery. Spec 5.2 allows deploys only with a flat book: this is the documented exception for bringing the runtime back.
 - A change to any strategy-fingerprinted file (`types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/`) is refused by the preflight and would reset the paper runtime's out-of-sample counter: never deploy one.
 
@@ -18254,7 +18389,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `46 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1106 passed, 1 skipped` without a candle cache (`1107 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `51 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1111 passed, 1 skipped` without a candle cache (`1112 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -18289,7 +18424,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `1107 passed` with the real cache (`1106 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `1112 passed` with the real cache (`1111 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
@@ -18315,10 +18450,11 @@ The contract's expiry is checked by hand once (the preflight cannot settle it): 
 cd ~/elliott-wave-btc-bot && bash deploy/live/deploy.sh live-v1
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight
 docker compose -f deploy/live/docker-compose.yml logs --tail 50 live
+journalctl -t ewbot-live -n 20 --no-pager
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live status
 ```
 
-Expected: deploy.sh ends with `deployed ewbot-live:live-v1 …` (exit 0) once the new runtime has journaled its loop heartbeat (up to 10 minutes on this first deployment: the candle history); the preflight prints five `ok` lines (fingerprint `e0435223a3f9`, lock `file sha256 6530175541c1, sha256 d1be04baa06c`, alerts `Telegram alerts and commands, heartbeat`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts, expires 2030-12-20 at the earliest`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11: the `ewbot-backup` healthchecks.io check - period 1 day, grace 2 hours -, the R2 bucket's lifecycle and lock rules, rclone with `no_check_bucket = true`, the root-only `/etc/ewbot/backup.env` with the age recipient and the check's ping URL) and run the backup service once: its log ends with `backup uploaded: …` and the `ewbot-backup` check turns up.
+Expected: deploy.sh ends with `deployed ewbot-live:live-v1 …` (exit 0) once the new runtime has journaled its loop heartbeat (up to 10 minutes on this first deployment: the candle history); the preflight prints five `ok` lines (fingerprint `e0435223a3f9`, lock `file sha256 6530175541c1, sha256 d1be04baa06c`, alerts `Telegram alerts and commands, heartbeat`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts, expires 2030-12-20 at the earliest`); `journalctl -t ewbot-live` (as `ewbot`, in the group `systemd-journal`) shows the same runtime lines as the compose log - the container log reaches the systemd journal and outlives the container; if it shows nothing, report it before anything else (the compose file then goes back to `json-file` with deploy.sh saving the log before a swap); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11: the `ewbot-backup` healthchecks.io check - period 1 day, grace 2 hours -, the R2 bucket's lifecycle and lock rules, rclone with `no_check_bucket = true`, the root-only `/etc/ewbot/backup.env` with the age recipient and the check's ping URL) and run the backup service once: its log ends with `backup uploaded: …` and the `ewbot-backup` check turns up.
 
 - [ ] **Step 5: Re-record the private-endpoint fixtures (first SHADOW week, controller)**
 
@@ -18352,7 +18488,7 @@ Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account i
 
 - [ ] **Step 6: Run SHADOW for at least 14 days (controller watches, user restarts once)**
 
-Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④ - at any time except hh:00 to hh:03, while that hour's cycle runs (gate ② counts every hour of the stage; a restart never rewrites an hour already decided, but a runtime down across a bar close fails it) -: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. The stop is graceful: Telegram shows `[종료] …`, then `[시작]`, never `[중단]`, and healthchecks.io gets no `/fail` (report either if it does). Also once during SHADOW, with the book flat and outside hh:59 to hh:03, the restore drill (runbook, "Restoring the journal"): a fresh backup, decrypted on the user's laptop, restored with the WAL-safe sequence (`docker compose … stop live`, `rm -f` `journal.sqlite-wal` and `journal.sqlite-shm`, `install -m 600 -o 1000 -g 1000` the restored file, `docker compose … start live`); `ewbot live status` then shows the same stage, cycles and gates. Every later deploy runs outside hh:58 to hh:05 UTC and ends with exit 0; an exit 4 (rolled back) or 5 is investigated first (`journalctl -t ewbot-live`). Any `[판단 불일치]`, `[판단 불일치: 봉 수정]`, `[판단 불일치 확인 중]` that the next hour does not clear, `[모의매매 대조 실패]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over: `ewbot live stage shadow --restart --confirm` (flat book, outside hh:59 to hh:03: the runtime restarts itself into the new stint within a minute) - every SHADOW gate then counts from the restart, and that self-restart is the stint's first start, so gate ④ needs one more manual restart. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
+Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④ - at any time except hh:00 to hh:03, while that hour's cycle runs (gate ② counts every hour of the stage; a restart never rewrites an hour already decided, but a runtime down across a bar close fails it) -: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. The stop is graceful: Telegram shows `[종료] …`, then `[시작]`, never `[중단]`, and healthchecks.io gets no `/fail` (report either if it does). Also once during SHADOW, the restore drill (runbook, "Restoring the journal"; it never touches the live journal or the running runtime, so it is no restart for gate ④ - that one stays the step above): a fresh backup, decrypted on the user's laptop, installed under `/var/lib/ewbot/drill/` (`sudo install -d -m 700 -o 1000 -g 1000` the directory, `sudo install -m 600 -o 1000 -g 1000 /dev/stdin` the file), checked through the image with `PRAGMA integrity_check` (`ok`) and `docker compose … run --rm --no-deps -T -e EWBOT_LIVE_DIR=/data/drill live status` (the same stage, cycles and gates as the live status, up to the backup's time), then removed. Every later deploy runs outside hh:54 to hh:05 UTC and ends with exit 0; an exit 4 (rolled back) or 5 is investigated first (`journalctl -t ewbot-live`). Any `[판단 불일치]`, `[판단 불일치: 봉 수정]`, `[판단 불일치 확인 중]` that the next hour does not clear, `[모의매매 대조 실패]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over: `ewbot live stage shadow --restart --confirm` (flat book, outside hh:59 to hh:03: the runtime restarts itself into the new stint within a minute) - every SHADOW gate then counts from the restart, and that self-restart is the stint's first start, so gate ④ needs one more manual restart. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
 
 - [ ] **Step 7: CANARY gate (around 2026-10-30; user approves explicitly)**
 
