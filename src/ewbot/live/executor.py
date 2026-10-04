@@ -6,7 +6,9 @@ failure (429 / 5xx / timeout / process killed) leaves it PENDING, and a PENDING 
 the exchange by client_order_id before it is ever sent again - so a restart never doubles an order.
 
 Entries are market IOC orders; the fill is awaited (10 s) and the trade is protected at once with
-trigger_bracket_gtc legs. Working protection is never removed before its replacement is in place. Stop
+trigger_bracket_gtc legs (a fill price the venue does not report as a finite number above 0 is stood in for -
+the position's average entry, the engine's reference, the stop - and alerted, FILL_PRICE_UNREAD: a trade is
+always saved and protected, and nothing the journal refuses, NaN or inf, is recorded). Working protection is never removed before its replacement is in place. Stop
 moves edit the resting bracket when `edit_stops` is on (unconfirmed for CFM brackets: off until CANARY
 confirms it; the edit sends the order's total size, filled + left), otherwise the new bracket is placed
 first and the old one cancelled (brackets only reduce, so a short overlap cannot over-close). Only when
@@ -37,9 +39,11 @@ with a size) are recorded on the trade before they are sent (`LiveTrade.pending_
 an unknown outcome is resolved by its client order id (`resolve_reduce`, before every read of the exchange
 state) and never followed by a second one, and a Protect planned with a reduce waits until the reduce is
 known to have filled. A reduce the venue refuses while our brackets cover what it would close
-(`CLOSE_CONFLICTS`) first makes room - TP1_SYNC cancels the TP1 leg (the contracts it sells), EXCESS / MARGIN
-resize the legs to the size after it (placed first) - and goes out again under a new reduce id; when that does
-not fill, the legs go back for the whole position. Market orders wait for an OPEN session; a deferred close is retried on every pass
+(`CLOSE_CONFLICTS`) first makes room - TP1_SYNC cancels the TP1 leg (the contracts it sells; only when that makes
+the room, judged before the cancel - those contracts have no stop from the cancel until the resent reduce sold them,
+one request later), EXCESS / MARGIN resize the legs to the size after it (placed first) - and goes out again under
+a new reduce id; when that does not fill, the legs go back for the whole position. Market orders wait for an OPEN
+session; a deferred close is retried on every pass
 (spec 4.5: `휴장 중에 필요해진 청산은 재개장 직후`). An entry skipped once is never sent later (never chase), and
 with `entry_deadline_s` none goes out later than that after its bar's close (checked right before the send).
 Client order ids are never reused: a trade rebuilt or taken over under the id of an earlier one goes on
@@ -55,6 +59,7 @@ previews)."""
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Sequence
@@ -134,9 +139,28 @@ def _code(sent: Sent) -> str | None:
     return str(sent.error).split(":", 1)[0].strip()
 
 
+def _price(x: Any) -> float | None:
+    """A price the venue reported as a finite number above 0; None otherwise (missing, 0, NaN, inf)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def _finite(x: Any) -> float | None:
+    """An amount (a fee) the venue reported as a finite number; None otherwise. The journal refuses NaN and inf, and
+    a record that cannot be written must never stop an order's follow-up (a trade not saved is not protected)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _leg_of(name: str, o: Order) -> Leg:
     """The trade's record of a resting bracket of ours, with the order's own terms."""
-    return Leg(name, o.size - o.filled, float(o.limit_price or 0.0), float(o.stop_price or 0.0), o.client_order_id,
+    return Leg(name, o.size - o.filled, _price(o.limit_price) or 0.0, _price(o.stop_price) or 0.0, o.client_order_id,
                o.order_id)
 
 
@@ -395,7 +419,7 @@ class Executor:
         lv = map_levels(e.direction, e.stop, e.tp1, e.tp2, ctx.ratio, ctx.tick)
         payload = {"signal_ts": e.signal_ts, "setup": e.setup, "direction": e.direction, "contracts": a.contracts,
                    "stop_spot": e.stop, "tp1_spot": e.tp1, "tp2_spot": e.tp2, "stop": lv.stop, "tp1": lv.tp1,
-                   "tp2": lv.tp2, "ratio": ctx.ratio}
+                   "tp2": lv.tp2, "ratio": ctx.ratio, "ref": e.entry_ref * ctx.ratio}
         sent = self.send(cid, "ENTRY", e.signal_ts, payload, lambda: self.ex.place_market(cid, e.direction, a.contracts))
         if sent.status != "ACCEPTED":
             self.event("ENTRY_FAILED", {"signal_ts": e.signal_ts, "status": sent.status, "error": sent.error},
@@ -413,7 +437,7 @@ class Executor:
         trade = self._trade_from(payload, order)
         self.save(trade)
         self.event("ENTRY", {"trade_id": trade.trade_id, "side": e.direction, "contracts": trade.contracts,
-                             "price": trade.entry_price, "ref": e.entry_ref * ctx.ratio, "fee": order.fee,
+                             "price": _price(order.avg_fill_price), "ref": payload["ref"], "fee": _finite(order.fee),
                              "order_id": order.order_id},
                    f"[진입] {e.setup} {_side(e.direction)} {trade.contracts}계약 @ {trade.entry_price:,.1f} · 손절 "
                    f"{trade.stop_price:,.0f} · TP1 {trade.tp1_price:,.0f} · TP2 {trade.tp2_price or 0:,.0f}")
@@ -423,17 +447,43 @@ class Executor:
 
     def _trade_from(self, payload: dict[str, Any], order: Order) -> LiveTrade:
         """The trade of our filled entry. It opened when the order was created (a trade rebuilt after an outage
-        was unprotected since then: PROTECTED_FIRST measures it); its ids go on from the journal's."""
+        was unprotected since then: PROTECTED_FIRST measures it); its ids go on from the journal's; its entry price
+        is `_entry_price`."""
         n = int(order.filled)
         trade_id = int(payload["signal_ts"])
         gen, closes = self._counters(trade_id)
         return LiveTrade(
             trade_id=trade_id, setup=str(payload["setup"]), direction=int(payload["direction"]),
-            contracts=n, tp1_n=_tp1_split(n, self.tp1_frac), entry_price=float(order.avg_fill_price or 0.0),
+            contracts=n, tp1_n=_tp1_split(n, self.tp1_frac), entry_price=self._entry_price(payload, order),
             tp1_price=float(payload["tp1"]), tp2_price=None if payload["tp2"] is None else float(payload["tp2"]),
             stop_spot=float(payload["stop_spot"]), stop_price=float(payload["stop"]),
             opened_ts=float(order.created_ts or self.clock()), gen=gen, closes=closes,
         )
+
+    def _entry_price(self, payload: dict[str, Any], order: Order) -> float:
+        """Our entry's average fill price - or, when the venue reported none that is usable (missing, 0, NaN: the
+        trade must still be saved and protected at once), a stand-in, alerted (FILL_PRICE_UNREAD): the position's
+        average entry on the trade's side, else the engine's reference mapped when the entry was sent (`ref`), else
+        the futures stop (the break-even stop after TP1 then stays at the stop: never moved past the real entry).
+        The entry price only sets that break-even stop and the reports."""
+        price = _price(order.avg_fill_price)
+        if price is not None:
+            return price
+        try:
+            pos = self.ex.position()
+        except ExchangeError:
+            pos = None
+        same_side = pos is not None and pos.side == int(payload["direction"])
+        for what, cand in (("position", pos.avg_entry if same_side and pos is not None else None),
+                           ("ref", payload.get("ref")), ("stop", payload.get("stop"))):
+            stand_in = _price(cand)
+            if stand_in is not None:
+                self.event("FILL_PRICE_UNREAD", {"trade_id": int(payload["signal_ts"]), "order_id": order.order_id,
+                                                 "stand_in": what, "price": stand_in},
+                           f"[경고] 진입 {payload['signal_ts']} 체결가를 읽지 못함: {what} {stand_in:,.1f}로 기록 "
+                           "(본전 손절과 비용 보고에만 쓰임)")
+                return stand_in
+        raise ExchangeError(f"entry {payload['signal_ts']}: no usable fill price and no stand-in")
 
     def adopt(self, tp: TargetPosition, ctx: PlanContext, contracts: int | None = None) -> None:
         """Take over a position the trade state does not know: at most `contracts` (default: the whole
@@ -479,9 +529,11 @@ class Executor:
         ratio = 1.0 if ctx.ratio is None else ctx.ratio
         lv = map_levels(tp.direction, tp.stop, tp.tp1, tp.tp2, ratio, ctx.tick)
         gen, closes = self._counters(tp.signal_ts)
+        # the position's average entry; unreported (0, NaN): the engine's entry mapped like the levels, else the stop
+        entry = _price(pos.avg_entry) or _price(tp.entry_price * ratio) or lv.stop
         trade = LiveTrade(
             trade_id=tp.signal_ts, setup=tp.setup, direction=tp.direction, contracts=n,
-            tp1_n=0 if after_tp1 else _tp1_split(n, self.tp1_frac), entry_price=pos.avg_entry, tp1_price=lv.tp1,
+            tp1_n=0 if after_tp1 else _tp1_split(n, self.tp1_frac), entry_price=entry, tp1_price=lv.tp1,
             tp2_price=lv.tp2, stop_spot=tp.stop, stop_price=lv.stop, opened_ts=self.clock(), tp1_filled=after_tp1,
             gen=gen, closes=closes,
         )
@@ -514,9 +566,10 @@ class Executor:
         p = own["payload"]
         trade_id = int(p["signal_ts"])
         gen, closes = self._counters(trade_id)
+        entry = _price(pos.avg_entry) or _price(p.get("ref")) or float(p["stop"])  # unreported: the entry's reference
         trade = LiveTrade(
             trade_id=trade_id, setup=str(p["setup"]), direction=int(p["direction"]), contracts=n,
-            tp1_n=_tp1_split(n, self.tp1_frac), entry_price=pos.avg_entry, tp1_price=float(p["tp1"]),
+            tp1_n=_tp1_split(n, self.tp1_frac), entry_price=entry, tp1_price=float(p["tp1"]),
             tp2_price=None if p["tp2"] is None else float(p["tp2"]), stop_spot=float(p["stop_spot"]),
             stop_price=float(p["stop"]), opened_ts=float(own["created_ts"]), gen=gen, closes=closes,
         )
@@ -796,8 +849,14 @@ class Executor:
         trade = self.trade()
         if self.ex.position() is None:
             if trade is not None and trade.status == "OPEN":
-                trade.status, trade.exit_reason = "CLOSED", trade.exit_reason or reason
+                # flat before this close went out (after the pass's reads): what observe() would have found - a bracket
+                # fill (or an earlier close of ours, whose reason the trade recorded when the venue took it) -, never
+                # this close's reason
+                why = trade.exit_reason or "BRACKET"
+                trade.status, trade.exit_reason, trade.unprotected_since = "CLOSED", why, None
                 self.save(trade)
+                self.event("CLOSED", {"trade_id": trade.trade_id, "reason": why, "observed": True},
+                           f"[청산 확인] 거래 {trade.trade_id} · {why}")
             return True
         if not ctx.session_open:
             self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
@@ -862,14 +921,15 @@ class Executor:
             return False
 
     def _fill_of(self, order_id: str | None) -> dict[str, Any]:
-        """Fill price, size and fee of a market order, for the cost report (best effort)."""
+        """Fill price, size and fee of a market order, for the cost report (best effort; a price or fee that is not a
+        finite number is None: never a value the journal refuses)."""
         if not order_id:
             return {}
         try:
             o = self.ex.get_order(order_id)
         except ExchangeError:
             return {}
-        return {"price": o.avg_fill_price, "contracts": o.filled, "side": o.side, "fee": o.fee}
+        return {"price": _price(o.avg_fill_price), "contracts": o.filled, "side": o.side, "fee": _finite(o.fee)}
 
     def reduce(self, size: int, reason: str, ctx: PlanContext) -> bool:
         """Close `size` contracts at market (close_position with a size: it only reduces). Intent before state: the
@@ -909,17 +969,11 @@ class Executor:
         current = self.trade()
         self.event("REDUCE_CONFLICT", {"trade_id": current.trade_id if current is not None else 0, "reason": reason,
                                        "size": size, "error": refused.error})
-        if not self._make_room(size, reason, ctx):
+        pos = self._make_room(size, reason, ctx)  # the position read that the room was made for (None: no room)
+        trade = self.trade()
+        if pos is None or trade is None or trade.pending_reduce is None:
             self._protect_left(ctx)
             trade = self.trade()
-            return trade is not None and self._reduce_outcome(trade, refused, first=True)
-        trade = self.trade()
-        try:
-            pos = self.ex.position()
-        except ExchangeError:
-            pos = None
-        if trade is None or trade.pending_reduce is None or pos is None or pos.side != trade.direction:
-            self._protect_left(ctx)
             return trade is not None and self._reduce_outcome(trade, refused, first=True)
         trade.closes += 1
         cid = reduce_cid(trade.trade_id, trade.closes)
@@ -933,35 +987,44 @@ class Executor:
             self._protect_left(ctx)
         return filled
 
-    def _make_room(self, size: int, reason: str, ctx: PlanContext) -> bool:
+    def _make_room(self, size: int, reason: str, ctx: PlanContext) -> Position | None:
         """Shrink our brackets so that a reduce of `size` fits under them: TP1_SYNC cancels the TP1 leg (the contracts
-        the reduce sells); EXCESS / MARGIN resize the legs to the trade after the reduce (`pending_reduce.after`, the
-        position less `size`), placed first. True when our resting brackets then leave room for the reduce."""
+        the reduce sells) - only when that alone makes the room, checked on the reads before the cancel: those TP1
+        contracts have no stop from the cancel until the reduce sold them (or, when it does not fill, until the legs
+        are placed again: `_reduce_with_room`), so the cancel never happens for nothing -; EXCESS / MARGIN resize
+        the legs to the trade after the reduce (`pending_reduce.after`, the position less `size`), placed first.
+        Returns the position read that the room was made for (the resent reduce goes against it), None when no room
+        was made."""
         trade = self.trade()
         if trade is None or trade.pending_reduce is None:
-            return False
+            return None
+
+        def cover(orders: list[Order]) -> int:  # what our resting brackets on the trade's exit side still close
+            return sum(o.size - o.filled for o in orders
+                       if is_ours(o) and o.kind == "BRACKET" and o.side == -trade.direction)
+
         try:
             pos = self.ex.position()
             if pos is None or pos.side != trade.direction or pos.contracts < size:
-                return False
+                return None
             if reason == "TP1_SYNC":
+                orders = self.ex.open_orders()
                 leg = next((x for x in trade.legs if x.name == "tp1" and x.order_id), None)
-                if leg is None:
-                    return False
+                o = next((o for o in orders if leg is not None and o.order_id == leg.order_id
+                          and o.status != CANCEL_QUEUED), None)
+                if leg is None or o is None or cover(orders) - (o.size - o.filled) + size > pos.contracts:
+                    return None  # no resting TP1 leg, or cancelling it would not make the room: the legs stay
                 self.ex.cancel([str(leg.order_id)])
                 trade.legs = [x for x in trade.legs if x is not leg]  # cancelled by us: nothing to look up
                 self.save(trade)
-            else:
-                after = LiveTrade.from_json({**trade.to_json(), **trade.pending_reduce["after"]})
-                legs, stop = desired_legs(after, pos.contracts - size, trade.stop_spot, ctx.ratio, ctx.tick,
-                                          ctx.price)
-                self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
-            cover = sum(o.size - o.filled for o in self.ex.open_orders()
-                        if is_ours(o) and o.kind == "BRACKET" and o.side == -trade.direction)
-            return cover + size <= pos.contracts
+                return pos
+            after = LiveTrade.from_json({**trade.to_json(), **trade.pending_reduce["after"]})
+            legs, stop = desired_legs(after, pos.contracts - size, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
+            self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
+            return pos if cover(self.ex.open_orders()) + size <= pos.contracts else None
         except ExchangeError as exc:
             self.event("ACTION_ERROR", {"action": "Reduce", "error": str(exc)[:200]})
-            return False
+            return None
 
     def resolve_reduce(self) -> None:
         """A reduce whose outcome is still unknown (an ambiguous answer, a killed process, a fill not read yet) is
@@ -1016,8 +1079,8 @@ class Executor:
         pr["filled"] = int(order.filled)
         trade.pending_reduce = pr  # kept until the position shows it (reconcile.observe settles it)
         self.save(trade)
-        self.event("REDUCED", {"trade_id": tid, "size": size, "reason": reason, "price": order.avg_fill_price,
-                               "contracts": order.filled, "side": order.side, "fee": order.fee},
+        self.event("REDUCED", {"trade_id": tid, "size": size, "reason": reason, "price": _price(order.avg_fill_price),
+                               "contracts": order.filled, "side": order.side, "fee": _finite(order.fee)},
                    f"[수량 축소] {order.filled}계약 · {reason}")
         return True
 

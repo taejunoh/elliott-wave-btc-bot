@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import pytest
 
-from ewbot.live.exchange import Order, PlaceResult, RateLimited, Unavailable
+from ewbot.live.exchange import Order, PlaceResult, Position, RateLimited, Unavailable
 from ewbot.live.executor import Executor
 from ewbot.live.reconcile import (
     Adopt,
@@ -1029,3 +1030,107 @@ def test_a_flip_waits_while_a_bracket_of_the_closed_position_still_rests(env):
     exe.execute([Close("FLIP"), Enter(short, 1)], ctx(clock))
     assert ex.position() is None and jr.intent(f"ewb-e-{T0 + 3600}-S") is None
     assert jr.events(kind="SKIP")[0]["data"]["signal_ts"] == T0 + 3600 and alerts.kinds().count("SKIP") == 1
+
+
+# ---------------------------------------------------------------------------- Final fix
+def nan_fills(ex) -> None:
+    """The venue reports a market order's average fill price and fee as no finite number (e.g. "NaN")."""
+    real = ex.get_order
+
+    def get(order_id):
+        o = real(order_id)
+        return dataclasses.replace(o, avg_fill_price=math.nan, fee=math.nan) if o.kind == "MARKET" else o
+
+    ex.get_order = get
+
+
+def test_an_entry_whose_fill_price_is_not_finite_is_saved_and_protected_at_once(env):
+    """Final fix (P0, probe f2_nan): a NaN fill price made the journal refuse the trade - a filled entry without a
+    trade or brackets, and the rebuild raised the same way at every pass. The position's average entry stands in."""
+    clock, ex, jr, alerts, exe = env
+    nan_fills(ex)
+    tr = exe.enter(Enter(entry(), 3), ctx(clock))
+    assert tr is not None and tr.entry_price == ex.position().avg_entry == 60_002.5
+    assert sum(n for n, _, _ in resting(ex)) == 3 and jr.events(kind="PROTECTED_FIRST")
+    unread = jr.events(kind="FILL_PRICE_UNREAD")[0]["data"]
+    assert (unread["stand_in"], unread["price"]) == ("position", 60_002.5) and "FILL_PRICE_UNREAD" in alerts.kinds()
+    e = jr.events(kind="ENTRY")[0]["data"]
+    assert (e["price"], e["fee"], e["ref"]) == (None, None, 60_000.0)  # no fill price recorded: no slippage sample
+
+
+def test_without_a_fill_price_or_a_position_read_the_reference_stands_in(env):
+    clock, ex, jr, _, exe = env
+    nan_fills(ex)
+    ex.fail_next("position", Unavailable("503"))
+    tr = exe.enter(Enter(entry(), 1), ctx(clock, ratio=1.001))
+    assert tr is not None and tr.entry_price == pytest.approx(60_060.0)  # entry_ref x ratio, as sent
+    assert jr.events(kind="FILL_PRICE_UNREAD")[0]["data"]["stand_in"] == "ref" and len(ex.open_orders()) == 1
+
+
+def test_an_entry_rebuilt_from_its_intent_with_a_non_finite_fill_price_is_protected(env):
+    clock, ex, jr, alerts, exe = env
+    ex.fail_next("get_order", Unavailable("503"), times=25)  # the fill is unread at first: rebuilt on the next pass
+    assert exe.enter(Enter(entry(), 1), ctx(clock)) is None
+    ex.clear_faults()
+    nan_fills(ex)
+    acts = plan(target(T0 + 3600, ent=entry()), None, ex.position(), ex.open_orders(), ctx(clock))
+    exe.execute(acts, ctx(clock))
+    t = exe.trade()
+    assert t.trade_id == T0 and t.entry_price == 60_002.5 and len(ex.open_orders()) == 1
+    assert "RECOVERED_ENTRY" in alerts.kinds() and "ACTION_ERROR" not in alerts.kinds()
+
+
+def test_a_foreign_position_without_a_finite_entry_price_is_taken_over_at_the_engines_entry(env):
+    clock, ex, jr, _, exe = env
+    ex.place_market("manual", 1, 1)
+    real = ex.position
+    ex.position = lambda: None if real() is None else dataclasses.replace(real(), avg_entry=math.nan)
+    acts = plan(target(T0 + 3600, position()), None, ex.position(), ex.open_orders(), ctx(clock))
+    assert any(isinstance(a, Adopt) for a in acts)
+    exe.execute(acts, ctx(clock))
+    assert exe.trade().entry_price == 60_000.0 and len(ex.open_orders()) == 1  # the engine's entry x ratio 1.0
+
+
+def test_close_and_reduce_fills_without_finite_prices_are_recorded_without_them(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    nan_fills(ex)
+    assert exe.reduce(1, "MARGIN", ctx(clock)) is True
+    r = jr.events(kind="REDUCED")[0]["data"]
+    assert (r["price"], r["fee"], r["contracts"]) == (None, None, 1)
+    assert exe.close("TIME", ctx(clock)) is True and ex.position() is None
+    c = jr.events(kind="CLOSED")[0]["data"]
+    assert (c["reason"], c["price"], c["fee"]) == ("TIME", None, None)
+
+
+def test_a_close_that_finds_the_position_flat_records_the_bracket_exit(env):
+    """Final fix (Task 12 review m10): a bracket filled after the pass's reads and before its close went out. The trade
+    closed on its bracket - recorded as observe() records it (BRACKET, a CLOSED event), never as this close's reason."""
+    clock, ex, jr, alerts, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    ex.set_prices(61_100.0)  # the TP1 bracket fills: flat
+    assert ex.position() is None
+    assert exe.close("TIME", ctx(clock)) is True
+    t = exe.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET") and "close_position" not in ex.calls
+    assert [(e["data"]["reason"], e["data"]["observed"]) for e in jr.events(kind="CLOSED")] == [("BRACKET", True)]
+    assert "CLOSED" in alerts.kinds()
+
+
+def test_a_tp1_sync_never_cancels_the_tp1_leg_when_that_would_not_make_the_room(env):
+    """Final fix (Task 7): the TP1 contracts have no stop from the TP1 leg's cancel until the resent reduce sold them -
+    so the room is judged on the reads before the cancel. Here another bracket of ours whose cancel is queued (it may
+    still fill) keeps the cover at the position even without the TP1 leg: nothing is cancelled, the legs stay and the
+    reduce is retried on a later pass."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 3), ctx(clock))
+    covered_refusal(ex)
+    real_open = ex.open_orders
+    queued = Order("sim-q", f"ewb-b-{T0}-tp2-9", -1, "BRACKET", 1, 0, "CANCEL_QUEUED", 62_000.0, 59_000.0)
+    ex.open_orders = lambda: real_open() + [queued]
+    ex.set_prices(60_900.0)
+    clock.now += 10
+    poll(exe, ex, clock, target(T0 + 3600, position(tp1_done=True, stop=60_000.0)))
+    assert "cancel" not in ex.calls and ex.position().contracts == 3
+    assert [(n, tp) for n, tp, _ in resting(ex) if n] == [(1, 61_000.0), (1, 62_000.0), (2, 62_000.0)]
+    assert jr.events(kind="REDUCE_CONFLICT") and not exe.trade().tp1_filled
