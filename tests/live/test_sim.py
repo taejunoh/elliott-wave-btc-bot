@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from ewbot.live.exchange import (
     STOP_LIMIT_OFFSET,
+    Exchange,
     ExchangeError,
     PlaceResult,
     Position,
@@ -292,3 +295,34 @@ def test_a_duplicate_result_is_flagged_explicitly():
     dup = strict.place_market("e1", 1, 1)
     assert dup == PlaceResult("e1", None, False, "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)
     assert not PlaceResult("x", None, False, "INVALID_REQUEST: duplicate field").duplicate
+
+
+# ---------------------------------------------------------------------------- final fix
+def test_every_exchange_method_takes_injected_faults():
+    """FAULT_METHODS is kept by hand: it must name every method of the Exchange protocol (a new one would otherwise be
+    a method no chaos test can fail), and each of them must really raise the injected fault."""
+    methods = {n for n, f in inspect.getmembers(Exchange, inspect.isfunction) if not n.startswith("_")}
+    assert SimExchange.FAULT_METHODS == methods
+    sim = SimExchange(clock=Clock())
+    sim.set_prices(60_000.0)
+    args = {"quote": ("BTC-USD",), "get_order": ("x",), "find_order": ("x", 0.0), "place_market": ("c", 1, 1),
+            "place_bracket": ("c", -1, 1, 61_000.0, 59_000.0), "edit_bracket": ("x", 1, 61_000.0, 59_000.0),
+            "cancel": ([],), "close_position": ("c",), "preview_market": (1, 1),
+            "preview_bracket": (-1, 1, 61_000.0, 59_000.0)}
+    for name in sorted(methods):
+        sim.fail_next(name, Unavailable(f"503 {name}"))
+        with pytest.raises(Unavailable, match=name):
+            getattr(sim, name)(*args.get(name, ()))
+
+
+def test_an_edit_below_what_already_filled_is_refused(ex):
+    """orders/edit takes the order's total size (filled + left): one below what already filled is refused."""
+    ex.edit_supported = True
+    ex.place_market("e1", 1, 3)
+    b = ex.place_bracket("b1", -1, 3, 61_000.0, 59_000.0)
+    ex.bracket_fill_cap = 2
+    ex.set_prices(61_000.0)  # the take-profit fills 2 of 3
+    assert ex.get_order(b.order_id).filled == 2
+    assert not ex.edit_bracket(b.order_id, 1, 61_000.0, 59_500.0) and not ex.edit_bracket(b.order_id, 2, 61_000.0,
+                                                                                          59_500.0)
+    assert ex.edit_bracket(b.order_id, 3, 61_000.0, 59_500.0) and ex.get_order(b.order_id).stop_price == 59_500.0

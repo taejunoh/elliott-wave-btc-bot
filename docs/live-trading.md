@@ -179,6 +179,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - Whether Coinbase accepts or refuses placing and cancelling brackets during the weekly Friday 17:00–18:00 New York halt and the quarterly maintenance, and with which code. Until it is known, a stop move refused while the session is not OPEN is judged by the protection still resting: no CANARY failure while the old bracket covers the position.
 - The limit of the first triggered bracket stop: the Create Order reference says 5% beyond the stop (`STOP_LIMIT_OFFSET`, also the stop-gap watchdog's threshold). If Coinbase uses another offset, change the constant and redeploy with a flat book.
 - Re-record the private-endpoint fixtures in `tests/live/fixtures/coinbase.json` (positions, balance summary, key permissions, orders, the open-orders query with every resting `order_status`, preview) from real responses with personal data removed, and rerun the tests.
+- What Coinbase does with a bracket whose stop is already through the market when it is placed (a leg placed again after a gap, a break-even stop after a fast move): refused, with which code, or triggered at once (the simulator triggers it at once).
 - How long Coinbase shows a bracket fill in the orders before the position (or the other way round): the planner reads a reduction the legs do not explain as `UNEXPLAINED_REDUCTION` at the first poll that sees it (see "Before FULL").
 
 ## Before FULL

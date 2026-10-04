@@ -5,7 +5,8 @@ book of the SHADOW stage. It models what the runtime relies on:
   - order intake is never more forgiving than the venue: a size that is not a whole number of
     base_increment (min one contract), a price off the price_increment grid ($5) or a bracket whose
     take-profit is not beyond its stop in the profit direction is rejected (PlaceResult not ok,
-    edit_bracket False, a preview with errors);
+    edit_bracket False, a preview with errors), as is an edit whose total size (filled + left) leaves
+    nothing to rest;
   - market orders and close_position are IOC: they fill at the ask (buy) / bid (sell) while the session
     is OPEN, possibly only partly (`market_fill_ratio`), the rest is cancelled; a bracket left with
     nothing to reduce is cancelled at once;
@@ -313,8 +314,8 @@ class SimExchange:
         o = self.orders.get(order_id)
         if not self.edit_supported or o is None or o.status != "OPEN" or o.triggered:
             return False
-        if self._rejected(size, o.side, limit_price, stop_price) is not None:
-            return False
+        if self._rejected(size, o.side, limit_price, stop_price) is not None or int(size) <= o.filled:
+            return False  # the total size (filled + left) must leave something to rest
         o.size, o.limit_price, o.stop_price = int(size), float(limit_price), float(stop_price)
         self._match()
         return True
