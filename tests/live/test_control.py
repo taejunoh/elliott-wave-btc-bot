@@ -377,3 +377,20 @@ def test_heartbeat_pings_once_a_minute_and_logs_state_changes(capsys):
     assert s.calls[-1][:3] == ("POST", "https://hc-ping.com/abc/fail?create=1", b"fatal: boom")
     assert fail_url("https://hc-ping.com/abc/") == "https://hc-ping.com/abc/fail"
     assert Heartbeat(None).beat() is False and Heartbeat("  ").url is None
+
+
+def test_a_wall_clock_step_back_never_withholds_a_ping_or_an_alert():
+    """Final review B minor 7: the heartbeat paces on the wall clock - after it steps back the next ping goes out at
+    once instead of after the size of the step (which looks like a dead VPS to healthchecks.io); the notifier's
+    10-minute dedupe never holds a message back for the size of a step either."""
+    clock = Clock(10_000.0)
+    s = Session([Resp(200, {}), Resp(200, {})])
+    hb = Heartbeat("https://hc-ping.com/abc", session=s, clock=clock)
+    assert hb.beat()
+    clock.now -= 3_600.0
+    assert hb.beat() and len(s.calls) == 2
+    sender = FakeSender()
+    n = LiveNotifier(sender, clock=clock)
+    assert n("BREAKER", "same text") and n.pump() == 0.0
+    clock.now -= 3_600.0
+    assert n("BREAKER", "same text") and n.pump() == 0.0 and len(sender.texts) == 2

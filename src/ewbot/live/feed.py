@@ -7,7 +7,13 @@ default TLS context, which verifies the certificate chain and the host name; the
 (SDK 1.8.4 opens wss:// with an SSLContext that verifies neither). This class subscribes to both channels
 for the futures and spot products, keeps the price per product - the mid of the ticker's best bid and ask
 (what the REST quote measures), its last trade price only when those are missing; only a finite price above
-0 - and the time of the last message, and watches the per-connection `sequence_num` for gaps.
+0 - and the time of the last message, and watches `sequence_num` for gaps. Coinbase's documents disagree on how
+it counts: the WebSocket overview says sequence numbers increase "for each product", the channel references
+"per connection". So a message is in sequence when it follows its (channel, product)'s previous message or the
+connection's previous message; a gap (`gaps`) is a number past both - a message lost under either numbering -,
+and the first message of a (channel, product) after a connect is never one (a lower number - out of order - is
+ignored, as the overview allows). Which numbering applies is a SHADOW week-1 check (the daily summary shows the
+gap count).
 
 `run` owns every reconnect. A connection that fails, closes (a clean 1000/1001 close included), raises, or
 brings no message for SILENT_S (the heartbeats channel sends one every second, so silence means the
@@ -80,7 +86,8 @@ class TickerFeed:
         self.silent_s = silent_s
         self.healthy_s = healthy_s
         self.last_msg: float | None = None
-        self.last_seq: int | None = None
+        self.last_seq: int | None = None  # the connection's last sequence number
+        self._seqs: dict[tuple[str, str | None], int] = {}  # (channel, product) -> its last sequence number
         self.gaps = 0
         self.connects = 0
         self.failures = 0
@@ -105,17 +112,20 @@ class TickerFeed:
         if not isinstance(msg, dict):
             raise ValueError("a message that is not a JSON object")
         ticks: dict[str, float] = {}
+        products: set[str] = set()
         unusable = 0
         if msg.get("channel") == "ticker":
             for ev in msg.get("events") or []:
                 for t in ev.get("tickers") or []:
                     if not t.get("product_id"):
                         continue
+                    products.add(str(t["product_id"]))
                     price = ticker_price(t)
                     if price is None:
                         unusable += 1
                     else:
                         ticks[t["product_id"]] = price
+        key = (str(msg.get("channel")), next(iter(products)) if len(products) == 1 else None)
         now = self.clock()
         with self._lock:
             self.unpriced_tickers += unusable
@@ -125,10 +135,13 @@ class TickerFeed:
                 self.last_msg = now
                 self.messages += 1
             seq = msg.get("sequence_num")
-            if isinstance(seq, int):
-                if self.last_seq is not None and seq != self.last_seq + 1:
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                last = self._seqs.get(key)
+                after_connection = self.last_seq is not None and seq == self.last_seq + 1
+                if last is not None and seq > last + 1 and not after_connection:  # past both numberings: one was lost
                     self.gaps += 1
                     self._resync = True
+                self._seqs[key] = seq if last is None else max(last, seq)
                 self.last_seq = seq
             for product, price in ticks.items():
                 self._ticks[product] = Tick(price, now)
@@ -160,6 +173,7 @@ class TickerFeed:
                 with self._lock:
                     self.connects += 1
                     self.last_seq = None
+                    self._seqs.clear()
                     self._resync = True
                     seen = self.messages
                 up = silent = 0

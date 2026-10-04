@@ -1,7 +1,8 @@
 """Heartbeat to an external monitor (Plan 3 spec 3.2 `health`, 5.1 `VPS 다운`).
 
 Every minute the runtime's main loop GETs EWBOT_HEALTHCHECK_URL (for example a healthchecks.io check
-with period 1 min and grace 2 min, so 3 silent minutes alert through its integrations). The ping is sent
+with period 1 min and grace 2 min, so 3 silent minutes alert through its integrations; a wall clock that
+stepped back never holds the next ping back). The ping is sent
 from the main loop only, so a hung loop stops the pings as surely as a dead VPS; it times out after 5 s.
 A failed ping - an exception (its type name) or an HTTP status of 400 or more (the status, e.g. 404 for a
 wrong check UUID) - never raises: it counts in `failures` (in a row, alerted by the runtime) and
@@ -44,7 +45,7 @@ class Heartbeat:
         if self.url is None:
             return False
         now = self.clock()
-        if self.last is not None and now - self.last < self.interval:
+        if self.last is not None and 0 <= now - self.last < self.interval:  # a clock stepped back pings at once
             return False
         self.last = now
         error: str | None = None

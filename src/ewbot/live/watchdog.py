@@ -6,12 +6,14 @@
                  the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
   AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.97, or <= the peak
                  x 0.85 -> flatten and pause (spec 4.5), on the second observation in a row that breaches.
-                 State lives in the journal (survives restarts).
+                 State lives in the journal (survives restarts). A deliberate capital change (`ewbot live rebase`)
+                 re-bases both references (`rebase`).
   SessionWatch   session state changes and the next scheduled maintenance (noticed 24 h ahead, or at once
                  when it is already under way).
   PriceSource    the futures price for the checks: the WebSocket ticker while it is fresh (a usable price in
                  the last 60 s), otherwise REST polled every 10 s; no price once the last good one is older
-                 than 60 s (spec 5.1)."""
+                 than 60 s (spec 5.1). A price stamped later than now (the wall clock stepped back) is not fresh:
+                 `fresh` allows CLOCK_SLACK_S between the feed's thread and the loop, no more."""
 
 from __future__ import annotations
 
@@ -39,6 +41,13 @@ WS_STALE_S = 60.0
 REST_POLL_S = 10.0
 MAINTENANCE_NOTICE_S = 24 * 3600
 BASING_READS = 3  # a reference (the day's, a re-based peak) is the median of its first three valid reads
+CLOCK_SLACK_S = 1.0  # a price stamped up to this much after `now` (another thread's clock read) is still fresh
+
+
+def fresh(age: float, limit: float) -> bool:
+    """A price `age` seconds old is fresh: at most `limit` old, and not stamped later than now by more than
+    CLOCK_SLACK_S (the wall clock stepped back: never fresh for the size of the step)."""
+    return -CLOCK_SLACK_S <= age <= limit
 
 
 class StopGapWatch:
@@ -163,6 +172,22 @@ class AccountGuard:
         self.journal.put(self.KEY, st)
         return trip
 
+    def rebase(self, equity: float, now: float) -> tuple[dict[str, Any], dict[str, Any]]:
+        """A deliberate capital change (a deposit or withdrawal: `ewbot live rebase`, applied by the runtime): the
+        day's reference and the peak are based again - this read is the first of their three basing reads, the
+        median of the three sets them - and the breach flags are cleared, so the change itself never trips a
+        breaker. A tripped breaker stays tripped (/resume re-bases it). Returns (before, after): day, day_ref, peak."""
+        e = _observed(equity)
+        st = self.state() or {"daily_tripped": False, "total_tripped": False}
+        before = {"day": st.get("day"), "day_ref": st.get("day_ref"), "peak": st.get("peak")}
+        day = ny_date(now)
+        if st.get("day") != day:  # a trip of an earlier day does not carry over (update() would end it as well)
+            st["daily_tripped"] = False
+        st.update(day=day, day_ref=e, day_reads=[e], peak=e, peak_reads=[e], daily_breach=False, total_breach=False,
+                  equity=e)
+        self.journal.put(self.KEY, st)
+        return before, {"day": day, "day_ref": e, "peak": e}
+
     def reset(self, equity: float, now: float) -> list[str]:
         """After the user resumes: only a breaker that tripped is re-based - the peak after TOTAL_DD, the day's
         reference after DAILY_LOSS (a TOTAL_DD trip marks the day too) - starting from this read as the first of
@@ -229,7 +254,7 @@ class PriceSource:
         now = self.clock()
         if self.feed is not None:
             tick = self.feed.latest(self.ex.futures_id)
-            if tick is not None and now - tick.ts <= self.stale_s and usable_price(tick.price) is not None:
+            if tick is not None and fresh(now - tick.ts, self.stale_s) and usable_price(tick.price) is not None:
                 self.mode = "ws"
                 return float(tick.price)
         self.mode = "rest"
@@ -241,6 +266,6 @@ class PriceSource:
                     self._rest, self._rest_ts = q.mid, now
             except ExchangeError:
                 pass
-        if self._rest_ts is None or now - self._rest_ts > self.stale_s:
+        if self._rest_ts is None or not fresh(now - self._rest_ts, self.stale_s):
             return None
         return self._rest

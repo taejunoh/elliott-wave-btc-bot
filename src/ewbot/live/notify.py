@@ -10,7 +10,8 @@ Telegram refuses outright (any other HTTP 4xx) is dropped at once, so it never h
 its send first fails, when it is dropped and when it is still undelivered at flush timeout or stop(), so the
 container log always has it. The queue holds MAX_PENDING messages: when it is full the oldest waiting one is
 dropped (`dropped` counts them). The same (kind, text) is never queued twice and is sent at most once per 10
-minutes, counted from its delivery (a failed send is never deduplicated away). A message is cut to MAX_CHARS
+minutes, counted from its delivery (a failed send is never deduplicated away; after the wall clock stepped back
+nothing is held back for the size of the step). A message is cut to MAX_CHARS
 with "…(잘림)" (Telegram refuses more than 4096); one delivered a minute or more late says so.
 
 For the runtime's view of Telegram: `failing_since` is when the oldest waiting message that has failed at least
@@ -126,7 +127,7 @@ class LiveNotifier:
         key = (kind, text)
         body = fit(f"{PREFIX} {text}")
         with self._cond:
-            self._last = {k: t for k, t in self._last.items() if now - t < self.dedupe_s}
+            self._last = {k: t for k, t in self._last.items() if 0 <= now - t < self.dedupe_s}  # a step back: none
             if key in self._queued or key in self._last:
                 return False
             if self.sender is None:

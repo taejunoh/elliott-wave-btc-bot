@@ -433,3 +433,83 @@ def test_the_pinned_websockets_client_takes_the_arguments_the_socket_passes():
     for name in ("send", "recv", "close"):
         assert callable(getattr(client.ClientConnection, name))
     assert "timeout" in inspect.signature(client.ClientConnection.recv).parameters
+
+
+def test_a_capital_change_rebases_both_references_from_three_reads(tmp_path):
+    """Final review B-2: a deliberate deposit or withdrawal (`ewbot live rebase`) re-bases the day's reference and the
+    peak with the same median-of-three basing - this read and the next two -, clears the breach flags so the change
+    itself never trips a breaker, and leaves a tripped breaker tripped (/resume). Before and after are returned."""
+    jr = journal(tmp_path)
+    g = AccountGuard(jr)
+    for k in range(3):
+        g.update(10_000.0, NY_NOON + 60 * k)
+    g.update(9_600.0, NY_NOON + 180)  # a withdrawal shows: one breaching read
+    before, after = g.rebase(9_600.0, NY_NOON + 200)
+    assert (before["day_ref"], before["peak"]) == (10_000.0, 10_000.0)
+    assert (after["day_ref"], after["peak"]) == (9_600.0, 9_600.0)
+    st = g.state()
+    assert not st["daily_breach"] and not st["total_breach"] and st["day_reads"] == [9_600.0] == st["peak_reads"]
+    assert g.update(9_500.0, NY_NOON + 260) is None  # the second basing read: no trip, the highest so far stands
+    assert g.update(9_550.0, NY_NOON + 320) is None
+    st = g.state()
+    assert (st["day_ref"], st["peak"], st["day_reads"], st["peak_reads"]) == (9_550.0, 9_550.0, None, None)  # median
+    with pytest.raises(BadEquity):
+        g.rebase(math.nan, NY_NOON + 400)
+    g.update(9_200.0, NY_NOON + 380)
+    assert g.update(9_200.0, NY_NOON + 440) == "DAILY_LOSS"
+    g.rebase(9_200.0, NY_NOON + 500)
+    assert g.state()["daily_tripped"]  # a trip stays until /resume
+    fresh = AccountGuard(journal(tmp_path, "fresh.sqlite"))
+    assert fresh.rebase(5_000.0, NY_NOON)[0] == {"day": None, "day_ref": None, "peak": None}
+    jr.close()
+
+
+def test_the_feed_counts_a_gap_only_where_neither_numbering_explains_it():
+    """Final review B-3: Coinbase's WebSocket overview numbers messages "for each product", its channel references
+    "per connection". A message is in sequence when it follows its (channel, product)'s previous message or the
+    connection's: per-product numbering of two products and the heartbeats is no gap (it was one every message), and a
+    message lost under either numbering still is."""
+    def feed_of():
+        return TickerFeed([FUT, "BTC-USD"], ws_factory=lambda **kw: None, clock=lambda: 0.0)
+
+    def hb(seq):
+        return json.dumps({"channel": "heartbeats", "sequence_num": seq, "events": []})
+
+    per_product, seq = feed_of(), {"hb": 7, FUT: 100, "BTC-USD": 5000}
+    for _ in range(60):
+        for key in ("hb", FUT, "BTC-USD"):
+            seq[key] += 1
+            per_product.on_message(hb(seq[key]) if key == "hb" else ticker(key, 60_000.0, seq[key]))
+    assert per_product.gaps == 0 and not per_product.take_resync()
+    per_product.on_message(ticker(FUT, 60_000.0, seq[FUT] + 2))  # one of the product's messages lost
+    assert per_product.gaps == 1 and per_product.take_resync()
+
+    per_connection, n = feed_of(), 0
+    for _ in range(20):
+        for key in ("hb", FUT, "BTC-USD"):
+            n += 1
+            per_connection.on_message(hb(n) if key == "hb" else ticker(key, 60_000.0, n))
+    assert per_connection.gaps == 0
+    per_connection.on_message(ticker("BTC-USD", 60_000.0, n + 2))  # one message of the connection lost
+    assert per_connection.gaps == 1
+
+
+def test_a_price_stamped_after_now_is_not_fresh():
+    """Final review B minor 7: after the wall clock steps back, a tick or a REST price read before the step looks newer
+    than now - it counts as stale (a second of slack between the threads), never fresh for the size of the step."""
+    clock = Clock(10_000.0)
+    book = Book(clock)
+    src = PriceSource(book, StuckFeed(Tick(60_500.0, 10_000.0)), clock=clock)  # type: ignore[arg-type]
+    assert src.futures_price() == 60_500.0 and src.mode == "ws"
+    clock.now -= 3_600.0  # the clock steps back an hour
+    book.bid = None  # and the REST book is down
+    assert src.futures_price() is None and src.mode == "rest"
+    clock2 = Clock(10_000.0)
+    book2 = Book(clock2)
+    src2 = PriceSource(book2, None, clock=clock2)
+    assert src2.futures_price() == 60_005.0
+    clock2.now -= 3_600.0
+    book2.bid = None
+    assert src2.futures_price() is None  # the last REST price is from "the future": stale
+    src3 = PriceSource(book, StuckFeed(Tick(60_500.0, clock.now + 0.5)), clock=clock)  # type: ignore[arg-type]
+    assert src3.futures_price() == 60_500.0  # stamped by the feed thread a moment after `now`: fresh
