@@ -15,14 +15,14 @@
 - Work on branch `feat/plan3-live` (from `docs/live-design`, or from `master` once PR #5 with the spec and this plan is merged), from the repository root; the venv must be Python 3.12.13 (`uv run python --version`; if not, `uv venv --python 3.12.13 && uv sync`).
 - Tests: `uv run pytest …` in Tasks 1–2, `uv run --group live pytest …` from Task 3 on (it keeps the `live` group installed; a plain `uv sync` later would remove it).
 - Never modify a strategy-fingerprinted file (Plan 2 spec §5.1, Plan 3 spec §3.1): `src/ewbot/types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/**`, `strategy/**`, `engine/**`, `execution/**`, `risk/**`. Never modify `holdout.lock`, `backtest/**`, `data/coinbase_history.py`, `src/ewbot/paper/**` or `.github/workflows/**`. Allowed: create `src/ewbot/live/**`, `tests/live/**`, `deploy/live/**`, `docs/live-trading.md`; modify `src/ewbot/cli.py`, the one `ALLOWED_TRUE` line of `tests/paper/test_static.py` (Decision D2) and `pyproject.toml` + `uv.lock` only through `uv add --group live coinbase-advanced-py==1.8.4` (Task 3) and `uv add --group live websockets==13.1` (Task 8; Decision D1).
-- Fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1` over 25 files and lock `sha256` `d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45` are pinned in `live/preflight.py`; the runtime refuses to start when either differs, or when the API key can transfer, or when the product is not 0.01 BTC / $5 tick / whole contracts.
-- Frozen inputs: params only from `holdout.lock`; config = `holdout_config(BotConfig(), params)`; replay from the first cached bar with `start_ts = HOLDOUT_START`; signals from the spot `BTC-USD` hourly candles of the public Coinbase Exchange API (`data.coinbase_history.update_cache`, as the paper runtime); no CLI option changes any of it.
-- Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short (recorded 2026-10-03). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
+- Fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1` over 25 files, lock `sha256` `d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45` and the sha256 of the committed `holdout.lock` file itself, `6530175541c177509dab874cb944273996fa4b5e8a9207d0c19e6222224d68bb` (`LOCK_FILE_SHA256`: the image has no git, and the file holds more than the digest's inputs), are pinned in `live/preflight.py`; the runtime refuses to start when any differs, when the API key can transfer, when the stage is not SHADOW, CANARY or FULL, when the exchange is not set up for `BIP-20DEC30-CDE` and `BTC-USD` or the product is not 0.01 BTC / $5 tick / whole contracts with a contract expiry no earlier than 2030-12-20 and more than 90 days away, or when CANARY / FULL lacks the Telegram bot token, chat id or health-check URL (alerts, `/pause` and `/flatten`, the heartbeat).
+- Frozen inputs: params only from `holdout.lock`; config = `holdout_config(BotConfig(), params)`; replay from the first cached bar with `start_ts = HOLDOUT_START`; signals from the spot `BTC-USD` hourly candles of the public Coinbase Exchange API (`data.coinbase_history.update_cache`, as the paper runtime); no CLI option or environment variable changes any of it (the products `BIP-20DEC30-CDE` and `BTC-USD` are fixed: `EWBOT_FUTURES_PRODUCT` / `EWBOT_SPOT_PRODUCT` are refused).
+- Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short, `contract_expiry` 2089-12-30T16:00:00Z of type `EXPIRING` although the id says 20 Dec 2030 (recorded 2026-10-03; neither can be required, so the preflight refuses an expiry before 2030-12-20 or within 90 days and Task 16 checks it by hand). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
 - Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 until FULL has run 30 days without a CANARY failure and with no manual intervention still in force (each one restarts the 30 days; spec §6.2 `이상이 없으면`); every entry and adoption is sized by the more conservative of the running stage and the journal's (a demotion applies to the next order at once).
 - Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s (no price once the last good one is older than 60 s; a connection without a message for 15 s is reopened, a feed without a futures price for 5 minutes while the market is open is alerted); heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min; Telegram unusable - 10 minutes of failures, a stuck sender or 3 refused messages in a row → a `/fail`, success pings withheld at most 30 minutes, the `/fail` repeated every 3 hours while it lasts); Telegram alerts are queued and sent by a background thread (never awaited; a protective action goes before its alert), commands come only from the user's private chat, a command sent more than 120 s before the loop reads it is ignored and `/flatten_confirm` counts within 60 s of `/flatten` by the messages' dates; daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour (up to the last bar whose cycle ended OK).
 - Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90% (only on a real futures price, never on a stand-in); real-account breakers −3% from the New York day's opening equity and −15% from the peak → flatten and pause, each reference the median of three balance reads (the day's first three; after a `/resume` that re-based it, that read and the next two) and each breaker tripping on two breaching reads in a row (a balance that is not a finite amount above 0 is no reading, and three in a row are an incident that pauses entries; `/resume` re-bases only the breaker that tripped).
-- Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name (healthchecks.io gets an exception's type name only; Telegram texts, loop errors and tracebacks go through the settings' redaction; a `LiveSettings` repr shows no secret).
-- Tests never touch the network, a real account, the real `data/cache` or `<repo>/holdout.lock`: `SimExchange`, recorded JSON fixtures, fake sessions, synthetic candles (`tests.paper.helpers.synth_frame`) and temp-dir locks. Exception: `check_fingerprint()` hashes the working tree's strategy files (read-only), as the paper fingerprint test does.
+- Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (a regular file of the runtime's user, mode 600, judged on the opened file; refused otherwise), mounted read-only; never in the repository, the image, the environment (`TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN` or `EWBOT_HEALTHCHECK_URL` set there is refused by name) or a log; the secrets file holds only its four keys (an unknown or repeated key, or a value with a space or a quote, is refused by file, line and key, never by value); HTTP exceptions that may carry a token are reduced to their type name (healthchecks.io gets an exception's type name only; Telegram texts, loop errors and tracebacks go through the settings' redaction; `LiveSettings` holds each secret as a `Secret` - repr, str and `dataclasses.asdict` redacted, `.reveal()` where it is used - and its repr shows no secret).
+- Tests never touch the network, a real account, the real `data/cache` or `<repo>/holdout.lock`: `SimExchange`, recorded JSON fixtures, fake sessions, synthetic candles (`tests.paper.helpers.synth_frame`) and temp-dir locks. Exceptions, both read-only: `check_fingerprint()` hashes the working tree's strategy files, as the paper fingerprint test does, and one Task 11 test runs `check_lock()` with the production defaults and hashes `<repo>/holdout.lock` against `LOCK_FILE_SHA256` (it never writes the file).
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Decisions for the controller (sign off before Task 3 / before merging)
@@ -70,8 +70,8 @@
 | `src/ewbot/live/health.py` | 9 | heartbeat pings and `/fail` (healthchecks.io) |
 | `src/ewbot/live/audit.py` | 10 | paper-ledger fetch (GitHub contents API) and decision comparison |
 | `src/ewbot/live/stage.py` | 10 | stages, gates, pause, incidents, transitions |
-| `src/ewbot/live/settings.py` | 11 | settings from the environment, secrets files (mode 600) |
-| `src/ewbot/live/preflight.py` | 11 | fingerprint, lock, key, product checks |
+| `src/ewbot/live/settings.py` | 11 | settings from the environment, secrets files (mode 600, judged on the opened file), `Secret` values |
+| `src/ewbot/live/preflight.py` | 11 | fingerprint, lock (file and digest), alerts, key, product (with expiry) checks |
 | `src/ewbot/live/shadow.py` | 12 | `ShadowExchange` (real reads and previews, virtual book) |
 | `src/ewbot/live/runtime.py` | 12 | `LiveRuntime` main loop, `status_lines` |
 | `src/ewbot/live/app.py` | 13 | production wiring (exchange, notifier, feed, control, heartbeat, audit) |
@@ -97,14 +97,14 @@
 | 8 | Watchdog and WebSocket feed | 27 |
 | 9 | `[LIVE]` notifier, Telegram control, heartbeat | 13 |
 | 10 | Paper audit, stages and gates | 20 |
-| 11 | Settings and preflight | 8 |
+| 11 | Settings and preflight | 19 |
 | 12 | `ShadowExchange` and the runtime loop | 43 |
 | 13 | CLI `ewbot live …` and production wiring | 9 |
 | 14 | Parity and chaos integration tests | 26 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 395 more tests, `1015 passed, 1 skipped` (`1016 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 406 more tests, `1026 passed, 1 skipped` (`1027 passed` with the cache), about 80 s.
 
 ---
 
@@ -117,8 +117,8 @@ Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks (stdlib only).
-- Produces (`ewbot.live.exchange`): constants `FUTURES_PRODUCT = "BIP-20DEC30-CDE"`, `SPOT_PRODUCT = "BTC-USD"`, `SESSION_OPEN = "OPEN"`, `OPEN_STATUSES` (`OPEN`, `PENDING`, `QUEUED`, `EDIT_QUEUED`, `CANCEL_QUEUED`: an order with a queued edit or cancel still rests and can fill), `TERMINAL_STATUSES`, `STOP_LIMIT_OFFSET = 0.05` (a triggered bracket stop is placed as a limit 5% beyond it, Create Order reference); frozen dataclasses `ProductSpec(product_id, contract_size, price_increment, base_increment, intraday_margin: tuple[float, float], overnight_margin: tuple[float, float])` with `margin_rate(side, overnight=True) -> float`, `SessionInfo(state, maintenance_start=None, maintenance_end=None)` with `.is_open`, `Quote(product_id, bid, ask, ts)` with `.mid`, `Position(side, contracts, avg_entry)`, `Order(order_id, client_order_id, side, kind, size, filled, status, limit_price=None, stop_price=None, avg_fill_price=None, created_ts=None, fee=None)` with `.is_open` / `.is_terminal`, `Balance(equity, available_margin=None)`, `KeyPermissions(can_view, can_trade, can_transfer, portfolio_type=None)`, `PlaceResult(client_order_id, order_id, ok, error=None, duplicate=False)` (`duplicate`: the client_order_id already exists), `PreviewResult(ok, errors=(), warnings=())`; errors `ExchangeError` (`.retryable = False`), `RateLimited(message, retry_after=1.0)` and `Unavailable` (both retryable); `class Exchange(Protocol)` with attributes `futures_id`, `spot_id` and methods `product()`, `session()`, `quote(product_id)`, `position()`, `open_orders()`, `get_order(order_id)`, `find_order(client_order_id, since_ts)`, `balance()`, `key_permissions()`, `place_market(client_order_id, side, size)`, `place_bracket(client_order_id, side, size, limit_price, stop_price)`, `edit_bracket(order_id, size, limit_price, stop_price) -> bool`, `cancel(order_ids)` (raises `ExchangeError` naming each order that may still rest; an order that already filled or whose cancel is already queued is not an error), `close_position(client_order_id, size=None)`, `preview_market(side, size)`, `preview_bracket(side, size, limit_price, stop_price)`.
-- Produces (`ewbot.live.sim`): `BIP_SPEC`, `VIEW_TRADE`, `class SimCrash(BaseException)`, `class SimExchange(product=BIP_SPEC, *, equity=10_000.0, clock=time.time, spot_id="BTC-USD", spread=5.0, duplicate="existing"|"error", reject_overlap=False, edit_supported=False, fee_per_contract=0.0, permissions=VIEW_TRADE)` implementing `Exchange`, plus the test/shadow drivers `set_prices(fut, spot=None) -> list[dict]` (fills it caused), `set_session(state)`, `fail_next(method, exc, times=1)`, `crash_after_accept(method, exc=None)` (both raise `ValueError` for a method outside the class attributes `FAULT_METHODS` / `CRASH_METHODS`, the methods that honour them), and the public attributes `pos`, `orders`, `fills`, `calls`, `cash`, `spread`, `session_state`, `market_fill_ratio`, `bracket_fill_cap`, `preview_errors`, `reject_overlap`, `edit_supported`. Order intake is never more forgiving than the venue: a size that is not a whole number of contracts (at least 1), a limit or stop price off the $5 grid, or a bracket whose take-profit is not beyond its stop in the profit direction is refused — `PlaceResult(ok=False, error="INVALID_SIZE_PRECISION" | "INVALID_PRICE_PRECISION" | "INVALID_STOP_PRICE_PRECISION" | "INVALID_BRACKET_PRICES")`, `edit_bracket` → `False`, previews → `PREVIEW_<reason>`. `close_position` is IOC like `place_market` (`market_fill_ratio`), and both re-match the book, so a bracket left with nothing to reduce is cancelled at once. `cancel` cancels every OPEN order given, then raises `ExchangeError` for the unknown or no longer cancellable ones (a FILLED order is not an error); a duplicate client_order_id in `duplicate="error"` mode answers `PlaceResult(..., "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)`.
+- Produces (`ewbot.live.exchange`): constants `FUTURES_PRODUCT = "BIP-20DEC30-CDE"`, `SPOT_PRODUCT = "BTC-USD"`, `SESSION_OPEN = "OPEN"`, `OPEN_STATUSES` (`OPEN`, `PENDING`, `QUEUED`, `EDIT_QUEUED`, `CANCEL_QUEUED`: an order with a queued edit or cancel still rests and can fill), `TERMINAL_STATUSES`, `STOP_LIMIT_OFFSET = 0.05` (a triggered bracket stop is placed as a limit 5% beyond it, Create Order reference); frozen dataclasses `ProductSpec(product_id, contract_size, price_increment, base_increment, intraday_margin: tuple[float, float], overnight_margin: tuple[float, float], expiry: int | None = None)` (`expiry`: the venue's `contract_expiry`, epoch s; None when unknown) with `margin_rate(side, overnight=True) -> float`, `SessionInfo(state, maintenance_start=None, maintenance_end=None)` with `.is_open`, `Quote(product_id, bid, ask, ts)` with `.mid`, `Position(side, contracts, avg_entry)`, `Order(order_id, client_order_id, side, kind, size, filled, status, limit_price=None, stop_price=None, avg_fill_price=None, created_ts=None, fee=None)` with `.is_open` / `.is_terminal`, `Balance(equity, available_margin=None)`, `KeyPermissions(can_view, can_trade, can_transfer, portfolio_type=None)`, `PlaceResult(client_order_id, order_id, ok, error=None, duplicate=False)` (`duplicate`: the client_order_id already exists), `PreviewResult(ok, errors=(), warnings=())`; errors `ExchangeError` (`.retryable = False`), `RateLimited(message, retry_after=1.0)` and `Unavailable` (both retryable); `class Exchange(Protocol)` with attributes `futures_id`, `spot_id` and methods `product()`, `session()`, `quote(product_id)`, `position()`, `open_orders()`, `get_order(order_id)`, `find_order(client_order_id, since_ts)`, `balance()`, `key_permissions()`, `place_market(client_order_id, side, size)`, `place_bracket(client_order_id, side, size, limit_price, stop_price)`, `edit_bracket(order_id, size, limit_price, stop_price) -> bool`, `cancel(order_ids)` (raises `ExchangeError` naming each order that may still rest; an order that already filled or whose cancel is already queued is not an error), `close_position(client_order_id, size=None)`, `preview_market(side, size)`, `preview_bracket(side, size, limit_price, stop_price)`.
+- Produces (`ewbot.live.sim`): `BIP_SPEC` (the recorded specs; `expiry` 2089-12-30T16:00:00Z as the venue reported it), `VIEW_TRADE`, `class SimCrash(BaseException)`, `class SimExchange(product=BIP_SPEC, *, equity=10_000.0, clock=time.time, spot_id="BTC-USD", spread=5.0, duplicate="existing"|"error", reject_overlap=False, edit_supported=False, fee_per_contract=0.0, permissions=VIEW_TRADE)` implementing `Exchange`, plus the test/shadow drivers `set_prices(fut, spot=None) -> list[dict]` (fills it caused), `set_session(state)`, `fail_next(method, exc, times=1)`, `crash_after_accept(method, exc=None)` (both raise `ValueError` for a method outside the class attributes `FAULT_METHODS` / `CRASH_METHODS`, the methods that honour them), and the public attributes `pos`, `orders`, `fills`, `calls`, `cash`, `spread`, `session_state`, `market_fill_ratio`, `bracket_fill_cap`, `preview_errors`, `reject_overlap`, `edit_supported`. Order intake is never more forgiving than the venue: a size that is not a whole number of contracts (at least 1), a limit or stop price off the $5 grid, or a bracket whose take-profit is not beyond its stop in the profit direction is refused — `PlaceResult(ok=False, error="INVALID_SIZE_PRECISION" | "INVALID_PRICE_PRECISION" | "INVALID_STOP_PRICE_PRECISION" | "INVALID_BRACKET_PRICES")`, `edit_bracket` → `False`, previews → `PREVIEW_<reason>`. `close_position` is IOC like `place_market` (`market_fill_ratio`), and both re-match the book, so a bracket left with nothing to reduce is cancelled at once. `cancel` cancels every OPEN order given, then raises `ExchangeError` for the unknown or no longer cancellable ones (a FILLED order is not an error); a duplicate client_order_id in `duplicate="error"` mode answers `PlaceResult(..., "DUPLICATE_CLIENT_ORDER_ID", duplicate=True)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -477,6 +477,7 @@ class ProductSpec:
     base_increment: float
     intraday_margin: tuple[float, float]  # (long, short) initial margin rates
     overnight_margin: tuple[float, float]  # (long, short): from 16:00 New York
+    expiry: int | None = None  # future_product_details.contract_expiry (epoch s) as the venue reports it; None: unknown
 
     def margin_rate(self, side: int, overnight: bool = True) -> float:
         rates = self.overnight_margin if overnight else self.intraday_margin
@@ -671,7 +672,8 @@ from ewbot.live.exchange import (
     SessionInfo,
 )
 
-BIP_SPEC = ProductSpec(FUTURES_PRODUCT, 0.01, 5.0, 1.0, (0.100079, 0.0999811), (0.21025, 0.256625))
+# as recorded 2026-10-03; the venue's contract_expiry is 2089-12-30T16:00:00Z although the id says 20 Dec 2030
+BIP_SPEC = ProductSpec(FUTURES_PRODUCT, 0.01, 5.0, 1.0, (0.100079, 0.0999811), (0.21025, 0.256625), expiry=3786796800)
 VIEW_TRADE = KeyPermissions(True, True, False, "DEFAULT")  # what the live key must look like
 
 
@@ -1068,7 +1070,7 @@ EOF
 
 **Interfaces:**
 - Consumes: stdlib `sqlite3` only.
-- Produces (`ewbot.live.journal`): `INTENT_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "ABANDONED")`, `DEFAULT_STAGE = "SHADOW"`, `class Journal(path: Path)` with `close()`; intents `record_intent(client_order_id, kind, trade_id, payload: dict, now) -> tuple[dict, bool]` (row, created; an existing id is never overwritten), `intent(client_order_id) -> dict | None`, `update_intent(client_order_id, status, now, order_id=None, note=None)`, `intents(status=None, trade_id=None, kind=None) -> list[dict]` (row dicts with `payload` decoded); events `add_event(ts, kind, data=None) -> int`, `events(kind=None, since=None) -> list[{"id","ts","kind","data"}]`; engine decisions `add_decisions(decisions, now) -> list[str]` (new ids), `decisions() -> list[dict]` (each with `recorded_ts`); cycles `start_cycle(bar_ts, now, stage)`, `finish_cycle(bar_ts, now, status, note=None)`, `cycles(since_bar=None) -> list[dict]` (`bar_ts, started_ts, finished_ts, status, stage, note`); stages `set_stage(stage, reason, now)`, `stage() -> tuple[str, float | None]` (`("SHADOW", None)` before the first record), `stage_history()`; key/value `get(key, default=None)`, `put(key, value)` (strict JSON); `backup(dest: Path) -> Path`.
+- Produces (`ewbot.live.journal`): `INTENT_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "ABANDONED")`, `DEFAULT_STAGE = "SHADOW"`, `KNOWN_STAGES = ("SHADOW", "CANARY", "FULL")`, `class Journal(path: Path)` with `close()`; intents `record_intent(client_order_id, kind, trade_id, payload: dict, now) -> tuple[dict, bool]` (row, created; an existing id is never overwritten), `intent(client_order_id) -> dict | None`, `update_intent(client_order_id, status, now, order_id=None, note=None)`, `intents(status=None, trade_id=None, kind=None) -> list[dict]` (row dicts with `payload` decoded); events `add_event(ts, kind, data=None) -> int`, `events(kind=None, since=None) -> list[{"id","ts","kind","data"}]`; engine decisions `add_decisions(decisions, now) -> list[str]` (new ids), `decisions() -> list[dict]` (each with `recorded_ts`); cycles `start_cycle(bar_ts, now, stage)`, `finish_cycle(bar_ts, now, status, note=None)`, `cycles(since_bar=None) -> list[dict]` (`bar_ts, started_ts, finished_ts, status, stage, note`); stages `set_stage(stage, reason, now)` (any other stage than `KNOWN_STAGES` is a `ValueError`; `live.stage.STAGES` is the same tuple), `stage() -> tuple[str, float | None]` (`("SHADOW", None)` before the first record), `stage_history()`; key/value `get(key, default=None)`, `put(key, value)` (strict JSON); `backup(dest: Path) -> Path`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1142,6 +1144,10 @@ def test_cycles_and_stages(jr):
     jr.set_stage("SHADOW", "initial", now=1.0)
     jr.set_stage("CANARY", "user approved", now=2.0)
     assert jr.stage() == ("CANARY", 2.0) and [s["stage"] for s in jr.stage_history()] == ["SHADOW", "CANARY"]
+    for bad in ("canary", "", "LIVE"):  # a typo is never written: the runtime would read it as a real-money stage
+        with pytest.raises(ValueError, match="unknown stage"):
+            jr.set_stage(bad, "typo", now=3.0)
+    assert jr.stage() == ("CANARY", 2.0)
     jr.start_cycle(3600, now=7230.0, stage="SHADOW")
     jr.finish_cycle(3600, now=7260.0, status="OK", note="flat")
     jr.start_cycle(7200, now=10830.0, stage="SHADOW")
@@ -1200,6 +1206,7 @@ from typing import Any, Iterable
 
 INTENT_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "ABANDONED")
 DEFAULT_STAGE = "SHADOW"
+KNOWN_STAGES = ("SHADOW", "CANARY", "FULL")  # = live.stage.STAGES (the stage module builds on this one)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS intents (
@@ -1336,6 +1343,9 @@ class Journal:
 
     # ------------------------------------------------------------------ stages
     def set_stage(self, stage: str, reason: str, now: float) -> None:
+        """Record a stage; any other value than KNOWN_STAGES is a ValueError (never read back as a stage)."""
+        if stage not in KNOWN_STAGES:
+            raise ValueError(f"unknown stage {stage!r} (one of {', '.join(KNOWN_STAGES)})")
         self._exec("INSERT INTO stages (ts, stage, reason) VALUES (?, ?, ?)", (float(now), stage, reason))
 
     def stage(self) -> tuple[str, float | None]:
@@ -1400,7 +1410,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.live.exchange` (Task 1); `requests` (existing dependency); the SDK `coinbase.rest.RESTClient` (only in `CoinbaseExchange.from_key_file` and the SDK test; imported lazily, so `ewbot` still imports without the `live` group).
-- Produces (`ewbot.live.coinbase`): `API = "/api/v3/brokerage"`, `SESSION_PREFIX`, `RETRY_AFTER_MAX_S = 10.0`, `CANCEL_DONE`, `class DuplicateClientOrderId(ExchangeError)`, `fmt_decimal(x) -> str`, `bad_size(size) -> bool`, `bad_price(price) -> bool`, `iso_ts(text) -> int | None`, `retry_after_s(value, now=None) -> float` (delta-seconds or HTTP-date, clamped to [0, 10], garbage → 1), `map_error(exc) -> ExchangeError` (429 → `RateLimited`, 5xx and every other `requests` exception → `Unavailable` with the type name only, a 4xx naming `DUPLICATE_CLIENT_ORDER_ID` → `DuplicateClientOrderId`, anything else → `ExchangeError(type name)`), `parse_order(dict) -> Order` (sides `BUY`/`SELL` only), `parse_place(dict, client_order_id) -> PlaceResult` (reason: `new_order_failure_reason`, then the deprecated `error` and `preview_failure_reason`, then `failure_reason`, skipping `UNKNOWN_*`; `duplicate=True` when any of them is `DUPLICATE_CLIENT_ORDER_ID`; accepted without an order id → `Unavailable`), `class CoinbaseExchange(client, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, *, sleep=time.sleep, clock=time.time, attempts=3, backoff_s=1.0, min_remaining=2)` implementing `Exchange` with the SDK's generic `client.get(path, params=..., public=...)` / `client.post(path, data=...)`, and `CoinbaseExchange.from_key_file(key_file, futures_id, spot_id, timeout=10)`. Reads and `cancel` retry 3 times on 429 / 5xx / network errors; `place_market`, `place_bracket`, `close_position` and `edit_bracket` are sent once. Only `ExchangeError` leaves the adapter (or `ValueError` for a side other than ±1): a reply of the wrong shape is an `ExchangeError`, one that is not a JSON object `Unavailable`. Refused locally without a request: sizes that are not whole contracts ≥ 1 (`INVALID_SIZE_PRECISION`), non-finite or ≤ 0 limit / stop prices (`INVALID_PRICE_PRECISION` / `INVALID_STOP_PRICE_PRECISION`). `position()` maps `LONG`/`SHORT` only and takes `abs()` of the contract count; `open_orders()` asks for every resting status (`order_status` repeated); `quote()` raises `Unavailable` for an empty book or a top of book without a finite bid and ask above 0; `balance()` requires `total_usd_balance`; a missing `can_transfer` reads `True`; `cancel()` raises `ExchangeError` for every order whose `results[].success` is false (except `DUPLICATE_CANCEL_REQUEST` / `ORDER_IS_FULLY_FILLED`) or that has no result.
+- Produces (`ewbot.live.coinbase`): `API = "/api/v3/brokerage"`, `SESSION_PREFIX`, `RETRY_AFTER_MAX_S = 10.0`, `CANCEL_DONE`, `class DuplicateClientOrderId(ExchangeError)`, `fmt_decimal(x) -> str`, `bad_size(size) -> bool`, `bad_price(price) -> bool`, `iso_ts(text) -> int | None`, `contract_expiry(text) -> int | None` (`future_product_details.contract_expiry` with a zone as epoch s, else None: `product()` reads it into `ProductSpec.expiry`), `retry_after_s(value, now=None) -> float` (delta-seconds or HTTP-date, clamped to [0, 10], garbage → 1), `map_error(exc) -> ExchangeError` (429 → `RateLimited`, 5xx and every other `requests` exception → `Unavailable` with the type name only, a 4xx naming `DUPLICATE_CLIENT_ORDER_ID` → `DuplicateClientOrderId`, anything else → `ExchangeError(type name)`), `parse_order(dict) -> Order` (sides `BUY`/`SELL` only), `parse_place(dict, client_order_id) -> PlaceResult` (reason: `new_order_failure_reason`, then the deprecated `error` and `preview_failure_reason`, then `failure_reason`, skipping `UNKNOWN_*`; `duplicate=True` when any of them is `DUPLICATE_CLIENT_ORDER_ID`; accepted without an order id → `Unavailable`), `class CoinbaseExchange(client, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, *, sleep=time.sleep, clock=time.time, attempts=3, backoff_s=1.0, min_remaining=2)` implementing `Exchange` with the SDK's generic `client.get(path, params=..., public=...)` / `client.post(path, data=...)`, and `CoinbaseExchange.from_key_file(key_file, futures_id, spot_id, timeout=10)`. Reads and `cancel` retry 3 times on 429 / 5xx / network errors; `place_market`, `place_bracket`, `close_position` and `edit_bracket` are sent once. Only `ExchangeError` leaves the adapter (or `ValueError` for a side other than ±1): a reply of the wrong shape is an `ExchangeError`, one that is not a JSON object `Unavailable`. Refused locally without a request: sizes that are not whole contracts ≥ 1 (`INVALID_SIZE_PRECISION`), non-finite or ≤ 0 limit / stop prices (`INVALID_PRICE_PRECISION` / `INVALID_STOP_PRICE_PRECISION`). `position()` maps `LONG`/`SHORT` only and takes `abs()` of the contract count; `open_orders()` asks for every resting status (`order_status` repeated); `quote()` raises `Unavailable` for an empty book or a top of book without a finite bid and ask above 0; `balance()` requires `total_usd_balance`; a missing `can_transfer` reads `True`; `cancel()` raises `ExchangeError` for every order whose `results[].success` is false (except `DUPLICATE_CANCEL_REQUEST` / `ORDER_IS_FULLY_FILLED`) or that has no result.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1920,6 +1930,12 @@ def test_product_spec_and_session_from_the_recorded_product():
     spec = ex.product()
     assert (spec.product_id, spec.contract_size, spec.price_increment, spec.base_increment) == (FUT, 0.01, 5.0, 1.0)
     assert spec.overnight_margin == (0.21025, 0.256625) and spec.intraday_margin == (0.100079, 0.0999811)
+    # contract_expiry as recorded: 2089-12-30T16:00:00Z (the id says 20 Dec 2030; the preflight checks both)
+    assert spec.expiry == 3786796800
+    for odd in (None, "", "soon", 20301220):  # missing or not a timestamp: None (the preflight refuses it)
+        reply = copy.deepcopy(FIXTURES["product_bip"])
+        reply["future_product_details"]["contract_expiry"] = odd
+        assert make({("GET", f"/products/{FUT}"): reply})[0].product().expiry is None
     s = ex.session()
     assert s.state == "OPEN" and s.is_open
     assert (s.maintenance_start, s.maintenance_end) == (1792836000, 1792868400)  # 2026-10-24 10:00-19:00 UTC
@@ -2481,6 +2497,18 @@ def iso_ts(text: str | None) -> int | None:
     return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
 
 
+def contract_expiry(text: Any) -> int | None:
+    """future_product_details.contract_expiry (RFC 3339 with a zone) as epoch s; None when it is missing or not
+    such a timestamp - the product still reads (increments, margins) and the preflight refuses an unknown expiry."""
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp()) if dt.tzinfo is not None else None
+
+
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -2691,6 +2719,7 @@ class CoinbaseExchange:
                 base_increment=_num(p.get("base_increment")),
                 intraday_margin=(_num(im.get("long_margin_rate")), _num(im.get("short_margin_rate"))),
                 overnight_margin=(_num(om.get("long_margin_rate")), _num(om.get("short_margin_rate"))),
+                expiry=contract_expiry(fpd.get("contract_expiry")),
             )
 
     def session(self) -> SessionInfo:
@@ -10395,9 +10424,9 @@ EOF
 - Test: `tests/live/test_preflight.py`
 
 **Interfaces:**
-- Consumes: `ewbot.backtest.holdout` (`DEFAULT_LOCK_PATH`, `lock_digest`), `ewbot.backtest.walkforward` (`HOLDOUT_START`, `grid_combos`), `ewbot.config.BotConfig`, `ewbot.paper.fingerprint` (`fingerprint_of`, `tree_files`), `ewbot.live.exchange`, `tests.paper.helpers` (`make_lock`, `synth_frame`), `tests.live.helpers` (`Clock`, `sim`).
-- Produces (`ewbot.live.settings`): `class SettingsError(RuntimeError)`, frozen `LiveSettings(data_dir=Path("/data"), key_file=None, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, telegram_token=None, telegram_chat=None, healthcheck_url=None, github_token=None, paper_repo=None, edit_stops=False, expiry={})` (its repr leaves out `key_file`, `telegram_token`, `healthcheck_url` and `github_token`) with `.journal_path` (`data_dir/journal.sqlite`) and `.cache_dir` (`data_dir/cache`); `check_private(path)`, `read_env_file(path) -> dict`, `parse_expiry(text) -> dict[name, ISO date]`, `private_chat(value) -> str | None` (`TELEGRAM_CHAT_ID` must be a positive number - the user's private chat with the bot, the only chat commands come from - and is returned canonical; a group or channel id or an @name is a `SettingsError`), `load_settings(environ=None) -> LiveSettings` (environment: `EWBOT_LIVE_DIR`, `EWBOT_COINBASE_KEY_FILE`, `EWBOT_SECRETS_FILE`, `EWBOT_FUTURES_PRODUCT`, `EWBOT_SPOT_PRODUCT`, `EWBOT_PAPER_REPO`, `EWBOT_LIVE_EDIT_STOPS`, `EWBOT_EXPIRY`; secrets file keys `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `EWBOT_GITHUB_TOKEN`, `EWBOT_HEALTHCHECK_URL`).
-- Produces (`ewbot.live.preflight`): `BASELINE_FINGERPRINT`, `LOCK_SHA256`, `FINGERPRINT_FILES = 25`, `CONTRACT_SIZE = 0.01`, `PRICE_INCREMENT = 5.0`, `BASE_INCREMENT = 1.0`; frozen `Check(name, ok, detail)`; `class PreflightError(RuntimeError)` (`.checks`); `check_fingerprint(files=None, expected=BASELINE_FINGERPRINT) -> Check`, `check_lock(path=DEFAULT_LOCK_PATH, expected=LOCK_SHA256) -> (Check, lock dict | None)`, `check_key(perms, stage) -> Check`, `check_product(spec, expected_id) -> Check`, `run_preflight(exchange | None, stage, lock_path=DEFAULT_LOCK_PATH, files=None, expected_lock=LOCK_SHA256) -> (list[Check], lock | None)` (names in order `fingerprint`, `lock`, `key`, `product`; `exchange=None` runs the first two), `require(checks)`.
+- Consumes: `ewbot.backtest.holdout` (`DEFAULT_LOCK_PATH`, `lock_digest`), `ewbot.backtest.walkforward` (`HOLDOUT_START`, `grid_combos`), `ewbot.config.BotConfig`, `ewbot.paper.fingerprint` (`fingerprint_of`, `tree_files`), `ewbot.live.exchange` (`FUTURES_PRODUCT`, `SPOT_PRODUCT`, `ProductSpec.expiry`), `ewbot.live.journal.KNOWN_STAGES`, `ewbot.live.stage.STAGES`, `tests.paper.helpers` (`make_lock`, `synth_frame`), `tests.live.helpers` (`Clock`, `sim`).
+- Produces (`ewbot.live.settings`): `SECRET_KEYS` (`TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN`, `EWBOT_HEALTHCHECK_URL`), `FILE_KEYS` (those and `TELEGRAM_CHAT_ID`), `FIXED_PRODUCTS`; `class SettingsError(RuntimeError)`; `class Secret(value)` (immutable, hashable, equal by value; repr and str `Secret('<redacted>')`, also inside `dataclasses.asdict`, which copies it; `.reveal() -> str`); frozen, hashable `LiveSettings(data_dir=Path("/data"), key_file=None, telegram_token: Secret | None = None, telegram_chat=None, healthcheck_url: Secret | None = None, github_token: Secret | None = None, paper_repo=None, edit_stops=False, expiry: tuple[tuple[str, str], ...] = ())` (no product: both are fixed; its repr leaves out `key_file`) with `.journal_path` (`data_dir/journal.sqlite`) and `.cache_dir` (`data_dir/cache`); `read_private(path) -> bytes` (one open, judged on the descriptor: a regular file of this process's user without group or other permission; a FIFO never blocks; an `OSError` is a `SettingsError` with the type name only), `check_private(path)`, `read_env_file(path) -> dict` (the secrets file: UTF-8 with an optional BOM, only `FILE_KEYS`, each once, an optional `export `, one matching pair of quotes stripped, a value with a space or a quote refused - no inline comments; errors name file, line and key, never a value), `parse_expiry(text) -> dict[name, ISO date]` (a name twice is refused), `private_chat(value) -> str | None` (`TELEGRAM_CHAT_ID` must be a positive number - the user's private chat with the bot, the only chat commands come from - and is returned canonical; a group or channel id or an @name is a `SettingsError`), `load_settings(environ=None) -> LiveSettings` (environment: `EWBOT_LIVE_DIR` (absolute, default `/data`), `EWBOT_COINBASE_KEY_FILE`, `EWBOT_SECRETS_FILE`, `EWBOT_PAPER_REPO` (`owner/repo`), `EWBOT_LIVE_EDIT_STOPS` (`0` or `1`), `EWBOT_EXPIRY`, `TELEGRAM_CHAT_ID` (the secrets file's value wins); `EWBOT_FUTURES_PRODUCT`, `EWBOT_SPOT_PRODUCT` or any of `SECRET_KEYS` in the environment is a `SettingsError` naming the variable; secrets file keys `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `EWBOT_GITHUB_TOKEN`, `EWBOT_HEALTHCHECK_URL` (an `https://` URL)).
+- Produces (`ewbot.live.preflight`): `BASELINE_FINGERPRINT`, `LOCK_SHA256`, `LOCK_FILE_SHA256` (the sha256 of the committed `holdout.lock` file's bytes, `6530175541c1…`), `FINGERPRINT_FILES = 25`, `CONTRACT_SIZE = 0.01`, `PRICE_INCREMENT = 5.0`, `BASE_INCREMENT = 1.0`, `PRODUCT_EXPIRY = "2030-12-20"`, `EXPIRY_MARGIN_DAYS = 90`, `ALERT_SETTINGS`; frozen `Check(name, ok, detail)`; `class PreflightError(RuntimeError)` (`.checks`); `check_fingerprint(files=None, expected=BASELINE_FINGERPRINT) -> Check`, `check_lock(path=DEFAULT_LOCK_PATH, expected=LOCK_SHA256, expected_file=LOCK_FILE_SHA256) -> (Check, lock dict | None)` (the file's sha256 first, a mismatch fails at once; a malformed lock is a failing check, never an exception), `check_key(perms, stage) -> Check` (an unknown stage fails), `check_alerts(settings, stage) -> Check` (CANARY / FULL need the bot token, the chat id and the health-check URL; SHADOW passes with a warning), `check_product(spec, expected_id=FUTURES_PRODUCT, now=None) -> Check` (the specs and the contract expiry: known, not before `PRODUCT_EXPIRY`, more than 90 days away), `run_preflight(exchange | None, stage, lock_path=DEFAULT_LOCK_PATH, files=None, expected_lock=LOCK_SHA256, expected_lock_file=LOCK_FILE_SHA256, settings=None, now=None) -> (list[Check], lock | None)` (names in order `fingerprint`, `lock`, `alerts` with `settings`, `key` and `product` with an exchange - one whose `futures_id` / `spot_id` is not `FUTURES_PRODUCT` / `SPOT_PRODUCT` fails `product`; `exchange=None` runs the offline ones), `require(checks)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -10406,16 +10435,29 @@ EOF
 ```python
 from __future__ import annotations
 
+import copy
 import dataclasses
+import hashlib
 import json
+import os
+import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from ewbot.live.exchange import KeyPermissions, Unavailable
+from ewbot.backtest.holdout import DEFAULT_LOCK_PATH
+from ewbot.backtest.walkforward import HOLDOUT_START
+from ewbot.live.exchange import FUTURES_PRODUCT, KeyPermissions, Unavailable
+from ewbot.live.journal import KNOWN_STAGES
 from ewbot.live.preflight import (
     BASELINE_FINGERPRINT,
+    LOCK_FILE_SHA256,
+    LOCK_SHA256,
+    PRODUCT_EXPIRY,
+    Check,
     PreflightError,
+    check_alerts,
     check_fingerprint,
     check_key,
     check_lock,
@@ -10423,11 +10465,15 @@ from ewbot.live.preflight import (
     require,
     run_preflight,
 )
-from ewbot.live.settings import SettingsError, load_settings, parse_expiry
+from ewbot.live.settings import LiveSettings, Secret, SettingsError, load_settings, parse_expiry, read_env_file
 from ewbot.live.sim import BIP_SPEC
+from ewbot.live.stage import STAGES
 from ewbot.paper.fingerprint import tree_files
 from tests.live.helpers import Clock, sim
 from tests.paper.helpers import make_lock, synth_frame
+
+
+NOW = datetime(2026, 10, 4, tzinfo=UTC).timestamp()
 
 
 @pytest.fixture(scope="module")
@@ -10436,6 +10482,15 @@ def lock_file(tmp_path_factory) -> tuple[Path, dict]:
     path = tmp_path_factory.mktemp("lock") / "holdout.lock"
     path.write_text(json.dumps(lock), encoding="utf-8")
     return path, lock
+
+
+def file_sha(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_lock(path: Path, lock: dict) -> Path:
+    path.write_text(json.dumps(lock), encoding="utf-8")
+    return path
 
 
 def test_the_working_tree_fingerprint_is_the_pinned_baseline():
@@ -10452,15 +10507,79 @@ def test_a_changed_or_missing_strategy_file_is_refused():
 
 def test_lock_checks(lock_file, tmp_path):
     path, lock = lock_file
-    ok, parsed = check_lock(path, expected=lock["sha256"])
+    ok, parsed = check_lock(path, expected=lock["sha256"], expected_file=file_sha(path))
     assert ok.ok and parsed["params"] == list(lock["params"])
-    wrong, none = check_lock(path, expected="0" * 64)
+    wrong, none = check_lock(path, expected="0" * 64, expected_file=file_sha(path))
     assert not wrong.ok and none is None and "committed" in wrong.detail
-    bad = dict(lock, params=[9.0, 9.0, 9.0])
-    (tmp_path / "bad.lock").write_text(json.dumps(bad), encoding="utf-8")
-    c, _ = check_lock(tmp_path / "bad.lock", expected=lock["sha256"])
+    bad = write_lock(tmp_path / "bad.lock", dict(lock, params=[9.0, 9.0, 9.0]))
+    c, _ = check_lock(bad, expected=lock["sha256"], expected_file=file_sha(bad))
     assert not c.ok and "grid combo" in c.detail and "lock_digest" in c.detail
+    # the digest does not cover the lock's own holdout_start: it is checked against HOLDOUT_START by itself
+    late = write_lock(tmp_path / "late.lock", dict(lock, holdout_start=lock["holdout_start"] + 3600))
+    c, none = check_lock(late, expected=lock["sha256"], expected_file=file_sha(late))
+    assert not c.ok and none is None and c.detail == f"holdout_start {lock['holdout_start'] + 3600} != {HOLDOUT_START}"
     assert not check_lock(tmp_path / "missing.lock")[0].ok
+
+
+def test_the_lock_file_itself_is_pinned_and_checked_first(lock_file, tmp_path):
+    path, lock = lock_file
+    assert len(LOCK_FILE_SHA256) == 64 and LOCK_FILE_SHA256 != LOCK_SHA256
+    # same sha256 field, same params and digest inputs, but another byte somewhere else in the file
+    edited = write_lock(tmp_path / "edited.lock", dict(lock, runs=[{"note": "edited after the holdout"}]))
+    c, parsed = check_lock(edited, expected=lock["sha256"], expected_file=file_sha(path))
+    assert not c.ok and parsed is None and c.detail == f"file sha256 {file_sha(edited)[:12]} != committed {file_sha(path)[:12]}"
+    assert check_lock(edited, expected=lock["sha256"], expected_file=file_sha(edited))[0].ok
+    # the same content with CRLF line ends, a BOM or re-serialised is another file: refused by the pin, not parsed
+    pretty = tmp_path / "pretty.lock"
+    pretty.write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
+    raw = pretty.read_bytes()
+    for name, data in (("crlf", raw.replace(b"\n", b"\r\n")), ("bom", b"\xef\xbb\xbf" + raw),
+                       ("compact", json.dumps(lock).encode())):
+        copy = tmp_path / f"{name}.lock"
+        copy.write_bytes(data)
+        c, parsed = check_lock(copy, expected=lock["sha256"], expected_file=file_sha(pretty))
+        assert not c.ok and parsed is None and c.detail.startswith("file sha256 ") and "!= committed" in c.detail, name
+    # the default pins the committed file: a synthetic lock is refused by it
+    d, none = check_lock(path, expected=lock["sha256"])
+    assert not d.ok and none is None and LOCK_FILE_SHA256[:12] in d.detail
+
+
+def test_the_committed_lock_passes_the_production_pins():
+    """The one test that reads <repo>/holdout.lock (read-only, never written): a wrong pin or a check that refuses
+    the real lock fails here, not first in deploy.sh on the VPS."""
+    assert hashlib.sha256(DEFAULT_LOCK_PATH.read_bytes()).hexdigest() == LOCK_FILE_SHA256
+    c, lock = check_lock()
+    assert c.ok and lock is not None and lock["sha256"] == LOCK_SHA256 and lock["params"] == [2.0, 0.7, 0.5]
+    assert c.detail == "file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]"
+
+
+def test_a_malformed_lock_is_a_failing_check_never_an_exception(tmp_path):
+    good = '"params": [2.0, 0.7, 0.5], "random_runs": 100, "code_sha256": "x", "holdout_start": 1704067200, "sha256": "x"'
+    cases = {
+        "random_runs Infinity": good.replace('"random_runs": 100', '"random_runs": Infinity'),
+        "a NaN param": good.replace("[2.0,", "[NaN,"),
+        "params a dict": good.replace("[2.0, 0.7, 0.5]", '{"k4": 2.0}'),
+        "params a string": good.replace("[2.0, 0.7, 0.5]", '"2.0"'),
+        "params booleans": good.replace("[2.0, 0.7, 0.5]", "[true, false, true]"),
+        "a param too large for a float": good.replace("[2.0,", "[" + "9" * 400 + ","),
+        "random_runs a float": good.replace('"random_runs": 100', '"random_runs": 1e300'),
+        "random_runs a boolean": good.replace('"random_runs": 100', '"random_runs": true'),
+        "code_sha256 a number": good.replace('"code_sha256": "x"', '"code_sha256": 7'),
+        "holdout_start a string": good.replace("1704067200", '"1704067200"'),
+        "no sha256": good.replace(', "sha256": "x"', ""),
+    }
+    blobs = {name: ("{" + body + "}").encode() for name, body in cases.items()}
+    blobs.update({"a list": b"[1, 2]", "a string": b'"x"', "not JSON": b"{", "not UTF-8": b"\xff\xfe\x00",
+                  "nested too deep": b"[" * 100_000})
+    for i, (name, data) in enumerate(blobs.items()):
+        p = tmp_path / f"m{i}.lock"
+        p.write_bytes(data)
+        c, lock = check_lock(p, expected="0" * 64, expected_file=hashlib.sha256(data).hexdigest())
+        assert not c.ok and lock is None and c.name == "lock", name
+        assert c.detail.startswith(f"{p} malformed") or c.detail.startswith(f"{p} unreadable"), (name, c.detail)
+    d = tmp_path / "dir.lock"
+    d.mkdir()
+    assert check_lock(d)[0].detail == f"{d} unreadable: IsADirectoryError"
 
 
 def test_key_permissions():
@@ -10470,50 +10589,94 @@ def test_key_permissions():
     c = check_key(KeyPermissions(True, True, True), "SHADOW")
     assert not c.ok and "TRANSFER" in c.detail
     assert not check_key(KeyPermissions(False, True, False), "SHADOW").ok
+    for stage in ("canary", "", "LIVE", "Shadow"):  # never read as SHADOW (view only) or as a real-money stage
+        c = check_key(KeyPermissions(True, True, False), stage)
+        assert not c.ok and f"unknown stage {stage!r}" in c.detail
+    assert KNOWN_STAGES == STAGES  # the journal refuses any other stage too (it sits below live.stage)
 
 
 def test_product_spec():
-    assert check_product(BIP_SPEC, "BIP-20DEC30-CDE").ok
-    assert not check_product(dataclasses.replace(BIP_SPEC, contract_size=0.1), "BIP-20DEC30-CDE").ok
-    assert not check_product(dataclasses.replace(BIP_SPEC, price_increment=1.0), "BIP-20DEC30-CDE").ok
-    assert not check_product(BIP_SPEC, "BIT-31OCT26-CDE").ok
+    assert check_product(BIP_SPEC, "BIP-20DEC30-CDE", now=NOW).ok
+    assert not check_product(dataclasses.replace(BIP_SPEC, contract_size=0.1), "BIP-20DEC30-CDE", now=NOW).ok
+    assert not check_product(dataclasses.replace(BIP_SPEC, price_increment=1.0), "BIP-20DEC30-CDE", now=NOW).ok
+    assert not check_product(BIP_SPEC, "BIT-31OCT26-CDE", now=NOW).ok
+
+
+def test_the_contract_expiry_is_checked():
+    # recorded 2026-10-03: contract_expiry 2089-12-30T16:00:00Z (type EXPIRING), while the id says 20 Dec 2030
+    assert BIP_SPEC.expiry == int(datetime(2089, 12, 30, 16, tzinfo=UTC).timestamp())
+    assert FUTURES_PRODUCT == "BIP-20DEC30-CDE" and PRODUCT_EXPIRY == "2030-12-20"
+    c = check_product(BIP_SPEC, now=NOW)
+    assert c.ok and "expires 2030-12-20 at the earliest" in c.detail
+    c = check_product(dataclasses.replace(BIP_SPEC, expiry=None), now=NOW)
+    assert not c.ok and "no contract expiry" in c.detail
+    early = int(datetime(2027, 3, 26, 16, tzinfo=UTC).timestamp())  # e.g. a contract that expires before its name says
+    c = check_product(dataclasses.replace(BIP_SPEC, expiry=early), now=NOW)
+    assert not c.ok and "contract expiry 2027-03-26 before 2030-12-20" in c.detail
+    # less than 90 days before the expiry (the id's date: the earlier one) the runtime refuses to start
+    last = datetime(2030, 12, 20, tzinfo=UTC).timestamp() - 90 * 86_400
+    assert check_product(BIP_SPEC, now=last).ok
+    c = check_product(BIP_SPEC, now=last + 1)
+    assert not c.ok and "less than 90 days away" in c.detail
 
 
 def test_run_preflight_online_offline_and_exchange_errors(lock_file):
     path, lock = lock_file
+    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW}
     ex = sim(Clock())
-    checks, parsed = run_preflight(ex, "CANARY", path, expected_lock=lock["sha256"])
+    checks, parsed = run_preflight(ex, "CANARY", path, **pins)
     assert [c.name for c in checks] == ["fingerprint", "lock", "key", "product"] and all(c.ok for c in checks)
     require(checks)
-    offline, _ = run_preflight(None, "SHADOW", path, expected_lock=lock["sha256"])
+    offline, _ = run_preflight(None, "SHADOW", path, **pins)
     assert [c.name for c in offline] == ["fingerprint", "lock"]
     ex.fail_next("key_permissions", Unavailable("503"))
-    failing, _ = run_preflight(ex, "SHADOW", path, expected_lock=lock["sha256"])
+    failing, _ = run_preflight(ex, "SHADOW", path, **pins)
     with pytest.raises(PreflightError, match="key_permissions failed"):
         require(failing)
     transfer = sim(Clock(), permissions=KeyPermissions(True, True, True))
     with pytest.raises(PreflightError, match="TRANSFER"):
-        require(run_preflight(transfer, "SHADOW", path, expected_lock=lock["sha256"])[0])
+        require(run_preflight(transfer, "SHADOW", path, **pins)[0])
+
+
+def test_the_products_are_fixed(lock_file):
+    path, lock = lock_file
+    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW}
+    # an exchange set up for another future (same specs) or another signal product is refused
+    for ex in (sim(Clock(), product=dataclasses.replace(BIP_SPEC, product_id="BIT-30OCT26-CDE")),
+               sim(Clock(), spot_id="ETH-USD")):
+        checks, _ = run_preflight(ex, "SHADOW", path, **pins)
+        bad = [c for c in checks if not c.ok]
+        assert [c.name for c in bad] == ["product"] and "both are fixed" in bad[0].detail
+    # and no setting names another one
+    assert not any(f.name in ("futures_id", "spot_id") for f in dataclasses.fields(LiveSettings))
+    for name in ("EWBOT_FUTURES_PRODUCT", "EWBOT_SPOT_PRODUCT"):
+        with pytest.raises(SettingsError, match=f"{name} is not a setting"):
+            load_settings({name: "BIT-30OCT26-CDE"})
+
+
+def private_file(path: Path, content: str | bytes, mode: int = 0o600) -> Path:
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    path.write_bytes(content)
+    path.chmod(mode)
+    return path
 
 
 def test_settings_read_secrets_only_from_private_files(tmp_path):
-    secrets = tmp_path / "live.env"
-    secrets.write_text("# ewbot\nTELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID='42'\nEWBOT_GITHUB_TOKEN=\"ghp_x\"\n",
-                       encoding="utf-8")
-    key = tmp_path / "cdp_api_key.json"
-    key.write_text('{"name": "organizations/o/apiKeys/k", "privateKey": "-----BEGIN EC PRIVATE KEY-----"}')
-    secrets.chmod(0o600)
-    key.chmod(0o600)
+    secrets = private_file(tmp_path / "live.env", "# ewbot\nTELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID='42'\n"
+                           "EWBOT_GITHUB_TOKEN=\"ghp_x\"\nEWBOT_HEALTHCHECK_URL=https://hc-ping.com/u-1\n")
+    key = private_file(tmp_path / "cdp_api_key.json",
+                       '{"name": "organizations/o/apiKeys/k", "privateKey": "-----BEGIN EC PRIVATE KEY-----"}')
     env = {"EWBOT_SECRETS_FILE": str(secrets), "EWBOT_COINBASE_KEY_FILE": str(key), "EWBOT_LIVE_DIR": str(tmp_path),
            "TELEGRAM_CHAT_ID": "7", "EWBOT_PAPER_REPO": "me/repo", "EWBOT_LIVE_EDIT_STOPS": "1",
-           "EWBOT_EXPIRY": "coinbase=2027-10-01, github=2027-09-30", "EWBOT_HEALTHCHECK_URL": "https://hc-ping.com/u-1"}
+           "EWBOT_EXPIRY": "coinbase=2027-10-01, github=2027-09-30"}
     s = load_settings(env)
-    assert (s.telegram_token, s.telegram_chat, s.github_token) == ("123:abc", "42", "ghp_x")  # the file wins
-    assert s.healthcheck_url == "https://hc-ping.com/u-1"
+    assert (s.telegram_token, s.telegram_chat, s.github_token) == (Secret("123:abc"), "42", Secret("ghp_x"))  # the file wins
+    assert s.healthcheck_url is not None and s.healthcheck_url.reveal() == "https://hc-ping.com/u-1"
     assert not any(secret in repr(s) for secret in ("123:abc", "ghp_x", "hc-ping.com/u-1", str(key)))
     assert s.key_file == key and s.journal_path == tmp_path / "journal.sqlite" and s.cache_dir == tmp_path / "cache"
-    assert s.paper_repo == "me/repo" and s.edit_stops and s.futures_id == "BIP-20DEC30-CDE"
-    assert s.expiry == {"coinbase": "2027-10-01", "github": "2027-09-30"}
+    assert s.paper_repo == "me/repo" and s.edit_stops
+    assert s.expiry == (("coinbase", "2027-10-01"), ("github", "2027-09-30"))
     secrets.chmod(0o644)
     with pytest.raises(SettingsError, match="mode 600"):
         load_settings(env)
@@ -10523,8 +10686,141 @@ def test_settings_read_secrets_only_from_private_files(tmp_path):
         load_settings(env)
     defaults = load_settings({})
     assert defaults.data_dir == Path("/data") and defaults.key_file is None and not defaults.edit_stops
+    assert defaults.telegram_token is None and defaults.expiry == ()
+    assert load_settings({"TELEGRAM_CHAT_ID": " 7 "}).telegram_chat == "7"  # not a secret: the environment may hold it
     with pytest.raises(SettingsError):
         parse_expiry("coinbase:2027-10-01")
+    with pytest.raises(SettingsError, match="twice"):
+        parse_expiry("coinbase=2027-10-01,coinbase=2027-10-02")
+
+
+def test_a_secret_in_the_environment_is_refused_by_name_never_by_value(tmp_path):
+    secrets = private_file(tmp_path / "live.env", "TELEGRAM_BOT_TOKEN=123:abc\n")
+    for name in ("TELEGRAM_BOT_TOKEN", "EWBOT_GITHUB_TOKEN", "EWBOT_HEALTHCHECK_URL"):
+        for env in ({name: "v4lue-1"}, {name: "v4lue-1", "EWBOT_SECRETS_FILE": str(secrets)}, {name: ""}):
+            with pytest.raises(SettingsError, match=f"{name} is set in the environment") as err:
+                load_settings(env)
+            assert "v4lue" not in str(err.value)
+
+
+def test_the_secrets_file_format(tmp_path):
+    good = private_file(tmp_path / "good.env",
+                        "\ufeff# ewbot live (a BOM is ignored)\n"
+                        "export TELEGRAM_BOT_TOKEN=123:abc\n"
+                        "  TELEGRAM_CHAT_ID = '42'  \n"
+                        "\n"
+                        "   # a comment line\n"
+                        "EWBOT_GITHUB_TOKEN=\"ghp_x\"\r\n"
+                        "EWBOT_HEALTHCHECK_URL=https://hc-ping.com/u-1#x\n")
+    assert read_env_file(good) == {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "42", "EWBOT_GITHUB_TOKEN": "ghp_x",
+                                   "EWBOT_HEALTHCHECK_URL": "https://hc-ping.com/u-1#x"}
+    assert read_env_file(private_file(tmp_path / "empty.env", "TELEGRAM_BOT_TOKEN=\n")) == {"TELEGRAM_BOT_TOKEN": ""}
+    refused = {
+        "TELEGRAM_TOKEN=SECRET\n": ":1: unknown key TELEGRAM_TOKEN",
+        "# x\nTELEGRAM_BOT_TOKEN=a\nTELEGRAM_BOT_TOKEN=SECRET\n": ":3: TELEGRAM_BOT_TOKEN again (first on line 2)",
+        "TELEGRAM_BOT_TOKEN=SECRET # the bot\n": ":1: the value of TELEGRAM_BOT_TOKEN has a space or a quote",
+        "TELEGRAM_BOT_TOKEN=\"SECRET'\n": ":1: the value of TELEGRAM_BOT_TOKEN has a space or a quote",
+        "EWBOT_GITHUB_TOKEN=SECRET\"\n": ":1: the value of EWBOT_GITHUB_TOKEN has a space or a quote",
+        "TELEGRAM_BOT_TOKEN SECRET\n": ":1 is not KEY=VALUE",
+        "123:SECRET=x\n": ":1 is not KEY=VALUE",  # a key that is not a name is never echoed
+        "export=SECRET\n": ":1 is not KEY=VALUE",
+    }
+    for i, (text, message) in enumerate(refused.items()):
+        path = private_file(tmp_path / f"bad{i}.env", text)
+        with pytest.raises(SettingsError, match=re.escape(f"{path}{message}")) as err:
+            read_env_file(path)
+        assert "SECRET" not in str(err.value)
+
+
+def test_secrets_files_are_judged_on_the_opened_file(tmp_path, monkeypatch):
+    target = private_file(tmp_path / "target.env", "TELEGRAM_CHAT_ID=42\n")
+    (tmp_path / "link.env").symlink_to(target)
+    assert load_settings({"EWBOT_SECRETS_FILE": str(tmp_path / "link.env")}).telegram_chat == "42"  # the target is judged
+    loose = private_file(tmp_path / "loose.env", "TELEGRAM_CHAT_ID=42\n", mode=0o644)
+    (tmp_path / "loose-link.env").symlink_to(loose)
+    with pytest.raises(SettingsError, match="mode 600"):
+        load_settings({"EWBOT_SECRETS_FILE": str(tmp_path / "loose-link.env")})
+    folder = tmp_path / "folder.env"
+    folder.mkdir(mode=0o700)
+    fifo = tmp_path / "fifo.env"
+    os.mkfifo(fifo, 0o600)  # never blocks: opened without waiting for a writer
+    for path in (folder, fifo):
+        for name in ("EWBOT_SECRETS_FILE", "EWBOT_COINBASE_KEY_FILE"):
+            with pytest.raises(SettingsError, match=re.escape(f"{path} is not a regular file")):
+                load_settings({name: str(path)})
+    latin = private_file(tmp_path / "latin.env", b"TELEGRAM_BOT_TOKEN=\xe9SECRET\n")
+    with pytest.raises(SettingsError, match="is not UTF-8 text") as err:
+        load_settings({"EWBOT_SECRETS_FILE": str(latin)})
+    assert "SECRET" not in str(err.value) and "xe9" not in str(err.value)
+    for path, kind in ((tmp_path / "missing.env", "FileNotFoundError"),
+                       (private_file(tmp_path / "none.env", "", mode=0o000), "PermissionError")):
+        with pytest.raises(SettingsError, match=f"is not readable: {kind}"):
+            load_settings({"EWBOT_SECRETS_FILE": str(path)})
+    monkeypatch.setattr(os, "geteuid", lambda: target.stat().st_uid + 1)  # a file of another user: refused
+    with pytest.raises(SettingsError, match="must belong to uid"):
+        load_settings({"EWBOT_SECRETS_FILE": str(target)})
+
+
+def test_settings_values_are_checked(tmp_path):
+    for value in ("", "  ", "data", "./data"):
+        with pytest.raises(SettingsError, match="EWBOT_LIVE_DIR must be an absolute path"):
+            load_settings({"EWBOT_LIVE_DIR": value})
+    assert load_settings({"EWBOT_LIVE_DIR": " /srv/ewbot "}).data_dir == Path("/srv/ewbot")
+    for value in ("true", "yes", "2", "", "on"):
+        with pytest.raises(SettingsError, match="EWBOT_LIVE_EDIT_STOPS must be 0 or 1"):
+            load_settings({"EWBOT_LIVE_EDIT_STOPS": value})
+    assert load_settings({"EWBOT_LIVE_EDIT_STOPS": " 1 "}).edit_stops
+    assert not load_settings({"EWBOT_LIVE_EDIT_STOPS": "0"}).edit_stops
+    for repo in ("not a repo", "owner", "owner/repo/x", "/repo", "owner/", "owner/..", "https://github.com/o/r"):
+        with pytest.raises(SettingsError, match="EWBOT_PAPER_REPO .* is not owner/repo"):
+            load_settings({"EWBOT_PAPER_REPO": repo})
+    s = load_settings({"EWBOT_PAPER_REPO": " taejunoh/elliott-wave-btc-bot "})
+    assert s.paper_repo == "taejunoh/elliott-wave-btc-bot" and load_settings({"EWBOT_PAPER_REPO": ""}).paper_repo is None
+    for i, url in enumerate(("ftp://hc-ping.com/SECRET", "http://hc-ping.com/SECRET", "hc-ping.com/SECRET",
+                             "https:///SECRET")):
+        path = private_file(tmp_path / f"hc{i}.env", f"EWBOT_HEALTHCHECK_URL={url}\n")
+        with pytest.raises(SettingsError, match="EWBOT_HEALTHCHECK_URL must be an https:// URL") as err:
+            load_settings({"EWBOT_SECRETS_FILE": str(path)})
+        assert "SECRET" not in str(err.value)
+
+
+def test_settings_are_hashable_and_no_dump_shows_a_secret(tmp_path):
+    path = private_file(tmp_path / "live.env", "TELEGRAM_BOT_TOKEN=123:SECRET\nTELEGRAM_CHAT_ID=42\n"
+                        "EWBOT_GITHUB_TOKEN=ghp_SECRET\nEWBOT_HEALTHCHECK_URL=https://hc-ping.com/SECRET\n")
+    env = {"EWBOT_SECRETS_FILE": str(path), "EWBOT_EXPIRY": "coinbase=2027-10-01"}
+    s = load_settings(env)
+    assert s == load_settings(env) and hash(s) == hash(load_settings(env)) and len({s, load_settings(env)}) == 1
+    for dump in (repr(s), str(s), str(dataclasses.asdict(s)), str(dataclasses.astuple(s)), f"{s.telegram_token}",
+                 repr(copy.deepcopy(s)), str(vars(s))):
+        assert "SECRET" not in dump, dump
+    assert repr(s.telegram_token) == "Secret('<redacted>')"
+    assert (s.telegram_token.reveal(), s.github_token.reveal()) == ("123:SECRET", "ghp_SECRET")  # only where used
+    assert copy.deepcopy(s).telegram_token.reveal() == "123:SECRET"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        s.expiry = ()  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        s.telegram_token._value = "x"  # type: ignore[union-attr]
+    assert Secret("a") != "a" and Secret("a") == Secret("a")
+
+
+def test_canary_and_full_need_telegram_and_the_heartbeat(lock_file):
+    full = LiveSettings(telegram_token=Secret("123:abc"), telegram_chat="42", healthcheck_url=Secret("https://hc-ping.com/u"))
+    for stage in STAGES:
+        assert check_alerts(full, stage) == Check("alerts", True, "Telegram alerts and commands, heartbeat")
+    c = check_alerts(LiveSettings(), "SHADOW")  # SHADOW may run without them, with a warning
+    assert c.ok and c.detail.startswith("WARNING: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EWBOT_HEALTHCHECK_URL not set")
+    for stage in ("CANARY", "FULL"):
+        for name, field in (("TELEGRAM_BOT_TOKEN", "telegram_token"), ("TELEGRAM_CHAT_ID", "telegram_chat"),
+                            ("EWBOT_HEALTHCHECK_URL", "healthcheck_url")):
+            c = check_alerts(dataclasses.replace(full, **{field: None}), stage)
+            assert not c.ok and c.detail.startswith(f"{stage} needs {name}")
+    assert not check_alerts(full, "canary").ok
+    path, lock = lock_file
+    pins = {"expected_lock": lock["sha256"], "expected_lock_file": file_sha(path), "now": NOW}
+    checks, _ = run_preflight(None, "CANARY", path, settings=LiveSettings(), **pins)
+    assert [(c.name, c.ok) for c in checks] == [("fingerprint", True), ("lock", True), ("alerts", False)]
+    checks, _ = run_preflight(sim(Clock()), "FULL", path, settings=full, **pins)
+    assert [c.name for c in checks] == ["fingerprint", "lock", "alerts", "key", "product"] and all(c.ok for c in checks)
 
 
 def test_telegram_commands_come_only_from_a_private_chat(tmp_path):
@@ -10554,44 +10850,102 @@ Expected: collection error `ModuleNotFoundError: No module named 'ewbot.live.pre
 ```python
 """Settings of `ewbot live` (Plan 3 spec 3.4).
 
-Non-secret values come from the environment (deploy/live/docker-compose.yml). Secrets live in two files
-on the VPS that only their owner may read (mode 600, refused otherwise), mounted read-only into the
-container and never stored in the repository, the image or a log:
+Non-secret values come from the environment (deploy/live/docker-compose.yml): EWBOT_LIVE_DIR (an absolute path,
+default /data), EWBOT_COINBASE_KEY_FILE, EWBOT_SECRETS_FILE, EWBOT_PAPER_REPO (owner/repo), EWBOT_LIVE_EDIT_STOPS
+(0 or 1), EWBOT_EXPIRY and TELEGRAM_CHAT_ID (the secrets file's value wins). The futures product and the signal
+product are fixed (exchange.FUTURES_PRODUCT, SPOT_PRODUCT; the preflight refuses an exchange set up for any
+other): EWBOT_FUTURES_PRODUCT or EWBOT_SPOT_PRODUCT in the environment is refused.
+
+Secrets live only in two files on the VPS that only their owner may read (a regular file of this process's user,
+mode 600 or stricter, judged on the opened file; a symlink is followed and its target judged), mounted read-only
+into the container and never stored in the repository, the image or a log:
   EWBOT_COINBASE_KEY_FILE  the CDP API key JSON as downloaded ({"name": ..., "privateKey": ...})
-  EWBOT_SECRETS_FILE       KEY=VALUE lines: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EWBOT_GITHUB_TOKEN,
-                           EWBOT_HEALTHCHECK_URL (values in the secrets file win over the environment).
+  EWBOT_SECRETS_FILE       TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EWBOT_GITHUB_TOKEN, EWBOT_HEALTHCHECK_URL
+TELEGRAM_BOT_TOKEN, EWBOT_GITHUB_TOKEN or EWBOT_HEALTHCHECK_URL set in the environment is refused (an environment
+is visible in `docker inspect` and /proc): they are read from the secrets file only.
+
+The secrets file (read_env_file): UTF-8 (a leading BOM is ignored); blank lines and lines whose first non-blank
+character is # are skipped; every other line is KEY=VALUE, optionally preceded by `export `, with KEY one of the
+four keys above, each at most once (spaces around KEY and VALUE are ignored). A VALUE may be wrapped in one
+matching pair of quotes and never contains a space or a quote, so a `#` inside it is part of it and a trailing
+comment (`KEY=value  # note`) is refused - put a comment on a line of its own. An empty VALUE is unset. An error
+names the file, the line and the key, never a value.
+
 TELEGRAM_CHAT_ID must be a positive number: the user's private chat with the bot (its id is the user's own id),
 the only chat Telegram commands are taken from (live/control.py); a group or channel id (negative) or an @name
-is refused. A LiveSettings repr never shows a secret or the key file's path."""
+is refused. EWBOT_HEALTHCHECK_URL must be an https:// URL. The settings hold every secret as a `Secret`: its
+repr and str are redacted (so is `dataclasses.asdict` of the settings, which copies it), `.reveal()` gives the
+value where it is used; a LiveSettings repr shows neither a secret nor the key file's path, and settings are
+hashable (EWBOT_EXPIRY is kept as sorted (name, day) pairs)."""
 
 from __future__ import annotations
 
 import os
+import re
+import stat
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from ewbot.live.exchange import FUTURES_PRODUCT, SPOT_PRODUCT
+
+SECRET_KEYS = ("TELEGRAM_BOT_TOKEN", "EWBOT_GITHUB_TOKEN", "EWBOT_HEALTHCHECK_URL")  # never from the environment
+FILE_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "EWBOT_GITHUB_TOKEN", "EWBOT_HEALTHCHECK_URL")
+FIXED_PRODUCTS = ("EWBOT_FUTURES_PRODUCT", "EWBOT_SPOT_PRODUCT")
+MAX_SECRET_FILE_BYTES = 1 << 20
+_KEY = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+\Z")
 
 
 class SettingsError(RuntimeError):
     """A setting or a secrets file is missing, malformed or readable by others."""
 
 
+class Secret:
+    """A secret value: repr and str show `<redacted>`; `.reveal()` returns it where it is used."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        object.__setattr__(self, "_value", str(value))
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "Secret('<redacted>')"
+
+    __str__ = __repr__
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Secret) and other._value == self._value
+
+    def __hash__(self) -> int:
+        return hash((Secret, self._value))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("a Secret is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("a Secret is immutable")
+
+    def __reduce__(self) -> tuple[Any, ...]:  # copy / deepcopy (dataclasses.asdict) build a new Secret
+        return (Secret, (self._value,))
+
+
 @dataclass(frozen=True)
 class LiveSettings:
     data_dir: Path = Path("/data")
-    key_file: Path | None = field(default=None, repr=False)  # secrets and where they are: never in a repr
-    futures_id: str = FUTURES_PRODUCT
-    spot_id: str = SPOT_PRODUCT
-    telegram_token: str | None = field(default=None, repr=False)
+    key_file: Path | None = field(default=None, repr=False)  # where the CDP key is: never in a repr
+    telegram_token: Secret | None = None
     telegram_chat: str | None = None
-    healthcheck_url: str | None = field(default=None, repr=False)
-    github_token: str | None = field(default=None, repr=False)
+    healthcheck_url: Secret | None = None
+    github_token: Secret | None = None
     paper_repo: str | None = None
     edit_stops: bool = False
-    expiry: dict[str, str] = field(default_factory=dict)
+    expiry: tuple[tuple[str, str], ...] = ()  # (name, ISO day) sorted by name: hashable, immutable
 
     @property
     def journal_path(self) -> Path:
@@ -10602,26 +10956,71 @@ class LiveSettings:
         return self.data_dir / "cache"
 
 
-def check_private(path: Path) -> None:
-    """The file exists and neither its group nor others have any permission on it."""
+def read_private(path: Path) -> bytes:
+    """The bytes of a secrets file, judged on the opened file itself (one open: no race between a check by path and
+    the read): a regular file of this process's user with no permission for its group or others. A FIFO or a
+    device is refused without blocking. Errors name the path and an exception type only."""
     try:
-        mode = path.stat().st_mode
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0))
     except OSError as exc:
         raise SettingsError(f"{path} is not readable: {type(exc).__name__}") from None
-    if mode & 0o077:
-        raise SettingsError(f"{path} must be mode 600 (chmod 600), is {oct(mode & 0o777)}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SettingsError(f"{path} is not a regular file")
+        if st.st_uid != os.geteuid():
+            raise SettingsError(f"{path} must belong to uid {os.geteuid()} (this process), belongs to uid {st.st_uid}")
+        if st.st_mode & 0o077:
+            raise SettingsError(f"{path} must be mode 600 (chmod 600), is {oct(st.st_mode & 0o777)}")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(fd, 65_536):
+            size += len(chunk)
+            if size > MAX_SECRET_FILE_BYTES:
+                raise SettingsError(f"{path} is larger than {MAX_SECRET_FILE_BYTES} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise SettingsError(f"{path} is not readable: {type(exc).__name__}") from None
+    finally:
+        os.close(fd)
+
+
+def check_private(path: Path) -> None:
+    """The file is a secrets file only its owner can access (read_private): the CDP key file, read by the SDK."""
+    read_private(path)
 
 
 def read_env_file(path: Path) -> dict[str, str]:
+    """The secrets file as {key: value} (read_private; the format is in the module docstring)."""
+    try:
+        text = read_private(path).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise SettingsError(f"{path} is not UTF-8 text") from None
     out: dict[str, str] = {}
-    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    first: dict[str, int] = {}
+    for n, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        if line.startswith("export") and line[6:7].isspace():
+            line = line[6:].lstrip()
         key, sep, value = line.partition("=")
-        if not sep or not key.strip():
-            raise SettingsError(f"{path}:{n} is not KEY=VALUE")
-        out[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        if not sep or not _KEY.match(key):
+            raise SettingsError(f"{path}:{n} is not KEY=VALUE (KEY one of {', '.join(FILE_KEYS)})")
+        if key not in FILE_KEYS:
+            raise SettingsError(f"{path}:{n}: unknown key {key} (the secrets file holds {', '.join(FILE_KEYS)})")
+        if key in first:
+            raise SettingsError(f"{path}:{n}: {key} again (first on line {first[key]})")
+        first[key] = n
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if any(c.isspace() or c in "'\"" for c in value):
+            raise SettingsError(f"{path}:{n}: the value of {key} has a space or a quote (a comment goes on a line "
+                                "of its own)")
+        out[key] = value
     return out
 
 
@@ -10631,11 +11030,14 @@ def parse_expiry(text: str) -> dict[str, str]:
     for item in filter(None, (x.strip() for x in text.split(","))):
         name, sep, day = item.partition("=")
         try:
-            out[name.strip()] = date.fromisoformat(day.strip()).isoformat()
+            iso = date.fromisoformat(day.strip()).isoformat()
         except ValueError:
             raise SettingsError(f"EWBOT_EXPIRY item {item!r} is not name=YYYY-MM-DD") from None
         if not sep or not name.strip():
             raise SettingsError(f"EWBOT_EXPIRY item {item!r} is not name=YYYY-MM-DD")
+        if name.strip() in out:
+            raise SettingsError(f"EWBOT_EXPIRY names {name.strip()!r} twice")
+        out[name.strip()] = iso
     return out
 
 
@@ -10650,32 +11052,68 @@ def private_chat(value: str | None) -> str | None:
     return str(int(value))
 
 
+def _live_dir(value: str | None) -> Path:
+    if value is None:
+        return Path("/data")
+    if not value.strip() or not Path(value.strip()).is_absolute():
+        raise SettingsError(f"EWBOT_LIVE_DIR must be an absolute path, is {value!r}")
+    return Path(value.strip())
+
+
+def _edit_stops(value: str | None) -> bool:
+    if value is None:
+        return False
+    if value.strip() not in ("0", "1"):
+        raise SettingsError(f"EWBOT_LIVE_EDIT_STOPS must be 0 or 1, is {value!r}")
+    return value.strip() == "1"
+
+
+def _paper_repo(value: str | None) -> str | None:
+    repo = (value or "").strip()
+    if not repo:
+        return None
+    if not _REPO.match(repo) or repo.split("/")[1] in (".", ".."):
+        raise SettingsError(f"EWBOT_PAPER_REPO {repo!r} is not owner/repo")
+    return repo
+
+
+def _healthcheck_url(value: str | None) -> Secret | None:
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if parts.scheme != "https" or not parts.hostname:
+        raise SettingsError("EWBOT_HEALTHCHECK_URL must be an https:// URL (the healthchecks.io ping URL)")
+    return Secret(value)
+
+
 def load_settings(environ: Mapping[str, str] | None = None) -> LiveSettings:
     env = os.environ if environ is None else environ
-    secrets: dict[str, str] = {}
+    for name in FIXED_PRODUCTS:
+        if name in env:
+            raise SettingsError(f"{name} is not a setting: the products are fixed ({FUTURES_PRODUCT}, {SPOT_PRODUCT})")
+    for name in SECRET_KEYS:
+        if name in env:
+            raise SettingsError(f"{name} is set in the environment: secrets are read only from the mode-600 secrets "
+                                "file (EWBOT_SECRETS_FILE) - unset it")
     sf = env.get("EWBOT_SECRETS_FILE", "").strip()
-    if sf:
-        check_private(Path(sf))
-        secrets = read_env_file(Path(sf))
-
-    def get(name: str) -> str | None:
-        return (secrets.get(name) or env.get(name) or "").strip() or None
-
+    secrets = read_env_file(Path(sf)) if sf else {}
     kf = env.get("EWBOT_COINBASE_KEY_FILE", "").strip()
     if kf:
         check_private(Path(kf))
+
+    def secret(name: str) -> Secret | None:
+        return Secret(secrets[name]) if secrets.get(name) else None
+
     return LiveSettings(
-        data_dir=Path(env.get("EWBOT_LIVE_DIR", "/data")),
+        data_dir=_live_dir(env.get("EWBOT_LIVE_DIR")),
         key_file=Path(kf) if kf else None,
-        futures_id=env.get("EWBOT_FUTURES_PRODUCT", FUTURES_PRODUCT).strip() or FUTURES_PRODUCT,
-        spot_id=env.get("EWBOT_SPOT_PRODUCT", SPOT_PRODUCT).strip() or SPOT_PRODUCT,
-        telegram_token=get("TELEGRAM_BOT_TOKEN"),
-        telegram_chat=private_chat(get("TELEGRAM_CHAT_ID")),
-        healthcheck_url=get("EWBOT_HEALTHCHECK_URL"),
-        github_token=get("EWBOT_GITHUB_TOKEN"),
-        paper_repo=(env.get("EWBOT_PAPER_REPO", "").strip() or None),
-        edit_stops=env.get("EWBOT_LIVE_EDIT_STOPS", "0").strip() == "1",
-        expiry=parse_expiry(env.get("EWBOT_EXPIRY", "")),
+        telegram_token=secret("TELEGRAM_BOT_TOKEN"),
+        telegram_chat=private_chat(secrets.get("TELEGRAM_CHAT_ID") or env.get("TELEGRAM_CHAT_ID", "").strip() or None),
+        healthcheck_url=_healthcheck_url(secrets.get("EWBOT_HEALTHCHECK_URL")),
+        github_token=secret("EWBOT_GITHUB_TOKEN"),
+        paper_repo=_paper_repo(env.get("EWBOT_PAPER_REPO")),
+        edit_stops=_edit_stops(env.get("EWBOT_LIVE_EDIT_STOPS")),
+        expiry=tuple(sorted(parse_expiry(env.get("EWBOT_EXPIRY", "")).items())),
     )
 ```
 
@@ -10687,31 +11125,53 @@ def load_settings(environ: Mapping[str, str] | None = None) -> LiveSettings:
   fingerprint  the 25 strategy-fingerprinted files hash to the frozen baseline e0435223... (the value is
                pinned here: the image has no git history). An empty file set (a non-editable install,
                where src/ewbot is not below the project root) fails as well.
-  lock         holdout.lock is the committed one (sha256 d1be04baa06c...), its params are a grid combo,
-               its holdout start is HOLDOUT_START and its sha256 equals lock_digest(BotConfig(), params,
-               random_runs, code_sha256): the configuration the runtime uses is the one the holdout ran.
-  key          GET /key_permissions: can_view, can_trade for CANARY/FULL, and never can_transfer.
-  product      the futures product is BIP: contract_size 0.01, price_increment 5, base_increment 1."""
+  lock         holdout.lock is the committed one: the sha256 of the FILE's bytes equals LOCK_FILE_SHA256
+               (6530175541c1...; the file holds more than the digest's inputs, e.g. the recorded runs and
+               the data fingerprint, and any edit changes it) - checked first, so an edited, re-encoded or
+               re-serialised copy is refused as such -, then its sha256 field is d1be04baa06c..., its
+               params are a grid combo, its holdout start is HOLDOUT_START and its sha256 equals
+               lock_digest(BotConfig(), params, random_runs, code_sha256): the configuration the runtime
+               uses is the one the holdout ran. A malformed lock is a failing check, never an exception.
+  alerts       (with the settings) CANARY and FULL need TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and
+               EWBOT_HEALTHCHECK_URL: alerts, /pause and /flatten, the heartbeat; SHADOW passes with a warning.
+  key          GET /key_permissions: can_view, can_trade for CANARY/FULL, and never can_transfer; a stage
+               that is not one of SHADOW, CANARY, FULL is refused.
+  product      the exchange is set up for FUTURES_PRODUCT (BIP-20DEC30-CDE) and SPOT_PRODUCT (BTC-USD), both
+               fixed, and the futures product is BIP: contract_size 0.01, price_increment 5, base_increment 1,
+               with a contract expiry (contract_expiry) no earlier than PRODUCT_EXPIRY, the date in its id, and
+               more than EXPIRY_MARGIN_DAYS = 90 days away (the earlier of the two). The venue reported
+               2089-12-30 for it on 2026-10-03 (contract_expiry_type EXPIRING): neither the venue's date nor the
+               type can be required to equal the id's; the runbook has the manual check."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
 from ewbot.backtest.holdout import DEFAULT_LOCK_PATH, lock_digest
 from ewbot.backtest.walkforward import HOLDOUT_START, grid_combos
 from ewbot.config import BotConfig
-from ewbot.live.exchange import Exchange, ExchangeError, KeyPermissions, ProductSpec
+from ewbot.live.exchange import FUTURES_PRODUCT, SPOT_PRODUCT, Exchange, ExchangeError, KeyPermissions, ProductSpec
+from ewbot.live.settings import LiveSettings
+from ewbot.live.stage import STAGES
 from ewbot.paper.fingerprint import fingerprint_of, tree_files
 
 BASELINE_FINGERPRINT = "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1"
 LOCK_SHA256 = "d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45"
+LOCK_FILE_SHA256 = "6530175541c177509dab874cb944273996fa4b5e8a9207d0c19e6222224d68bb"  # sha256 of holdout.lock's bytes
 FINGERPRINT_FILES = 25
 CONTRACT_SIZE = 0.01
 PRICE_INCREMENT = 5.0
 BASE_INCREMENT = 1.0
+PRODUCT_EXPIRY = "2030-12-20"  # the date in FUTURES_PRODUCT (BIP-20DEC30-CDE)
+EXPIRY_MARGIN_DAYS = 90
+ALERT_SETTINGS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "EWBOT_HEALTHCHECK_URL")
 
 
 @dataclass(frozen=True)
@@ -10735,42 +11195,92 @@ def check_fingerprint(files: Mapping[str, bytes] | None = None, expected: str = 
     return Check("fingerprint", ok, f"{fp[:12]} over {len(files)} files (baseline {expected[:12]}, {FINGERPRINT_FILES} files)")
 
 
-def check_lock(path: Path = DEFAULT_LOCK_PATH, expected: str = LOCK_SHA256) -> tuple[Check, dict[str, Any] | None]:
+def _number(x: Any) -> float:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise TypeError("not a finite number")
+    return float(x)
+
+
+def _integer(x: Any) -> int:
+    if isinstance(x, bool) or not isinstance(x, int):
+        raise TypeError("not an integer")
+    return x
+
+
+def _parse_lock(raw: bytes) -> tuple[dict[str, Any], tuple[float, ...], int, str, int, str]:
+    lock = json.loads(raw.decode("utf-8"))
+    if not isinstance(lock, dict) or not isinstance(lock["params"], list):
+        raise TypeError("not a lock object")
+    params = tuple(_number(x) for x in lock["params"])
+    code_sha, sha = lock["code_sha256"], lock["sha256"]
+    if not (isinstance(code_sha, str) and isinstance(sha, str)):
+        raise TypeError("not a string")
+    return lock, params, _integer(lock["random_runs"]), code_sha, _integer(lock["holdout_start"]), sha
+
+
+def check_lock(path: Path = DEFAULT_LOCK_PATH, expected: str = LOCK_SHA256,
+               expected_file: str = LOCK_FILE_SHA256) -> tuple[Check, dict[str, Any] | None]:
     try:
-        lock = json.loads(Path(path).read_text(encoding="utf-8"))
-        params = tuple(float(x) for x in lock["params"])
-        random_runs = int(lock["random_runs"])
-        code_sha = str(lock["code_sha256"])
-        holdout_start = int(lock["holdout_start"])
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
         return Check("lock", False, f"{path} unreadable: {type(exc).__name__}"), None
+    file_sha = hashlib.sha256(raw).hexdigest()
+    if file_sha != expected_file:  # first: any other file (edited, CRLF, a BOM, re-serialised) is refused as such
+        return Check("lock", False, f"file sha256 {file_sha[:12]} != committed {expected_file[:12]}"), None
+    try:
+        lock, params, random_runs, code_sha, holdout_start, sha = _parse_lock(raw)
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as exc:  # incl. JSONDecodeError
+        return Check("lock", False, f"{path} malformed: {type(exc).__name__}"), None
     problems = []
     if params not in grid_combos():
         problems.append(f"params {list(params)} not a grid combo")
     if holdout_start != HOLDOUT_START:
-        problems.append(f"holdout_start {holdout_start}")
+        problems.append(f"holdout_start {holdout_start} != {HOLDOUT_START}")
     digest = lock_digest(BotConfig(), params, random_runs, code_sha)
-    if digest != lock.get("sha256"):
-        problems.append(f"lock_digest {digest[:12]} != lock sha256 {str(lock.get('sha256'))[:12]}")
-    if lock.get("sha256") != expected:
-        problems.append(f"lock sha256 {str(lock.get('sha256'))[:12]} != committed {expected[:12]}")
-    detail = "; ".join(problems) or f"sha256 {expected[:12]}, params {list(params)}"
+    if digest != sha:
+        problems.append(f"lock_digest {digest[:12]} != lock sha256 {sha[:12]}")
+    if sha != expected:
+        problems.append(f"lock sha256 {sha[:12]} != committed {expected[:12]}")
+    detail = "; ".join(problems) or f"file sha256 {file_sha[:12]}, sha256 {expected[:12]}, params {list(params)}"
     return Check("lock", not problems, detail), (lock if not problems else None)
 
 
 def check_key(perms: KeyPermissions, stage: str) -> Check:
     problems = []
+    if stage not in STAGES:  # never read as SHADOW (view only is enough) nor trusted as a real-money stage
+        problems.append(f"unknown stage {stage!r} (one of {', '.join(STAGES)})")
     if perms.can_transfer:
         problems.append("the key can TRANSFER: create a view+trade key only")
     if not perms.can_view:
         problems.append("the key cannot view")
-    if stage in ("CANARY", "FULL") and not perms.can_trade:
+    if stage != "SHADOW" and not perms.can_trade:
         problems.append(f"{stage} needs trade permission")
     detail = "; ".join(problems) or f"view={perms.can_view} trade={perms.can_trade} transfer=False"
     return Check("key", not problems, detail)
 
 
-def check_product(spec: ProductSpec, expected_id: str) -> Check:
+def check_alerts(settings: LiveSettings, stage: str) -> Check:
+    """CANARY and FULL trade real money: they need the Telegram alerts and commands (/pause, /flatten) and the
+    external heartbeat. SHADOW may run without them; the check then passes with a warning."""
+    if stage not in STAGES:
+        return Check("alerts", False, f"unknown stage {stage!r} (one of {', '.join(STAGES)})")
+    missing = [name for name, value in zip(ALERT_SETTINGS, (settings.telegram_token, settings.telegram_chat,
+                                                              settings.healthcheck_url)) if not value]
+    if not missing:
+        return Check("alerts", True, "Telegram alerts and commands, heartbeat")
+    if stage == "SHADOW":
+        return Check("alerts", True, f"WARNING: {', '.join(missing)} not set - SHADOW runs without alerts, Telegram "
+                                     "commands or heartbeat; CANARY and FULL refuse to start")
+    return Check("alerts", False, f"{stage} needs {', '.join(missing)} in the secrets file (alerts, /pause and "
+                                  "/flatten, the heartbeat)")
+
+
+def _day(ts: float) -> str:
+    return datetime.fromtimestamp(ts, UTC).date().isoformat()
+
+
+def check_product(spec: ProductSpec, expected_id: str = FUTURES_PRODUCT, now: float | None = None) -> Check:
+    now = time.time() if now is None else now
     problems = []
     if spec.product_id != expected_id:
         problems.append(f"product {spec.product_id} != {expected_id}")
@@ -10780,25 +11290,44 @@ def check_product(spec: ProductSpec, expected_id: str) -> Check:
         problems.append(f"price_increment {spec.price_increment} != {PRICE_INCREMENT}")
     if spec.base_increment != BASE_INCREMENT:
         problems.append(f"base_increment {spec.base_increment} != {BASE_INCREMENT}")
-    detail = "; ".join(problems) or f"{spec.product_id}: 0.01 BTC/contract, $5 tick, whole contracts"
+    named = datetime.fromisoformat(PRODUCT_EXPIRY).replace(tzinfo=UTC).timestamp()
+    if spec.expiry is None:
+        problems.append("no contract expiry in the product reply (contract_expiry)")
+    elif spec.expiry < named:
+        problems.append(f"contract expiry {_day(spec.expiry)} before {PRODUCT_EXPIRY} (the date in {FUTURES_PRODUCT})")
+    ends = named if spec.expiry is None else min(spec.expiry, named)
+    if ends - now < EXPIRY_MARGIN_DAYS * 86_400:
+        problems.append(f"the contract expires {_day(ends)}: less than {EXPIRY_MARGIN_DAYS} days away "
+                        "(a new contract needs a plan change)")
+    detail = "; ".join(problems) or (f"{spec.product_id}: 0.01 BTC/contract, $5 tick, whole contracts, "
+                                     f"expires {_day(ends)} at the earliest")
     return Check("product", not problems, detail)
 
 
 def run_preflight(exchange: Exchange | None, stage: str, lock_path: Path = DEFAULT_LOCK_PATH,
-                  files: Mapping[str, bytes] | None = None, expected_lock: str = LOCK_SHA256
-                  ) -> tuple[list[Check], dict[str, Any] | None]:
-    """All checks; `exchange=None` runs the offline ones only (fingerprint, lock)."""
-    lock_check, lock = check_lock(lock_path, expected_lock)
+                  files: Mapping[str, bytes] | None = None, expected_lock: str = LOCK_SHA256,
+                  expected_lock_file: str = LOCK_FILE_SHA256, settings: LiveSettings | None = None,
+                  now: float | None = None) -> tuple[list[Check], dict[str, Any] | None]:
+    """All checks in this order: fingerprint, lock, alerts (only with `settings`), key and product (only with an
+    `exchange`; `exchange=None` runs the offline ones)."""
+    lock_check, lock = check_lock(lock_path, expected_lock, expected_lock_file)
     checks = [check_fingerprint(files), lock_check]
+    if settings is not None:
+        checks.append(check_alerts(settings, stage))
     if exchange is not None:
         try:
             checks.append(check_key(exchange.key_permissions(), stage))
         except ExchangeError as exc:
             checks.append(Check("key", False, f"key_permissions failed: {exc}"))
-        try:
-            checks.append(check_product(exchange.product(), exchange.futures_id))
-        except ExchangeError as exc:
-            checks.append(Check("product", False, f"product failed: {exc}"))
+        if (exchange.futures_id, exchange.spot_id) != (FUTURES_PRODUCT, SPOT_PRODUCT):
+            checks.append(Check("product", False, f"the exchange is set up for {exchange.futures_id} and "
+                                                  f"{exchange.spot_id}, not {FUTURES_PRODUCT} and {SPOT_PRODUCT}: "
+                                                  "both are fixed"))
+        else:
+            try:
+                checks.append(check_product(exchange.product(), FUTURES_PRODUCT, now))
+            except ExchangeError as exc:
+                checks.append(Check("product", False, f"product failed: {exc}"))
     return checks, lock
 
 
@@ -10813,14 +11342,14 @@ def require(checks: list[Check]) -> None:
 uv run --group live pytest tests/live/test_preflight.py -q
 ```
 
-Expected: `8 passed`.
+Expected: `19 passed`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/ewbot/live/settings.py src/ewbot/live/preflight.py tests/live/test_preflight.py
 git commit -m "$(cat <<'EOF'
-feat(live): settings with mode-600 secrets files and the startup preflight (fingerprint, lock, key, product)
+feat(live): settings with mode-600 secrets files and the startup preflight (fingerprint, lock file and digest, alerts, key, product)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
@@ -13191,8 +13720,8 @@ EOF
 
 **Interfaces:**
 - Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
-- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier` (its sending thread started), `redact(text, settings) -> str` (the bot token, the GitHub token and the health-check URL replaced by `<secret>`), `fatal_report(exc, settings) -> str` (the traceback, `redact`ed), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `price_feed(settings) -> TickerFeed | None` (the ticker feed on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, notify=None) -> Wired` (hands the preflight-checked lock to `LiveDeps`, the Telegram control so the runtime watches it and `redact` for its error texts; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit test also `Heartbeat`, `notifier` and `TelegramControl`.
-- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `shadow|canary --restart` - a new stint of the current stage, which reads no key permissions - need a flat book before writing; a demotion is written first and the flat book reported after), `backup --out PATH` (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`; `live run` closes the wiring on every exit; on a fatal exception it sends healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text and stderr the `fatal_report`, and returns 1 (KeyboardInterrupt and SystemExit are re-raised). Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
+- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file; the fixed products `FUTURES_PRODUCT`, `SPOT_PRODUCT`), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier` (its sending thread started), `redact(text, settings) -> str` (the bot token, the GitHub token and the health-check URL - each `Secret` revealed here - replaced by `<secret>`), `fatal_report(exc, settings) -> str` (the traceback, `redact`ed), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `price_feed(settings) -> TickerFeed | None` (the ticker feed for `FUTURES_PRODUCT` and `SPOT_PRODUCT` on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, notify=None) -> Wired` (hands the preflight-checked lock and the expiry reminders, as a dict, to `LiveDeps`, the Telegram control so the runtime watches it and `redact` for its error texts; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit test also `Heartbeat`, `notifier` and `TelegramControl`.
+- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `shadow|canary --restart` - a new stint of the current stage, which reads no key permissions - need a flat book before writing; a demotion is written first and the flat book reported after), `backup --out PATH` (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256 field, file sha256)` (production: `DEFAULT_LOCK_PATH`, `LOCK_SHA256`, `LOCK_FILE_SHA256`; the tests pin their temp lock by its own field and file hash), `cmd_live(args) -> int`; `live run` and `live preflight` run the preflight with the settings (the `alerts` check) and the lock-file pin; a `live run` refused by the settings waits `LIVE_REFUSAL_WAIT_S` like one refused by the preflight; `live run` closes the wiring on every exit; on a fatal exception it sends healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text and stderr the `fatal_report`, and returns 1 (KeyboardInterrupt and SystemExit are re-raised). Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -13202,6 +13731,7 @@ EOF
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -13217,7 +13747,7 @@ from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
 from ewbot.live.notify import LiveNotifier
 from ewbot.live.runtime import LiveRuntime
-from ewbot.live.settings import LiveSettings, SettingsError
+from ewbot.live.settings import LiveSettings, Secret, SettingsError
 from ewbot.live.sim import SimExchange
 from tests.live.helpers import Clock
 from tests.paper.helpers import FakeFetch, FakeSender, make_lock, synth_frame, ts
@@ -13227,7 +13757,8 @@ NOW = ts("2024-03-13 23:00") + 30
 
 @pytest.fixture
 def live_env(tmp_path, monkeypatch):
-    """Settings in a temp dir, a temp holdout lock, a SimExchange instead of Coinbase, synthetic candles."""
+    """Settings in a temp dir, a temp holdout lock (pinned by its own sha256 field and file sha256), a SimExchange
+    instead of Coinbase, synthetic candles."""
     df = synth_frame()
     lock = make_lock(df)
     lock_path = tmp_path / "holdout.lock"
@@ -13237,7 +13768,8 @@ def live_env(tmp_path, monkeypatch):
     ex = SimExchange(clock=clock)
     ex.set_prices(26_744.5, 26_744.5)
     monkeypatch.setattr(cli, "_live_settings", lambda: settings)
-    monkeypatch.setattr(cli, "_live_lock", lambda: (lock_path, lock["sha256"]))
+    lock_file_sha = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "_live_lock", lambda: (lock_path, lock["sha256"], lock_file_sha))
     monkeypatch.setattr(live_app, "real_exchange", lambda s: ex)
     monkeypatch.setattr(live_app, "price_feed", lambda s: None)  # no WebSocket in tests
     monkeypatch.setattr(live_app, "update_cache", lambda product, cache_dir: FakeFetch(df, clock)(cache_dir))
@@ -13263,10 +13795,11 @@ def test_the_price_feed_uses_the_public_endpoint_without_a_key():
 def test_preflight_offline_and_online(live_env, capsys, monkeypatch):
     assert main(["live", "preflight", "--offline"]) == 0
     out = capsys.readouterr().out
-    assert "preflight fingerprint: ok" in out and "preflight lock: ok" in out and "key" not in out
+    assert "preflight fingerprint: ok" in out and "preflight lock: ok - file sha256" in out and "key" not in out
+    assert "preflight alerts: ok - WARNING: TELEGRAM_BOT_TOKEN" in out  # SHADOW without Telegram: a warning
     assert main(["live", "preflight"]) == 0
     assert "preflight product: ok" in capsys.readouterr().out
-    monkeypatch.setattr(cli, "_live_lock", lambda: (live_env[0].data_dir / "missing.lock", "0" * 64))
+    monkeypatch.setattr(cli, "_live_lock", lambda: (live_env[0].data_dir / "missing.lock", "0" * 64, "0" * 64))
     assert main(["live", "preflight", "--offline"]) == 2
 
 
@@ -13280,6 +13813,24 @@ def test_run_refuses_without_a_key_file_or_a_passing_preflight(live_env, monkeyp
     transfer = SimExchange(permissions=KeyPermissions(True, True, True))
     monkeypatch.setattr(live_app, "real_exchange", lambda s: transfer)
     assert main(["live", "run"]) == 2 and "preflight key: FAILED" in capsys.readouterr().out
+    # CANARY and FULL trade real money: no start without the Telegram alerts and commands and the heartbeat
+    jr = Journal(settings.journal_path)
+    jr.set_stage("CANARY", "test", NOW)
+    jr.close()
+    monkeypatch.setattr(live_app, "real_exchange", lambda s: ex)
+    assert main(["live", "run"]) == 2
+    out = capsys.readouterr().out
+    assert "preflight alerts: FAILED - CANARY needs TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EWBOT_HEALTHCHECK_URL" in out
+    # settings refused (e.g. a secret in the environment): `live run` waits too, the other commands do not
+    waits: list[float] = []
+    monkeypatch.setattr(cli, "LIVE_REFUSAL_WAIT_S", 7.0)
+    monkeypatch.setattr("ewbot.cli.time.sleep", waits.append)
+
+    def refused() -> LiveSettings:
+        raise SettingsError("TELEGRAM_BOT_TOKEN is set in the environment")
+
+    monkeypatch.setattr(cli, "_live_settings", refused)
+    assert main(["live", "run"]) == 2 and main(["live", "status"]) == 2 and waits == [7.0]
 
 
 def test_run_status_and_backup(live_env, monkeypatch, capsys, tmp_path):
@@ -13309,7 +13860,8 @@ def test_run_status_and_backup(live_env, monkeypatch, capsys, tmp_path):
 def test_a_fatal_exit_tells_healthchecks_only_the_exception_type_and_stops_the_threads(live_env, monkeypatch, capsys):
     settings, _, _ = live_env
     token = "123456:SECRET-TOKEN"
-    s = dataclasses.replace(settings, telegram_token=token, telegram_chat="42", healthcheck_url="https://hc-ping.com/u1")
+    s = dataclasses.replace(settings, telegram_token=Secret(token), telegram_chat="42",
+                            healthcheck_url=Secret("https://hc-ping.com/u1"))
     monkeypatch.setattr(cli, "_live_settings", lambda: s)
     posts: list[tuple[str, Any]] = []
     pings = SimpleNamespace(get=lambda url, timeout=None: SimpleNamespace(status_code=200),
@@ -13431,8 +13983,9 @@ Expected: collection error `ImportError: cannot import name 'app' from 'ewbot.li
 ```python
 """Production wiring of `ewbot live` (Plan 3): settings -> Coinbase exchange (ShadowExchange in SHADOW),
 journal, [LIVE] notifier, WebSocket price feed (Coinbase's public endpoint: no key), Telegram control,
-heartbeat and paper audit -> LiveRuntime. The CLI calls these factories; tests replace `real_exchange`,
-`price_feed` and `paper_status` (no network)."""
+heartbeat and paper audit -> LiveRuntime. The products are fixed (FUTURES_PRODUCT, SPOT_PRODUCT: no setting
+names them); the settings' secrets are revealed only here, where they are used. The CLI calls these factories;
+tests replace `real_exchange`, `price_feed` and `paper_status` (no network)."""
 
 from __future__ import annotations
 
@@ -13448,7 +14001,7 @@ from ewbot.data.coinbase_history import update_cache
 from ewbot.live.audit import AuditError, fetch_paper_ledger
 from ewbot.live.coinbase import CoinbaseExchange
 from ewbot.live.control import Command, TelegramControl
-from ewbot.live.exchange import Exchange
+from ewbot.live.exchange import FUTURES_PRODUCT, SPOT_PRODUCT, Exchange
 from ewbot.live.feed import TickerFeed, public_ws_factory
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
@@ -13464,7 +14017,7 @@ from ewbot.paper.notify import TelegramSender
 def real_exchange(s: LiveSettings) -> Exchange:
     if s.key_file is None:
         raise SettingsError("EWBOT_COINBASE_KEY_FILE is not set")
-    return CoinbaseExchange.from_key_file(s.key_file, s.futures_id, s.spot_id)
+    return CoinbaseExchange.from_key_file(s.key_file, FUTURES_PRODUCT, SPOT_PRODUCT)
 
 
 def stage_exchange(real: Exchange, journal: Journal, stage: str, notify: Callable[[str, str], Any]) -> Exchange:
@@ -13474,7 +14027,8 @@ def stage_exchange(real: Exchange, journal: Journal, stage: str, notify: Callabl
 
 def notifier(s: LiveSettings) -> LiveNotifier:
     """The [LIVE] notifier with its sending thread started: a call only queues, the loop never waits on Telegram."""
-    sender = TelegramSender(s.telegram_token, s.telegram_chat) if s.telegram_token and s.telegram_chat else None
+    sender = (TelegramSender(s.telegram_token.reveal(), s.telegram_chat)
+              if s.telegram_token and s.telegram_chat else None)
     notify = LiveNotifier(sender)
     notify.start()
     return notify
@@ -13484,7 +14038,7 @@ def redact(text: str, s: LiveSettings) -> str:
     """`text` with the settings' secrets (bot token, GitHub token, health-check URL) replaced by <secret>."""
     for secret in (s.telegram_token, s.github_token, s.healthcheck_url):
         if secret:
-            text = text.replace(secret, "<secret>")
+            text = text.replace(secret.reveal(), "<secret>")
     return text
 
 
@@ -13496,7 +14050,7 @@ def fatal_report(exc: BaseException, s: LiveSettings) -> str:
 def paper_fetcher(s: LiveSettings) -> Callable[[], dict[str, Any]] | None:
     if not (s.paper_repo and s.github_token):
         return None
-    repo, token = s.paper_repo, s.github_token
+    repo, token = s.paper_repo, s.github_token.reveal()
     return lambda: fetch_paper_ledger(repo, token)
 
 
@@ -13514,7 +14068,7 @@ def paper_status(s: LiveSettings, now: float) -> dict[str, Any] | None:
 
 def price_feed(s: LiveSettings) -> TickerFeed | None:
     """The WebSocket ticker feed for the watchdog (public channels: no key, verified TLS)."""
-    return TickerFeed([s.futures_id, s.spot_id], public_ws_factory())
+    return TickerFeed([FUTURES_PRODUCT, SPOT_PRODUCT], public_ws_factory())
 
 
 @dataclass
@@ -13543,14 +14097,14 @@ def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journa
     ex = stage_exchange(real, journal, stage, notify)
     feed = price_feed(s)
     commands: queue.Queue[Command] = queue.Queue()
-    control = (TelegramControl(s.telegram_token, s.telegram_chat, journal)
+    control = (TelegramControl(s.telegram_token.reveal(), s.telegram_chat, journal)
                if s.telegram_token and s.telegram_chat else None)
-    heartbeat = Heartbeat(s.healthcheck_url)
+    heartbeat = Heartbeat(s.healthcheck_url.reveal() if s.healthcheck_url else None)
     deps = LiveDeps(
         journal=journal, exchange=ex, lock=lock,
-        fetch=lambda cache_dir: update_cache(s.spot_id, Path(cache_dir)), cache_dir=s.cache_dir, notify=notify,
+        fetch=lambda cache_dir: update_cache(SPOT_PRODUCT, Path(cache_dir)), cache_dir=s.cache_dir, notify=notify,
         clock=time.time, sleep=time.sleep, feed=feed, heartbeat=heartbeat, commands=commands, control=control,
-        paper_ledger=paper_fetcher(s), edit_stops=s.edit_stops, expiry=s.expiry,
+        paper_ledger=paper_fetcher(s), edit_stops=s.edit_stops, expiry=dict(s.expiry),
         redact=lambda text: redact(text, s),
     )
     rt = LiveRuntime(deps)
@@ -13620,7 +14174,7 @@ from ewbot.live import app as live_app
 from ewbot.live import runtime as live_runtime
 from ewbot.live.exchange import Exchange, ExchangeError
 from ewbot.live.journal import Journal
-from ewbot.live.preflight import LOCK_SHA256, run_preflight
+from ewbot.live.preflight import LOCK_FILE_SHA256, LOCK_SHA256, run_preflight
 from ewbot.live.settings import LiveSettings, SettingsError, load_settings
 from ewbot.live.stage import (
     STAGES,
@@ -13651,8 +14205,9 @@ from ewbot.live.stage import (
     p_live = sub.add_parser("live", help="live-trading runtime (Plan 3): Coinbase CFM BIP, SHADOW -> CANARY -> FULL")
     live_sub = p_live.add_subparsers(dest="live_cmd", required=True)
     live_sub.add_parser("run", help="run the live runtime (settings and secrets from the environment)")
-    p_pre = live_sub.add_parser("preflight", help="startup checks: fingerprint, holdout.lock, key permissions, product")
-    p_pre.add_argument("--offline", action="store_true", help="fingerprint and lock only (no Coinbase request)")
+    p_pre = live_sub.add_parser("preflight", help="startup checks: fingerprint, holdout.lock, alerts, key permissions, "
+                                "product")
+    p_pre.add_argument("--offline", action="store_true", help="fingerprint, lock and alerts only (no Coinbase request)")
     p_ls = live_sub.add_parser("status", help="journal status and the current stage's gates (read-only)")
     p_ls.add_argument("--json", action="store_true", help="machine-readable (deploy/live/deploy.sh)")
     p_ls.add_argument("--max-age", type=float, default=None, help="exit 1 when the loop heartbeat is older (seconds)")
@@ -13686,9 +14241,10 @@ def _live_settings() -> LiveSettings:
     return load_settings()
 
 
-def _live_lock() -> tuple[Path, str]:
-    """The committed holdout lock and its pinned sha256 (tests replace this function)."""
-    return DEFAULT_LOCK_PATH, LOCK_SHA256
+def _live_lock() -> tuple[Path, str, str]:
+    """The committed holdout lock, its pinned sha256 field and the pinned sha256 of the file's bytes (tests replace
+    this function)."""
+    return DEFAULT_LOCK_PATH, LOCK_SHA256, LOCK_FILE_SHA256
 
 
 def _print_checks(checks: list) -> bool:
@@ -13708,8 +14264,8 @@ def _live_run(s: LiveSettings) -> int:
         notify("PREFLIGHT", f"[시작 거부] {exc}")
         time.sleep(LIVE_REFUSAL_WAIT_S)
         return 2
-    path, sha = _live_lock()
-    checks, lock = run_preflight(real, stage, path, expected_lock=sha)
+    path, sha, file_sha = _live_lock()
+    checks, lock = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
     if not _print_checks(checks) or lock is None:
         notify("PREFLIGHT", "[시작 거부] 시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in checks if not c.ok))
         time.sleep(LIVE_REFUSAL_WAIT_S)
@@ -13741,8 +14297,8 @@ def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
         except SettingsError as exc:
             print(f"refusing: {exc}", file=sys.stderr)
             return 2
-    path, sha = _live_lock()
-    checks, _ = run_preflight(real, stage, path, expected_lock=sha)
+    path, sha, file_sha = _live_lock()
+    checks, _ = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
     return 0 if _print_checks(checks) else 2
 
 
@@ -13880,6 +14436,8 @@ def cmd_live(args: argparse.Namespace) -> int:
         s = _live_settings()
     except SettingsError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
+        if args.live_cmd == "run":
+            time.sleep(LIVE_REFUSAL_WAIT_S)  # no Telegram without settings: the wait keeps Docker's restarts sparse
         return 2
     if args.live_cmd == "run":
         return _live_run(s)
@@ -14382,7 +14940,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `384 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `395 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -14408,7 +14966,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot live run | preflight --offline | status --json --exchange --require-flat | status --max-age 180 | backup --out` (Task 13).
-- Produces: the image `ewbot-live:<tag>` (Python 3.12.13 slim + uv 0.12.13, both pinned by digest; editable install at `/app` with `--no-dev --group live`; user uid 1000; `HEALTHCHECK ewbot live status --max-age 180`; `ENTRYPOINT ["ewbot", "live"]`, `CMD ["run"]`); the compose service `live` (`restart: unless-stopped`, read-only root, `/var/lib/ewbot:/data`, `/etc/ewbot:/run/ewbot:ro`, no secret value in the file); `deploy.sh <tag>` (exit 2 on a tag off `origin/master`, a dirty checkout or a failing offline preflight, exit 3 when not flat); `backup.sh` + systemd timer (daily, age-encrypted, rclone to R2); the runbook.
+- Produces: the image `ewbot-live:<tag>` (Python 3.12.13 slim + uv 0.12.13, both pinned by digest; editable install at `/app` with `--no-dev --group live`; user uid 1000; `HEALTHCHECK ewbot live status --max-age 180`; `ENTRYPOINT ["ewbot", "live"]`, `CMD ["run"]`); the compose service `live` (`restart: unless-stopped`, read-only root, `/var/lib/ewbot:/data`, `/etc/ewbot:/run/ewbot:ro`, no secret value and no product in the file, its defaults valid settings); `deploy.sh <tag>` (exit 2 on a tag off `origin/master`, a dirty checkout or a failing offline preflight, exit 3 when not flat); `backup.sh` + systemd timer (daily, age-encrypted, rclone to R2); the runbook.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -14430,6 +14988,7 @@ import pytest
 import yaml
 
 import ewbot
+from ewbot.live.settings import load_settings
 
 ROOT = Path(ewbot.__file__).resolve().parents[2]
 LIVE = ROOT / "deploy" / "live"
@@ -14462,7 +15021,11 @@ def test_compose_service_restarts_mounts_secrets_read_only_and_holds_no_secret_v
     assert set(svc["volumes"]) == {"/var/lib/ewbot:/data", "/etc/ewbot:/run/ewbot:ro"}
     env = svc["environment"]
     assert env["EWBOT_SECRETS_FILE"] == "/run/ewbot/live.env" and env["EWBOT_COINBASE_KEY_FILE"] == "/run/ewbot/cdp_api_key.json"
-    assert not any(k in env for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "EWBOT_GITHUB_TOKEN", "EWBOT_HEALTHCHECK_URL"))
+    assert not any(k in env for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "EWBOT_GITHUB_TOKEN", "EWBOT_HEALTHCHECK_URL",
+                                      "EWBOT_FUTURES_PRODUCT", "EWBOT_SPOT_PRODUCT"))
+    defaults = {k: re.sub(r"^\$\{\w+:-(.*)\}$", r"\1", str(v)) for k, v in env.items()
+                if k not in ("EWBOT_SECRETS_FILE", "EWBOT_COINBASE_KEY_FILE")}  # the files exist only on the VPS
+    assert load_settings(defaults).paper_repo == "taejunoh/elliott-wave-btc-bot"  # every default is a valid setting
     assert svc["cap_drop"] == ["ALL"] and "no-new-privileges:true" in svc["security_opt"]
     assert svc["logging"]["options"] == {"max-size": "10m", "max-file": "5"}
 
@@ -14630,7 +15193,8 @@ CMD ["run"]
 # checks it, tags it ewbot-live:current and runs `docker compose -f deploy/live/docker-compose.yml up -d`.
 # Host paths: /var/lib/ewbot (journal, candle cache, backups; owned by uid 1000) and /etc/ewbot (secrets,
 # mode 700 dir / 600 files, owned by uid 1000), mounted read-only. Non-secret settings may be overridden
-# in deploy/live/.env (EWBOT_EXPIRY, EWBOT_LIVE_EDIT_STOPS, EWBOT_FUTURES_PRODUCT, EWBOT_PAPER_REPO).
+# in deploy/live/.env (EWBOT_EXPIRY, EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO). The products are fixed and a
+# secret in the environment is refused at start (ewbot.live.settings): never add one here or in .env.
 name: ewbot-live
 services:
   live:
@@ -14641,7 +15205,6 @@ services:
       EWBOT_LIVE_DIR: /data
       EWBOT_SECRETS_FILE: /run/ewbot/live.env
       EWBOT_COINBASE_KEY_FILE: /run/ewbot/cdp_api_key.json
-      EWBOT_FUTURES_PRODUCT: ${EWBOT_FUTURES_PRODUCT:-BIP-20DEC30-CDE}
       EWBOT_PAPER_REPO: ${EWBOT_PAPER_REPO:-taejunoh/elliott-wave-btc-bot}
       EWBOT_LIVE_EDIT_STOPS: ${EWBOT_LIVE_EDIT_STOPS:-0}
       EWBOT_EXPIRY: ${EWBOT_EXPIRY:-}
@@ -14837,7 +15400,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    Delete the downloaded copy from your laptop once the VPS has it. Note the key's creation date for the expiry reminder.
 5. **Health check** (spec 5.1 `VPS 다운`). At <https://healthchecks.io> create a check `ewbot-live` with period **1 minute** and grace **2 minutes** (3 silent minutes alert), add the **Telegram** integration to it and keep the **email** integration (your account address) on it too, and copy its ping URL. The email is the channel that works when Telegram does not. Telegram counts as unusable when the command thread has been failing, dead or hung for 10 minutes, a message has failed to go out for 10 minutes, messages have waited 10 minutes without a send attempt (a stuck sender), or Telegram refused 3 messages in a row (e.g. the bot was blocked). The runtime then sends the check a `/fail` with the reason (`[LIVE] 텔레그램 사용 불가 - ...`) and withholds its success pings for at most 30 minutes, so the check stays down; after that the pings resume - so a hung runtime or a dead VPS still trips the check - and the `/fail` is repeated every 3 hours while Telegram stays unusable. A healthchecks.io alert therefore means the VPS or the runtime is down, or Telegram is unusable: only the latter comes with a `/fail` body.
 6. **GitHub token for the audit** (spec 3.5). A fine-grained personal access token at <https://github.com/settings/personal-access-tokens/new>: resource owner `taejunoh`, only the repository `elliott-wave-btc-bot`, permission **Contents: Read-only**, expiry 1 year.
-7. **Secrets file** `/etc/ewbot/live.env` (mode 600; the runtime refuses any other mode). Create it empty with the right mode, then edit it (nothing goes to the shell history):
+7. **Secrets file** `/etc/ewbot/live.env` (owned by uid 1000, mode 600; the runtime refuses another owner, any other mode or anything but a regular file). Create it empty with the right mode, then edit it (nothing goes to the shell history):
 
    ```bash
    sudo install -m 600 -o 1000 -g 1000 /dev/null /etc/ewbot/live.env
@@ -14851,6 +15414,8 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    EWBOT_HEALTHCHECK_URL=<the ping URL of step 5>
    ```
 
+   One `KEY=VALUE` per line, only these four keys; `export ` before a key and one pair of matching quotes around a value are accepted, comments go on lines of their own. An unknown key, a key twice or a value with a space or a quote (e.g. a trailing `# note`) is refused at start, named by line and key, never by value. These secrets are read only from this file: `TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN` or `EWBOT_HEALTHCHECK_URL` in the container's environment (compose, `deploy/live/.env`) is refused. `EWBOT_HEALTHCHECK_URL` must be the `https://` ping URL. SHADOW may start without Telegram and the health check (the preflight's `alerts` line warns); CANARY and FULL refuse to start without the bot token, the chat id and the health-check URL.
+
    Commands are taken only from a **private chat** with the bot: `TELEGRAM_CHAT_ID` must be its id, a positive number (your own Telegram user id); a group or channel id (negative) or an `@name` is refused at start. If the paper runtime reports to a group, use your private chat with the bot here. Only this runtime may read the bot's updates: no webhook on the bot, no second runtime with the same token, and do not run a `getUpdates` request by hand while it runs (Telegram answers the runtime with HTTP 409, alerted as `[텔레그램 명령 수신 이상] … 충돌`). Sending (`sendMessage`, as the paper runtime does) is not affected.
 8. **Repository checkout** on the VPS (a read-only deploy key: <https://github.com/taejunoh/elliott-wave-btc-bot/settings/keys>):
 
@@ -14860,10 +15425,10 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    git clone git@github.com:taejunoh/elliott-wave-btc-bot.git ~/elliott-wave-btc-bot
    ```
 
-   Non-secret settings go to `~/elliott-wave-btc-bot/deploy/live/.env` (read by compose; not committed), for example the expiry reminders (30 days ahead, in the daily summary):
+   Non-secret settings go to `~/elliott-wave-btc-bot/deploy/live/.env` (read by compose; not committed): `EWBOT_EXPIRY`, `EWBOT_LIVE_EDIT_STOPS` (`0` or `1`) and `EWBOT_PAPER_REPO` (`owner/repo`). Never a secret, and no product: the runtime trades `BIP-20DEC30-CDE` on signals from `BTC-USD`, both fixed (`EWBOT_FUTURES_PRODUCT` / `EWBOT_SPOT_PRODUCT` are refused). For example the expiry reminders (30 days ahead, in the daily summary) - `bip` is the day from which the preflight refuses to start on the contract (90 days before its 2030-12-20 expiry):
 
    ```
-   EWBOT_EXPIRY=coinbase=2027-10-03,github=2027-10-03
+   EWBOT_EXPIRY=coinbase=2027-10-03,github=2027-10-03,bip=2030-09-21
    ```
 9. **Fund the futures account** with enough for one contract's margin plus buffer (about $500). SHADOW's previews run against the real account: an unfunded account fails gate ③.
 10. **First deployment**: tag the merged commit on `master` (for example `live-v1`, `git tag live-v1 origin/master && git push origin live-v1` on your laptop), then on the VPS:
@@ -14873,7 +15438,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     docker compose -f deploy/live/docker-compose.yml logs -f live
     ```
 
-    The first start downloads the candle history (a few minutes), records stage SHADOW and sends `[LIVE] [시작]` to Telegram. Check `docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight` (all four checks `ok`).
+    The first start downloads the candle history (a few minutes), records stage SHADOW and sends `[LIVE] [시작]` to Telegram. Check `docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight` (all five checks `ok`: fingerprint, lock, alerts, key, product).
 11. **Backups** (spec 5.2): daily, encrypted with [age](https://github.com/FiloSottile/age) and copied with rclone to a Cloudflare R2 bucket.
     - On your laptop: `age-keygen -o ewbot-backup.key` — keep this private key offline; note the `age1...` public key it prints.
     - In Cloudflare: an R2 bucket `ewbot-backups` and an R2 API token with Object Read & Write on that bucket only.
@@ -14937,7 +15502,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - **An order failure not resolved in time** (`[주문 실패 미해결]`, `ORDER_UNRESOLVED`; in CANARY `[CANARY 실패] ORDER_UNRESOLVED: paused`): a bracket that could not be replaced within 30 s, or a close or a reduction that did not go through by the next poll. Read the order events (`BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED`, `ACTION_ERROR`) and check the position's brackets in the Coinbase app before `/resume`. A failure the runtime resolved in time (`ORDER_RESOLVED`, e.g. one 429 on a stop move replaced at the next poll, or - in an hour without a decision - a bracket seen resting over the whole position at the next poll) is no CANARY failure. An unresolved failure, like a manual intervention, is recorded once per episode, not at every poll: the episode ends at the first poll where the trade has no failure left inside its time (one whose fix awaits its confirmation does not count; a fix still not confirmed 2 polls and 10 minutes later is itself unresolved) - a later failure is a new incident, pauses again and in FULL restarts the cap's 30 days -, and with a restart or a stage change; while no trade is open every failure is its own episode.
 - **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app. If the alert came with a `/fail` body `텔레그램 사용 불가 - ...`, the runtime was running when it sent it but cannot be reached on Telegram - check that it still runs (`docker compose ... ps`; its pings resume within 30 minutes of the `/fail`, so a check that stays down longer means it stopped) - and then check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
 - **API key leaked or a transfer-permission alert**: delete the key in the CDP portal at once (open brackets stay), create a new View + Trade key bound to the VPS IP, replace the file and restart.
-- **A start refused by the preflight** (fingerprint, lock, key, product): the message names the failing check. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag.
+- **A start refused by the preflight** (fingerprint, lock, alerts, key, product): the message names the failing check. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag. A start refused by the settings (`refusing: ...` in the log: a secrets-file line, a secret in the environment, a setting out of range - named by variable, file and line, never by value) waits 10 minutes before Docker starts it again: fix the file or `deploy/live/.env` and `docker compose -f deploy/live/docker-compose.yml restart live`.
 - **Breaker or incident pause**: read `/status` and the latest journal events, fix the cause, then `/resume`. `/resume` re-bases only the breaker that tripped (the day's reference after −3%, the peak after −15% - which also marks the day), as the median of the `/resume` balance read and the next two; a `/pause` → `/resume` without a trip changes neither. If the balance cannot be read at that moment, the reply says so and a tripped breaker still blocks entries: send `/resume` again. The latest journal events:
 
   ```bash
@@ -14947,14 +15512,15 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 ## Deploying a new version
 
 - The image verifies Coinbase's TLS certificates with the base image's CA store (`ca-certificates`, part of `python:3.12.13-slim-bookworm`); the build stops if `/etc/ssl/certs/ca-certificates.crt` is missing (a new base image without it): keep the pinned base, or install `ca-certificates` in the Dockerfile.
-- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` refuses a tag off `master`, a dirty checkout, an image whose offline preflight fails (fingerprint `e0435223…`, lock `d1be04baa06c…`) and any open trade, position or resting order. Rollback = deploy the previous tag.
+- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` refuses a tag off `master`, a dirty checkout, an image whose offline preflight fails (fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`) and any open trade, position or resting order. Rollback = deploy the previous tag.
 - A change to any strategy-fingerprinted file (`types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/`) is refused by the preflight and would reset the paper runtime's out-of-sample counter: never deploy one.
 
 ## Weekly checks
 
 - `df -h /var/lib/ewbot`, `docker system df` (prune old images: `docker image prune`), `journalctl -u ewbot-backup.service -n 5`, the newest backup in R2.
 - Pending updates are installed by unattended-upgrades; if `/var/run/reboot-required` exists, reboot only with a flat book (`/flatten` not needed if no trade is open), then check `[시작]` in Telegram.
-- Expiry reminders (`EWBOT_EXPIRY`) arrive 30 days ahead in the daily summary: the Coinbase API key, the GitHub audit token and the Cloudflare Workers trigger token of the paper runtime.
+- Expiry reminders (`EWBOT_EXPIRY`) arrive 30 days ahead in the daily summary: the Coinbase API key, the GitHub audit token, the Cloudflare Workers trigger token of the paper runtime and the contract (`bip`).
+- Coinbase's notices for `BIP-20DEC30-CDE` (a delisting, a new expiry): the preflight checks the contract's expiry (`contract_expiry` no earlier than 2030-12-20 and more than 90 days away) only when the runtime starts.
 
 ## Cost
 
@@ -14972,7 +15538,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `1015 passed, 1 skipped` without a candle cache (`1016 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file; the full suite `1026 passed, 1 skipped` without a candle cache (`1027 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -15007,7 +15573,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `1016 passed` with the real cache (`1015 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `1027 passed` with the real cache (`1026 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
@@ -15023,7 +15589,9 @@ Expected: `epoch 1 of 1` with the baseline fingerprint, `discrepancies … (unex
 
 - [ ] **Step 3: VPS, keys and secrets (user, with the controller reading along)**
 
-Follow `docs/live-trading.md` → One-time setup, steps 1–9: Ubuntu 24.04 US-East VPS (SSH keys only, ufw), unattended-upgrades, Docker, user `ewbot` (uid 1000), `/var/lib/ewbot` and `/etc/ewbot` (mode 700); a **View-only** CDP key bound to the VPS IP for SHADOW (`/etc/ewbot/cdp_api_key.json`, mode 600); healthchecks.io check (period 1 min, grace 2 min, Telegram and email integrations: the email reaches the user when Telegram is unusable); the fine-grained GitHub token (Contents: read on this repository); `/etc/ewbot/live.env` (mode 600; `TELEGRAM_CHAT_ID` = the user's private chat with the bot, a positive id; no webhook or second poller on the bot); `timedatectl` shows the clock synchronised (command ages use it); the repository checkout with a read-only deploy key; `deploy/live/.env` with `EWBOT_EXPIRY`; about $500 in the futures account. The user types every secret; the controller never sees one.
+Follow `docs/live-trading.md` → One-time setup, steps 1–9: Ubuntu 24.04 US-East VPS (SSH keys only, ufw), unattended-upgrades, Docker, user `ewbot` (uid 1000), `/var/lib/ewbot` and `/etc/ewbot` (mode 700); a **View-only** CDP key bound to the VPS IP for SHADOW (`/etc/ewbot/cdp_api_key.json`, mode 600); healthchecks.io check (period 1 min, grace 2 min, Telegram and email integrations: the email reaches the user when Telegram is unusable); the fine-grained GitHub token (Contents: read on this repository); `/etc/ewbot/live.env` (owned by uid 1000, mode 600, only its four keys; `TELEGRAM_CHAT_ID` = the user's private chat with the bot, a positive id; no webhook or second poller on the bot); `timedatectl` shows the clock synchronised (command ages use it); the repository checkout with a read-only deploy key; `deploy/live/.env` with `EWBOT_EXPIRY` (incl. `bip=2030-09-21`; never a secret or a product there: both are refused); about $500 in the futures account. The user types every secret; the controller never sees one.
+
+The contract's expiry is checked by hand once (the preflight cannot settle it): `GET /market/products/BIP-20DEC30-CDE` reported `contract_expiry` 2089-12-30T16:00:00Z, `contract_expiry_type` `EXPIRING` and `contract_expiry_name` 2030-12 on 2026-10-03, while the id says 20 Dec 2030 and Coinbase calls it a perp; the preflight refuses only an expiry before 2030-12-20 or within 90 days. The user confirms on Coinbase (the product's page, the help center's nano Bitcoin perp-style futures article) which expiry applies and that no delisting or earlier expiry is announced; the controller records the answer in the project notes. If an expiry before 2030-12-20 is announced, stop before SHADOW: a new contract needs a plan change.
 
 - [ ] **Step 4: Deploy and start SHADOW**
 
@@ -15034,7 +15602,7 @@ docker compose -f deploy/live/docker-compose.yml logs --tail 50 live
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live status
 ```
 
-Expected: the preflight prints four `ok` lines (fingerprint `e0435223a3f9`, lock `d1be04baa06c`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11) and run the backup service once.
+Expected: the preflight prints five `ok` lines (fingerprint `e0435223a3f9`, lock `file sha256 6530175541c1, sha256 d1be04baa06c`, alerts `Telegram alerts and commands, heartbeat`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts, expires 2030-12-20 at the earliest`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11) and run the backup service once.
 
 - [ ] **Step 5: Re-record the private-endpoint fixtures (first SHADOW week, controller)**
 
@@ -15080,7 +15648,7 @@ docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live stage canary --confirm
 ```
 
-Expected: the preflight's key line reads `view=True trade=True transfer=False`; the stage command prints every gate `[충족]` and `stage SHADOW -> CANARY recorded`; within a minute Telegram shows `[단계 변경] SHADOW → CANARY` and a new `[시작] 단계 CANARY`. If any gate is `[미충족]`, the command refuses: do not work around it.
+Expected: the preflight's key line reads `view=True trade=True transfer=False` and its alerts line `Telegram alerts and commands, heartbeat` (CANARY refuses to start without them); the stage command prints every gate `[충족]` and `stage SHADOW -> CANARY recorded`; within a minute Telegram shows `[단계 변경] SHADOW → CANARY` and a new `[시작] 단계 CANARY`. If any gate is `[미충족]`, the command refuses: do not work around it.
 
 - [ ] **Step 8: CANARY confirmations (controller records the answers in the project notes)**
 
