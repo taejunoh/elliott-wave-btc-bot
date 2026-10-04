@@ -1,4 +1,5 @@
-# /etc/systemd/system/ewbot-backup.service (docs/live-trading.md, "Backups")
+# /etc/systemd/system/ewbot-backup.service (docs/live-trading.md, "Backups"). If the runtime's user is not ewbot
+# (uid 1000 was taken), change User= and the home directory in ExecStart= to that user's.
 [Unit]
 Description=ewbot live journal backup (encrypted, off-site)
 After=docker.service
@@ -7,5 +8,8 @@ Requires=docker.service
 [Service]
 Type=oneshot
 User=ewbot
+# root-only (mode 600): read by systemd, not by the user or the container
 EnvironmentFile=/etc/ewbot/backup.env
 ExecStart=/usr/bin/bash /home/ewbot/elliott-wave-btc-bot/deploy/live/backup.sh
+# a hung run is stopped (backup.sh then pings /fail) instead of holding back every later one
+TimeoutStartSec=30min

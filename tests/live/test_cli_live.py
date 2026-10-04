@@ -19,7 +19,7 @@ from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
 from ewbot.live.notify import LiveNotifier
 from ewbot.live.reconcile import is_ours
-from ewbot.live.runtime import LiveRuntime
+from ewbot.live.runtime import FLATTEN_KEY, LiveRuntime
 from ewbot.live.settings import LiveSettings, Secret, SettingsError
 from ewbot.live.shadow import ShadowExchange
 from ewbot.live.sim import SimExchange
@@ -360,6 +360,31 @@ def test_require_flat_sees_the_journal_trade_and_the_account(live_env, capsys):
     ex.place_market("manual", 1, 1)
     assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 3
     assert "not flat" in capsys.readouterr().err
+
+
+def test_require_flat_is_the_runtimes_flat_book(live_env, capsys):
+    """deploy.sh swaps only what the running runtime would call flat (LiveRuntime.flat): an order of unknown outcome
+    or a standing flatten keeps the book open even with no trade and nothing on the exchange."""
+    settings, ex, _ = live_env
+    jr = Journal(settings.journal_path)
+    jr.record_intent("ewb-e-1700000000-L", "ENTRY", 1_700_000_000, {"side": 1, "contracts": 1}, NOW)
+    jr.close()
+    assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["pending_intents"] == 1 and "1 order(s) of unknown outcome" in captured.err
+    jr = Journal(settings.journal_path)
+    jr.update_intent("ewb-e-1700000000-L", "ABANDONED", NOW + 600)
+    jr.put(FLATTEN_KEY, {"reason": "USER_FLATTEN", "origin": "USER", "ts": NOW, "deferred": True})
+    jr.close()
+    assert main(["live", "status", "--json", "--require-flat"]) == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["flatten"]["reason"] == "USER_FLATTEN" and "a standing flatten" in captured.err
+    jr = Journal(settings.journal_path)
+    jr.put(FLATTEN_KEY, None)  # cleared once the account was flat (FLATTENED)
+    jr.close()
+    assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["pending_intents"] == 0 and out["flatten"] is None and out["exchange_open_orders"] == 0
 
 
 def test_stage_changes_need_confirm_gates_and_a_flat_book(live_env, monkeypatch, capsys):

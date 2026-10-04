@@ -42,24 +42,26 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    ```
 
    Do not enable automatic reboots: reboot by hand when the book is flat (see Weekly checks).
-3. **Docker Engine and the compose plugin** from Docker's apt repository (<https://docs.docker.com/engine/install/ubuntu/>), then a user `ewbot` with uid 1000 that runs everything:
+3. **Docker Engine and the compose plugin** from Docker's apt repository (<https://docs.docker.com/engine/install/ubuntu/>), then a user `ewbot` with uid 1000 that runs everything (the group `systemd-journal` lets it read the container log, which goes to the systemd journal):
 
    ```bash
-   sudo useradd --uid 1000 --create-home --shell /bin/bash ewbot   # if uid 1000 is taken, use that user instead
-   sudo usermod -aG docker ewbot
+   sudo useradd --uid 1000 --create-home --shell /bin/bash ewbot
+   sudo usermod -aG docker,systemd-journal ewbot
    sudo install -d -m 700 -o 1000 -g 1000 /var/lib/ewbot /etc/ewbot
    ```
+
+   If uid 1000 is taken (`getent passwd 1000`: some images give it to their default user), use that user instead of `ewbot` everywhere below, and in your copy of `deploy/live/ewbot-backup.service` (step 11) change `User=` and the home directory in `ExecStart=` to that user's. The container always runs as uid 1000.
 4. **Coinbase CDP API key** (spec 3.4). In <https://portal.cdp.coinbase.com> → API Keys → Secret API Keys → Create:
    - signature algorithm **ECDSA**;
    - permissions **View** and **Trade** only, never **Transfer** (the runtime refuses to start with a transfer key and treats one found later as a major incident). For SHADOW a **View**-only key is enough; create the View + Trade key when CANARY is approved;
    - **IP allowlist**: the VPS's public IPv4 only;
-   - download the key JSON and copy it to the VPS, then lock it down (`chmod 600`):
+   - download the key JSON and send it from your laptop straight into its place, owned by uid 1000 with mode 600 (the runtime refuses any other: `chmod 600`), through your admin login on the VPS (`ewbot` has no SSH key and no password):
 
    ```bash
-   scp cdp_api_key.json ewbot@<vps>:/tmp/cdp_api_key.json
-   sudo install -m 600 -o 1000 -g 1000 /tmp/cdp_api_key.json /etc/ewbot/cdp_api_key.json && rm /tmp/cdp_api_key.json
+   ssh <admin>@<vps> 'sudo install -m 600 -o 1000 -g 1000 /dev/stdin /etc/ewbot/cdp_api_key.json' < cdp_api_key.json
    ```
-   Delete the downloaded copy from your laptop once the VPS has it. Note the key's creation date for the expiry reminder.
+
+   If sudo asks for a password there (`a terminal is required`), log in (`ssh <admin>@<vps>`), run the same `sudo install …` command, paste the file's content and press Ctrl-D. The key never lands in `/tmp` or a home directory. Delete the downloaded copy from your laptop once the VPS has it. Note the key's creation date for the expiry reminder.
 5. **Health check** (spec 5.1 `VPS 다운`). At <https://healthchecks.io> create a check `ewbot-live` with period **1 minute** and grace **2 minutes** (3 silent minutes alert), add the **Telegram** integration to it and keep the **email** integration (your account address) on it too, and copy its ping URL. The email is the channel that works when Telegram does not. Telegram counts as unusable when the command thread has been failing, dead or hung for 10 minutes, a message has failed to go out for 10 minutes, messages have waited 10 minutes without a send attempt (a stuck sender), or Telegram refused 3 messages in a row (e.g. the bot was blocked). The runtime then sends the check a `/fail` with the reason (`[LIVE] 텔레그램 사용 불가 - ...`) and withholds its success pings for at most 30 minutes, so the check stays down; after that the pings resume - so a hung runtime or a dead VPS still trips the check - and the `/fail` is repeated every 3 hours while Telegram stays unusable. A healthchecks.io alert therefore means the VPS or the runtime is down, or Telegram is unusable: only the latter comes with a `/fail` body.
 6. **GitHub token for the audit** (spec 3.5). A fine-grained personal access token at <https://github.com/settings/personal-access-tokens/new>: resource owner `taejunoh`, only the repository `elliott-wave-btc-bot`, permission **Contents: Read-only**, expiry 1 year.
 7. **Secrets file** `/etc/ewbot/live.env` (owned by uid 1000, mode 600; the runtime refuses another owner, any other mode or anything but a regular file). Create it empty with the right mode, then edit it (nothing goes to the shell history):
@@ -76,7 +78,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    EWBOT_HEALTHCHECK_URL=<the ping URL of step 5>
    ```
 
-   One `KEY=VALUE` per line, only these four keys; `export ` before a key and one pair of matching quotes around a value are accepted, comments go on lines of their own. An unknown key, a key twice or a value with a space or a quote (e.g. a trailing `# note`) is refused at start, named by line and key, never by value. These secrets are read only from this file: `TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN` or `EWBOT_HEALTHCHECK_URL` in the container's environment (compose, `deploy/live/.env`) is refused. `EWBOT_HEALTHCHECK_URL` must be the `https://` ping URL. SHADOW may start without Telegram and the health check (the preflight's `alerts` line warns); CANARY and FULL refuse to start without the bot token, the chat id and the health-check URL.
+   One `KEY=VALUE` per line, only these four keys; `export ` before a key and one pair of matching quotes around a value are accepted, comments go on lines of their own. An unknown key, a key twice or a value with a space or a quote (e.g. a trailing `# note`) is refused at start, named by line and key, never by value. These secrets are read only from this file: `TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN` or `EWBOT_HEALTHCHECK_URL` in the container's environment (an `environment:` entry of the compose file) is refused at start. `deploy/live/.env` (step 8) only fills the compose file's `${…}` settings: a secret written there never reaches the runtime - it is ignored, not refused - and sits in a plain file, so never put one there. `EWBOT_HEALTHCHECK_URL` must be the `https://` ping URL. SHADOW may start without Telegram and the health check (the preflight's `alerts` line warns); CANARY and FULL refuse to start without the bot token, the chat id and the health-check URL.
 
    Commands are taken only from a **private chat** with the bot: `TELEGRAM_CHAT_ID` must be its id, a positive number (your own Telegram user id); a group or channel id (negative) or an `@name` is refused at start. If the paper runtime reports to a group, use your private chat with the bot here. Only this runtime may read the bot's updates: no webhook on the bot, no second runtime with the same token, and do not run a `getUpdates` request by hand while it runs (Telegram answers the runtime with HTTP 409, alerted as `[텔레그램 명령 수신 이상] … 충돌`). Sending (`sendMessage`, as the paper runtime does) is not affected.
 8. **Repository checkout** on the VPS (a read-only deploy key: <https://github.com/taejunoh/elliott-wave-btc-bot/settings/keys>):
@@ -87,12 +89,12 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    git clone git@github.com:taejunoh/elliott-wave-btc-bot.git ~/elliott-wave-btc-bot
    ```
 
-   Non-secret settings go to `~/elliott-wave-btc-bot/deploy/live/.env` (read by compose; not committed): `EWBOT_EXPIRY`, `EWBOT_LIVE_EDIT_STOPS` (`0` or `1`) and `EWBOT_PAPER_REPO` (`owner/repo`). Never a secret, and no product: the runtime trades `BIP-20DEC30-CDE` on signals from `BTC-USD`, both fixed (`EWBOT_FUTURES_PRODUCT` / `EWBOT_SPOT_PRODUCT` are refused). For example the expiry reminders (30 days ahead, in the daily summary; the contract's own two dates - its 2030-12-20 expiry and 2030-09-21, from which the preflight refuses to start on it, 90 days before - are reminded without a setting):
+   Non-secret settings go to `~/elliott-wave-btc-bot/deploy/live/.env` (read by compose for the `${…}` settings of `deploy/live/docker-compose.yml`; never committed: `deploy/live/.gitignore`): `EWBOT_EXPIRY`, `EWBOT_LIVE_EDIT_STOPS` (`0` or `1`) and `EWBOT_PAPER_REPO` (`owner/repo`). Never a secret (step 7), no `EWBOT_IMAGE` (deploy.sh starts `ewbot-live:current` whatever it says) and no product: the runtime trades `BIP-20DEC30-CDE` on signals from `BTC-USD`, both fixed (`EWBOT_FUTURES_PRODUCT` / `EWBOT_SPOT_PRODUCT` in the container's environment are refused). For example the expiry reminders (30 days ahead, in the daily summary; the contract's own two dates - its 2030-12-20 expiry and 2030-09-21, from which the preflight refuses to start on it, 90 days before - are reminded without a setting):
 
    ```
    EWBOT_EXPIRY=coinbase=2027-10-03,github=2027-10-03
    ```
-9. **Fund the futures account** with enough for one contract's margin plus buffer (about $500). SHADOW's previews run against the real account: an unfunded account fails gate ③.
+9. **Fund the futures account** with enough for one contract's margin plus buffer (about $500). SHADOW's previews run against the real account: an unfunded account fails gate ③. The account is the bot's alone: never hold a `BIP-20DEC30-CDE` position or order of your own in it. The runtime takes a position it does not know for a foreign one - it closes it, or adopts it when the engine holds the same side (in CANARY a failure that pauses entries) - and a journal that was never CANARY or FULL refuses to start beside it (`[시작 거부] 실계좌에 …`).
 10. **First deployment**: tag the merged commit on `master` (for example `live-v1`, `git tag live-v1 origin/master && git push origin live-v1` on your laptop), then on the VPS:
 
     ```bash
@@ -100,13 +102,33 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     docker compose -f deploy/live/docker-compose.yml logs -f live
     ```
 
-    The first start downloads the candle history (a few minutes), records stage SHADOW and sends `[LIVE] [시작]` to Telegram. Check `docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight` (all five checks `ok`: fingerprint, lock, alerts, key, product).
-11. **Backups** (spec 5.2): daily, encrypted with [age](https://github.com/FiloSottile/age) and copied with rclone to a Cloudflare R2 bucket.
-    - On your laptop: `age-keygen -o ewbot-backup.key` — keep this private key offline; note the `age1...` public key it prints.
-    - In Cloudflare: an R2 bucket `ewbot-backups` and an R2 API token with Object Read & Write on that bucket only.
-    - On the VPS: `sudo apt-get install -y age rclone`, then `sudo -u ewbot rclone config` → new remote `r2`, type S3, provider Cloudflare, the token's access key / secret and the account endpoint.
-    - `/etc/ewbot/backup.env` (mode 600): `EWBOT_BACKUP_AGE_RECIPIENT=age1...` and optionally `EWBOT_BACKUP_REMOTE=r2:ewbot-backups`.
-    - Install and start the timer:
+    deploy.sh checks the tag, builds the image, runs its preflight with the service's configuration, starts it and waits for its loop heartbeat - up to 10 minutes this first time: the first start downloads the candle history (a few minutes) -; the runtime records stage SHADOW and sends `[LIVE] [시작]` to Telegram. Check `docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight` (all five checks `ok`: fingerprint, lock, alerts, key, product).
+11. **Backups** (spec 5.2): daily, encrypted with [age](https://github.com/FiloSottile/age), copied with rclone to a Cloudflare R2 bucket and watched by a healthchecks.io check of their own.
+    - On your laptop: `age-keygen -o ewbot-backup.key` — keep this private key offline (the VPS never has it: a restore is decrypted on the laptop); note the `age1...` public key it prints.
+    - In Cloudflare: an R2 bucket `ewbot-backups` and an R2 API token with Object Read & Write on that bucket only. In the bucket's settings add an object lifecycle rule that deletes objects after 90 days and, where R2 offers it, a bucket lock (retention) rule of 30 days: a token stolen from the VPS can then neither delete nor overwrite the recent backups.
+    - At healthchecks.io a second check `ewbot-backup`: period **1 day**, grace **2 hours**, the same Telegram and email integrations; copy its ping URL. Every run pings it at its start and at its end - `/fail` with the exit code when it failed -, so a backup that fails, hangs or never runs is alerted.
+    - On the VPS: `sudo apt-get install -y age rclone`, then the rclone remote `r2` (type `s3`, provider `Cloudflare`, the token's access key and secret, the endpoint `https://<account id>.r2.cloudflarestorage.com`) with `no_check_bucket = true`: a token scoped to one bucket may not check for the bucket, and without that line every upload fails with AccessDenied.
+
+    ```bash
+    sudo -u ewbot rclone config                                  # n (new remote), name r2, s3, Cloudflare, the keys, the endpoint
+    sudo -u ewbot rclone config update r2 no_check_bucket true   # the r2 section now holds: no_check_bucket = true
+    sudo -u ewbot rclone lsf r2:ewbot-backups                    # answers (empty at first), no AccessDenied
+    ```
+
+    - `/etc/ewbot/backup.env`, owned by root with mode 600 (systemd reads it for the backup service; neither `ewbot` nor the container can), never in the repository:
+
+    ```bash
+    sudo install -m 600 -o root -g root /dev/null /etc/ewbot/backup.env
+    sudo nano /etc/ewbot/backup.env
+    ```
+
+    ```
+    EWBOT_BACKUP_AGE_RECIPIENT=age1...
+    EWBOT_BACKUP_PING_URL=<the ping URL of the ewbot-backup check>
+    ```
+
+    and optionally `EWBOT_BACKUP_REMOTE=r2:ewbot-backups`.
+    - Install and start the timer, then run one backup now:
 
     ```bash
     sudo cp ~ewbot/elliott-wave-btc-bot/deploy/live/ewbot-backup.service ~ewbot/elliott-wave-btc-bot/deploy/live/ewbot-backup.timer /etc/systemd/system/
@@ -114,13 +136,14 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     sudo systemctl start ewbot-backup.service && journalctl -u ewbot-backup.service -n 20
     ```
 
-    Restore: download the newest `journal-*.sqlite.age`, `age -d -i ewbot-backup.key -o journal.sqlite journal-...sqlite.age`, stop the service, copy it to `/var/lib/ewbot/journal.sqlite` (owner 1000), start the service: the restart recovery reconciles it with Coinbase.
+    The log ends with `backup uploaded: r2:ewbot-backups/journal-….sqlite.age` and the `ewbot-backup` check turns up. A backup is made inside the running container, or in a one-off container of the same image while the service is stopped; a run that hangs is stopped after 30 minutes (`TimeoutStartSec`) and reported as failed. Restoring: see "Restoring the journal" - do it once during SHADOW (the restore drill).
 
 ## Daily operation
 
 - Telegram commands (only from your private chat with the bot, `TELEGRAM_CHAT_ID`; messages from anyone else, forwarded messages, edits and commands addressed to another bot are ignored): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` sent within 60 s of it (entries pause and the close is recorded first, then sent at market at every poll until the position is gone - the brackets rest until Coinbase takes it, and while the market is closed it goes out at the reopen; the answer says what happened: `전량 청산 완료`, `장이 열려 있지 않아 청산 대기` or `청산 요청 - …`, still being sent, with `[전량 청산 완료]` when it is done; `/resume` does not cancel it), `/help`. Every command is answered. A command sent more than 2 minutes before the runtime reads it (for example while it restarted) is not acted on: the answer is `오래된 명령 무시: /…` - send it again if you still want it (the ages come from Telegram's message dates and the VPS clock, which Ubuntu keeps synchronised: `timedatectl` shows `System clock synchronized: yes`). The first start ignores whatever was sent to the bot before. Delivery is at most once: a command the runtime fetched right before a crash or a restart is lost without an answer - if no answer comes within a minute, check `/status` and send it again.
 - **Telegram and health-check alerts.** `[텔레그램 명령 수신 이상]` means the command thread failed 5 polls in a row (the reason: `HTTP 401` - the bot token was refused; `HTTP 409` - another process or a webhook reads this bot's updates; a network error), was in conflict with another poller (`충돌`, HTTP 409), had stopped and was started again, or stopped answering (`응답 없음`: a hung request; it is not replaced automatically, since the hung thread would keep polling beside a new one - restart the container: `docker compose -f deploy/live/docker-compose.yml restart live`); `[텔레그램 복구]` that commands work again. While it lasts the commands may not arrive: use the VPS (`ewbot live status`, and the emergency procedures). `[외부 감시 핑 실패]` means three healthchecks.io pings in a row failed (`HTTP 404`: a wrong ping URL - fix `EWBOT_HEALTHCHECK_URL`): a dead VPS would then go unreported; `[외부 감시 핑 복구]` that they work again.
-- Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes).
+- Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes). A container that runs but is `unhealthy` has a hung loop, and Docker never restarts an unhealthy container by itself: `docker compose -f deploy/live/docker-compose.yml restart live` at once (a hung loop runs no cycle anyway), then report it with the log.
+- The container log goes to the systemd journal: `docker compose -f deploy/live/docker-compose.yml logs live` shows the running container's, `journalctl -t ewbot-live` every container's - also those a deploy, a rollback or a restart replaced (a crashed release's traceback, the messages logged at a stop).
 - **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker, on Coinbase's public market-data endpoint (`wss://advanced-trade-ws.coinbase.com`: no API key, TLS certificate and host name verified); the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket futures price for 5 minutes while the market is open (with the reconnect failures and the last error; `server error: ...` means Coinbase refused the subscription), `[가격 피드 복구]` that futures prices are back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect) and the margin check is skipped - never reduced on a stand-in price - with one `[증거금 점검: 가격 없음]` alert until a price is back. `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives; three such reads in a row are an incident (`[중대 사건] 잔고 이상이 3회 연속`) that pauses new entries - the position and its brackets stay, nothing is closed. Check the balance in the Coinbase app, then `/resume`. `[15:30 증거금 점검] 조회 실패` means the 15:30 check could not read the position or the balance; it is retried every minute until 16:00.
 - **Paper comparison alerts** (from minute 50, against the paper ledger up to the last bar whose cycle ended OK, so a held or failed cycle is never a mismatch). `[판단 불일치 확인 중]` (`AUDIT_PENDING`): a decision one runtime recorded and the other not; it becomes `[판단 불일치]` (`AUDIT_MISMATCH`, a major incident) only if the next hourly comparison still finds it. A decision both recorded differently, or a paper ledger on another strategy fingerprint, is `[판단 불일치]` at once. `[판단 불일치: 봉 수정]` (`AUDIT_REVISION`): the two runtimes decided on different candles for that bar - equal up to the paper's previous run, different at it (Coinbase changed the bar between the live fetch at hh:00:30 and the paper run at :37); no incident, and an explained cause (as in the paper runtime's criterion 4): the comparison gates do not count it - their detail shows it (`봉 수정 N건 (원인 설명됨, 미반영)`). Compare that bar in both candle caches (the live cache on the VPS, the paper runtime's in its workflow) anyway. A revision is only recognised at the bar where the two candle histories part: a later decision it changed counts as unexplained. `[모의매매 대조 실패]`: the paper ledger could not be read or is not a valid paper ledger; the gates are unmet until a comparison succeeds again (`[모의매매 대조 복구]`).
 - The daily summary (09:00 New York) shows the stage, the position, the cycle, the paper comparison, the fills of the last 24 h (entry slippage vs. the engine's reference, stop slippage vs. the stop price, measured fees vs. the paper cost model; funding is part of the balance change) and the margin.
@@ -139,7 +162,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    docker compose -f deploy/live/docker-compose.yml exec live ewbot live stage canary --confirm
    ```
 
-   The command prints every gate and refuses while one is unmet or the book is not flat. The running container restarts itself into CANARY within a minute; Telegram shows `[단계 변경]` and a new `[시작] 단계 CANARY`.
+   The command prints every gate and refuses while one is unmet or the book is not flat. The running container restarts itself into CANARY within a minute; Telegram shows `[단계 변경]` and a new `[시작] 단계 CANARY`. Then delete the View-only key in the CDP portal: no process uses it any more.
 3. **CANARY → FULL**: only after all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades) and the CANARY gates are met, with your approval. Before it, check by hand what no gate can see: re-check the spec §2 Coinbase facts against Coinbase's current documentation (spec §8: the product - 0.01 BTC, $5 tick, whole contracts -, the intraday and overnight margin rates, the order types `market_market_ioc`, `trigger_bracket_gtc`, `close_position` and `orders/preview`, the triggered bracket stop's 5% limit, the rate limits, the fee tier, the session hours and maintenance) and record the result, and that the trade key's IP allowlist still holds only the VPS's IPv4. Then `... exec live ewbot live stage full --confirm`.
 4. **Demotion** (any time): `... exec live ewbot live stage shadow --confirm` (or `canary`). It is written first - the running runtime sizes new entries and adoptions for the lower stage from its next order - and then the command reports whether the book is flat: with a position open the runtime keeps protecting and managing it and restarts into the new stage once flat (`book not flat …`). A restart before the book is flat (a crash, a reboot, `docker compose restart`) never hides it behind SHADOW's virtual book: while the journal still holds something real - the open trade, an order of unknown outcome - or Coinbase shows a position or orders of ours, the process starts again on the real account in the last real stage, with that stage's preflight (the trade key, the alerts) and no new entry (`[시작] 단계 CANARY (기록된 단계 SHADOW: …)`); `/flatten` closes the real position, and once flat it restarts into SHADOW.
 5. **Restarting a stint**, with the book flat: `... exec live ewbot live stage shadow --restart --confirm` - SHADOW after a fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`: a gate that can no longer pass, such as a late cycle, a failed preview or an unresolved restart) - or `... stage canary --restart --confirm` - CANARY after a CANARY failure, once its cause is fixed. Every gate of the stage counts from the restart; `/resume` lifts a pause. Run it outside hh:59 to hh:03: the running runtime restarts itself into the new stint within a minute, and a restart across the top of the hour can make that hour's cycle late (gate ②). That restart is the new stint's first start (`재시작 복구 1회 (첫 시작 포함)`): gate ④ still needs one manual restart after it.
@@ -161,9 +184,9 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - **Close everything now**: `/flatten`, then `/flatten_confirm` (an answer `청산 요청 - …` means the runtime keeps sending the close at every poll: `[전량 청산 완료]` follows once the account is flat). If Telegram does not answer: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` and, if the runtime is down, close the position and cancel the orders in the Coinbase app (a manual intervention: the runtime alerts it and CANARY gate ④ records it).
 - **Stop trading but keep the protection**: `/pause`, or `docker compose -f deploy/live/docker-compose.yml stop live` (the brackets stay on Coinbase and keep protecting). A stop is graceful: the runtime finishes its current one-second tick, sends `[종료]` and exits 0 - no `[중단]`, no health-check `/fail` (healthchecks.io reports the silence after 3 minutes). Compose runs it under an init (`init: true`), so the signal reaches it, and gives it `stop_grace_period` 150 s before killing it.
-- **`[중단]`** (the runtime stopped on an unexpected error; Docker starts it again): the container log has the traceback (secrets redacted), healthchecks.io a `/fail` with the error's type only. The same error type is alerted once an hour, across restarts, and an error that repeats within 15 minutes waits before exiting - 1, 2, 4 … up to 30 minutes - so a crash loop stays sparse. Read the traceback, then fix it (a new tag) or `docker compose -f deploy/live/docker-compose.yml stop live`; the brackets protect an open position meanwhile.
+- **`[중단]`** (the runtime stopped on an unexpected error; Docker starts it again): the container log has the traceback (secrets redacted), healthchecks.io a `/fail` with the error's type only. The same error type is alerted once an hour, across restarts, and an error that repeats within 15 minutes waits before exiting - 1, 2, 4 … up to 30 minutes - so a crash loop stays sparse. Read the traceback, then fix it (a new tag) and deploy it - with a position open the plain deploy refuses (exit 3) and a crash-looping runtime cannot act on `/flatten`, so use `bash deploy/live/deploy.sh --recover <tag>` (the fixed tag, or the last one that ran well; "Deploying a new version") - or `docker compose -f deploy/live/docker-compose.yml stop live`; the brackets protect an open position meanwhile.
 - **An order failure not resolved in time** (`[주문 실패 미해결]`, `ORDER_UNRESOLVED`; in CANARY `[CANARY 실패] ORDER_UNRESOLVED: paused`): a bracket that could not be replaced within 30 s, or a close or a reduction that did not go through by the next poll. Read the order events (`BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED`, `ACTION_ERROR`) and check the position's brackets in the Coinbase app before `/resume`. A failure the runtime resolved in time (`ORDER_RESOLVED`, e.g. one 429 on a stop move replaced at the next poll, or - in an hour without a decision - a bracket seen resting over the whole position at the next poll) is no CANARY failure. An unresolved failure, like a manual intervention, is recorded once per episode, not at every poll: the episode ends at the first poll where the trade has no failure left inside its time (one whose fix awaits its confirmation does not count; a fix still not confirmed 2 polls and 10 minutes later is itself unresolved) - a later failure is a new incident, pauses again and in FULL restarts the cap's 30 days -, and with a restart or a stage change; while no trade is open every failure is its own episode.
-- **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app. If the alert came with a `/fail` body `텔레그램 사용 불가 - ...`, the runtime was running when it sent it but cannot be reached on Telegram - check that it still runs (`docker compose ... ps`; its pings resume within 30 minutes of the `/fail`, so a check that stays down longer means it stopped) - and then check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
+- **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app and follow "Recovering from VPS loss". If the alert came with a `/fail` body `텔레그램 사용 불가 - ...`, the runtime was running when it sent it but cannot be reached on Telegram - check that it still runs (`docker compose ... ps`; its pings resume within 30 minutes of the `/fail`, so a check that stays down longer means it stopped) - and then check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
 - **API key leaked or a transfer-permission alert**: delete the key in the CDP portal at once (open brackets stay), create a new View + Trade key bound to the VPS IP, replace the file and restart.
 - **A start refused by the preflight** (fingerprint, lock, alerts, key, product): the message names the failing check. A start that cannot read the product or the session from Coinbase for 5 minutes (an outage after the preflight passed) is refused the same way (`[시작 거부] … 조회 실패`) and waits 10 minutes before Docker starts it again. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag. A Coinbase key file the SDK cannot read is refused like a missing one. A start that finds a position or orders of ours on Coinbase while the journal was never CANARY or FULL (a lost or replaced journal) is refused too (`[시작 거부] 실계좌에 …`): restore the journal from the backup, or close them in the Coinbase app. A start refused by the settings (`refusing: ...` in the log: a secrets-file line, a secret in the environment, a setting out of range - named by variable, file and line, never by value) waits 10 minutes before Docker starts it again: fix the file or `deploy/live/.env` and `docker compose -f deploy/live/docker-compose.yml restart live`.
 - **Breaker or incident pause**: read `/status` and the latest journal events, fix the cause, then `/resume`. `/resume` re-bases only the breaker that tripped (the day's reference after −3%, the peak after −15% - which also marks the day), as the median of the `/resume` balance read and the next two; a `/pause` → `/resume` without a trip changes neither. If the balance cannot be read at that moment, the reply says so and a tripped breaker still blocks entries: send `/resume` again. The latest journal events:
@@ -172,15 +195,67 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
   docker compose -f deploy/live/docker-compose.yml exec live python -c "from ewbot.live.journal import Journal; [print(e['ts'], e['kind'], e['data']) for e in Journal('/data/journal.sqlite').events()[-40:]]"
   ```
 
+## Restoring the journal
+
+The journal holds the open trade, the order intents, the stage history and the gates' records; Coinbase holds the position and its brackets. A restore puts back the newest backup (up to a day old) and the start's recovery reconciles it with Coinbase.
+
+1. On your laptop (the age key never leaves it): download the newest `journal-*.sqlite.age` from the R2 bucket and decrypt it:
+
+   ```bash
+   age -d -i ewbot-backup.key -o journal.sqlite journal-<stamp>.sqlite.age
+   ```
+
+2. Send it to the VPS through your admin login, owned by uid 1000 with mode 600 (as the key in setup step 4), then delete `journal.sqlite` on the laptop:
+
+   ```bash
+   ssh <admin>@<vps> 'sudo install -m 600 -o 1000 -g 1000 /dev/stdin /var/lib/ewbot/journal.restore' < journal.sqlite
+   ```
+
+3. On the VPS, as `ewbot`, exactly in this order. The runtime keeps the journal in SQLite's WAL mode: a `journal.sqlite-wal` or `journal.sqlite-shm` left from the old journal (after a kill, an out-of-memory or a power loss) would be replayed into the restored file and corrupt it silently.
+
+   ```bash
+   cd ~/elliott-wave-btc-bot
+   docker compose -f deploy/live/docker-compose.yml stop live   # the container (not ewbot-backup.service)
+   rm -f /var/lib/ewbot/journal.sqlite-wal /var/lib/ewbot/journal.sqlite-shm
+   install -m 600 -o 1000 -g 1000 /var/lib/ewbot/journal.restore /var/lib/ewbot/journal.sqlite && rm /var/lib/ewbot/journal.restore
+   docker compose -f deploy/live/docker-compose.yml start live
+   ```
+
+   On a new VPS there is no container yet: skip the stop and the start, `deploy.sh --recover` starts it ("Recovering from VPS loss").
+4. Check `[시작]` in Telegram and `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status`. What happened after the backup is not in the restored journal: a trade opened since is a position the journal does not know (adopted when the engine holds it - in CANARY a failure that pauses entries: check, then `/resume` - or closed), a trade that closed since is found closed, and the hours since the backup have no cycle (SHADOW ② fails: restart the stint, `ewbot live stage shadow --restart --confirm`).
+
+**Restore drill** (once during SHADOW, with the book flat, outside hh:59 to hh:03): take a backup (`sudo systemctl start ewbot-backup.service`), restore it by steps 1–4 and check that `ewbot live status` shows the same stage, cycles and gates as before. It proves the age key, the R2 copy and this sequence before they are needed (and counts as a restart for SHADOW ④).
+
+## Recovering from VPS loss
+
+The brackets on Coinbase keep protecting an open position while the VPS is gone (spec 5.1), but nothing moves its stop, syncs its TP1 or closes it at the engine's exit, and nothing new is entered. Check the position and its brackets in the Coinbase app first; if it cannot wait for the steps below, close it there (a manual intervention: CANARY ④).
+
+1. A new VPS: One-time setup steps 1–3 and 8, with its own public IPv4.
+2. A new CDP key (setup step 4: View + Trade in CANARY and FULL, View only in SHADOW) with the **new** IPv4 in its IP allowlist: the old key's allowlist holds the old address, so Coinbase refuses it from the new VPS. Delete the old key in the CDP portal (it was on the lost disk) and send the new one to `/etc/ewbot/cdp_api_key.json` as in step 4.
+3. `/etc/ewbot/live.env` (step 7: the same bot, chat and health-check URL) and `deploy/live/.env` (step 8). If the old VPS may be in someone else's hands rather than just gone, also replace the GitHub token (step 6) and the R2 token, and delete the old deploy key.
+4. Backups on the new VPS (step 11: rclone, `/etc/ewbot/backup.env`, the timer).
+5. Restore the newest backup: "Restoring the journal", steps 1–3.
+6. Start the runtime on it without the flat-book check - the plain deploy refuses the open position (exit 3):
+
+   ```bash
+   cd ~/elliott-wave-btc-bot && bash deploy/live/deploy.sh --recover <the tag that ran before>
+   ```
+
+   Type `recover <tag>` when asked. It still checks the tag, the checkout and the preflight and keeps out of hh:58 to hh:05; the first start downloads the candle history, so it waits up to 10 minutes for the heartbeat.
+7. Verify: `[시작]` in Telegram, `/status` answered, `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status --exchange` (the position and the open orders as in the Coinbase app), the healthchecks.io checks up again; then "Restoring the journal", step 4.
+
 ## Deploying a new version
 
 - The image verifies Coinbase's TLS certificates with the base image's CA store (`ca-certificates`, part of `python:3.12.13-slim-bookworm`); the build stops if `/etc/ssl/certs/ca-certificates.crt` is missing (a new base image without it): keep the pinned base, or install `ca-certificates` in the Dockerfile.
-- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` refuses a tag off `master`, a dirty checkout, an image whose offline preflight fails (fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`) and any open trade, position or resting order (exit 3), or a book it could not check (exit 2). Rollback = deploy the previous tag.
+- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` (as `ewbot`, in the checkout). Nothing changes and the checkout goes back where it was when it refuses (exit 2) a missing tag or one off `master`, local changes or untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's own configuration (a one-off container of the new image with the service's mounts, secrets file, key file, user and read-only root: fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`, the settings, the alerts the journal's stage needs), the minutes hh:58 to hh:05 UTC (the hour's cycle at hh:00:30 and its entries until hh:05: run it again from hh:06) or a book it could not check; or (exit 3) any open trade, order of unknown outcome, standing flatten, position or resting order.
+- The swap keeps the running image as `ewbot-live:previous`, tags the new one `ewbot-live:current`, recreates the container and waits up to 3 minutes (10 on a first deployment) for the new runtime's loop heartbeat. Without one it starts `ewbot-live:previous` again with the previous checkout: exit 4 when that one is up again - read the failed release's log (`journalctl -t ewbot-live`) before the next try -, exit 5 when it is not either (act now: the logs, "Emergency procedures"). Rollback by hand = deploy the previous tag.
+- `deploy.sh --recover <tag>` deploys while a position is open, for two cases only: a release that crash-loops while it holds a position (`[중단]` again and again, `/flatten` not acted on) and a new VPS after a VPS loss. It skips only the flat-book check (it prints the book instead), asks you to type `recover <tag>` (`--i-understand` skips the question) and never rolls back by itself (exit 5 when the new runtime does not come up); the new runtime takes over the position and its brackets through the restart recovery. Spec 5.2 allows deploys only with a flat book: this is the documented exception for bringing the runtime back.
 - A change to any strategy-fingerprinted file (`types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/`) is refused by the preflight and would reset the paper runtime's out-of-sample counter: never deploy one.
 
 ## Weekly checks
 
-- `df -h /var/lib/ewbot`, `docker system df` (prune old images: `docker image prune`), `journalctl -u ewbot-backup.service -n 5`, the newest backup in R2.
+- `df -h /var/lib/ewbot` and `docker system df`. Keep the images of `ewbot-live:current` and `ewbot-live:previous` (in `docker image ls ewbot-live` a tag with the same IMAGE ID as one of them stays), remove the older release tags (`docker image rm ewbot-live:<old tag>`), then `docker image prune -f` (dangling images) and `docker builder prune -f --filter until=720h` (build cache older than 30 days; the next build downloads what it needs again).
+- `journalctl -u ewbot-backup.service -n 5`, the `ewbot-backup` check up, the newest backup in R2.
 - Pending updates are installed by unattended-upgrades; if `/var/run/reboot-required` exists, reboot only with a flat book (`/flatten` not needed if no trade is open), then check `[시작]` in Telegram.
 - Expiry reminders arrive 30 days ahead in the daily summary: from `EWBOT_EXPIRY` the Coinbase API key, the GitHub audit token and the Cloudflare Workers trigger token of the paper runtime; without a setting the contract's expiry (`BIP-20DEC30-CDE 만기`) and the day the preflight starts refusing it (`BIP-20DEC30-CDE 시작 점검 거부`).
 - Coinbase's notices for `BIP-20DEC30-CDE` (a delisting, a new expiry): the preflight checks the contract's expiry (`contract_expiry` no earlier than 2030-12-20 and more than 90 days away) only when the runtime starts.

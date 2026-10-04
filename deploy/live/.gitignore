@@ -1,0 +1,3 @@
+# deploy/live/.env: the VPS's non-secret compose settings (EWBOT_EXPIRY, EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO),
+# never committed (docs/live-trading.md, One-time setup step 8).
+/.env

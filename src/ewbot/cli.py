@@ -107,7 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--max-age", type=float, default=None, help="exit 1 when the loop heartbeat is older (seconds)")
     p_ls.add_argument("--exchange", action="store_true", help="also read the Coinbase position and open orders")
     p_ls.add_argument("--require-flat", action="store_true",
-                      help="exit 3 unless no trade is open and (with --exchange) the account is flat (deploy.sh)")
+                      help="exit 3 unless the journal holds no open trade, no order of unknown outcome and no standing "
+                      "flatten and (with --exchange) the account has no position and no resting order (deploy.sh)")
     p_stage = live_sub.add_parser("stage", help="change the operating stage (promotions need every gate met)")
     p_stage.add_argument("to", choices=("shadow", "canary", "full"))
     p_stage.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
@@ -613,8 +614,9 @@ def _live_gates(journal: Journal, stage: str, now: float) -> list[Gate]:
 
 def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
     """Journal status (no journal yet: --json still answers, stage null). Exit 1 when --max-age is exceeded
-    (Docker HEALTHCHECK), 2 when --exchange cannot read Coinbase, 3 when --require-flat finds an open trade, position
-    or resting order."""
+    (Docker HEALTHCHECK), 2 when --exchange cannot read Coinbase, 3 when --require-flat finds what the running
+    runtime still manages (its flat book, `LiveRuntime.flat`): an open trade, an order of unknown outcome (a PENDING
+    intent) or a standing flatten in the journal, or - with --exchange - a position or any resting order."""
     if not s.journal_path.exists() and not args.json:
         print(f"no journal at {s.journal_path}", file=sys.stderr)
         return 1
@@ -627,7 +629,9 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
         trade = journal.get("trade") if journal is not None else None
         out: dict[str, Any] = {"stage": stage, "since": since, "heartbeat_age": age,
                                "paused": journal.get("paused") if journal is not None else None,
-                               "trade": trade if trade and trade.get("status") == "OPEN" else None}
+                               "trade": trade if trade and trade.get("status") == "OPEN" else None,
+                               "pending_intents": len(journal.intents(status="PENDING")) if journal is not None else 0,
+                               "flatten": journal.get(live_runtime.FLATTEN_KEY) if journal is not None else None}
         if args.exchange:
             try:
                 real = _exchange(s)
@@ -645,9 +649,15 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
                 print(line)
             if args.exchange:
                 print(f"exchange position: {out['exchange_position']}, open orders: {out['exchange_open_orders']}")
-        if args.require_flat and (out["trade"] is not None or out.get("exchange_position") is not None
-                                  or out.get("exchange_open_orders", 0) > 0):
-            print("not flat: an open trade, position or resting order (flatten first: /flatten)", file=sys.stderr)
+        held = [what for what, there in (
+            ("an open trade", out["trade"] is not None),
+            (f"{out['pending_intents']} order(s) of unknown outcome (PENDING)", out["pending_intents"] > 0),
+            ("a standing flatten", out["flatten"] is not None),
+            ("a position", out.get("exchange_position") is not None),
+            (f"{out.get('exchange_open_orders', 0)} resting order(s)", out.get("exchange_open_orders", 0) > 0)) if there]
+        if args.require_flat and held:
+            print(f"not flat: {', '.join(held)} (flatten first: /flatten, or wait until the runtime is done)",
+                  file=sys.stderr)
             return 3
         return 1 if args.max_age is not None and (age is None or age > args.max_age) else 0
     finally:
