@@ -35,7 +35,7 @@ from ewbot.live import app as live_app
 from ewbot.live import runtime as live_runtime
 from ewbot.live.exchange import Exchange, ExchangeError
 from ewbot.live.journal import Journal
-from ewbot.live.preflight import LOCK_FILE_SHA256, LOCK_SHA256, run_preflight
+from ewbot.live.preflight import LOCK_FILE_SHA256, LOCK_SHA256, Check, check_alerts, run_preflight
 from ewbot.live.settings import LiveSettings, SettingsError, load_settings
 from ewbot.live.stage import (
     STAGES,
@@ -479,6 +479,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
 
 
 LIVE_REFUSAL_WAIT_S = 600.0  # a refused start waits before exiting: Docker restarts it, alerts stay sparse
+ALERTS_GATE = "알림 설정 (Telegram 알림·명령, 헬스체크)"  # a promotion to CANARY or FULL needs them (preflight `alerts`)
 
 
 def _live_settings() -> LiveSettings:
@@ -492,46 +493,95 @@ def _live_lock() -> tuple[Path, str, str]:
     return DEFAULT_LOCK_PATH, LOCK_SHA256, LOCK_FILE_SHA256
 
 
-def _print_checks(checks: list) -> bool:
+def _print_checks(checks: list[Check]) -> bool:
     for c in checks:
         print(f"preflight {c.name}: {'ok' if c.ok else 'FAILED'} - {c.detail}")
     return all(c.ok for c in checks)
 
 
+def _exchange(s: LiveSettings) -> Exchange:
+    """The real exchange: anything that fails to set it up is a SettingsError (a refusal, never a traceback)."""
+    try:
+        return live_app.real_exchange(s)
+    except SettingsError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - e.g. the SDK's bare Exception for a malformed key file
+        raise SettingsError(live_app.redact(f"Coinbase: {type(exc).__name__}: {exc}", s)) from None
+
+
 def _live_run(s: LiveSettings) -> int:
-    journal = Journal(s.journal_path)
-    stage, _ = journal.stage()
+    """`ewbot live run`: the preflight for the process's stage (`live_app.process_stage`: a demoted journal with
+    something real left runs its last real stage), then the runtime until a stage change (exit 0, Docker starts it
+    again), a stop (SIGTERM / Ctrl-C: after the current tick, exit 0), a refusal (exit 2 after LIVE_REFUSAL_WAIT_S) or
+    a fatal error (exit 1, after a back-off when it repeats). The wiring is closed - the Telegram poller and the feed
+    stopped, the queued messages flushed - before any wait, and on every exit."""
+    stop = live_app.StopRequest()
     notify = live_app.notifier(s)
-    try:
-        real = live_app.real_exchange(s)
-    except SettingsError as exc:
-        print(f"refusing: {exc}", file=sys.stderr)
-        notify("PREFLIGHT", f"[시작 거부] {exc}")
-        time.sleep(LIVE_REFUSAL_WAIT_S)
+    journal: Journal | None = None
+    wired: live_app.Wired | None = None
+    closed = False
+
+    def close() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        if wired is not None:
+            wired.close()
+        else:
+            notify.flush(10.0)
+            notify.stop()
+
+    def refuse(why: str) -> int:
+        print(f"refusing: {why}", file=sys.stderr)
+        notify("PREFLIGHT", f"[시작 거부] {why}")
+        close()  # nothing keeps polling Telegram or the feed during the wait: a command sent now is answered later
+        stop.wait(LIVE_REFUSAL_WAIT_S)
         return 2
-    path, sha, file_sha = _live_lock()
-    checks, lock = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
-    if not _print_checks(checks) or lock is None:
-        notify("PREFLIGHT", "[시작 거부] 시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in checks if not c.ok))
-        time.sleep(LIVE_REFUSAL_WAIT_S)
-        return 2
-    wired = live_app.build(s, lock, real, journal, notify)
-    try:
-        return wired.runtime.run_forever()
-    except live_runtime.StartupRefused as exc:  # Coinbase unreadable for minutes at start: refused, no /fail
-        print(f"refusing: {exc}", file=sys.stderr)
-        notify("PREFLIGHT", f"[시작 거부] {exc}")
-        time.sleep(LIVE_REFUSAL_WAIT_S)
-        return 2
-    except BaseException as exc:
-        wired.heartbeat.fail(f"[LIVE] 중단: {type(exc).__name__}")  # a third party: the type name only, never the text
-        notify("FATAL", f"[중단] {type(exc).__name__}: {live_app.redact(str(exc), s)[:300]}")
-        if not isinstance(exc, Exception):
-            raise  # KeyboardInterrupt, SystemExit
+
+    def fatal(exc: Exception) -> int:
+        kind = type(exc).__name__
+        wait, alert = live_app.fatal_backoff(journal, kind, time.time())
+        if alert:  # healthchecks.io is a third party: the type name only, never the text
+            (wired.heartbeat if wired is not None else live_app.heartbeat(s)).fail(f"[LIVE] 중단: {kind}")
+            again = (f" ({live_app.FATAL_REPEAT_S / 60:.0f}분 안에 반복: {wait / 60:.0f}분 뒤 종료, Docker가 다시 시작)"
+                     if wait else "")
+            notify("FATAL", f"[중단] {kind}: {live_app.redact(str(exc), s)[:300]}{again}")
         print(live_app.fatal_report(exc, s), file=sys.stderr, end="")  # re-raised, Python would print it unredacted
+        close()
+        stop.wait(wait)
         return 1
-    finally:
-        wired.close()  # stops the Telegram poller and the feed, lets the queued messages go out
+
+    with stop.installed():
+        try:
+            journal = Journal(s.journal_path)
+            try:
+                real = _exchange(s)
+            except SettingsError as exc:
+                return refuse(str(exc))
+            try:
+                stage, why = live_app.process_stage(journal, real)
+            except live_app.RealExposure as exc:
+                return refuse(str(exc))
+            if why is not None:
+                print(f"stage {stage}: {why} (journal stage {journal.stage()[0]})", file=sys.stderr)
+            path, sha, file_sha = _live_lock()
+            checks, lock = run_preflight(real, stage, path, expected_lock=sha, expected_lock_file=file_sha, settings=s)
+            if not _print_checks(checks) or lock is None:
+                return refuse("시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in checks if not c.ok))
+            wired = live_app.build(s, lock, real, journal, stage, notify)
+            stop.attach(wired.runtime)
+            return 0 if stop.requested else wired.runtime.run_forever()
+        except live_runtime.StartupRefused as exc:  # Coinbase unreadable for minutes at start: refused, no /fail
+            return refuse(str(exc))
+        except KeyboardInterrupt:  # a deliberate stop where no handler could be installed
+            return 0
+        except Exception as exc:  # noqa: BLE001 - every other failure, the wiring's included, is fatal
+            return fatal(exc)
+        finally:
+            close()  # stops the Telegram poller and the feed, lets the queued messages go out
+            if journal is not None:
+                journal.close()
 
 
 def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
@@ -543,7 +593,7 @@ def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
     real = None
     if not args.offline:
         try:
-            real = live_app.real_exchange(s)
+            real = _exchange(s)
         except SettingsError as exc:
             print(f"refusing: {exc}", file=sys.stderr)
             return 2
@@ -563,7 +613,8 @@ def _live_gates(journal: Journal, stage: str, now: float) -> list[Gate]:
 
 def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
     """Journal status (no journal yet: --json still answers, stage null). Exit 1 when --max-age is exceeded
-    (Docker HEALTHCHECK), 3 when --require-flat finds an open trade, position or resting order."""
+    (Docker HEALTHCHECK), 2 when --exchange cannot read Coinbase, 3 when --require-flat finds an open trade, position
+    or resting order."""
     if not s.journal_path.exists() and not args.json:
         print(f"no journal at {s.journal_path}", file=sys.stderr)
         return 1
@@ -578,10 +629,14 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
                                "paused": journal.get("paused") if journal is not None else None,
                                "trade": trade if trade and trade.get("status") == "OPEN" else None}
         if args.exchange:
-            real = live_app.real_exchange(s)
-            pos = real.position()
-            out["exchange_position"] = None if pos is None else {"side": pos.side, "contracts": pos.contracts}
-            out["exchange_open_orders"] = len(real.open_orders())
+            try:
+                real = _exchange(s)
+                pos = real.position()
+                out["exchange_position"] = None if pos is None else {"side": pos.side, "contracts": pos.contracts}
+                out["exchange_open_orders"] = len(real.open_orders())
+            except (SettingsError, ExchangeError) as exc:
+                print(f"exchange unreadable: {exc}", file=sys.stderr)
+                return 2
         if args.json:
             print(json.dumps(out, sort_keys=True))
         elif journal is not None:
@@ -603,16 +658,21 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
 def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
     """(no open trade in the journal and no position or resting order on Coinbase, the real exchange)."""
     trade = journal.get("trade")
-    real = live_app.real_exchange(s)
+    real = _exchange(s)
     flat = not (trade and trade.get("status") == "OPEN") and real.position() is None and not real.open_orders()
     return flat, real
 
 
 def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
-    """A promotion (one stage up, every gate met) and a restart of the current SHADOW or CANARY stint (--restart)
-    need --confirm and a flat book (journal and Coinbase) before anything is written. A demotion needs only --confirm: it is written first - a running
-    runtime sizes new entries for it at once - and then the command reports whether the book is flat (the runtime
-    keeps protecting and managing an open position and restarts into the new stage once flat)."""
+    """A promotion (one stage up, every gate met, the alerts of the new stage configured) and a restart of the
+    current SHADOW or CANARY stint (--restart) need --confirm and a flat book (journal and Coinbase) before anything
+    is written. A demotion needs only --confirm: it is written first - a running runtime sizes new entries for it at
+    once - and then the command reports whether the book is flat (the runtime keeps protecting and managing an open
+    position - after a restart too - and restarts into the new stage once flat). Without a journal nothing is
+    written (exit 1)."""
+    if not s.journal_path.exists():
+        print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
+        return 1
     journal = Journal(s.journal_path)
     try:
         now = time.time()
@@ -659,6 +719,8 @@ def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
             gates = canary_entry_gates(journal, now, audit, live_app.paper_status(s, now), perms)
         elif (cur, to) == ("CANARY", "FULL"):
             gates = full_entry_gates(journal, now, audit, live_app.paper_status(s, now), perms)
+        alerts = check_alerts(s, to)  # the new stage refuses to start without them: never written without them
+        gates.append(Gate(ALERTS_GATE, alerts.ok, alerts.detail))
         for line in gate_lines(gates):
             print(line)
         try:
@@ -673,6 +735,9 @@ def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
 
 
 def _live_backup(s: LiveSettings, args: argparse.Namespace) -> int:
+    if not s.journal_path.exists():  # never an empty journal created and copied as if it were the real one
+        print(f"no journal at {s.journal_path}", file=sys.stderr)
+        return 1
     journal = Journal(s.journal_path)
     try:
         print(f"journal backup: {journal.backup(args.out)}")
@@ -687,7 +752,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     except SettingsError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         if args.live_cmd == "run":
-            time.sleep(LIVE_REFUSAL_WAIT_S)  # no Telegram without settings: the wait keeps Docker's restarts sparse
+            live_app.StopRequest().wait(LIVE_REFUSAL_WAIT_S)  # no Telegram without settings: Docker's restarts sparse
         return 2
     if args.live_cmd == "run":
         return _live_run(s)

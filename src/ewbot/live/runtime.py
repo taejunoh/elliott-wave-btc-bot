@@ -47,9 +47,12 @@ is taken before its alert.
             overnight-margin report (its reads retried every minute until 16:00), the daily summary (09:00 New York)
             with expiry reminders and the daily key-permission check (each marked done for the day only once it
             succeeded), the paper audit (from minute 50, up
-            to the last bar whose cycle ended OK: a revised bar is alerted only, a decision missing on one side
-            is pending until the next audit confirms it, a different decision is a major incident at once; a
-            failed audit is stored as failed and alerted), and the stage-change restart
+            to the last bar whose cycle ended OK: the paper ledger is fetched on a worker thread - the loop never
+            waits on GitHub, a DNS lookup included -, one fetch at a time, given up after 60 s, and compared on the
+            loop once it is there; a revised bar is alerted only, a decision missing on one side is pending until
+            the next audit confirms it, a different decision is a major incident at once; a failed audit is
+            stored as failed and alerted), and the stage-change restart (a new stage or stint once flat: no open
+            trade, no order of unknown outcome, no standing flatten, no position or order of ours)
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
             reconcile. Retried every 15 s while the bar is missing or the candles cannot be downloaded; 2 minutes
             after the close the decision is held and only protection is kept (spec 4.1 step 1). An engine error,
@@ -63,13 +66,17 @@ is taken before its alert.
 Errors in alerts and in the journal go through the settings' redaction; repeating failure alerts (a close, a
 bracket, a loop section that keeps failing) go out at once, then with growing gaps (1 to 30 minutes) while the
 failure lasts. The start reads the product and the session with retries for up to 5 minutes, then refuses
-(StartupRefused: `ewbot live run` waits like a refused preflight)."""
+(StartupRefused: `ewbot live run` waits like a refused preflight). The process runs the stage `ewbot live run` gives it
+(`LiveDeps.stage`, live.app.process_stage): after a demotion to SHADOW with something real left it stays on the real
+account in the last real stage - entries blocked by the journal's SHADOW cap - until flat. A stop request
+(`stop_requested`: SIGTERM, Ctrl-C) ends the loop after the current tick (`STOPPED`, alerted)."""
 
 from __future__ import annotations
 
 import math
 import queue
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -138,6 +145,7 @@ ENTRY_DEADLINE_S = 300
 POLL_ACTIVE_S = 10.0
 POLL_IDLE_S = 60.0
 AUDIT_MINUTE = 50
+AUDIT_FETCH_MAX_S = 60.0  # the paper ledger fetch (a worker thread) is given up after this: a failed audit
 DAILY_HOUR_NY = 9
 MARGIN_CHECK_NY = (15, 30)
 FLATTEN_CONFIRM_S = 60.0  # /flatten_confirm must be sent within this of its /flatten (Telegram message dates)
@@ -194,6 +202,43 @@ class StartupRefused(RuntimeError):
     and waits like a refused preflight (no healthchecks.io /fail)."""
 
 
+class _Fetch:
+    """One call on a daemon thread, so the main loop never waits on it (a DNS lookup included): `done()` without
+    blocking, then `result()` - the value, or the call's exception raised again on the loop."""
+
+    def __init__(self, call: Callable[[], dict[str, Any]], started: float) -> None:
+        self.started = started  # monotonic
+        self.given_up = False  # the loop stopped waiting (AUDIT_FETCH_MAX_S); the thread still runs until it ends
+        self.value: dict[str, Any] | None = None
+        self.error: Exception | None = None
+        self.thread = threading.Thread(target=self._run, args=(call,), name="ewbot-paper-ledger", daemon=True)
+        self.thread.start()
+
+    def _run(self, call: Callable[[], dict[str, Any]]) -> None:
+        try:
+            self.value = call()
+        except Exception as exc:  # noqa: BLE001 - handed to the loop: a failed audit
+            self.error = exc
+
+    def done(self) -> bool:
+        self.thread.join(0)
+        return not self.thread.is_alive()
+
+    def result(self) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        if self.value is None:
+            raise AuditError("paper ledger fetch failed: no result")
+        return self.value
+
+
+def _failing(why: str) -> Callable[[], dict[str, Any]]:
+    def fetch() -> dict[str, Any]:
+        raise AuditError(why)
+
+    return fetch
+
+
 @dataclass
 class LiveDeps:
     journal: Journal
@@ -213,6 +258,7 @@ class LiveDeps:
     edit_stops: bool = False
     expiry: dict[str, str] = field(default_factory=dict)
     redact: Callable[[str], str] = lambda text: text  # removes the settings' secrets from error texts (live.app.redact)
+    stage: str | None = None  # the stage this process runs (live.app.process_stage); None: the journal's
 
 
 def _utc(ts: float) -> str:
@@ -232,7 +278,8 @@ class LiveRuntime:
         self.mono = deps.monotonic
         self.backoff: dict[str, dict[str, Any]] = {}  # repeating alerts held back (`_limited`)
         self.cfg = frozen_config(deps.lock)  # holdout_config(BotConfig(), lock params), checked
-        self.stage, self.stage_since = self.journal.stage()  # the stint this process runs (a restart starts a new one)
+        recorded, self.stage_since = self.journal.stage()  # the stint this process runs (a restart starts a new one)
+        self.stage = deps.stage or recorded  # after a demotion with something real left: the last real stage
         self.executor = Executor(self.ex, self.journal, clock=deps.clock, sleep=deps.sleep, alert=self._repeating,
                                  tp1_frac=self.cfg.strategy.tp1_frac, edit_stops=deps.edit_stops,
                                  entry_deadline_s=ENTRY_DEADLINE_S)
@@ -257,6 +304,8 @@ class LiveRuntime:
         self._after_pass: list[tuple[str, str]] = []  # a flatten's alerts, queued once the pass's actions ran
         self.flatten_sent: float | None = None  # the Telegram date of a /flatten awaiting its /flatten_confirm
         self.exit_code: int | None = None
+        self.stop_requested = False  # SIGTERM / Ctrl-C (`ewbot live run`): the loop ends after the current tick
+        self.audit_job: _Fetch | None = None  # the paper ledger fetch in flight (a given-up one until its thread ended)
         self.bad_equity_reads = 0  # balance reads in a row that were not an observation
         self.feed_down_since: float | None = None
         self.feed_failures = 0  # the feed's failure count when this outage began
@@ -396,8 +445,9 @@ class LiveRuntime:
         return n, None
 
     def flat(self) -> bool:
-        t = self.executor.trade()
-        if t is not None and t.status == "OPEN":
+        """Nothing left to manage: no open trade, no order of unknown outcome (PENDING), no standing flatten (the
+        journal), no position and no order of ours (the exchange)."""
+        if self._busy():
             return False
         return self.ex.position() is None and not [o for o in self.ex.open_orders() if is_ours(o)]
 
@@ -438,7 +488,10 @@ class LiveRuntime:
         # the session state seen at start (a change is journaled by minute(); a reopen while down never is)
         self.journal.add_event(now, "SESSION", {"text": f"시작 시 장 운영 상태 {self.session.state}",
                                                 "state": self.session.state})
-        self.alert("STARTUP", f"[시작] 단계 {self.stage} · 재시작 복구 {out} · {_utc(now)}")
+        recorded = self.journal.stage()[0]
+        kept = "" if recorded == self.stage else (f" (기록된 단계 {recorded}: 실계좌에 남은 포지션·주문을 관리하고 정리되면 "
+                                                  f"{recorded}(으)로 다시 시작, 신규 진입 없음)")
+        self.alert("STARTUP", f"[시작] 단계 {self.stage}{kept} · 재시작 복구 {out} · {_utc(now)}")
         for kind, text in notices:
             self.journal.add_event(now, kind, {"text": text})
             self.alert(kind, f"[장 상태] {text}")
@@ -971,7 +1024,7 @@ class LiveRuntime:
         if local.hour >= DAILY_HOUR_NY:
             self._daily_due(now, today)
         if datetime.fromtimestamp(now, UTC).minute >= AUDIT_MINUTE and self._once("audit", int(now) // H1):
-            self.run_audit(now)
+            self._audit_start(now)
         stage, since = self.journal.stage()
         if (stage != self.stage or since != self.stage_since) and self.flat():  # a new stage or a new stint
             again = " (다시 시작)" if stage == self.stage else ""
@@ -1228,8 +1281,34 @@ class LiveRuntime:
         """The last bar whose cycle ended OK (0: none): the live runtime has decided every bar up to it."""
         return max((int(c["bar_ts"]) for c in self.journal.cycles() if c["status"] == "OK"), default=0)
 
-    def run_audit(self, now: float) -> AuditResult | None:
-        """The journal's decisions against the paper ledger (spec 3.5), up to the last bar whose cycle ended OK. A
+    def _audit_start(self, now: float) -> None:
+        """The hour's audit: the paper ledger is fetched on a worker thread (`_Fetch`: the loop never waits on GitHub,
+        a DNS lookup included) and compared on the loop once it is there (`_audit_poll`). One fetch at a time: while
+        an earlier one still runs - a hung one the loop gave up on included - the audit fails at once."""
+        if self.d.paper_ledger is None:
+            return
+        if self.audit_job is not None and not self.audit_job.done():
+            self.run_audit(now, _failing("paper ledger fetch failed: the previous fetch is still running"))
+            return
+        self.audit_job = _Fetch(self.d.paper_ledger, self.mono())
+
+    def _audit_poll(self, now: float) -> None:
+        """Every tick while a fetch is in flight: the comparison once it is there; after AUDIT_FETCH_MAX_S without
+        an answer a failed audit (the thread is left to end on its own, its late answer dropped)."""
+        job = self.audit_job
+        if job is None:
+            return
+        if job.done():
+            self.audit_job = None
+            if not job.given_up:
+                self.run_audit(now, job.result)
+        elif not job.given_up and not 0 <= self.mono() - job.started < AUDIT_FETCH_MAX_S:
+            job.given_up = True
+            self.run_audit(now, _failing(f"paper ledger fetch failed: no answer in {AUDIT_FETCH_MAX_S:.0f} s"))
+
+    def run_audit(self, now: float, ledger: Callable[[], dict[str, Any]] | None = None) -> AuditResult | None:
+        """The journal's decisions against the paper ledger (spec 3.5), up to the last bar whose cycle ended OK - the
+        ledger from `ledger` (the worker thread's answer) or fetched here (`LiveDeps.paper_ledger`). A
         mismatch the candles explain (DATA_REVISION: the bar changed between the two fetches) is alerted once and is
         no incident; a decision missing on one side is AUDIT_PENDING first (alerted once) and AUDIT_MISMATCH - a
         major incident, its pause before its alert - only when the next audit still finds it; a different decision
@@ -1238,8 +1317,9 @@ class LiveRuntime:
         per failing episode."""
         if self.d.paper_ledger is None:
             return None
+        read = self.d.paper_ledger if ledger is None else ledger
         try:
-            res = audit(self.journal.decisions(), self.d.paper_ledger(), BASELINE_FINGERPRINT,
+            res = audit(self.journal.decisions(), read(), BASELINE_FINGERPRINT,
                         until=self._decided_until(), now=now, data_hash=self._data_hash())
         except Exception as exc:  # noqa: BLE001 - every failure is a failed audit, never the last good one
             why = self.d.redact(str(exc) if isinstance(exc, AuditError) else f"{type(exc).__name__}: {exc}")[:300]
@@ -1435,6 +1515,7 @@ class LiveRuntime:
             ("watch", self.watch, self.active),
             ("poll", self.poll, self._due(self.last_poll, POLL_ACTIVE_S if self.active else POLL_IDLE_S, mono)
              or (self.d.feed is not None and self.d.feed.take_resync())),
+            ("audit", self._audit_poll, self.audit_job is not None),
             ("minute", self.minute, self._due(self.last_minute, 60.0, mono)),
             ("cycle", self._cycle_due, True),
         ]
@@ -1449,12 +1530,17 @@ class LiveRuntime:
                 self._loop_error(name, exc, now)
 
     def run_forever(self, max_ticks: int | None = None) -> int:
+        """Start, then tick every second until a stage change (`exit_code`) or a stop request (`stop_requested`,
+        honoured after the current tick: `STOPPED`, alerted; 0)."""
         self.startup()
         n = 0
-        while self.exit_code is None and (max_ticks is None or n < max_ticks):
+        while self.exit_code is None and not self.stop_requested and (max_ticks is None or n < max_ticks):
             self.tick()
             n += 1
             self.d.sleep(1.0)
+        if self.stop_requested and self.exit_code is None:
+            self.journal.add_event(self.clock(), "STOPPED", {"ticks": n})
+            self.alert("STOPPED", "[종료] 정지 요청: 하던 일을 마치고 종료 (거래소의 보호 주문은 그대로)")
         return 0 if self.exit_code is None else self.exit_code
 
 

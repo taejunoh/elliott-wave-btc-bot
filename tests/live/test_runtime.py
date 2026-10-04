@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -27,7 +29,13 @@ from ewbot.live.notify import LiveNotifier
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.journal import Journal
 from ewbot.live.reconcile import PlanContext, pending_position
-from ewbot.live.runtime import STARTUP_READ_MAX_S, StartupRefused, audit_from_journal, status_lines
+from ewbot.live.runtime import (
+    AUDIT_FETCH_MAX_S,
+    STARTUP_READ_MAX_S,
+    StartupRefused,
+    audit_from_journal,
+    status_lines,
+)
 from ewbot.live.shadow import CALLS_KEPT, FILLS_KEPT, PREVIEW_RETRY_LIMIT, ShadowExchange
 from ewbot.live.sim import SimCrash, SimExchange
 from ewbot.live.stage import canary_gates, full_cap, on_incident, paused, restart_stint, resume, shadow_gates
@@ -564,6 +572,94 @@ def test_a_stage_change_restarts_the_runtime_once_flat(h):
     h.rt.handle("/flatten_confirm", ENTRY_BAR + 111)
     h.at(ENTRY_BAR + 170)
     assert h.rt.exit_code == 0 and "STAGE" in h.alerts.kinds()
+
+
+def test_a_stage_change_waits_for_every_order_of_unknown_outcome(h):
+    h.journal.record_intent("ewb-x-1-1", "CLOSE", 1, {"reason": "X"}, ENTRY_BAR + 20)  # its outcome is unknown
+    h.journal.set_stage("SHADOW", "demotion", ENTRY_BAR + 25)
+    h.at(ENTRY_BAR + 30)
+    assert h.rt.exit_code is None and h.journal.intents(status="PENDING")  # not flat while it may still fill
+    h.journal.update_intent("ewb-x-1-1", "ABANDONED", ENTRY_BAR + 40)
+    h.at(ENTRY_BAR + 100)
+    assert h.rt.exit_code == 0 and "STAGE" in h.alerts.kinds()
+
+
+def test_a_process_kept_on_the_real_account_after_a_demotion_says_so_and_ends_once_flat(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="SHADOW")  # the journal: demoted; the process: its last real stage
+    hs.rt = hs.make_runtime(stage="CANARY")
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    assert hs.rt.stage == "CANARY" and hs.journal.events(kind="STARTUP")[-1]["data"]["stage"] == "CANARY"
+    start = [t for k, t in hs.alerts.items if k == "STARTUP"][-1]
+    assert start.startswith("[시작] 단계 CANARY (기록된 단계 SHADOW: 실계좌")
+    hs.at(ENTRY_BAR + 30)  # flat: the minute ends the process before this hour's cycle could enter
+    assert hs.rt.exit_code == 0 and hs.ex.position() is None and not hs.journal.events(kind="ENTRY")
+    hs.journal.close()
+
+
+def test_a_stop_request_ends_the_loop_after_the_current_tick(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    ticks: list[float] = []
+    original = hs.rt.tick
+
+    def tick() -> None:
+        assert not ticks, "a tick after the stop request"
+        original()
+        ticks.append(hs.clock())
+        hs.rt.stop_requested = True  # SIGTERM arrived during this tick (`docker stop`)
+
+    hs.rt.tick = tick  # type: ignore[method-assign]
+    assert hs.rt.run_forever() == 0 and len(ticks) == 1 and hs.journal.cycles()[-1]["status"] == "OK"
+    assert [e["kind"] for e in hs.journal.events(kind="STOPPED")] == ["STOPPED"]
+    assert [t for k, t in hs.alerts.items if k == "STOPPED"] == [
+        "[종료] 정지 요청: 하던 일을 마치고 종료 (거래소의 보호 주문은 그대로)"]
+    hs.journal.close()
+
+
+def test_the_hourly_audit_fetches_the_paper_ledger_off_the_loop_one_at_a_time(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    led = paper_ledger(SIGNAL, [d for d in hs.journal.decisions() if d["ts"] < SIGNAL])
+    release, threads = threading.Event(), []
+
+    def slow() -> dict[str, Any]:
+        threads.append(threading.current_thread().name)
+        release.wait(10)
+        return led
+
+    hs.rt.d.paper_ledger = slow
+    t50 = ENTRY_BAR + 3000  # 23:50 UTC: the hour's audit
+    begun = time.monotonic()
+    hs.at(t50)
+    assert time.monotonic() - begun < 5 and hs.journal.get("audit") is None  # the tick never waits on GitHub
+    hs.at(t50 + 1)
+    assert hs.journal.get("audit") is None and threads == ["ewbot-paper-ledger"]
+    release.set()
+    hs.rt.audit_job.thread.join(5)
+    hs.at(t50 + 2)  # compared on the loop once it is there
+    assert audit_from_journal(hs.journal).ok and hs.rt.audit_job is None
+    hang = threading.Event()
+
+    def stuck() -> dict[str, Any]:
+        threads.append("stuck")
+        hang.wait(30)
+        return led
+
+    hs.rt.d.paper_ledger = stuck
+    hs.at(t50 + 3600)  # the next hour's fetch never answers (a DNS lookup that hangs): given up, a failed audit
+    hs.at(t50 + 3600 + AUDIT_FETCH_MAX_S + 1)
+    assert audit_from_journal(hs.journal).error == "paper ledger fetch failed: no answer in 60 s"
+    hs.at(t50 + 7200)  # still hanging an hour later: no second fetch beside it, the audit fails at once
+    assert threads.count("stuck") == 1
+    assert audit_from_journal(hs.journal).error == "paper ledger fetch failed: the previous fetch is still running"
+    hang.set()
+    hs.rt.audit_job.thread.join(5)
+    hs.at(t50 + 7201)
+    assert hs.rt.audit_job is None
+    hs.journal.close()
 
 
 def test_daily_summary_audit_and_status(tmp_path):
