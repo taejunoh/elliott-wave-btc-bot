@@ -119,9 +119,12 @@ class AccountGuard:
 
     Accepted limits: two wrong reads among a reference's three basing reads set it - two wrong high ones can
     trip that breaker two reads later; two wrong low ones loosen it, the day's reference until the next New
-    York day, a re-based peak until two true reads in a row lift it - and so does a real move within those
-    reads (the first ~2 minutes of the day); two wrong high reads in a row raise the peak; two wrong low reads
-    in a row trip a breaker."""
+    York day, a re-based peak until two true reads in a row lift it -; a real move between a reference's first
+    read and its median read is absorbed into the reference whatever its size (the day's reference is then the
+    lower equity, a loss in that span never counts toward DAILY_LOSS; the peak still bounds it through
+    TOTAL_DD) - those reads are a minute apart while the balance reads succeed, but failed or unusable reads, a
+    restart or a runtime down at midnight spread them over a longer span; two wrong high reads in a row raise
+    the peak; two wrong low reads in a row trip a breaker."""
 
     KEY = "account_guard"
 

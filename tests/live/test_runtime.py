@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import pytest
 
+import ewbot.live.runtime as runtime_mod
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.live.audit import AuditError, audit
 from ewbot.live.control import Command
@@ -32,6 +33,7 @@ from ewbot.live.reconcile import PlanContext, pending_position
 from ewbot.live.runtime import (
     AUDIT_FETCH_MAX_S,
     STARTUP_READ_MAX_S,
+    STOP_GRACE_S,
     StartupRefused,
     audit_from_journal,
     status_lines,
@@ -1284,7 +1286,8 @@ def test_a_failure_after_the_replay_ends_the_cycle_once(h):
         h.at(ENTRY_BAR + 30 + k)
     c = h.journal.cycles()[-1]
     assert (c["status"], c["note"], h.rt.done_bar) == ("ERROR", "KeyError: 'a planner bug on this state'", SIGNAL)
-    assert h.fetch.calls - fetched == 1 and h.rt.target is None  # one download and one replay, not one per tick
+    assert h.fetch.calls - fetched == 1  # one download and one replay, not one per tick
+    assert h.rt.target is not None and h.rt.target.bar_ts == SIGNAL  # the failure was in its reconcile: target kept
     assert [e["data"]["section"] for e in h.journal.events(kind="LOOP_ERROR")] == ["cycle"]
     assert h.alerts.kinds().count("CYCLE_ERROR") == 1
 
@@ -1680,3 +1683,132 @@ def test_error_texts_in_alerts_and_the_journal_are_redacted(h):
     assert all("<secret>" in json.dumps(e["data"]) and "SECRET" not in json.dumps(e["data"]).replace("<secret>", "")
                for k in runtime_events for e in h.journal.events(kind=k)) and all(
         h.journal.events(kind=k) for k in runtime_events)
+
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# final fix
+
+
+def test_a_fill_price_the_venue_reports_as_nan_never_leaves_the_entry_unprotected(h):
+    """Final fix (P0, probe t12rev/r2/f2_nan.py): a market order read back with a NaN fill price and fee. The trade
+    used to be refused by the journal - a filled entry with no trade and no bracket, the cycle ERROR, and the rebuild
+    raising the same way at every pass. Now it is saved (a stand-in entry price, alerted) and protected at once."""
+    real = h.ex.get_order
+
+    def nan_fill(order_id: str) -> Order:
+        o = real(order_id)
+        return dataclasses.replace(o, avg_fill_price=math.nan, fee=math.nan) if o.kind == "MARKET" else o
+
+    h.ex.get_order = nan_fill
+    for k in range(13):
+        h.at(ENTRY_BAR + 30 + 10 * k)
+    t = h.rt.executor.trade()
+    assert t is not None and t.status == "OPEN" and t.entry_price == h.ex.position().avg_entry == 26_747.0
+    assert [(o.size, o.stop_price) for o in h.ex.open_orders()] == [(1, 26_585.0)]
+    assert not h.journal.events(kind="LOOP_ERROR") and h.journal.cycles()[-1]["status"] == "OK"
+    assert "FILL_PRICE_UNREAD" in h.alerts.kinds() and not h.journal.events(kind="UNPROTECTED")
+
+
+def test_a_hung_candle_download_never_stops_the_loop(h, monkeypatch):
+    """Final fix (Task 12): the download (15 s timeouts, retries) ran on the loop - the watchdog and the polls stopped
+    while it hung. It runs on a worker thread now, waited for at most FETCH_WAIT_S per try, and the cycle runs at the
+    first tick after it ended."""
+    monkeypatch.setattr(runtime_mod, "FETCH_WAIT_S", 0.05)
+    release = threading.Event()
+    real = h.rt.d.fetch
+
+    def hung(cache_dir):
+        release.wait(3)
+        return real(cache_dir)
+
+    h.rt.d.fetch = hung
+    begun = time.monotonic()
+    h.at(ENTRY_BAR + 30)  # the cycle starts the download and the tick goes on
+    h.at(ENTRY_BAR + 31)
+    assert time.monotonic() - begun < 1.0 and h.rt.done_bar != SIGNAL and h.ex.position() is None
+    assert h.journal.cycles()[-1]["status"] == "RUNNING"
+    release.set()
+    h.rt.candle_job.thread.join(5)
+    h.at(ENTRY_BAR + 32)  # the download ended: decided at this tick, not at the next 15 s retry
+    assert h.rt.done_bar == SIGNAL and h.ex.position() is not None and h.journal.cycles()[-1]["status"] == "OK"
+    assert h.rt.d.fetch is hung and h.rt.candle_job is None
+
+
+def test_a_deferred_flatten_reads_the_session_every_pass_and_drops_its_waiting_wording(h):
+    """Final fix (Task 12): while a flatten waits for the reopen the session is read at every pass (not only every
+    minute), and once its close goes out again /status no longer says it waits for the reopen."""
+    entered(h)
+    h.ex.set_session("CLOSE")
+    h.at(ENTRY_BAR + 100)  # the minute sees it
+    h.commands.put(Command("/flatten", ENTRY_BAR + 105))
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 108))
+    h.at(ENTRY_BAR + 110)
+    assert h.journal.get("flatten")["deferred"] is True
+    h.ex.set_session("OPEN")
+    h.ex.fail_next("close_position", RateLimited("429"))  # the first close after the reopen fails
+    h.at(ENTRY_BAR + 120)  # a poll 10 s later - the next minute is 40 s away: the session is read, the close goes out
+    assert h.ex.calls.count("close_position") == 1 and h.ex.position() is not None
+    assert h.journal.get("flatten")["deferred"] is False and h.journal.events(kind="FLATTEN_RESUMED")
+    assert "(2024-03-13 23:01 UTC부터, 매 확인마다 청산 주문)" in h.rt.handle("/status", ENTRY_BAR + 125)
+    h.at(ENTRY_BAR + 130)
+    assert h.ex.position() is None and h.journal.get("flatten") is None
+
+
+def test_the_overnight_margin_report_without_the_product_is_alerted(h):
+    """Final fix (Task 8): a position at 15:30 New York whose margin cannot be computed is reported - never the day
+    marked done in silence (here: no product spec)."""
+    entered(h)
+    h.rt.product = None
+    h.rt._overnight_report(ts("2024-03-14 19:31"))  # 15:31 New York (EDT)
+    assert [x for k, x in h.alerts.items if k == "MARGIN_1530"] == [
+        "[15:30 증거금 점검] 가격, 잔고 또는 상품 정보를 읽지 못해 계산하지 못함 (1계약)"]
+    assert h.journal.events(kind="MARGIN_1530")[-1]["data"]["ratio"] is None
+
+
+def test_a_stop_request_ends_the_start_while_it_retries_a_read(tmp_path):
+    """Final fix (Task 13 N-5): `docker stop` while the start retries the session read (an outage) ends the process at
+    once - the retry waits run in steps of a second - instead of retrying for 5 minutes past the stop grace period."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.ex.fail_next("session", Unavailable("503"), times=1000)
+    slept: list[float] = []
+
+    def sleep(s: float) -> None:
+        slept.append(s)
+        hs.clock.sleep(s)
+        if sum(slept) >= 3:
+            hs.rt.stop_requested = True  # SIGTERM during the second wait
+
+    hs.rt = hs.make_runtime(sleep=sleep)
+    assert hs.rt.run_forever(max_ticks=5) == 0
+    assert max(slept) <= 1.0 and sum(slept) == 3
+    assert [e["data"].get("during") for e in hs.journal.events(kind="STOPPED")] == ["startup"]
+    assert not hs.journal.events(kind="STARTUP") and not hs.journal.events(kind="STARTUP_REFUSED")
+    assert [t for k, t in hs.alerts.items if k == "STOPPED"] == [
+        "[종료] 정지 요청: session 조회를 다시 시도하던 중 - 시작하지 않고 종료"]
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("failures", [3, 1000])
+def test_a_stop_request_waits_while_the_open_trade_has_no_resting_stop(tmp_path, failures):
+    """Final fix (Task 13 N-5): a stop while the open trade has no resting stop (its brackets refused) lets the loop go
+    on until the next passes placed it - at most STOP_GRACE_S - then ends; past that it ends anyway and says so."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.ex.fail_next("place_bracket", RateLimited("429"), times=failures)
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)  # entered; its bracket refused
+    assert hs.ex.position() is not None and not hs.ex.open_orders()
+    hs.rt = hs.make_runtime()  # a process that gets `docker stop` right after its start
+    hs.rt.stop_requested = True
+    assert hs.rt.run_forever(max_ticks=500) == 0
+    stopped = hs.journal.events(kind="STOPPED")[-1]["data"]
+    assert len(hs.journal.events(kind="STOP_DEFERRED")) == 1
+    if failures == 3:
+        assert [(o.size, o.stop_price) for o in hs.ex.open_orders()] == [(1, 26_585.0)]
+        assert stopped["unprotected"] is False and 0 < stopped["ticks"] < 30
+    else:
+        assert not hs.ex.open_orders() and stopped["unprotected"] is True
+        assert STOP_GRACE_S - 1 <= stopped["ticks"] <= STOP_GRACE_S + 1
+        assert "경고" in [t for k, t in hs.alerts.items if k == "STOPPED"][-1]
+    hs.journal.close()

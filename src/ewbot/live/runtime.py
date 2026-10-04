@@ -11,9 +11,10 @@ is taken before its alert.
   flatten   a breaker or /flatten_confirm journals a flatten request (reason, origin, time) before anything else,
             then pauses entries; every pass while it stands and a position exists sends the close (the brackets
             rest until the venue took it) - deferred while the session is not OPEN (alerted once: closed at the
-            reopen, the position kept protected) - until the account is flat (FLATTENED). A crash before the close
-            went out still flattens after the restart; replies and alerts say what happened (done, deferred, still
-            retried), never "done" before it is
+            reopen, the position kept protected; the session is then read at every pass, and the request no longer
+            reads deferred once the close goes out again) - until the account is flat (FLATTENED). A crash before
+            the close went out still flattens after the restart; replies and alerts say what happened (done,
+            deferred, still retried), never "done" before it is
   watch     every second while a trade is open (or the journal shows one at start): the stop-gap check on the
             futures price, and a close when no stop rests (refused bracket) and the price is through the stop -
             at most one close per 10 s per trade, after a pass that observes the account first (a bracket fill
@@ -54,9 +55,11 @@ is taken before its alert.
             stored as failed and alerted), and the stage-change restart (a new stage or stint once flat: no open
             trade, no order of unknown outcome, no standing flatten, no position or order of ours)
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
-            reconcile. Retried every 15 s while the bar is missing or the candles cannot be downloaded; 2 minutes
-            after the close the decision is held and only protection is kept (spec 4.1 step 1). An engine error,
-            or any failure after the replay, ends the bar's cycle as ERROR once (never replayed every tick). A bar
+            reconcile. The candle download runs on a worker thread, waited for at most 5 s per try (a hung request
+            never stops the loop); retried every 15 s - at once when a running download ends - while the bar is
+            missing or the candles cannot be downloaded; 2 minutes after the close the decision is held and only
+            protection is kept (spec 4.1 step 1). An engine error, or any failure after the replay, ends the bar's
+            cycle as ERROR once (never replayed every tick; a failure in the reconcile keeps the target). A bar
             whose cycle ended OK is never decided again into its cycles row: a restart takes the last such bar
             as done and only refreshes its target (SHADOW gate 2 keeps the on-time row; a failed download is
             retried until the hour ends); a bar held or failed before a restart stays so (only a cycle a crash
@@ -66,10 +69,12 @@ is taken before its alert.
 Errors in alerts and in the journal go through the settings' redaction; repeating failure alerts (a close, a
 bracket, a loop section that keeps failing) go out at once, then with growing gaps (1 to 30 minutes) while the
 failure lasts. The start reads the product and the session with retries for up to 5 minutes, then refuses
-(StartupRefused: `ewbot live run` waits like a refused preflight). The process runs the stage `ewbot live run` gives it
-(`LiveDeps.stage`, live.app.process_stage): after a demotion to SHADOW with something real left it stays on the real
-account in the last real stage - entries blocked by the journal's SHADOW cap - until flat. A stop request
-(`stop_requested`: SIGTERM, Ctrl-C) ends the loop after the current tick (`STOPPED`, alerted)."""
+(StartupRefused: `ewbot live run` starts again after a short wait - an outage, not a configuration error). The process
+runs the stage `ewbot live run` gives it (`LiveDeps.stage`, live.app.process_stage): after a demotion to SHADOW with
+something real left it stays on the real account in the last real stage - entries blocked by the journal's SHADOW cap -
+until flat. A stop request (`stop_requested`: SIGTERM, Ctrl-C) ends the start's read retries, or the loop after the
+current tick - while the open trade has no resting stop, after up to STOP_GRACE_S more of passes that place it
+(`STOPPED`, alerted)."""
 
 from __future__ import annotations
 
@@ -187,6 +192,8 @@ DAILY_RETRY_S = 600.0  # a daily summary that raised is tried again after this l
 STARTUP_READ_MAX_S = 300.0  # the start's product and session reads are retried this long, then the start is refused
 STARTUP_RETRY_S = 2.0  # ... the wait doubling up to STARTUP_RETRY_MAX_S
 STARTUP_RETRY_MAX_S = 60.0
+FETCH_WAIT_S = 5.0  # the loop waits at most this long for a candle download (a worker thread), then ticks on
+STOP_GRACE_S = 90.0  # a stop request waits at most this long while the open trade has no resting stop (docker: 150 s)
 # what a flatten did by the end of its first pass: the /flatten_confirm reply and the breaker alert say it
 FLATTEN_OUTCOME = {
     "done": "전량 청산 완료",
@@ -199,36 +206,45 @@ FLATTEN_OUTCOME = {
 
 class StartupRefused(RuntimeError):
     """The product or the session could not be read at start for STARTUP_READ_MAX_S: `ewbot live run` refuses
-    and waits like a refused preflight (no healthchecks.io /fail)."""
+    (no healthchecks.io /fail) and starts again soon (a passing outage: live.app.OUTAGE_WAIT_S, not the long wait of
+    a configuration error)."""
+
+
+class StartupStopped(RuntimeError):
+    """A stop request (SIGTERM, Ctrl-C) arrived while the start was still retrying a read: the process ends (0)."""
 
 
 class _Fetch:
     """One call on a daemon thread, so the main loop never waits on it (a DNS lookup included): `done()` without
-    blocking, then `result()` - the value, or the call's exception raised again on the loop."""
+    blocking, then `result()` - the value, or the call's exception raised again on the loop. The paper ledger for the
+    audit, and the candle download for the cycle (`bar`: the cycle it was started for)."""
 
-    def __init__(self, call: Callable[[], dict[str, Any]], started: float) -> None:
+    def __init__(self, call: Callable[[], Any], started: float, name: str = "ewbot-paper-ledger",
+                 what: str = "paper ledger fetch", bar: int | None = None) -> None:
         self.started = started  # monotonic
         self.given_up = False  # the loop stopped waiting (AUDIT_FETCH_MAX_S); the thread still runs until it ends
-        self.value: dict[str, Any] | None = None
+        self.what = what
+        self.bar = bar
+        self.value: Any = None
         self.error: Exception | None = None
-        self.thread = threading.Thread(target=self._run, args=(call,), name="ewbot-paper-ledger", daemon=True)
+        self.thread = threading.Thread(target=self._run, args=(call,), name=name, daemon=True)
         self.thread.start()
 
-    def _run(self, call: Callable[[], dict[str, Any]]) -> None:
+    def _run(self, call: Callable[[], Any]) -> None:
         try:
             self.value = call()
-        except Exception as exc:  # noqa: BLE001 - handed to the loop: a failed audit
+        except Exception as exc:  # noqa: BLE001 - handed to the loop: a failed audit, a failed download
             self.error = exc
 
     def done(self) -> bool:
         self.thread.join(0)
         return not self.thread.is_alive()
 
-    def result(self) -> dict[str, Any]:
+    def result(self) -> Any:
         if self.error is not None:
             raise self.error
         if self.value is None:
-            raise AuditError("paper ledger fetch failed: no result")
+            raise AuditError(f"{self.what} failed: no result")
         return self.value
 
 
@@ -306,6 +322,8 @@ class LiveRuntime:
         self.exit_code: int | None = None
         self.stop_requested = False  # SIGTERM / Ctrl-C (`ewbot live run`): the loop ends after the current tick
         self.audit_job: _Fetch | None = None  # the paper ledger fetch in flight (a given-up one until its thread ended)
+        self.candle_job: _Fetch | None = None  # the candle download in flight (one at a time: one writer of the cache)
+        self.stop_since: float | None = None  # monotonic: when the loop first saw the stop request
         self.bad_equity_reads = 0  # balance reads in a row that were not an observation
         self.feed_down_since: float | None = None
         self.feed_failures = 0  # the feed's failure count when this outage began
@@ -456,18 +474,27 @@ class LiveRuntime:
     # ------------------------------------------------------------------ startup
     def _startup_read(self, what: str, read: Callable[[], Any]) -> Any:
         """A read the start needs (product, session): retried with a doubling wait for up to STARTUP_READ_MAX_S,
-        then StartupRefused (a passing outage never kills the process with a /fail)."""
+        then StartupRefused (a passing outage never kills the process with a /fail). A stop request ends the retries
+        (StartupStopped): the wait runs in steps of at most a second."""
         start, wait = self.mono(), STARTUP_RETRY_S
         while True:
             try:
                 return read()
             except ExchangeError as exc:
                 why = self.d.redact(f"{type(exc).__name__}: {exc}")[:200]
+                if self.stop_requested:
+                    raise StartupStopped(f"정지 요청: {what} 조회를 다시 시도하던 중") from None
                 if not 0 <= self.mono() - start + wait <= STARTUP_READ_MAX_S:
                     self.journal.add_event(self.clock(), "STARTUP_REFUSED", {"read": what, "error": why})
                     raise StartupRefused(f"{what} 조회 실패 ({STARTUP_READ_MAX_S / 60:.0f}분 동안 재시도): {why}") from None
                 self.journal.add_event(self.clock(), "STARTUP_RETRY", {"read": what, "error": why, "wait_s": wait})
-                self.d.sleep(wait)
+                left = float(wait)
+                while left > 0 and not self.stop_requested:
+                    step = min(left, 1.0)
+                    self.d.sleep(step)
+                    left -= step
+                if self.stop_requested:
+                    raise StartupStopped(f"정지 요청: {what} 조회를 다시 시도하던 중") from None
                 wait = min(wait * 2, STARTUP_RETRY_MAX_S)
 
     def startup(self) -> dict[str, int]:
@@ -535,12 +562,33 @@ class LiveRuntime:
         return kind
 
     # ------------------------------------------------------------------ decision cycle
-    def _frame(self) -> pd.DataFrame:
-        raw = load_1h(Path(self.d.fetch(Path(self.d.cache_dir))))
+    def _frame(self, path: Path | None = None) -> pd.DataFrame:
+        """The candles of the cache - `path`, a finished download's; None: downloaded here, on the loop (the start only:
+        the first download of the history takes minutes and runs before any timed cycle)."""
+        raw = load_1h(Path(self.d.fetch(Path(self.d.cache_dir))) if path is None else path)
         if raw.empty:
             raise TargetError("the candle cache is empty")
         self.frame = fill_gaps(raw)
         return self.frame
+
+    def _download(self, bar_ts: int) -> pd.DataFrame | None:
+        """The cycle's candles. The download (`LiveDeps.fetch`: 15 s timeouts, retries) runs on a worker thread and the
+        loop waits for it at most FETCH_WAIT_S - a hung request never stops the watchdog, the polls or the commands.
+        One still running is left to finish (None: the cycle is late and tried again; `_cycle_due` tries at once
+        when it ends); one at a time - never two writers of the cache. A download that ended after its own cycle
+        gave up on it is not this bar's: a new one starts. Its error is raised here (a failed download)."""
+        job = self.candle_job
+        if job is not None and job.done() and job.bar != bar_ts:
+            job = self.candle_job = None  # an earlier bar's download that ended since: stale
+        if job is None:
+            fetch, cache = self.d.fetch, Path(self.d.cache_dir)
+            job = self.candle_job = _Fetch(lambda: fetch(cache), self.mono(), "ewbot-candles", "candle download",
+                                           bar=bar_ts)
+        job.thread.join(FETCH_WAIT_S)
+        if not job.done() or job.bar != bar_ts:
+            return None  # still downloading (this bar's, or an earlier bar's: one at a time)
+        self.candle_job = None
+        return self._frame(Path(job.result()))
 
     def _cycle_row(self, bar_ts: int) -> dict[str, Any] | None:
         return next((c for c in self.journal.cycles(since_bar=bar_ts) if int(c["bar_ts"]) == bar_ts), None)
@@ -558,12 +606,15 @@ class LiveRuntime:
         if row is None:
             self.journal.start_cycle(bar_ts, now, self.stage)
         try:
-            df = self._frame()
+            df = self._download(bar_ts)
         except Exception as exc:  # noqa: BLE001 - a failed download is a late bar: retried until the deadline
             why = self.d.redact(f"{type(exc).__name__}: {exc}")[:300]
             if self.fetch_error is None or self.fetch_error[0] != bar_ts:  # journaled once per bar
                 self.journal.add_event(now, "FETCH_ERROR", {"bar_ts": bar_ts, "error": why})
             self.fetch_error = (bar_ts, why)
+            return "LATE"
+        if df is None:  # the download is still running on its thread: the loop goes on, the cycle is tried again
+            self.fetch_error = (bar_ts, f"the candle download has not finished (waited {FETCH_WAIT_S:.0f} s per try)")
             return "LATE"
         if int(df["ts"].iloc[-1]) < bar_ts:
             return "LATE"
@@ -584,17 +635,22 @@ class LiveRuntime:
             self.journal.add_event(now, "LOOP_ERROR", {"section": "cycle",
                                                        "error": self.d.redact(f"{type(exc).__name__}: {exc}")[:300]})
             print(self.d.redact(traceback.format_exc()), file=sys.stderr, end="")
-            return self._cycle_error(bar_ts, decided, exc)
+            # a failure after the target was taken (its reconcile) keeps it: the next poll reconciles against it
+            return self._cycle_error(bar_ts, decided, exc, keep_target=self.target is target)
         if not decided:
             self.journal.finish_cycle(bar_ts, self.clock(), "OK", note)
         return "OK"
 
-    def _cycle_error(self, bar_ts: int, decided: bool, exc: Exception) -> str:
+    def _cycle_error(self, bar_ts: int, decided: bool, exc: Exception, keep_target: bool = False) -> str:
+        """The bar's cycle ends as ERROR (once). The target goes with it - unless the failure came after it was taken
+        (`keep_target`: in its reconcile), so the hour's decision (an exit, a stop move) is not lost to it."""
         why = self.d.redact(f"{type(exc).__name__}: {exc}")
         if not decided:
             self.journal.finish_cycle(bar_ts, self.clock(), "ERROR", why[:300])
-        self.alert("CYCLE_ERROR", f"[사이클 오류] {_utc(bar_ts)} 봉: {why[:200]}")
-        self.target = None
+        kept = " (판단은 유지: 다음 확인에서 다시 맞춤)" if keep_target else ""
+        self.alert("CYCLE_ERROR", f"[사이클 오류] {_utc(bar_ts)} 봉: {why[:200]}{kept}")
+        if not keep_target:
+            self.target = None
         return "ERROR"
 
     def _cycle_due(self, now: float) -> None:
@@ -602,7 +658,8 @@ class LiveRuntime:
         if self.done_bar is not None and bar <= self.done_bar:
             return
         mono = self.mono()
-        if now < bar + H1 + CYCLE_OFFSET_S or (self.try_bar == bar and self.next_try is not None
+        landed = self.candle_job is not None and self.candle_job.done()  # a download just ended: tried at once
+        if now < bar + H1 + CYCLE_OFFSET_S or (self.try_bar == bar and self.next_try is not None and not landed
                                                 and 0 < self.next_try - mono <= CYCLE_RETRY_S):
             return
         decided = self._cycle_ok(bar)  # decided before a restart: its target is refreshed until the hour ends
@@ -671,6 +728,12 @@ class LiveRuntime:
                 self._incident(kind, now)
                 self.alert(kind, f"[경고] 거래 {data['trade_id']}: 주문 없이 {data['expected']}계약 → "
                                  f"{data['position']}계약 (손절 유지, 남은 수량 보호)")
+        waiting = self.journal.get(FLATTEN_KEY)
+        if waiting is not None and waiting.get("deferred"):  # a flatten waits for the reopen: the session every pass
+            try:
+                self._read_session(now)
+            except ExchangeError as exc:
+                self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
         ctx = self._ctx(now)
         planned = plan(self.target, seen, pos, orders, ctx)
         req = self.journal.get(FLATTEN_KEY)
@@ -744,6 +807,9 @@ class LiveRuntime:
             return planned
         keep: list[Action] = [a for a in planned if isinstance(a, (Alert, Skip))]
         if ctx.session_open:
+            if req.get("deferred"):  # reopened: the close goes out again from this pass on (status says so)
+                self.journal.put(FLATTEN_KEY, {**req, "deferred": False})
+                self.journal.add_event(now, "FLATTEN_RESUMED", {"reason": req["reason"]})
             self._flatten_outcome = "retry"
             return keep + [Close(str(req["reason"]))]
         self._flatten_outcome = "deferred"
@@ -982,7 +1048,9 @@ class LiveRuntime:
         if done:
             self.gap.reset()
             self.watch_tried.pop(t.trade_id, None)
-            self.alert(kind, f"{what}: 시장가 청산 완료")
+            after = self.executor.trade()
+            how = after.exit_reason if after is not None and after.trade_id == t.trade_id else None
+            self.alert(kind, f"{what}: 시장가 청산 완료" if how in (None, kind) else f"{what}: 이미 청산됨 ({how})")
             return
         held = self._limited(f"{kind}:{t.trade_id}")
         if held is not None:
@@ -999,13 +1067,7 @@ class LiveRuntime:
             self.journal.add_event(now, "LOOP_ERROR", {"section": "telegram", "error": type(exc).__name__})
             print(f"[LIVE] telegram and heartbeat check failed: {type(exc).__name__}", file=sys.stderr)
         try:
-            was_open = self.session is not None and self.session.is_open
-            self.session = self.ex.session()
-            for kind, text in self.sessions.update(self.session, now):
-                self.journal.add_event(now, kind, {"text": text, "state": self.session.state} if kind == "SESSION"
-                                       else {"text": text})
-                self.alert(kind, f"[장 상태] {text}")
-            if self.session.is_open and not was_open:
+            if self._read_session(now):
                 self.poll(now)  # deferred closes run right after the reopen (spec 4.5)
         except ExchangeError as exc:
             self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
@@ -1032,6 +1094,17 @@ class LiveRuntime:
             again = " (다시 시작)" if stage == self.stage else ""
             self.alert("STAGE", f"[단계 변경] {self.stage} → {stage}{again}: 재시작해 적용")
             self.exit_code = 0
+
+    def _read_session(self, now: float) -> bool:
+        """Read the session (every minute; every pass while a flatten waits for the reopen), journal and alert its
+        changes (the SESSION events SHADOW gate 2 reads); True when it just turned OPEN."""
+        was_open = self.session is not None and self.session.is_open
+        self.session = self.ex.session()
+        for kind, text in self.sessions.update(self.session, now):
+            self.journal.add_event(now, kind, {"text": text, "state": self.session.state} if kind == "SESSION"
+                                   else {"text": text})
+            self.alert(kind, f"[장 상태] {text}")
+        return self.session.is_open and not was_open
 
     def _control_problem(self, now: float) -> str | None:
         """What is wrong with the Telegram command thread this minute, or None. A dead thread is started again. A
@@ -1248,13 +1321,14 @@ class LiveRuntime:
                 self.alert("MARGIN_1530", f"[15:30 증거금 점검] 조회 실패: {why[:120]} (16시 전까지 매분 다시 시도)")
             return
         self._once("margin1530", today)
-        if pos is None or balance is None or self.product is None:
+        if pos is None or balance is None:
             return
         equity = usable_price(balance.equity)
         price = self.prices.futures_price() or usable_price(pos.avg_entry)  # a report: the entry price may stand in
-        if price is None or equity is None:
+        if price is None or equity is None or self.product is None:  # never marked done in silence
             self.journal.add_event(now, "MARGIN_1530", {"ratio": None, "contracts": pos.contracts})
-            self.alert("MARGIN_1530", f"[15:30 증거금 점검] 가격 또는 잔고를 읽지 못해 계산하지 못함 ({pos.contracts}계약)")
+            self.alert("MARGIN_1530", f"[15:30 증거금 점검] 가격, 잔고 또는 상품 정보를 읽지 못해 계산하지 못함 "
+                                      f"({pos.contracts}계약)")
             return
         r = margin_ratio(pos.contracts, price, pos.side, self.product, equity)
         self.journal.add_event(now, "MARGIN_1530", {"ratio": r})
@@ -1531,18 +1605,47 @@ class LiveRuntime:
             except Exception as exc:  # noqa: BLE001 - one failing section must not stop the others
                 self._loop_error(name, exc, now)
 
+    def _stop_waits(self) -> bool:
+        """A stop request is honoured after the current tick - except while the journal's open trade has no resting
+        stop over its position (`unprotected_since`: a refused bracket, an entry right before the stop): the loop
+        goes on, so the next passes place it, for at most STOP_GRACE_S from the request (Docker's stop_grace_period is
+        150 s: the 10 s message flush stays inside it). Journaled once (STOP_DEFERRED)."""
+        mono = self.mono()
+        if self.stop_since is None:
+            self.stop_since = mono
+        t = self.executor.trade()
+        if t is None or t.status != "OPEN" or t.unprotected_since is None:
+            return False
+        if not 0 <= mono - self.stop_since < STOP_GRACE_S:
+            return False
+        if not self.journal.events(kind="STOP_DEFERRED", since=self.clock() - STOP_GRACE_S - 60.0):
+            self.journal.add_event(self.clock(), "STOP_DEFERRED", {"trade_id": t.trade_id, "max_s": STOP_GRACE_S})
+        return True
+
     def run_forever(self, max_ticks: int | None = None) -> int:
         """Start, then tick every second until a stage change (`exit_code`) or a stop request (`stop_requested`,
-        honoured after the current tick: `STOPPED`, alerted; 0)."""
-        self.startup()
+        honoured after the current tick - after up to STOP_GRACE_S more while the open trade has no resting stop:
+        `_stop_waits` -: `STOPPED`, alerted; 0). A stop request during the start's read retries ends it there (0)."""
+        try:
+            self.startup()
+        except StartupStopped as exc:
+            self.journal.add_event(self.clock(), "STOPPED", {"ticks": 0, "during": "startup"})
+            self.alert("STOPPED", f"[종료] {exc} - 시작하지 않고 종료")
+            return 0
         n = 0
-        while self.exit_code is None and not self.stop_requested and (max_ticks is None or n < max_ticks):
+        while self.exit_code is None and (max_ticks is None or n < max_ticks):
+            if self.stop_requested and not self._stop_waits():
+                break
             self.tick()
             n += 1
             self.d.sleep(1.0)
         if self.stop_requested and self.exit_code is None:
-            self.journal.add_event(self.clock(), "STOPPED", {"ticks": n})
-            self.alert("STOPPED", "[종료] 정지 요청: 하던 일을 마치고 종료 (거래소의 보호 주문은 그대로)")
+            t = self.executor.trade()
+            bare = t is not None and t.status == "OPEN" and t.unprotected_since is not None
+            self.journal.add_event(self.clock(), "STOPPED", {"ticks": n, "unprotected": bare})
+            self.alert("STOPPED", "[종료] 정지 요청: 하던 일을 마치고 종료 " + (
+                f"- 경고: 거래 {t.trade_id}에 거래소 손절 주문이 없음 (Coinbase 앱에서 확인)" if bare and t is not None
+                else "(거래소의 보호 주문은 그대로)"))
         return 0 if self.exit_code is None else self.exit_code
 
 
