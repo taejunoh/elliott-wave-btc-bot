@@ -473,5 +473,8 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    # final review: money movements, refusal codes, an unreadable account, the cache, the positions reply
                    "no deposits, withdrawals, spot trades", "## Adding or withdrawing capital", "rebase --confirm",
                    "EWBOT_CLOSE_CONFLICTS", "[계좌 조회 불가]", "BTC-USD_1h.parquet.bad-", "순서 끊김", "FLAT_UNCONFIRMED",
-                   "cfm/positions", "5–10 s on a 1-vCPU VPS", "at most 15 s"):
+                   "cfm/positions", "5–10 s on a 1-vCPU VPS", "at most 15 s",
+                   # re-reviews: rebases kept visible, never UNKNOWN_* codes, a leg that still covers is kept
+                   "손실 한도 기준 재설정 24시간", "never an `UNKNOWN_*` code", "a leg that still covers contracts",
+                   "for 5 minutes", "paced and rate-limited apart"):
         assert needle in text, needle
