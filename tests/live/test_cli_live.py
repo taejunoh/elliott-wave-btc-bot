@@ -768,7 +768,8 @@ def test_a_promotion_or_restart_needs_the_runtimes_flat_book_and_a_quiet_minute(
 def test_a_rebase_is_requested_with_confirm_and_refused_while_a_flatten_stands(live_env, monkeypatch, capsys):
     """Final review B-2: after a deliberate deposit or withdrawal, `ewbot live rebase --confirm` asks the runtime (the
     breakers' one writer) to re-base both references at its next minute; it prints before and after, needs --confirm,
-    and is refused while a flatten stands or a tripped breaker still waits for its flatten."""
+    and is refused unless the book is flat as the runtime sees it (re-review B: an open trade's unrealized P&L would be
+    folded into both references) - an open trade, an order of unknown outcome or a standing flatten."""
     settings, ex, _ = live_env
     monkeypatch.setattr("ewbot.cli.time.time", lambda: NOW)  # New York 2024-03-13
     assert main(["live", "rebase", "--confirm"]) == 1  # no journal
@@ -791,9 +792,17 @@ def test_a_rebase_is_requested_with_confirm_and_refused_while_a_flatten_stands(l
                              "total_tripped": False})
     jr.put("trade", {"status": "OPEN", "trade_id": 1})
     jr.close()
-    assert main(["live", "rebase", "--confirm"]) == 2 and "breaker" in capsys.readouterr().err
+    assert main(["live", "rebase", "--confirm"]) == 2 and "an open trade" in capsys.readouterr().err
     jr = Journal(settings.journal_path)
+    jr.put("account_guard", {"day": "2024-03-13", "day_ref": 10_000.0, "peak": 10_500.0, "daily_tripped": False,
+                             "total_tripped": False})
+    assert main(["live", "rebase", "--confirm"]) == 2  # an ordinary open trade too
     jr.put("trade", None)
+    jr.record_intent("ewb-e-1700000000-L", "ENTRY", 1_700_000_000, {"side": 1, "contracts": 1}, NOW)
+    jr.close()
+    assert main(["live", "rebase", "--confirm"]) == 2 and "unknown outcome" in capsys.readouterr().err
+    jr = Journal(settings.journal_path)
+    jr.update_intent("ewb-e-1700000000-L", "ABANDONED", NOW + 600)
     jr.close()
     assert main(["live", "rebase", "--confirm"]) == 0 and "requested" in capsys.readouterr().out
     jr = Journal(settings.journal_path)

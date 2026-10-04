@@ -49,7 +49,7 @@ from ewbot.live.stage import (
     shadow_gates,
     transition,
 )
-from ewbot.live.watchdog import AccountGuard, ny_date
+from ewbot.live.watchdog import AccountGuard
 from ewbot.paper.criteria import golive_status, status_lines
 from ewbot.paper.ledger import LedgerError, current_epoch, load_ledger
 from ewbot.paper.notify import deliver, failure_text, make_event, position_line, sender_from_env
@@ -793,8 +793,9 @@ def _live_rebase(s: LiveSettings, args: argparse.Namespace) -> int:
     """`ewbot live rebase [--confirm]`: after a deliberate deposit or withdrawal (docs/live-trading.md) the account loss
     breakers' references - the day's and the peak - are based again. The CLI only asks (REBASE_KEY, a REBASE_REQUESTED
     event): the running runtime, the breakers' one writer, applies it at its next minute with its own balance reads
-    (the median of three; alerted). Prints the references before and the equity now; needs --confirm; refused while a
-    flatten stands or a tripped breaker's flatten has not gone out yet (an open trade while tripped)."""
+    (the median of three; alerted). Prints the references before and the equity now; needs --confirm and a flat book as
+    the running runtime sees it (`_held`: an open trade's unrealized P&L would be folded into both references; an order
+    of unknown outcome, a standing flatten, a position or a resting order - the latter two when Coinbase can be read)."""
     if not s.journal_path.exists():
         print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
         return 1
@@ -803,20 +804,21 @@ def _live_rebase(s: LiveSettings, args: argparse.Namespace) -> int:
         now = time.time()
         g = journal.get(AccountGuard.KEY) or {}
         print(f"before: day {g.get('day') or '-'} reference {_usd(g.get('day_ref'))} USD, peak {_usd(g.get('peak'))} USD")
+        position, orders = False, 0
         try:
-            equity = f"equity now {_usd(_exchange(s).balance().equity)} USD"
+            real = _exchange(s)
+            equity = f"equity now {_usd(real.balance().equity)} USD"
+            position, orders = real.position() is not None, len(real.open_orders())
         except (SettingsError, ExchangeError) as exc:
             equity = f"equity now unreadable ({exc})"
         print(f"after: both references based again from the runtime's next balance read and the two after it (their "
               f"median) - {equity}")
         trade = journal.get("trade")
-        tripped = g.get("total_tripped") or (g.get("daily_tripped") and g.get("day") == ny_date(now))
-        if journal.get(live_runtime.FLATTEN_KEY) is not None:
-            print("refusing: a flatten stands - let it finish (the account flat), then rebase", file=sys.stderr)
-            return 2
-        if tripped and trade and trade.get("status") == "OPEN":
-            print("refusing: a breaker tripped and its flatten has not gone out yet - the runtime flattens at its start; "
-                  "rebase once flat", file=sys.stderr)
+        held = _held(bool(trade and trade.get("status") == "OPEN"), len(journal.intents(status="PENDING")),
+                     journal.get(live_runtime.FLATTEN_KEY) is not None, position, orders)
+        if held:
+            print(f"refusing: not flat: {', '.join(held)} - rebase with a flat book (/flatten, or wait until the runtime "
+                  "is done)", file=sys.stderr)
             return 2
         if not args.confirm:
             print("refusing: a rebase needs --confirm (the user's explicit approval)", file=sys.stderr)
