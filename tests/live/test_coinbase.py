@@ -330,13 +330,19 @@ def test_position_sides_are_mapped_explicitly():
     ex, _, _ = make({("GET", "/cfm/positions"): ["positions_bip_long", {"positions": [
         {"product_id": FUT, "side": "SHORT", "number_of_contracts": "-3", "avg_entry_price": "85100"}]},
         {"positions": [{"product_id": FUT, "side": "UNKNOWN", "number_of_contracts": "2", "avg_entry_price": "1"}]},
-        {"positions": [{"product_id": FUT, "side": "FUTURES_POSITION_SIDE_LONG", "number_of_contracts": "2"}]}]})
+        {"positions": [{"product_id": FUT, "side": "FUTURES_POSITION_SIDE_UNKNOWN", "number_of_contracts": "2"}]},
+        {"positions": [{"product_id": FUT, "side": "FUTURES_POSITION_SIDE_LONG", "number_of_contracts": "2"}]},
+        {"positions": [{"product_id": FUT, "side": "FUTURES_POSITION_SIDE_SHORT", "number_of_contracts": "1",
+                        "avg_entry_price": "85100"}]}]})
     assert ex.position() == Position(1, 2, 84000.0)
     assert ex.position() == Position(-1, 3, 85100.0)  # abs() of a signed count
-    for _ in range(2):
+    for _ in range(2):  # UNKNOWN, with or without the enum's prefix
         with pytest.raises(ExchangeError) as err:
             ex.position()
         assert not err.value.retryable
+    # the enum's full name (FUTURES_POSITION_SIDE_LONG) reads as LONG; no average entry reads 0.0
+    assert ex.position() == Position(1, 2, 0.0)
+    assert ex.position() == Position(-1, 1, 85100.0)
 
 
 def test_order_sides_are_mapped_explicitly():
@@ -455,17 +461,35 @@ def test_balance_without_a_cash_total_is_an_error(summary):
         ex.balance()
 
 
+def _order_reply(order_id: str, status: str) -> dict:
+    return {"order": {"order_id": order_id, "side": "SELL", "status": status, "client_order_id": "ewb-b-1-tp1-1",
+                      "order_configuration": {"trigger_bracket_gtc": {"base_size": "1", "limit_price": "86000",
+                                                                      "stop_trigger_price": "83500"}}}}
+
+
 def test_cancel_honours_each_result():
     ex, client, _ = make({("POST", "/orders/batch_cancel"): ["cancel_done_or_refused", "cancel_done_or_refused",
-                                                             "cancel_ok"]})
+                                                             "cancel_ok"],
+                          ("GET", "/orders/historical/o-refused"): _order_reply("o-refused", "OPEN")})
     ex.cancel(["o-ok", "o-queued", "o-filled"])  # cancelled, already queued, already filled: nothing rests
     with pytest.raises(ExchangeError) as err:
-        ex.cancel(["o-ok", "o-refused"])
+        ex.cancel(["o-ok", "o-refused"])  # refused, and read back still OPEN
     assert "o-refused: UNKNOWN_CANCEL_ORDER" in str(err.value) and "o-ok" not in str(err.value)
     assert not err.value.retryable
-    with pytest.raises(ExchangeError, match="o-missing: NO_RESULT"):
+    with pytest.raises(ExchangeError, match="o-missing: NO_RESULT"):  # no result, and it cannot be read back
         ex.cancel(["11111111-aaaa-4000-8000-000000000001", "o-missing"])
-    assert len(client.calls) == 3
+    assert [c[1].rsplit("/", 1)[-1] for c in client.calls] == ["batch_cancel", "batch_cancel", "o-refused",
+                                                               "batch_cancel", "o-missing"]
+
+
+@pytest.mark.parametrize("status", ["CANCELLED", "FILLED", "EXPIRED", "FAILED"])
+def test_a_refused_cancel_of_an_order_that_already_ended_is_no_error(status):
+    """Final fix: the failure reason for an order that left the book is undocumented (e.g. UNKNOWN_CANCEL_ORDER). An
+    order read back terminal rests no more - no error; one read back open, or unreadable, may still rest."""
+    ex, client, _ = make({("POST", "/orders/batch_cancel"): ["cancel_done_or_refused"],
+                          ("GET", "/orders/historical/o-refused"): _order_reply("o-refused", status)})
+    ex.cancel(["o-ok", "o-refused"])
+    assert client.calls[-1][:2] == ("GET", API + "/orders/historical/o-refused")
 
 
 def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypatch):
@@ -493,3 +517,64 @@ def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypa
     assert CoinbaseExchange(client, FUT).open_orders() == []
     query = urls[0].split("?", 1)[1]
     assert [p.split("=")[1] for p in query.split("&") if p.startswith("order_status=")] == list(OPEN_STATUSES)
+
+
+# ---------------------------------------------------------------------------- Final fix (non-finite amounts, replies)
+def _order(**fields) -> dict:
+    o = {"order_id": "o1", "side": "SELL", "status": "FILLED", "client_order_id": "ewb-e-1-S", "filled_size": "1",
+         "order_configuration": {"market_market_ioc": {"base_size": "1"}}}
+    return {"order": {**o, **fields}}
+
+
+@pytest.mark.parametrize("bad", ["NaN", "nan", "inf", "-Infinity", "1e999"])
+def test_non_finite_amounts_never_leave_the_adapter(bad):
+    """Final fix (P0): Python reads "NaN" / "inf" as floats. An optional amount that is not finite reads None (an
+    unread fill price, never a NaN the journal refuses - which left a filled entry without a trade or brackets); a
+    required one is an unexpected reply (ExchangeError, never an OverflowError escaping the adapter)."""
+    bracket = {"trigger_bracket_gtc": {"base_size": "1", "limit_price": bad, "stop_trigger_price": bad}}
+    routes = {
+        ("GET", "/orders/historical/o1"): [_order(average_filled_price=bad, total_fees=bad), _order(filled_size=bad),
+                                           _order(order_configuration=bracket, status="OPEN", filled_size="0")],
+        ("GET", "/cfm/positions"): [
+            {"positions": [{"product_id": FUT, "side": "LONG", "number_of_contracts": "2", "avg_entry_price": bad}]},
+            {"positions": [{"product_id": FUT, "side": "LONG", "number_of_contracts": bad}]}],
+        ("GET", "/cfm/balance_summary"): [
+            {"balance_summary": {"total_usd_balance": {"value": "5000"}, "available_margin": {"value": bad}}},
+            {"balance_summary": {"total_usd_balance": {"value": "5000"}, "unrealized_pnl": {"value": bad}}},
+            {"balance_summary": {"total_usd_balance": {"value": bad}}}],
+        ("GET", f"/products/{FUT}"): {**FIXTURES["product_bip"], "price_increment": bad},
+    }
+    ex, _, _ = make(routes)
+    o = ex.get_order("o1")
+    assert (o.filled, o.avg_fill_price, o.fee) == (1, None, None)
+    assert ex.position() == Position(1, 2, 0.0)  # the size and side are what protection needs
+    for read in (lambda: ex.get_order("o1"), ex.position, ex.product):
+        with pytest.raises(ExchangeError) as err:
+            read()
+        assert not err.value.retryable
+    o = ex.get_order("o1")
+    assert (o.kind, o.limit_price, o.stop_price) == ("BRACKET", None, None)
+    b = ex.balance()
+    assert b.equity == 5000.0 and b.available_margin is None
+    for _ in range(2):
+        with pytest.raises(ExchangeError):
+            ex.balance()
+
+
+def test_a_position_without_a_finite_entry_price_stays_readable():
+    ex, _, _ = make({("GET", "/cfm/positions"): {"positions": [
+        {"product_id": FUT, "side": "SHORT", "number_of_contracts": "3", "avg_entry_price": "NaN"}]}})
+    assert ex.position() == Position(-1, 3, 0.0)  # what protection is placed for; the executor never takes 0 as a price
+
+
+@pytest.mark.parametrize("reply", [{}, {"order_id": "33333333-cccc-4000-8000-000000000001"}, {"success": "true"},
+                                   {"success": None, "failure_reason": "UNKNOWN_FAILURE_REASON"}])
+def test_an_order_reply_without_a_boolean_success_is_ambiguous_not_a_refusal(reply):
+    """Final fix: a 200 reply that is not a create reply says nothing about the order: Unavailable (looked up by its
+    client order id), never a refusal (a refused entry is never sent again). Sent once."""
+    ex, client, _ = make({("POST", "/orders"): [reply], ("POST", "/orders/close_position"): [reply]})
+    with pytest.raises(Unavailable):
+        ex.place_market("ewb-e-1-L", 1, 1)
+    with pytest.raises(Unavailable):
+        ex.close_position("ewb-x-1-1")
+    assert len(client.calls) == 2

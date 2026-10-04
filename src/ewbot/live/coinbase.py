@@ -14,9 +14,11 @@ reply after the send, a bad header, ...) is ambiguous too: Unavailable, never a 
 `x-ratelimit-remaining` drops to `min_remaining`, the next request waits for the reset.
 
 Only ExchangeError (or ValueError for a side that is not +1/-1, a programming error) leaves this module:
-an unexpected reply shape is an ExchangeError, a reply that is not a JSON object is Unavailable. Error
-messages never carry an exception's text (it may hold the JWT): the HTTP status and the start of the
-reply body, or the exception's type name."""
+an unexpected reply shape is an ExchangeError, a reply that is not a JSON object - or an order reply without
+a boolean `success` - is Unavailable. No amount that is not a finite number ("NaN", "inf") leaves it: a
+required one (a size, a balance, a product's increments) is an unexpected shape, an optional one (a fill
+price, a fee, a bracket's prices) reads None. Error messages never carry an exception's text (it may hold
+the JWT): the HTTP status and the start of the reply body, or the exception's type name."""
 
 from __future__ import annotations
 
@@ -51,6 +53,7 @@ from ewbot.live.exchange import (
 
 API = "/api/v3/brokerage"
 SESSION_PREFIX = "FCM_TRADING_SESSION_STATE_"
+POSITION_SIDE_PREFIX = "FUTURES_POSITION_SIDE_"  # FCMPositionSide is LONG / SHORT; a prefixed enum name reads the same
 _STATUS = {"UNKNOWN_ORDER_STATUS": "UNKNOWN"}  # EDIT_QUEUED / CANCEL_QUEUED keep their name: open (exchange.py)
 _BRACKETS = ("trigger_bracket_gtc", "trigger_bracket_gtd")
 _ORDER_SIDES = {"BUY": 1, "SELL": -1}  # OrderSide
@@ -137,11 +140,27 @@ def _iso(ts: float) -> str:
 
 
 def _num(x: Any, default: float = 0.0) -> float:
+    """A required amount: `default` when missing or empty, else a finite number - Python reads "NaN", "inf" and
+    "1e999" as floats, the API never means one: ValueError (inside `_parsing`, an ExchangeError)."""
     if x is None or x == "":
         return default
     if isinstance(x, dict):  # {"value": "12.3", "currency": "USD"}
         return _num(x.get("value"), default)
-    return float(x)
+    v = float(x)
+    if not math.isfinite(v):
+        raise ValueError("not a finite number")
+    return v
+
+
+def _opt(x: Any) -> float | None:
+    """An optional amount (a fill price, a fee, a bracket's prices, the available margin): None when it is missing,
+    empty or not a finite number - an unreadable fill price is no fill price, never a NaN handed on (the journal
+    refuses one)."""
+    try:
+        v = _num(x, math.nan)
+    except _PARSE_ERRORS:
+        return None
+    return v if math.isfinite(v) else None
 
 
 def retry_after_s(value: Any, now: float | None = None) -> float:
@@ -207,9 +226,9 @@ def parse_order(o: dict[str, Any]) -> Order:
             if key in cfg:
                 b = cfg[key]
                 kind, size = "BRACKET", b.get("base_size")
-                limit, stop = _num(b.get("limit_price"), 0.0) or None, _num(b.get("stop_trigger_price"), 0.0) or None
+                limit, stop = _opt(b.get("limit_price")) or None, _opt(b.get("stop_trigger_price")) or None
         filled = int(_num(o.get("filled_size")))
-        avg = _num(o.get("average_filled_price")) or None
+        avg = _opt(o.get("average_filled_price")) or None  # 0, missing or not finite: not reported
         status = str(o.get("status") or "UNKNOWN")
         return Order(
             order_id=str(o["order_id"]),
@@ -223,7 +242,7 @@ def parse_order(o: dict[str, Any]) -> Order:
             stop_price=stop,
             avg_fill_price=avg,
             created_ts=iso_ts(o.get("created_time")),
-            fee=None if o.get("total_fees") in (None, "") else _num(o.get("total_fees")),
+            fee=_opt(o.get("total_fees")),
         )
 
 
@@ -236,8 +255,12 @@ def _reasons(resp: dict[str, Any]) -> list[str]:
 
 
 def parse_place(resp: dict[str, Any], client_order_id: str) -> PlaceResult:
-    """A create / close_position reply -> PlaceResult. Accepted without an order id is ambiguous
-    (Unavailable: the executor looks the order up by client_order_id)."""
+    """A create / close_position reply -> PlaceResult. Ambiguous (Unavailable: the executor looks the order up by
+    client_order_id): accepted without an order id, and a reply without a boolean `success` - not the shape of a
+    create reply, so it says nothing about the order; never read as a refusal (an entry refused is never sent again,
+    while the order may exist)."""
+    if not isinstance(resp.get("success"), bool):
+        raise Unavailable("order reply without a success field")
     with _parsing("order placement"):
         if resp.get("success"):
             order_id = str((resp.get("success_response") or {}).get("order_id") or "")
@@ -360,12 +383,15 @@ class CoinbaseExchange:
             bids, asks = pb.get("bids") or [], pb.get("asks") or []
             if not bids or not asks:
                 raise Unavailable(f"empty order book for {product_id}")
-            bid, ask = _num(bids[0]["price"], math.nan), _num(asks[0]["price"], math.nan)
-            if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > 0):
+            bid, ask = _opt(bids[0]["price"]), _opt(asks[0]["price"])
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
                 raise Unavailable(f"unusable top of book for {product_id}")  # never a price of 0, NaN or inf
             return Quote(product_id, bid, ask, self.clock())
 
     def position(self) -> Position | None:
+        """The BIP position. Its size and side are required; an average entry price that is missing or not a finite
+        number reads 0.0 (the position stays readable - it is what protection is placed for -, and the executor
+        never takes 0 for an entry price)."""
         reply = self._call("GET", "/cfm/positions")
         with _parsing("positions"):
             for p in reply.get("positions") or []:
@@ -374,7 +400,8 @@ class CoinbaseExchange:
                 n = abs(int(_num(p.get("number_of_contracts"))))
                 if n == 0:
                     return None
-                return Position(_side_of(p.get("side"), _POSITION_SIDES, "position"), n, _num(p.get("avg_entry_price")))
+                side = str(p.get("side") or "").removeprefix(POSITION_SIDE_PREFIX)
+                return Position(_side_of(side, _POSITION_SIDES, "position"), n, _opt(p.get("avg_entry_price")) or 0.0)
             return None
 
     def _orders(self, params: dict[str, Any]) -> list[Order]:
@@ -412,12 +439,11 @@ class CoinbaseExchange:
         reply = self._call("GET", "/cfm/balance_summary")
         with _parsing("balance_summary"):
             bs = reply.get("balance_summary") or {}
-            cash = _num(bs.get("total_usd_balance"), math.nan)
-            if not math.isfinite(cash):
+            cash = _opt(bs.get("total_usd_balance"))
+            if cash is None:
                 raise ExchangeError("balance_summary without a total_usd_balance")
             equity = cash + _num(bs.get("unrealized_pnl"))
-            avail = bs.get("available_margin")
-            return Balance(equity, None if avail is None else _num(avail))
+            return Balance(equity, _opt(bs.get("available_margin")))
 
     def key_permissions(self) -> KeyPermissions:
         """Fail closed: a missing can_view / can_trade reads False, a missing can_transfer reads True
@@ -484,22 +510,32 @@ class CoinbaseExchange:
 
     def cancel(self, order_ids: Sequence[str]) -> None:
         """batch_cancel, retried like a read (a repeated cancel is answered DUPLICATE_CANCEL_REQUEST).
-        Raises ExchangeError naming each order that may still rest: refused, or missing from results."""
+        Raises ExchangeError naming each order that may still rest: refused, or missing from results - unless the
+        order, read back (`get_order`), already ended (filled, cancelled, expired, failed: the failure reasons for an
+        order that left the book are not documented, e.g. UNKNOWN_CANCEL_ORDER); one that cannot be read may rest."""
         if not order_ids:
             return
         ids = [str(i) for i in order_ids]
         reply = self._call("POST", "/orders/batch_cancel", data={"order_ids": ids})
         with _parsing("batch_cancel"):
             results = {str(r.get("order_id")): r for r in reply.get("results") or []}
-            refused = []
+            refused: list[tuple[str, str]] = []
             for oid in ids:
                 r = results.get(oid)
                 if r is None:
-                    refused.append(f"{oid}: NO_RESULT")
+                    refused.append((oid, "NO_RESULT"))
                 elif not r.get("success") and str(r.get("failure_reason")) not in CANCEL_DONE:
-                    refused.append(f"{oid}: {r.get('failure_reason') or 'UNKNOWN_CANCEL_FAILURE_REASON'}")
-        if refused:
-            raise ExchangeError("cancel refused: " + ", ".join(refused))
+                    refused.append((oid, str(r.get("failure_reason") or "UNKNOWN_CANCEL_FAILURE_REASON")))
+        still = [f"{oid}: {why}" for oid, why in refused if not self._ended(oid)]
+        if still:
+            raise ExchangeError("cancel refused: " + ", ".join(still))
+
+    def _ended(self, order_id: str) -> bool:
+        """The order left the book for good (a terminal status, read back); False when it cannot be read."""
+        try:
+            return self.get_order(order_id).is_terminal
+        except ExchangeError:
+            return False
 
     def close_position(self, client_order_id: str, size: int | None = None) -> PlaceResult:
         if size is not None and bad_size(size):
