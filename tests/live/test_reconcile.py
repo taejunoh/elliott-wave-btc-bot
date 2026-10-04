@@ -495,20 +495,21 @@ def test_an_entry_intent_reads_as_the_engine_position_it_opens():
 def test_without_a_target_a_position_on_the_side_of_our_unsettled_entry_is_protected_from_it():
     """Final review A-A: killed after the venue took our entry, restarted while the hour has no target (the candles
     cannot be had): the position is taken over from the entry's own intent at once (the executor settles it as ours
-    or foreign) - still alerted as an unknown position - instead of waiting up to an hour unprotected."""
+    or foreign: ADOPTED_PROVISIONAL, then RECOVERED_ENTRY or ADOPTED) instead of waiting up to an hour unprotected. It
+    is our own entry, no manual intervention: no UNKNOWN_POSITION alert (an incident that would pause CANARY)."""
     own = own_entry()
     pos = Position(1, 1, 60_000.0)
     with_own = dataclasses.replace(CTX, own_entry=own)
     acts = plan(None, None, pos, [], with_own)
-    assert acts == [Alert("UNKNOWN_POSITION", "+1 x1: no target - protected from our entry "
-                                              f"{T} until its outcome is known"), Adopt(own, 1)]
+    assert acts == [Adopt(own, 1)]
     waiting = [Alert("UNKNOWN_POSITION", "+1 x1: waiting for a target")]
     assert plan(None, None, pos, [], CTX) == waiting  # no unsettled entry of ours
     assert plan(None, None, Position(-1, 1, 60_000.0), [], with_own) == [
         Alert("UNKNOWN_POSITION", "-1 x1: waiting for a target")]  # the other side: not our entry
     capped = dataclasses.replace(with_own, max_contracts=1)
     acts = plan(None, None, Position(1, 3, 60_000.0), [], capped)
-    assert acts[-2:] == [Adopt(own, 1), Reduce(2, "EXCESS")] and acts[1].kind == "EXCESS_POSITION"
+    assert acts == [Alert("EXCESS_POSITION", "position 3 > stage maximum 1: adopting 1"), Adopt(own, 1),
+                    Reduce(2, "EXCESS")]  # more than our entry: the excess is still an incident
     assert plan(target(position=tpos(direction=-1)), None, pos, [], with_own) == [Close("UNKNOWN_POSITION")]  # a target rules
 
 

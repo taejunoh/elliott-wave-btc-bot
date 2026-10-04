@@ -32,7 +32,9 @@ resting (both only reduce); only a known close-conflict refusal (`CLOSE_CONFLICT
 close while brackets rest; the watchdog's closes - a gapped stop, no resting stop - take any refusal for one:
 `any_refusal`) cancels them - after a session read, deferring while it is not OPEN - and the close is sent again
 once no bracket of ours rests (waiting up to CLEAR_TIMEOUT_S: a venue that queues cancels refuses a close sent
-beside them; still resting then, the close waits for the next pass - no resend, no new legs). The flat position is
+beside them; still resting then, the close waits for the next pass - no resend, no new legs, and for CLEARING_MAX_S
+the planner's legs are held back too, so the pass before the next attempt never places again what the close just
+cancelled: a close would be refused for them again and again). The flat position is
 awaited (30 s; at once over when the IOC close ended without closing everything: then the trade no longer names
 that close as its exit). After every close that did not go flat - failed or unconfirmed, this pass or a
 later one - the legs are made the ones for the position left (resized, or placed again when none rests), so
@@ -103,6 +105,7 @@ POLL_S = 0.5
 LOOKUP_WINDOW_S = 300.0  # find_order searches orders created up to 5 min before the intent
 ABANDON_AFTER_S = 600.0  # a PENDING intent not found on the exchange after 10 min was never sent
 UNSETTLED_ENTRY_MAX_S = 7200.0  # an accepted entry no trade records stops counting as unsettled this long after it
+CLEARING_MAX_S = 30.0  # a close waiting for the brackets it cancelled holds the planner's legs back at most this long
 LEG_SETTLE_S = 30.0  # a leg that left the book with fills is not placed again for this long (the position catches up)
 CLEAR_TIMEOUT_S = 5.0  # an entry after a close or a cancel waits this long for our brackets to leave the book
 TRADE_KEY = "trade"
@@ -375,7 +378,7 @@ class Executor:
                 elif isinstance(a, Reduce):
                     reduced = self.reduce(a.size, a.reason, ctx)
                 elif isinstance(a, Protect):
-                    if reduced:
+                    if reduced and not self._clearing():  # a waiting close's cancelled legs: never placed again
                         self.protect(a, ctx)
                 elif isinstance(a, Adopt):
                     self.adopt(a.target, ctx, a.contracts)
@@ -394,6 +397,15 @@ class Executor:
                     closed = False
                 elif isinstance(a, Reduce):
                     reduced = False
+
+    def _clearing(self) -> bool:
+        """A close is waiting for the brackets it cancelled to leave the book (`close`, WAITING), for at most
+        CLEARING_MAX_S from that cancel: the planner's legs are held back meanwhile."""
+        t = self.trade()
+        if t is None or t.status != "OPEN":
+            return False
+        until = self._scratch(t.trade_id).get("clearing")
+        return until is not None and 0 <= float(until) - self.clock() <= CLEARING_MAX_S
 
     def _brackets_clear(self) -> bool:
         """No bracket of ours rests (one whose cancel is queued still does), waiting up to CLEAR_TIMEOUT_S; an
@@ -859,6 +871,10 @@ class Executor:
         trade = self.trade()
         if trade is None or trade.status != "OPEN":
             return
+        scratch = self._scratch(trade.trade_id)
+        if scratch.get("clearing") is not None:  # the legs go back now: no longer held for a waiting close
+            scratch["clearing"] = None
+            self.journal.put(SCRATCH_KEY, scratch)
         try:
             pos = self.ex.position()
             if pos is None or pos.side != trade.direction:
@@ -906,6 +922,10 @@ class Executor:
             if ours:
                 self._cancel_quietly(ours, tid)
             if not self._brackets_clear():  # a cancel still queued: a close sent now is refused again
+                if open_trade is not None and not self._clearing():  # the planner's legs held back until the next try
+                    scratch = self._scratch(open_trade.trade_id)
+                    scratch["clearing"] = self.clock() + CLEARING_MAX_S
+                    self.journal.put(SCRATCH_KEY, scratch)
                 self.event("CLOSE_FAILED", {"trade_id": tid, "reason": reason, "status": "WAITING",
                                             "error": "our brackets still rest after their cancel: the close goes out "
                                                      "again on the next pass"},

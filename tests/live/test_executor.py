@@ -6,7 +6,7 @@ import math
 import pytest
 
 from ewbot.live.exchange import Order, PlaceResult, Position, RateLimited, Unavailable
-from ewbot.live.executor import CLOSE_CONFLICTS, UNSETTLED_ENTRY_MAX_S, Executor
+from ewbot.live.executor import CLEARING_MAX_S, CLOSE_CONFLICTS, UNSETTLED_ENTRY_MAX_S, Executor
 from ewbot.live.reconcile import (
     Adopt,
     Alert,
@@ -1310,3 +1310,32 @@ def test_an_entry_that_ended_unfilled_is_settled(env):
     assert exe.enter(Enter(entry(), 1), ctx(clock)) is None
     assert jr.events(kind="ENTRY_UNFILLED")[0]["data"]["terminal"] is True
     assert exe.unsettled_entry(clock()) is None
+
+
+def test_a_close_waiting_for_its_brackets_to_leave_holds_the_planners_legs(env):
+    """Final re-review A (watchdog path): after a close-conflict cancel Coinbase still queues, the close waits for the
+    next attempt; the observing pass before that attempt must not place again the legs the close just cancelled, or
+    the close is refused again and the cancel / re-place loop never ends while cancels take over 5 s. The planner's
+    legs are held back while that close waits - at most CLEARING_MAX_S - and then protect the position again."""
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    bracket_conflict(ex)
+    queued_cancels(ex, clock, delay=8.0)
+    assert exe.close("STOP_GAP", ctx(clock), any_refusal=True) is False  # WAITING: its cancel is still queued
+    placed = ex.calls.count("place_bracket")
+    clock.now += 5  # the watchdog's next attempt, 10 s after the first: first its observing pass
+    poll(exe, ex, clock, target(T0 + 3600, position()))
+    assert ex.calls.count("place_bracket") == placed and ex.open_orders() == []
+    assert exe.close("STOP_GAP", ctx(clock), any_refusal=True) is True and ex.position() is None
+
+
+def test_the_planners_legs_are_held_back_at_most_while_the_close_may_still_go_out(env):
+    clock, ex, jr, _, exe = env
+    exe.enter(Enter(entry(), 1), ctx(clock))
+    bracket_conflict(ex)
+    queued_cancels(ex, clock, delay=8.0)
+    assert exe.close("TIME", ctx(clock)) is False
+    placed = ex.calls.count("place_bracket")
+    clock.now += CLEARING_MAX_S + 1  # no close came: the position is protected again
+    poll(exe, ex, clock, target(T0 + 3600, position()))
+    assert ex.calls.count("place_bracket") == placed + 1 and len(ex.open_orders()) == 1

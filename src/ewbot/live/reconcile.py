@@ -20,10 +20,11 @@ the engine's target (live/target.py) and the exchange's position and open orders
   2. `plan` returns the actions, in order:
        - a position the journal does not know: adopt it when the engine holds the same direction (at
          most the stage maximum `ctx.max_contracts`, the rest is reduced: EXCESS), else close it
-         (spec 4.4: the actual position always follows the target); without a target it is alerted and - on the
-         side of our latest entry whose outcome or fill is still unknown and no trade records (`ctx.own_entry`, the
-         engine position its intent opens: `entry_position`) - taken over from that entry at once (the executor
-         settles it as ours or foreign), never left unprotected until a target comes;
+         (spec 4.4: the actual position always follows the target); without a target, one on the side of our
+         latest entry whose outcome or fill is still unknown and no trade records (`ctx.own_entry`, the engine
+         position its intent opens: `entry_position`) is taken over from that entry at once - our own entry, no
+         manual intervention: the executor protects it provisionally and settles it as ours or foreign (a foreign
+         one is then the incident) -, never left unprotected until a target comes; any other is alerted;
        - within the hour after an entry the replay still shows it as queued (`target.entry`): the live
          trade of that signal is the engine position (`pending_position`), never a reason to close;
        - flat: nothing while the trade is still OPEN (its flat read is unconfirmed: observe); else cancel our
@@ -516,9 +517,7 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
             own = ctx.own_entry
             if own is None or own.direction != position.side:
                 return acts + [Alert("UNKNOWN_POSITION", f"{position.side:+d} x{n}: waiting for a target")]
-            acts.append(Alert("UNKNOWN_POSITION", f"{position.side:+d} x{n}: no target - protected from our entry "
-                                                  f"{own.signal_ts} until its outcome is known"))
-            held: TargetPosition | None = own
+            held: TargetPosition | None = own  # our own entry: ADOPTED_PROVISIONAL / RECOVERED_ENTRY, no incident
         else:
             held = engine_position(target)
         if held is None or held.direction != position.side:
