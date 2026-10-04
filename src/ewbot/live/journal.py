@@ -10,7 +10,10 @@ committed row survives a kill or power loss, and `ewbot live status` can read wh
 database that does not take WAL is refused (JournalError), as is one whose schema version (`PRAGMA
 user_version`, SCHEMA_VERSION) is newer than this runtime's - a rollback never writes into a journal it does not
 know. Every statement and its fetch run under one lock (the Telegram thread writes too), and an update of an
-intent or a cycle that does not exist raises KeyError (never a silent no-op)."""
+intent or a cycle that does not exist raises KeyError (never a silent no-op). `read_only=True` (`live status`,
+`live preflight`, the deploy script's probes from a candidate image) opens an existing journal for reading only: it
+never creates, migrates or writes it (a write raises sqlite3.OperationalError), so a candidate image never changes
+the journal the running image uses; a missing file or a newer schema is a JournalError."""
 
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
 
 SCHEMA_VERSION = 1  # PRAGMA user_version of the journal this module writes
 INTENT_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "ABANDONED")
@@ -52,14 +56,21 @@ class JournalError(RuntimeError):
 
 
 class Journal:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False, timeout=30.0)
+        if read_only:
+            if not self.path.is_file():
+                raise JournalError(f"{self.path}: no journal to read")
+            uri = f"file:{quote(str(self.path.resolve()))}?mode=ro"
+            self._db = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False, timeout=30.0)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False, timeout=30.0)
         self._db.row_factory = sqlite3.Row
         try:
-            mode = str(self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            mode = str(self._db.execute("PRAGMA journal_mode" if read_only else "PRAGMA journal_mode=WAL").fetchone()[0])
             if mode.lower() != "wal":  # the pragma answers the mode in force: refused (e.g. no shared memory)
                 raise JournalError(f"{self.path}: journal_mode is {mode!r}, not WAL - a committed row might not "
                                    "survive a crash")
@@ -67,6 +78,8 @@ class Journal:
             if version > SCHEMA_VERSION:
                 raise JournalError(f"{self.path}: journal schema version {version} is newer than this runtime's "
                                    f"{SCHEMA_VERSION} (deploy the release that wrote it)")
+            if read_only:  # never created, migrated or written
+                return
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(_SCHEMA)
             if version < SCHEMA_VERSION:  # a new journal, or one written before the version was recorded

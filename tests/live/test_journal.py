@@ -134,3 +134,33 @@ def test_committed_rows_survive_a_killed_process(tmp_path):
     j = Journal(path)
     assert j.intent("ewb-e-7-L")["status"] == "PENDING" and j.get("trade") == {"trade_id": 7}
     j.close()
+
+
+def test_a_read_only_journal_reads_and_never_writes_nor_migrates(tmp_path):
+    """Final review B minor 12: the deploy probes, `live preflight` and `live status` open the live journal read-only:
+    a candidate image never migrates (or otherwise writes) the journal the running image uses - a later schema version
+    would make the old image refuse it on a rollback."""
+    p = tmp_path / "journal.sqlite"
+    j = Journal(p)
+    j.put("x", 1)
+    j.set_stage("CANARY", "test", 1.0)
+    j.close()
+    raw = sqlite3.connect(p)
+    raw.execute("PRAGMA user_version = 0")  # a journal written before the version was recorded
+    raw.close()
+    before = p.read_bytes()
+    ro = Journal(p, read_only=True)
+    assert ro.get("x") == 1 and ro.stage()[0] == "CANARY"
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        ro.put("y", 2)
+    ro.close()
+    assert p.read_bytes() == before
+    raw = sqlite3.connect(p)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 0  # not migrated
+    raw.execute("PRAGMA user_version = 2")
+    raw.close()
+    with pytest.raises(JournalError, match="newer"):
+        Journal(p, read_only=True)
+    with pytest.raises(JournalError, match="no journal"):
+        Journal(tmp_path / "missing.sqlite", read_only=True)
+    assert not (tmp_path / "missing.sqlite").exists()
