@@ -11,9 +11,11 @@ database that does not take WAL is refused (JournalError), as is one whose schem
 user_version`, SCHEMA_VERSION) is newer than this runtime's - a rollback never writes into a journal it does not
 know. Every statement and its fetch run under one lock (the Telegram thread writes too), and an update of an
 intent or a cycle that does not exist raises KeyError (never a silent no-op). `read_only=True` (`live status`,
-`live preflight`, the deploy script's probes from a candidate image) opens an existing journal for reading only: it
-never creates, migrates or writes it (a write raises sqlite3.OperationalError), so a candidate image never changes
-the journal the running image uses; a missing file or a newer schema is a JournalError."""
+`live preflight`, the deploy script's probes from a candidate image) opens an existing journal for reading only: the
+database file is never changed - no WAL switch, no schema, no migration; a write raises sqlite3.OperationalError -, so
+a candidate image never changes the journal the running image uses (SQLite may create the -wal and -shm side files
+beside a cleanly closed journal, which needs a writable directory); a missing file or a newer schema is a
+JournalError."""
 
 from __future__ import annotations
 
