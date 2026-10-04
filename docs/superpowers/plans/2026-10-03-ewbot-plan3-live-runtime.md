@@ -48,7 +48,7 @@
 11. **Gates operationalised.** SHADOW `신호 1건 이상` = a signal first known in the stage (`known_at` after its start: the first cycle records every decision since 2024). SHADOW ① = a passing audit (no mismatch the data do not explain: a `DATA_REVISION` is shown in the detail, not counted - as paper criterion 4 ignores explained causes) whose window starts at or before the stage's start and reaches a bar that closed at most 3 hours ago; a failed audit is stored and unmet, never the last good one. SHADOW ② (`모든 사이클`) = every hourly bar that closed in the stage has a cycle that ended OK within 2 minutes of the close - a runtime that was down misses bars; a bar whose deadline is still ahead is not due, and one with no cycle row at all while the futures session was recorded closed is excused: from a `SESSION` event whose `state` is not OPEN (the runtime records the state at every start and every change) to the next `SESSION` or `STARTUP` event, at most 4 hours (spec §2: the longest closure is the quarterly 3-hour maintenance). A restart never rewrites a bar whose cycle ended OK: it takes that bar as done and only refreshes its target (a failed download retried until the hour ends); a bar held or failed before a restart is not decided again, and a cycle a crash left RUNNING (or one never started) runs under the usual deadlines. SHADOW ④ (`장애·재시작 시험`) = at least two `RECOVERY` events in the stage (first start + ≥ 1 restart) and none with an unresolved intent. CANARY ② (`손절 이동과 청산이 목표와 일치`) = no `ORDER_UNRESOLVED`: the runtime watches every `BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED` and `ACTION_ERROR` of a Protect, Close or Reduce until it is resolved - its trade closed, or a later pass that saw a target and quotes had no order failure for that trade (a close needs the close itself). A bracket's 30 s are judged at the strict pass (a target, quotes, the session OPEN) that placed its wanted legs - it planned a Protect for the trade and had no failure for it -, and a later strict pass that plans nothing for the trade and has no failure confirms it whenever it runs (one that fails or plans again leaves it open; still unconfirmed after 2 further strict passes and 10 minutes, it is unresolved - never in an outage without strict passes); a strict pass that finds the legs as wanted within the 30 s resolves it at once. A pass without a target, quotes or an OPEN session (a data-late hour; a venue refusing order entry while closed) shows only the protection - the trade's resting stop legs covering its position -: that resolves a failure first seen in such a pass, and is provisional for one first seen in a strict pass until the next strict pass confirms it - within 30 s for a bracket and by the next pass for a close or a reduction (the cancel-first fallback on a venue that refuses overlapping brackets writes `LEG_GAP` only: the designed path, not a failure; so do `CLOSE_CONFLICT` / `REDUCE_CONFLICT`, refusals answered by making room); CANARY ⑤ = at least one `COSTS` event (a daily summary with fills). The CANARY pass and FULL entry gates also need no other CANARY failure in the stint (audit mismatch, breaker, transfer key), the runtime not paused and a current audit without an unexplained mismatch of a decision known in the stint. `transition` refuses a promotion unless every gate of that promotion (`stage.REQUIRED_GATES`) is among those given and all are met. The paper criteria come from the paper ledger (`paper.criteria.golive_status`).
 12. **Audit** (spec §3.5): the journal stores the engine decisions in the paper ledger's format; hourly (from minute 50) they are compared with the paper ledger's current epoch (known_at in (its recording floor - the previous epoch's through_ts for a later epoch -, min(epoch through_ts, the last bar whose live cycle ended OK)]: a held or failed cycle is never a mismatch). Every mismatch has a cause like the paper runtime's: `DATA_REVISION` (the candles the two runtimes decided on differ at the decision's bar although they were equal at the paper's previous run) is alerted only and explained (it fails no audit gate); a decision missing on one side is `AUDIT_PENDING` and a major incident (`AUDIT_MISMATCH`, in CANARY/FULL) only if the next audit still finds it; a different decision or a paper fingerprint change is one at once. A ledger that is not a valid schema-1 paper ledger, like a failed fetch, is a failed audit: stored as failed, alerted once per episode.
 13. **Costs in the daily summary**: entry slippage against the engine's reference (spot `entry_ref` × ratio), stop slippage of bracket stop fills against the stop price (every leg's fills - a partial one too - are journaled as `BRACKET_FILL` as they show: from the open orders while it rests, read back with `get_order` once it left the book and recorded only once that read succeeded), measured fees vs. the paper cost model (`execution.costs.fee`); funding is not measured separately (Coinbase books it into the balance) — the summary says so.
-14. **Deployment**: only tags on `origin/master`, only with a flat book; the new image's offline preflight runs before anything else; the running image is `ewbot-live:current` (rollback = deploy the previous tag).
+14. **Deployment** (spec §5.2): only tags on `origin/master`, from a clean checkout (no local change, no untracked file under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`); the new image's offline preflight runs first, with the service's real configuration (a compose `run` of the new image: the journal's stage, the secrets and key files, the user, the read-only root); then only with a flat book - what the running runtime calls flat (`LiveRuntime.flat`, `status --require-flat`): no open trade, no PENDING intent, no standing flatten, no position, no resting order - and never from hh:58 to hh:05 UTC (the hour's cycle and its entries). The running image is kept as `ewbot-live:previous` and the new one becomes `ewbot-live:current`; it must journal a loop heartbeat newer than the swap within 3 minutes (10 on a first deployment: the candle history is downloaded first), else the previous image is started again (rollback by hand = deploy the previous tag). `deploy.sh --recover <tag>` skips only the flat-book check, after a typed confirmation, and never rolls back: the one exception to the flat-book rule, to bring the runtime back while a position is open (a release that crash-loops, a new VPS after a VPS loss; runbook). Backups are watched by a healthchecks.io check of their own; a restore removes the journal's `-wal` and `-shm` files first.
 
 ## File Map
 
@@ -79,8 +79,8 @@
 | `pyproject.toml`, `uv.lock` (via `uv add`) | 3, 8 | `live` dependency group: `coinbase-advanced-py==1.8.4`, `websockets==13.1` |
 | `tests/paper/test_static.py` (one line) | 4 | `live/target.py` in `ALLOWED_TRUE` |
 | `tests/live/*` | 1–15 | unit, fixture, parity, chaos, CLI and deploy tests; `helpers.py` (7), `harness.py` (12), `fixtures/coinbase.json` (3) |
-| `deploy/live/Dockerfile`, `Dockerfile.dockerignore`, `docker-compose.yml` | 15 | image and service |
-| `deploy/live/deploy.sh`, `backup.sh`, `ewbot-backup.service`, `ewbot-backup.timer` | 15 | deployment (tag on master, flat book) and daily encrypted backups |
+| `deploy/live/Dockerfile`, `Dockerfile.dockerignore`, `docker-compose.yml`, `.gitignore` | 15 | image and service (`deploy/live/.env` never committed) |
+| `deploy/live/deploy.sh`, `backup.sh`, `ewbot-backup.service`, `ewbot-backup.timer` | 15 | deployment (tag on master, real-configuration preflight, flat book, time window, rollback, `--recover`) and daily encrypted, watched backups |
 | `docs/live-trading.md` | 15 | ops runbook |
 
 ## Task Overview
@@ -99,12 +99,12 @@
 | 10 | Paper audit, stages and gates | 20 |
 | 11 | Settings and preflight | 19 |
 | 12 | `ShadowExchange` and the runtime loop | 72 |
-| 13 | CLI `ewbot live …` and production wiring | 20 |
+| 13 | CLI `ewbot live …` and production wiring | 21 |
 | 14 | Parity and chaos integration tests | 29 |
-| 15 | Docker image, compose, deploy and backup scripts, runbook | 12 |
+| 15 | Docker image, compose, deploy and backup scripts, runbook | 46 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 451 more tests, `1071 passed, 1 skipped` (`1072 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 486 more tests, `1106 passed, 1 skipped` (`1107 passed` with the cache; two more skipped without `shellcheck`), about 100 s.
 
 ---
 
@@ -15075,7 +15075,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
 - Produces (`ewbot.live.app`): `REAL_STAGES = ("CANARY", "FULL")`, `VIRTUAL_ORDER_ID` (`v<n>-`: live.shadow's virtual order ids), `FATAL_KEY = "fatal"`, `FATAL_REPEAT_S = 900.0`, `FATAL_WAIT_S = 60.0`, `FATAL_WAIT_MAX_S = 1800.0`, `FATAL_ALERT_S = 3600.0`; `class RealExposure(RuntimeError)`; `real_exchange(settings) -> Exchange` (a `SettingsError` without a key file and for any failure to set the exchange up - the SDK raises a bare `Exception` for a malformed key file -, its text redacted; the fixed products `FUTURES_PRODUCT`, `SPOT_PRODUCT`), `last_real_stage(journal) -> str | None`, `journal_exposure(journal) -> str | None` (the OPEN trade or a PENDING intent, unless order ids prove it virtual: there is one for its trade - intents, legs - and every one is a virtual book's), `account_exposure(real) -> str | None` (a position or orders of ours on the real account; `ExchangeError` when unreadable), `process_stage(journal, real) -> (stage, why | None)` (CANARY and FULL as recorded; SHADOW only with nothing real left - a demoted journal's real open trade or PENDING intents, or a position or orders of ours on the real account, an unreadable one counting as there, keep the process on the real account in the last real stage of the stage history, entries blocked by the journal's SHADOW cap, until it is flat and restarts; a journal never CANARY or FULL with a position or our orders on the real account raises `RealExposure`, an unreadable account does not), `stage_exchange(real, journal, stage, notify)` (the real exchange for CANARY and FULL, `ShadowExchange` for any other stage), `notifier(settings) -> LiveNotifier` (its sending thread started), `heartbeat(settings) -> Heartbeat`, `redact(text, settings) -> str` (every form of the bot token, the GitHub token and the health-check URL - each `Secret` revealed here -, raw and URL-encoded, the URL's path - its UUID or ping key - and query wherever they appear, e.g. `url: /<uuid>/fail?…` in a requests error, replaced by `<secret>`), `fatal_report(exc, settings) -> str` (the traceback, `redact`ed), `fatal_backoff(journal | None, kind, now) -> (wait_s, alert)` (a fatal within `FATAL_REPEAT_S` of the previous one waits `FATAL_WAIT_S`, doubling with every repeat up to `FATAL_WAIT_MAX_S`; its `[중단]` and `/fail` go out once per error type per `FATAL_ALERT_S`, across restarts - journaled under `FATAL_KEY`; without a usable journal the longest wait, alerted), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None` (None for any failure - the gates fail closed -, the reason redacted on stderr), `price_feed(settings) -> TickerFeed | None` (the ticker feed for `FUTURES_PRODUCT` and `SPOT_PRODUCT` on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), `contract_reminders() -> dict` (the contract's expiry `PRODUCT_EXPIRY` and the day the preflight starts refusing it, `EXPIRY_MARGIN_DAYS` before), `class StopRequest` (`installed()`: inside it SIGTERM and SIGINT set `requested` and the attached runtime's `stop_requested`, the previous handlers back after it; `attach(runtime)`; `wait(seconds)` in steps of at most 1 s, ending early on a stop), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, stage, notify=None) -> Wired` (`stage` is the preflight's, from `process_stage`, read once; hands the preflight-checked lock, the expiry reminders - the settings' and `contract_reminders()` - as a dict, the process stage, the Telegram control so the runtime watches it and `redact` for its error texts to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit and stop tests also `Heartbeat`, `notifier` and `TelegramControl`.
-- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `shadow|canary --restart` - a new stint of the current stage, which reads no key permissions - need a flat book before writing, a promotion also the new stage's alerts - the preflight's `alerts` check as the gate `ALERTS_GATE`; a demotion is written first and the flat book reported after; without a journal nothing is written), `backup --out PATH` (refused without a journal: never an empty copy) (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), `ALERTS_GATE`, test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256 field, file sha256)` (production: `DEFAULT_LOCK_PATH`, `LOCK_SHA256`, `LOCK_FILE_SHA256`; the tests pin their temp lock by its own field and file hash), `_exchange(settings) -> Exchange` (any failure to set the exchange up is a `SettingsError`), `cmd_live(args) -> int`; `live run` and `live preflight` run the preflight with the settings (the `alerts` check) and the lock-file pin, `live run` for the process stage (`live_app.process_stage`, read once and handed to `build`); a `live run` refused - the settings, the exchange's setup, `RealExposure`, the preflight, or a runtime start that raised `StartupRefused` (Coinbase unreadable for `STARTUP_READ_MAX_S` after the preflight) - sends `[시작 거부]`, no healthchecks.io `/fail`, and waits `LIVE_REFUSAL_WAIT_S` before exit 2; the wiring is closed - the Telegram poller and the feed stopped, the queued messages flushed - before any wait and on every exit, and the journal closed; SIGTERM (`docker stop`) and SIGINT are a graceful stop (`live_app.StopRequest`: the runtime finishes its tick, `[종료]`, exit 0, no `/fail` or `[중단]`; a wait ends early), KeyboardInterrupt the same, SystemExit passes through; any other exception - `build`'s included - is fatal: healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text, both once per error type an hour (`fatal_backoff`), stderr the `fatal_report`, a back-off wait when fatals repeat within 15 minutes, exit 1. Exit codes: 0 ok (a stage change or a stop); 1 no journal (`status`, `stage`, `backup`) / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, the exchange's setup or a read `status --exchange` or `stage` needs, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
+- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `shadow|canary --restart` - a new stint of the current stage, which reads no key permissions - need a flat book before writing, a promotion also the new stage's alerts - the preflight's `alerts` check as the gate `ALERTS_GATE`; a demotion is written first and the flat book reported after; without a journal nothing is written), `backup --out PATH` (refused without a journal: never an empty copy) (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), `ALERTS_GATE`, test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256 field, file sha256)` (production: `DEFAULT_LOCK_PATH`, `LOCK_SHA256`, `LOCK_FILE_SHA256`; the tests pin their temp lock by its own field and file hash), `_exchange(settings) -> Exchange` (any failure to set the exchange up is a `SettingsError`), `cmd_live(args) -> int`; `live run` and `live preflight` run the preflight with the settings (the `alerts` check) and the lock-file pin, `live run` for the process stage (`live_app.process_stage`, read once and handed to `build`); a `live run` refused - the settings, the exchange's setup, `RealExposure`, the preflight, or a runtime start that raised `StartupRefused` (Coinbase unreadable for `STARTUP_READ_MAX_S` after the preflight) - sends `[시작 거부]`, no healthchecks.io `/fail`, and waits `LIVE_REFUSAL_WAIT_S` before exit 2; the wiring is closed - the Telegram poller and the feed stopped, the queued messages flushed - before any wait and on every exit, and the journal closed; SIGTERM (`docker stop`) and SIGINT are a graceful stop (`live_app.StopRequest`: the runtime finishes its tick, `[종료]`, exit 0, no `/fail` or `[중단]`; a wait ends early), KeyboardInterrupt the same, SystemExit passes through; any other exception - `build`'s included - is fatal: healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text, both once per error type an hour (`fatal_backoff`), stderr the `fatal_report`, a back-off wait when fatals repeat within 15 minutes, exit 1. Exit codes: 0 ok (a stage change or a stop); 1 no journal (`status`, `stage`, `backup`) / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, the exchange's setup or a read `status --exchange` or `stage` needs, preflight, stage gate); 3 `--require-flat` found what the running runtime still manages (`LiveRuntime.flat`): an open trade, a PENDING intent or a standing flatten in the journal, or - with `--exchange` - a position or any resting order (`status --json` also reports `pending_intents` and `flatten`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -15103,7 +15103,7 @@ from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
 from ewbot.live.notify import LiveNotifier
 from ewbot.live.reconcile import is_ours
-from ewbot.live.runtime import LiveRuntime
+from ewbot.live.runtime import FLATTEN_KEY, LiveRuntime
 from ewbot.live.settings import LiveSettings, Secret, SettingsError
 from ewbot.live.shadow import ShadowExchange
 from ewbot.live.sim import SimExchange
@@ -15444,6 +15444,31 @@ def test_require_flat_sees_the_journal_trade_and_the_account(live_env, capsys):
     ex.place_market("manual", 1, 1)
     assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 3
     assert "not flat" in capsys.readouterr().err
+
+
+def test_require_flat_is_the_runtimes_flat_book(live_env, capsys):
+    """deploy.sh swaps only what the running runtime would call flat (LiveRuntime.flat): an order of unknown outcome
+    or a standing flatten keeps the book open even with no trade and nothing on the exchange."""
+    settings, ex, _ = live_env
+    jr = Journal(settings.journal_path)
+    jr.record_intent("ewb-e-1700000000-L", "ENTRY", 1_700_000_000, {"side": 1, "contracts": 1}, NOW)
+    jr.close()
+    assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["pending_intents"] == 1 and "1 order(s) of unknown outcome" in captured.err
+    jr = Journal(settings.journal_path)
+    jr.update_intent("ewb-e-1700000000-L", "ABANDONED", NOW + 600)
+    jr.put(FLATTEN_KEY, {"reason": "USER_FLATTEN", "origin": "USER", "ts": NOW, "deferred": True})
+    jr.close()
+    assert main(["live", "status", "--json", "--require-flat"]) == 3
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["flatten"]["reason"] == "USER_FLATTEN" and "a standing flatten" in captured.err
+    jr = Journal(settings.journal_path)
+    jr.put(FLATTEN_KEY, None)  # cleared once the account was flat (FLATTENED)
+    jr.close()
+    assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["pending_intents"] == 0 and out["flatten"] is None and out["exchange_open_orders"] == 0
 
 
 def test_stage_changes_need_confirm_gates_and_a_flat_book(live_env, monkeypatch, capsys):
@@ -16094,7 +16119,8 @@ from ewbot.live.stage import (
     p_ls.add_argument("--max-age", type=float, default=None, help="exit 1 when the loop heartbeat is older (seconds)")
     p_ls.add_argument("--exchange", action="store_true", help="also read the Coinbase position and open orders")
     p_ls.add_argument("--require-flat", action="store_true",
-                      help="exit 3 unless no trade is open and (with --exchange) the account is flat (deploy.sh)")
+                      help="exit 3 unless the journal holds no open trade, no order of unknown outcome and no standing "
+                      "flatten and (with --exchange) the account has no position and no resting order (deploy.sh)")
     p_stage = live_sub.add_parser("stage", help="change the operating stage (promotions need every gate met)")
     p_stage.add_argument("to", choices=("shadow", "canary", "full"))
     p_stage.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
@@ -16249,8 +16275,9 @@ def _live_gates(journal: Journal, stage: str, now: float) -> list[Gate]:
 
 def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
     """Journal status (no journal yet: --json still answers, stage null). Exit 1 when --max-age is exceeded
-    (Docker HEALTHCHECK), 2 when --exchange cannot read Coinbase, 3 when --require-flat finds an open trade, position
-    or resting order."""
+    (Docker HEALTHCHECK), 2 when --exchange cannot read Coinbase, 3 when --require-flat finds what the running
+    runtime still manages (its flat book, `LiveRuntime.flat`): an open trade, an order of unknown outcome (a PENDING
+    intent) or a standing flatten in the journal, or - with --exchange - a position or any resting order."""
     if not s.journal_path.exists() and not args.json:
         print(f"no journal at {s.journal_path}", file=sys.stderr)
         return 1
@@ -16263,7 +16290,9 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
         trade = journal.get("trade") if journal is not None else None
         out: dict[str, Any] = {"stage": stage, "since": since, "heartbeat_age": age,
                                "paused": journal.get("paused") if journal is not None else None,
-                               "trade": trade if trade and trade.get("status") == "OPEN" else None}
+                               "trade": trade if trade and trade.get("status") == "OPEN" else None,
+                               "pending_intents": len(journal.intents(status="PENDING")) if journal is not None else 0,
+                               "flatten": journal.get(live_runtime.FLATTEN_KEY) if journal is not None else None}
         if args.exchange:
             try:
                 real = _exchange(s)
@@ -16281,9 +16310,15 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
                 print(line)
             if args.exchange:
                 print(f"exchange position: {out['exchange_position']}, open orders: {out['exchange_open_orders']}")
-        if args.require_flat and (out["trade"] is not None or out.get("exchange_position") is not None
-                                  or out.get("exchange_open_orders", 0) > 0):
-            print("not flat: an open trade, position or resting order (flatten first: /flatten)", file=sys.stderr)
+        held = [what for what, there in (
+            ("an open trade", out["trade"] is not None),
+            (f"{out['pending_intents']} order(s) of unknown outcome (PENDING)", out["pending_intents"] > 0),
+            ("a standing flatten", out["flatten"] is not None),
+            ("a position", out.get("exchange_position") is not None),
+            (f"{out.get('exchange_open_orders', 0)} resting order(s)", out.get("exchange_open_orders", 0) > 0)) if there]
+        if args.require_flat and held:
+            print(f"not flat: {', '.join(held)} (flatten first: /flatten, or wait until the runtime is done)",
+                  file=sys.stderr)
             return 3
         return 1 if args.max_age is not None and (age is None or age > args.max_age) else 0
     finally:
@@ -16419,7 +16454,7 @@ uv run --group live pytest tests/live/test_cli_live.py tests/paper/test_cli_pape
 uv run ewbot live --help
 ```
 
-Expected: `46 passed` (20 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, backup`.
+Expected: `47 passed` (21 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, backup`.
 
 - [ ] **Step 5: Commit**
 
@@ -17076,7 +17111,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `439 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `440 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -17095,21 +17130,22 @@ EOF
 ### Task 15: Docker image, compose service, deploy and backup scripts, ops runbook
 
 **Files:**
-- Create: `deploy/live/Dockerfile`, `deploy/live/Dockerfile.dockerignore`, `deploy/live/docker-compose.yml`
+- Create: `deploy/live/Dockerfile`, `deploy/live/Dockerfile.dockerignore`, `deploy/live/docker-compose.yml`, `deploy/live/.gitignore`
 - Create: `deploy/live/deploy.sh`, `deploy/live/backup.sh` (both executable), `deploy/live/ewbot-backup.service`, `deploy/live/ewbot-backup.timer`
 - Create: `docs/live-trading.md`
 - Test: `tests/live/test_deploy.py`
 
 **Interfaces:**
-- Consumes: `ewbot live run | preflight --offline | status --json --exchange --require-flat | status --max-age 180 | backup --out` (Task 13).
-- Produces: the image `ewbot-live:<tag>` (Python 3.12.13 slim + uv 0.12.13, both pinned by digest; editable install at `/app` with `--no-dev --group live`; user uid 1000; `HEALTHCHECK ewbot live status --max-age 180`; `STOPSIGNAL SIGTERM`, `ENTRYPOINT ["ewbot", "live"]`, `CMD ["run"]`); the compose service `live` (`restart: unless-stopped`, `init: true` - an init as PID 1 hands `docker stop`'s SIGTERM to the runtime, which finishes its tick and exits 0 -, `stop_grace_period: 150s` for that tick and the 10 s Telegram flush, read-only root, `/var/lib/ewbot:/data`, `/etc/ewbot:/run/ewbot:ro`, no secret value and no product in the file, its defaults valid settings); `deploy.sh <tag>` (exit 2 on a tag off `origin/master`, a dirty checkout, a failing offline preflight or a flat-book check that could not read Coinbase or the journal, exit 3 when not flat); `backup.sh` + systemd timer (daily, age-encrypted, rclone to R2); the runbook.
+- Consumes: `ewbot live run | preflight --offline | status --json [--exchange] [--require-flat] [--max-age S] | backup --out` (Task 13; `--require-flat` is the running runtime's flat book).
+- Produces: the image `ewbot-live:<tag>` (Python 3.12.13 slim + uv 0.12.13, both pinned by digest; editable install at `/app` with `--no-dev --group live` and no uv cache left in it (`UV_NO_CACHE`); `/app/src` byte-compiled at build time - the root is read-only at run time, the fingerprint hashes `*.py` only -; user uid 1000; `HEALTHCHECK ewbot live status --json --max-age 180` (the journal's loop heartbeat only); `STOPSIGNAL SIGTERM`, `ENTRYPOINT ["ewbot", "live"]`, `CMD ["run"]`); the compose service `live` (`restart: unless-stopped`, `init: true` - an init as PID 1 hands `docker stop`'s SIGTERM to the runtime, which finishes its tick and exits 0 -, `stop_grace_period: 150s` for that tick and the 10 s Telegram flush, read-only root, `/var/lib/ewbot:/data`, `/etc/ewbot:/run/ewbot:ro`, the `journald` log driver with the tag `ewbot-live` - the log outlives a container a deploy or a restart replaces -, no secret value and no product in the file, its defaults valid settings; `deploy/live/.env` only fills its `${…}` settings and is never committed: `deploy/live/.gitignore`); `deploy.sh [--recover [--i-understand]] <tag>` (exit 2, nothing changed and the checkout moved back: no such tag, a tag off `origin/master`, local changes or a failing `git status`, untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's real configuration - `EWBOT_IMAGE=<new> docker compose … run --rm --no-deps -T live preflight --offline`: the journal's stage, the secrets and key files, the user, the read-only root -, the UTC minutes 58 to 05, a flat-book check that could not read Coinbase or the journal, `--recover` not confirmed; exit 3 when not flat; then the running image is kept as `ewbot-live:previous`, the new one tagged `ewbot-live:current` and started with `EWBOT_IMAGE` pinned, and deploy.sh waits for a loop heartbeat newer than the swap - `exec -T live ewbot live status --json --max-age <seconds since the swap - 1>` every 10 s for 180 s, 600 s on a first deployment: an older heartbeat is the old runtime's -: exit 0; exit 4 once `ewbot-live:previous` runs again, started with the previous checkout; exit 5 when that does not come up either or when nothing is rolled back - `--recover`, a first deployment; `--recover` skips only the flat-book check, prints the book and needs `recover <tag>` typed on stdin, or `--i-understand`); `backup.sh` + systemd timer (daily, age-encrypted, rclone to R2; made in the running container, or in a one-off container of the image while the service is stopped; the healthchecks.io check `EWBOT_BACKUP_PING_URL` pinged at `/start`, at the end and at `/fail` with the exit code - a SIGTERM included -; `TimeoutStartSec=30min`; its settings in the root-only `/etc/ewbot/backup.env`); the runbook (setup, stages, emergencies, restoring the journal - the WAL-safe sequence and a restore drill -, recovering from VPS loss, deploys).
 
 - [ ] **Step 1: Write the failing test**
 
 **File: `tests/live/test_deploy.py`**
 
 ```python
-"""Static checks of deploy/live and a stubbed run of deploy.sh (fake git / docker on PATH, no daemon)."""
+"""Static checks of deploy/live and stubbed runs of deploy.sh and backup.sh (fake git / docker / date / sleep / age /
+rclone / curl on PATH: no daemon, no network)."""
 
 from __future__ import annotations
 
@@ -17129,6 +17165,8 @@ from ewbot.live.settings import load_settings
 ROOT = Path(ewbot.__file__).resolve().parents[2]
 LIVE = ROOT / "deploy" / "live"
 DOC = ROOT / "docs" / "live-trading.md"
+COMPOSE = "docker compose -f deploy/live/docker-compose.yml"
+PREV_SHA = "1111111111111111111111111111111111111111"
 
 
 def test_dockerfile_pins_the_runtime_and_ships_no_secret():
@@ -17136,9 +17174,12 @@ def test_dockerfile_pins_the_runtime_and_ships_no_secret():
     assert re.search(r"^FROM python:3\.12\.13-slim-bookworm@sha256:[0-9a-f]{64}$", text, re.M)
     assert re.search(r"^COPY --from=ghcr\.io/astral-sh/uv:0\.12\.13@sha256:[0-9a-f]{64} /uv /bin/uv$", text, re.M)
     assert text.count("uv sync --frozen --no-dev --group live") == 2
+    assert "UV_NO_CACHE=1" in text  # uv's download cache never stays in a layer
+    assert "python -m compileall -q /app/src" in text  # the read-only root: compiled once, at build time
     copies = re.findall(r"^COPY (?!--from)(.+)$", text, re.M)
     assert copies == ["pyproject.toml uv.lock ./", "src ./src", "holdout.lock ./"]
-    assert "USER ewbot" in text and '"live", "status", "--max-age", "180"' in text
+    # the cheap health check: the journal's loop heartbeat only, no gates
+    assert "USER ewbot" in text and 'CMD ["ewbot", "live", "status", "--json", "--max-age", "180"]' in text
     assert "RUN test -s /etc/ssl/certs/ca-certificates.crt" in text  # verified TLS needs the CA store
     assert 'ENTRYPOINT ["ewbot", "live"]' in text and 'CMD ["run"]' in text
     assert "STOPSIGNAL SIGTERM" in text  # `docker stop`: the runtime finishes its tick and exits 0
@@ -17166,16 +17207,29 @@ def test_compose_service_restarts_mounts_secrets_read_only_and_holds_no_secret_v
                 if k not in ("EWBOT_SECRETS_FILE", "EWBOT_COINBASE_KEY_FILE")}  # the files exist only on the VPS
     assert load_settings(defaults).paper_repo == "taejunoh/elliott-wave-btc-bot"  # every default is a valid setting
     assert svc["cap_drop"] == ["ALL"] and "no-new-privileges:true" in svc["security_opt"]
-    assert svc["logging"]["options"] == {"max-size": "10m", "max-file": "5"}
+    # the journal keeps the log of the containers a deploy or a restart replaced (json-file logs go with them)
+    assert svc["logging"] == {"driver": "journald", "options": {"tag": "ewbot-live"}}
+
+
+def test_the_vps_settings_file_is_never_committed():
+    assert "/.env" in (LIVE / ".gitignore").read_text().splitlines()  # deploy/live/.env
 
 
 @pytest.mark.parametrize("script", ["deploy.sh", "backup.sh"])
 def test_scripts_parse_and_fail_fast(script):
     path = LIVE / script
     assert path.read_text().splitlines()[0] == "#!/usr/bin/env bash" and "set -euo pipefail" in path.read_text()
+    assert os.access(path, os.X_OK)
     assert subprocess.run(["bash", "-n", str(path)], capture_output=True).returncode == 0
-    if shutil.which("shellcheck"):
-        assert subprocess.run(["shellcheck", str(path)], capture_output=True).returncode == 0
+
+
+@pytest.mark.parametrize("script", ["deploy.sh", "backup.sh"])
+def test_scripts_pass_shellcheck(script):
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck is not installed (apt-get install shellcheck / brew install shellcheck)")
+    r = subprocess.run(["shellcheck", "--enable=check-extra-masked-returns", str(LIVE / script)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
 
 
 def test_backup_encrypts_before_upload_and_the_timer_runs_it_daily():
@@ -17183,6 +17237,7 @@ def test_backup_encrypts_before_upload_and_the_timer_runs_it_daily():
     assert text.index("ewbot live backup") < text.index("age -r") < text.index("rclone copy")
     service = (LIVE / "ewbot-backup.service").read_text()
     assert "EnvironmentFile=/etc/ewbot/backup.env" in service and "deploy/live/backup.sh" in service
+    assert "TimeoutStartSec=30min" in service  # a hung run never holds back the later ones
     assert "OnCalendar=*-*-* 06:15:00 UTC" in (LIVE / "ewbot-backup.timer").read_text()
 
 
@@ -17192,64 +17247,282 @@ def _stub(bin_dir: Path, name: str, body: str) -> None:
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
 
 
-def run_deploy(tmp_path: Path, *, on_master: bool = True, flat_rc: int = 0, preflight_rc: int = 0):
+def run_deploy(tmp_path: Path, *args: str, on_master: bool = True, has_tag: bool = True, changes: str = "",
+               untracked: str = "", status_rc: int = 0, build_rc: int = 0, preflight_rc: int = 0, flat_rc: int = 0,
+               minute: str = "30", current: bool = True, health: tuple[str, ...] = ("ok",), answer: str | None = None):
+    """deploy.sh with stubs. `health`: per `up -d` (the swap, then a rollback) whether `status --max-age` succeeds.
+    The clock starts at 1 000 000 s and moves only with `sleep`."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    log = tmp_path / "calls.log"
+    log, clock, ups = tmp_path / "calls.log", tmp_path / "clock", tmp_path / "ups"
+    clock.write_text("1000000")
+    ups.write_text("0")
     _stub(bin_dir, "git", f"""echo "git $*" >> "{log}"
-case "$1" in
-  rev-parse) if [ "$2" = "--show-toplevel" ]; then echo "{ROOT}"; fi; exit 0 ;;
-  merge-base) exit {0 if on_master else 1} ;;
-  status) exit 0 ;;
-  *) exit 0 ;;
-esac
-""")
-    _stub(bin_dir, "docker", f"""echo "docker $*" >> "{log}"
 case "$*" in
+  "rev-parse --show-toplevel") echo "{ROOT}" ;;
+  "rev-parse --verify --quiet refs/tags/"*) exit {0 if has_tag else 1} ;;
+  "rev-parse --verify HEAD") echo "{PREV_SHA}" ;;
+  "symbolic-ref --quiet --short HEAD") exit 1 ;;
+  "merge-base "*) exit {0 if on_master else 1} ;;
+  "status --porcelain --untracked-files=no") printf '%s' "{changes}"; exit {status_rc} ;;
+  "status --porcelain --untracked-files=all -- "*) printf '%s' "{untracked}" ;;
+esac
+exit 0
+""")
+    health_case = "\n".join(f"    {i + 1}) exit {0 if h == 'ok' else 1} ;;" for i, h in enumerate(health))
+    _stub(bin_dir, "docker", f"""echo "docker $*${{EWBOT_IMAGE+ [EWBOT_IMAGE=$EWBOT_IMAGE]}}" >> "{log}"
+case "$*" in
+  build*) exit {build_rc} ;;
   *"preflight --offline"*) exit {preflight_rc} ;;
   *"--require-flat"*) exit {flat_rc} ;;
-  *) exit 0 ;;
+  "image inspect ewbot-live:current") exit {0 if current else 1} ;;
+  *"up -d"*) echo $(( $(cat "{ups}") + 1 )) > "{ups}" ;;
+  *"exec -T live ewbot live status"*)
+    case "$(cat "{ups}")" in
+{health_case}
+    esac
+    exit 1 ;;
+esac
+exit 0
+""")
+    _stub(bin_dir, "date", f"""case "$*" in
+  "-u +%M") echo "{minute}" ;;
+  "+%s") cat "{clock}" ;;
+  *) exec /bin/date "$@" ;;
 esac
 """)
+    _stub(bin_dir, "sleep", f"""echo $(( $(cat "{clock}") + $1 )) > "{clock}"
+""")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
-    r = subprocess.run(["bash", str(LIVE / "deploy.sh"), "v3.0.0"], capture_output=True, text=True, env=env)
+    env.pop("EWBOT_IMAGE", None)
+    stdin = {"input": answer} if answer is not None else {"stdin": subprocess.DEVNULL}  # never the terminal
+    r = subprocess.run(["bash", str(LIVE / "deploy.sh"), *(args or ("v3.0.0",))], capture_output=True, text=True,
+                       env=env, timeout=60, **stdin)
     calls = log.read_text().splitlines() if log.exists() else []
     return r, calls
 
 
-def test_deploy_happy_path_builds_checks_and_restarts(tmp_path):
+def docker_calls(calls: list[str]) -> list[str]:
+    return [c for c in calls if c.startswith("docker")]
+
+
+def health_polls(calls: list[str]) -> list[str]:
+    return [c for c in calls if "exec -T live ewbot live status" in c]
+
+
+SWAP = [
+    "docker image inspect ewbot-live:current",
+    "docker image tag ewbot-live:current ewbot-live:previous",
+    "docker image tag ewbot-live:v3.0.0 ewbot-live:current",
+    f"{COMPOSE} up -d --force-recreate [EWBOT_IMAGE=ewbot-live:current]",
+]
+
+
+def test_deploy_happy_path_checks_the_image_with_the_service_config_then_swaps_and_waits_for_the_heartbeat(tmp_path):
     r, calls = run_deploy(tmp_path)
     assert r.returncode == 0, r.stderr
-    docker = [c for c in calls if c.startswith("docker")]
-    assert docker == [
+    assert docker_calls(calls) == [
         "docker build --pull -f deploy/live/Dockerfile -t ewbot-live:v3.0.0 .",
-        "docker run --rm ewbot-live:v3.0.0 preflight --offline",
-        "docker compose -f deploy/live/docker-compose.yml run --rm --no-deps -T live status --json --exchange --require-flat",
-        "docker image tag ewbot-live:v3.0.0 ewbot-live:current",
-        "docker compose -f deploy/live/docker-compose.yml up -d --force-recreate",
+        # the new image's preflight with the service's mounts, secrets, user and read-only root
+        f"{COMPOSE} run --rm --no-deps -T live preflight --offline [EWBOT_IMAGE=ewbot-live:v3.0.0]",
+        f"{COMPOSE} run --rm --no-deps -T live status --json --exchange --require-flat [EWBOT_IMAGE=ewbot-live:v3.0.0]",
+        *SWAP,
+        # only a heartbeat younger than the time since the swap counts: never the old runtime's
+        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9",
     ]
     assert "git checkout --quiet --detach v3.0.0" in calls
+    assert f"git checkout --quiet --detach {PREV_SHA}" not in calls  # the checkout stays at the deployed tag
 
 
 def test_deploy_refuses_a_tag_off_master(tmp_path):
     r, calls = run_deploy(tmp_path, on_master=False)
-    assert r.returncode == 2 and "not on origin/master" in r.stderr and not [c for c in calls if c.startswith("docker")]
+    assert r.returncode == 2 and "not on origin/master" in r.stderr and not docker_calls(calls)
+    assert not any(c.startswith("git checkout") for c in calls)
 
 
-def test_deploy_refuses_while_not_flat(tmp_path):
+def test_deploy_refuses_a_missing_tag(tmp_path):
+    r, calls = run_deploy(tmp_path, has_tag=False)
+    assert r.returncode == 2 and "no tag v3.0.0" in r.stderr and not docker_calls(calls)
+
+
+@pytest.mark.parametrize("changes, status_rc", [(" M src/ewbot/live/runtime.py\n", 0), ("", 128)])
+def test_deploy_refuses_local_changes_and_a_git_status_that_fails(tmp_path, changes, status_rc):
+    r, calls = run_deploy(tmp_path, changes=changes, status_rc=status_rc)
+    assert r.returncode == 2 and "local changes" in r.stderr and not docker_calls(calls)
+    assert not any(c.startswith("git checkout") for c in calls)
+
+
+def test_deploy_refuses_untracked_files_in_the_build_context(tmp_path):
+    r, calls = run_deploy(tmp_path, untracked="?? src/ewbot/live/extra.py\n")
+    assert r.returncode == 2 and "untracked files" in r.stderr and not docker_calls(calls)
+    assert "git status --porcelain --untracked-files=all -- src deploy pyproject.toml uv.lock holdout.lock" in calls
+
+
+def test_deploy_refuses_while_not_flat_and_moves_the_checkout_back(tmp_path):
     r, calls = run_deploy(tmp_path, flat_rc=3)
     assert r.returncode == 3 and "/flatten" in r.stderr and not any("up -d" in c for c in calls)
+    assert calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
 
 
 def test_deploy_refuses_when_the_flat_check_cannot_read_the_account(tmp_path):
     r, calls = run_deploy(tmp_path, flat_rc=2)  # Coinbase or the journal unreadable: not "send /flatten"
     assert r.returncode == 2 and "could not check" in r.stderr and "/flatten" not in r.stderr
-    assert not any("up -d" in c for c in calls)
+    assert not any("up -d" in c for c in calls) and calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
 
 
-def test_deploy_refuses_an_image_that_fails_its_offline_preflight(tmp_path):
-    r, calls = run_deploy(tmp_path, preflight_rc=2)
-    assert r.returncode == 2 and not any("--require-flat" in c for c in calls)
+@pytest.mark.parametrize("build_rc, preflight_rc", [(1, 0), (0, 2)])
+def test_deploy_refuses_an_image_that_does_not_build_or_fails_its_preflight(tmp_path, build_rc, preflight_rc):
+    r, calls = run_deploy(tmp_path, build_rc=build_rc, preflight_rc=preflight_rc)
+    assert r.returncode == 2 and not any("--require-flat" in c or "image tag" in c for c in calls)
+    assert calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
+
+
+@pytest.mark.parametrize("minute, refused", [("57", False), ("58", True), ("59", True), ("00", True), ("05", True),
+                                             ("06", False)])
+def test_deploy_never_swaps_from_hh58_to_hh05(tmp_path, minute, refused):
+    r, calls = run_deploy(tmp_path, minute=minute)
+    if refused:
+        assert r.returncode == 2 and "hh:58 to hh:05" in r.stderr
+        assert not any("--require-flat" in c or "up -d" in c for c in calls)
+    else:
+        assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("answer", [None, "", "yes\n", "recover v2.9.0\n"])
+def test_deploy_recover_needs_the_typed_confirmation(tmp_path, answer):
+    r, calls = run_deploy(tmp_path, "--recover", "v3.0.0", answer=answer)
+    assert r.returncode == 2 and "--recover not confirmed" in r.stderr and not any("up -d" in c for c in calls)
+    assert calls[-1] == f"git checkout --quiet --detach {PREV_SHA}"
+
+
+@pytest.mark.parametrize("args, answer", [(("--recover", "v3.0.0"), "recover v3.0.0\n"),
+                                          (("--recover", "--i-understand", "v3.0.0"), None)])
+def test_deploy_recover_skips_only_the_flat_check(tmp_path, args, answer):
+    r, calls = run_deploy(tmp_path, *args, answer=answer, flat_rc=3)  # an open position
+    assert r.returncode == 0, r.stderr
+    assert docker_calls(calls) == [
+        "docker build --pull -f deploy/live/Dockerfile -t ewbot-live:v3.0.0 .",
+        f"{COMPOSE} run --rm --no-deps -T live preflight --offline [EWBOT_IMAGE=ewbot-live:v3.0.0]",
+        f"{COMPOSE} run --rm --no-deps -T live status --json --exchange [EWBOT_IMAGE=ewbot-live:v3.0.0]",  # shown only
+        *SWAP,
+        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9",
+    ]
+
+
+def test_deploy_recover_still_keeps_the_time_window_and_the_preflight(tmp_path):
+    r, calls = run_deploy(tmp_path, "--recover", "--i-understand", "v3.0.0", minute="00")
+    assert r.returncode == 2 and "hh:58 to hh:05" in r.stderr and not any("up -d" in c for c in calls)
+    r, calls = run_deploy(tmp_path, "--recover", "--i-understand", "v3.0.0", preflight_rc=2)
+    assert r.returncode == 2 and not any("up -d" in c for c in calls)
+
+
+@pytest.mark.parametrize("args", [(), ("--i-understand", "v3.0.0"), ("v3.0.0", "v3.0.1"), ("--force", "v3.0.0")])
+def test_deploy_refuses_bad_arguments(tmp_path, args):
+    r, calls = run_deploy(tmp_path, *(args or ("",)))
+    assert r.returncode == 2 and "usage: deploy.sh" in r.stderr and not docker_calls(calls)
+
+
+def test_deploy_rolls_back_when_the_new_runtime_writes_no_heartbeat(tmp_path):
+    r, calls = run_deploy(tmp_path, health=("fail", "ok"))
+    assert r.returncode == 4 and "rolled back" in r.stderr
+    polls = health_polls(calls)
+    assert len(polls) == 19 and polls[17].endswith("--max-age 179")  # 3 minutes of polls, then the rollback's first
+    after = calls[calls.index(polls[17]) + 1:]
+    assert after == [
+        f"git checkout --quiet --detach {PREV_SHA}",  # the previous release's compose file and scripts first
+        "docker image tag ewbot-live:previous ewbot-live:current",
+        f"{COMPOSE} up -d --force-recreate [EWBOT_IMAGE=ewbot-live:current]",
+        f"{COMPOSE} exec -T live ewbot live status --json --max-age 9",
+    ]
+
+
+def test_deploy_reports_a_rollback_that_does_not_come_up_either(tmp_path):
+    r, calls = run_deploy(tmp_path, health=("fail", "fail"))
+    assert r.returncode == 5 and "not up either" in r.stderr and len(health_polls(calls)) == 36
+
+
+@pytest.mark.parametrize("args, current, polls", [(("--recover", "--i-understand", "v3.0.0"), True, 18),
+                                                  (("v3.0.0",), False, 60)])  # a first deployment waits 10 minutes
+def test_deploy_never_rolls_back_a_recovery_or_a_first_deployment(tmp_path, args, current, polls):
+    r, calls = run_deploy(tmp_path, *args, current=current, health=("fail",))
+    assert r.returncode == 5 and "not rolled back" in r.stderr
+    assert len(health_polls(calls)) == polls and not any("ewbot-live:previous" in c for c in calls[-polls - 2:])
+    assert sum("up -d" in c for c in calls) == 1 and f"git checkout --quiet --detach {PREV_SHA}" not in calls
+    if not current:
+        assert "docker image tag ewbot-live:current ewbot-live:previous" not in calls
+
+
+def run_backup(tmp_path: Path, *, running: bool = True, rclone_rc: int = 0, ping: bool = True,
+               recipient: bool = True):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    log = tmp_path / "calls.log"
+    _stub(bin_dir, "docker", f"""echo "docker $*" >> "{log}"
+case "$*" in
+  *"ps --status running --quiet live") {"echo 0123abcd" if running else "true"} ;;
+  *" backup --out /data/"*)
+    last="${{@: -1}}"; out="$EWBOT_DATA_DIR/${{last#/data/}}"; mkdir -p "$(dirname "$out")"; echo plain > "$out" ;;
+esac
+""")
+    _stub(bin_dir, "age", f"""echo "age $*" >> "{log}"
+test "$(cat "${{@: -1}}")" = plain || exit 1
+echo sealed > "$4"
+""")
+    _stub(bin_dir, "rclone", f"""echo "rclone $*" >> "{log}"
+test "$(cat "$2")" = sealed || exit 1
+exit {rclone_rc}
+""")
+    _stub(bin_dir, "curl", f"""echo "curl $*" >> "{log}"
+""")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("EWBOT_")}
+    env.update({"PATH": f"{bin_dir}:{os.environ['PATH']}", "EWBOT_DATA_DIR": str(data)})
+    if recipient:
+        env["EWBOT_BACKUP_AGE_RECIPIENT"] = "age1examplerecipient"
+    if ping:
+        env["EWBOT_BACKUP_PING_URL"] = "https://hc-ping.com/backup-uuid"
+    r = subprocess.run(["bash", str(LIVE / "backup.sh")], capture_output=True, text=True, env=env, timeout=60)
+    calls = log.read_text().splitlines() if log.exists() else []
+    left = [p for p in data.rglob("*") if p.is_file()]
+    return r, calls, left
+
+
+def pings(calls: list[str]) -> list[str]:
+    return [re.sub(r"^curl -fsS -m 10 --retry 3 -o /dev/null --data-raw ", "", c) for c in calls if c.startswith("curl")]
+
+
+def test_backup_from_the_running_service_is_encrypted_uploaded_and_reported(tmp_path):
+    r, calls, left = run_backup(tmp_path)
+    assert r.returncode == 0, r.stderr
+    names = [c for c in calls if c.startswith(("docker", "age", "rclone"))]
+    assert names[1].startswith(f"docker compose -f {LIVE}/docker-compose.yml exec -T live ewbot live backup --out "
+                               "/data/backup/journal-")
+    assert names[2].startswith("age -r age1examplerecipient -o ") and names[3].startswith("rclone copy ")
+    assert names[3].endswith(".sqlite.age r2:ewbot-backups/")
+    assert pings(calls) == [" https://hc-ping.com/backup-uuid/start", " https://hc-ping.com/backup-uuid"]
+    assert left == []  # the plaintext copy is gone
+
+
+def test_backup_with_the_service_stopped_uses_a_one_off_container(tmp_path):
+    r, calls, left = run_backup(tmp_path, running=False)
+    assert r.returncode == 0, r.stderr
+    assert any(c.startswith(f"docker compose -f {LIVE}/docker-compose.yml run --rm --no-deps -T live backup --out ")
+               for c in calls)
+    assert not any(" exec " in c for c in calls) and left == []
+
+
+@pytest.mark.parametrize("kw", [{"rclone_rc": 1}, {"recipient": False}])
+def test_a_failed_backup_pings_fail_and_leaves_no_plaintext(tmp_path, kw):
+    r, calls, left = run_backup(tmp_path, **kw)
+    assert r.returncode != 0 and left == []
+    assert pings(calls)[0] == " https://hc-ping.com/backup-uuid/start"
+    assert pings(calls)[-1] == f"backup.sh exit {r.returncode} https://hc-ping.com/backup-uuid/fail"
+
+
+def test_a_backup_without_its_check_says_nobody_is_told(tmp_path):
+    r, calls, _ = run_backup(tmp_path, ping=False)
+    assert r.returncode == 0 and "alerts nobody" in r.stderr and not pings(calls)
 
 
 def test_the_runbook_covers_setup_stages_and_emergencies():
@@ -17260,7 +17533,12 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "spec §2 Coinbase facts", "ORDER_UNRESOLVED", "AUDIT_PENDING", "--restart --confirm",
                    "book not flat", "stage shadow --restart --confirm", "except hh:00 to hh:03",
                    "outside hh:59 to hh:03", "the new stint's first start", "`[종료]`", "`[중단]`",
-                   "last real stage", "15 minutes", "stop_grace_period"):
+                   "last real stage", "15 minutes", "stop_grace_period",
+                   # deploys, recovery and backups
+                   "hh:58 to hh:05", "ewbot-live:previous", "deploy.sh --recover", "Recovering from VPS loss",
+                   "journal.sqlite-wal", "install -m 600 -o 1000 -g 1000 /dev/stdin", "no_check_bucket = true",
+                   "EWBOT_BACKUP_PING_URL", "restore drill", "journalctl -t ewbot-live", "unhealthy",
+                   "docker builder prune", "never hold", "View-only key"):
         assert needle in text, needle
 ```
 
@@ -17270,7 +17548,7 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
 uv run --group live pytest tests/live/test_deploy.py -q
 ```
 
-Expected: `12 failed`, each with `FileNotFoundError` (`deploy/live/…` and `docs/live-trading.md` do not exist yet).
+Expected: `46 failed` (`44 failed, 2 skipped` without `shellcheck`): `deploy/live/…` and `docs/live-trading.md` do not exist yet (`FileNotFoundError`; the stubbed runs of the scripts end with bash's `No such file or directory`).
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -17290,8 +17568,10 @@ mkdir -p deploy/live
 FROM python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2
 COPY --from=ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 /uv /bin/uv
 
+# UV_NO_CACHE: uv's download cache (~300 MB) never stays in a layer of the image.
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
     UV_PYTHON_DOWNLOADS=never \
     PYTHONUNBUFFERED=1 \
     EWBOT_LIVE_DIR=/data \
@@ -17302,7 +17582,11 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --group live --no-install-project
 COPY src ./src
 COPY holdout.lock ./
+# The root file system is read-only at run time: /app/src is byte-compiled here (the venv by UV_COMPILE_BYTECODE),
+# else every `ewbot` process - the health check every minute included - compiles it again. The fingerprint hashes the
+# *.py files only.
 RUN uv sync --frozen --no-dev --group live \
+    && python -m compileall -q /app/src \
     && useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin ewbot \
     && mkdir -p /data \
     && chown ewbot:ewbot /data
@@ -17316,8 +17600,10 @@ USER ewbot
 # Telegram messages and exits 0 (no [중단], no /fail). Compose runs it under an init (`init: true`) that hands the
 # signal on, and its stop_grace_period leaves time for the tick and the flush.
 STOPSIGNAL SIGTERM
+# Unhealthy = the loop's heartbeat (journaled every minute) is older than 3 minutes: a hung loop. `--json` answers
+# from the journal alone (no gates computed). Docker never restarts an unhealthy container: see the runbook.
 HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=3 \
-    CMD ["ewbot", "live", "status", "--max-age", "180"]
+    CMD ["ewbot", "live", "status", "--json", "--max-age", "180"]
 ENTRYPOINT ["ewbot", "live"]
 CMD ["run"]
 ```
@@ -17340,11 +17626,13 @@ CMD ["run"]
 
 ```yaml
 # ewbot live runtime on the VPS (docs/live-trading.md). deploy/live/deploy.sh builds ewbot-live:<tag>,
-# checks it, tags it ewbot-live:current and runs `docker compose -f deploy/live/docker-compose.yml up -d`.
-# Host paths: /var/lib/ewbot (journal, candle cache, backups; owned by uid 1000) and /etc/ewbot (secrets,
-# mode 700 dir / 600 files, owned by uid 1000), mounted read-only. Non-secret settings may be overridden
-# in deploy/live/.env (EWBOT_EXPIRY, EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO). The products are fixed and a
-# secret in the environment is refused at start (ewbot.live.settings): never add one here or in .env.
+# checks it, tags it ewbot-live:current and runs `docker compose -f deploy/live/docker-compose.yml up -d`
+# (with EWBOT_IMAGE pinned to ewbot-live:current). Host paths: /var/lib/ewbot (journal, candle cache, backups;
+# owned by uid 1000) and /etc/ewbot (secrets, mode 700 dir / 600 files, owned by uid 1000), mounted read-only.
+# deploy/live/.env (not committed: deploy/live/.gitignore) only fills the ${...} settings below - EWBOT_EXPIRY,
+# EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO -; anything else written there, a secret included, never reaches the
+# runtime (and would sit in a plain file: never put one there). A secret or a product added to `environment:`
+# below is refused at start (ewbot.live.settings): secrets live only in /etc/ewbot, the products are fixed.
 name: ewbot-live
 services:
   live:
@@ -17371,93 +17659,272 @@ services:
     cap_drop:
       - ALL
     stop_grace_period: 150s  # a stop finishes the current tick (at worst ~100 s: candle retries, a fill wait) + 10 s flush
+    # The systemd journal keeps the log of every container, also the ones a deploy or a restart replaced
+    # (`journalctl -t ewbot-live`; `docker compose ... logs live` shows the running one's); journald rotates it.
     logging:
-      driver: json-file
+      driver: journald
       options:
-        max-size: "10m"
-        max-file: "5"
+        tag: ewbot-live
 ```
 
 **File: `deploy/live/deploy.sh`**
 
 ```bash
 #!/usr/bin/env bash
-# Deploy a tagged master commit of ewbot's live runtime to this VPS (Plan 3 spec 5.2).
-# Usage (from the repository checkout on the VPS): bash deploy/live/deploy.sh <tag>
-# Refuses (exit 2) a tag that is not on origin/master, a checkout with local changes or an image whose
-# offline preflight fails (fingerprint, holdout.lock) or a flat-book check that cannot read Coinbase or the journal;
-# refuses (exit 3) while a trade is open in the journal (SHADOW's virtual one included) or the Coinbase account has
-# a position or a resting order.
+# Deploy a tagged master commit of ewbot's live runtime to this VPS (Plan 3 spec 5.2; docs/live-trading.md,
+# "Deploying a new version"). From the repository checkout on the VPS, as the user ewbot:
+#   bash deploy/live/deploy.sh <tag>              the deploy: only with a flat book
+#   bash deploy/live/deploy.sh --recover <tag>    the same without the flat-book check, only to bring a runtime back
+#                                                 while a position is open - a release that crash-loops, a new VPS
+#                                                 after a VPS loss (runbook); asks to type "recover <tag>"
+#                                                 (--i-understand instead: no question)
+# Before the running runtime is touched, the new image runs its offline preflight with the service's real
+# configuration (the journal's stage, the secrets and key files, the read-only root, no capabilities). The swap
+# happens only outside the minutes hh:58-hh:05 UTC (the hour's cycle and its entries), keeps the running image as
+# ewbot-live:previous and waits for the new runtime's loop heartbeat: 3 minutes (10 on the VPS's first deployment,
+# which downloads the candle history first), else the previous image is started again (only after a flat-book check).
+# Exit codes:
+#   0  deployed, the new runtime is up
+#   2  refused, nothing changed: no such tag, a tag off origin/master, local changes or untracked files (src, deploy,
+#      pyproject.toml, uv.lock, holdout.lock), an image that does not build or fails its preflight, the minutes
+#      hh:58-hh:05 UTC, a book that could not be checked, --recover not confirmed
+#   3  refused, nothing changed: not flat (an open trade, an order of unknown outcome, a standing flatten, a position or
+#      a resting order)
+#   4  the new runtime did not come up: rolled back, the previous image runs again and is up
+#   5  the new runtime did not come up and was left running (--recover, a first deployment), or the rolled-back
+#      previous image did not come up either: act now (runbook, "Deploying a new version")
+# The checkout is moved to <tag> for the build and moved back on every refusal and on a rollback.
 set -euo pipefail
 
-TAG="${1:?usage: deploy.sh <tag>}"
-ROOT="$(git rev-parse --show-toplevel)"
-cd "$ROOT"
+USAGE="usage: deploy.sh [--recover [--i-understand]] <tag>"
 COMPOSE=(docker compose -f deploy/live/docker-compose.yml)
+TREE=(src deploy pyproject.toml uv.lock holdout.lock)  # what the image or the deploy is made of
+UP_WAIT_S=180
+FIRST_UP_WAIT_S=600
+MOVED=0
+PREV_BRANCH=""
+PREV_HEAD=""
 
-git fetch --quiet --tags origin master
-if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-  echo "refusing: no tag $TAG" >&2
-  exit 2
-fi
-if ! git merge-base --is-ancestor "$TAG^{commit}" origin/master; then
-  echo "refusing: $TAG is not on origin/master" >&2
-  exit 2
-fi
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-  echo "refusing: the checkout has local changes" >&2
-  exit 2
-fi
-git checkout --quiet --detach "$TAG"
+refuse() {  # $1: why, $2: exit code (2)
+  echo "refusing: $1" >&2
+  exit "${2:-2}"
+}
 
-IMAGE="ewbot-live:$TAG"
-docker build --pull -f deploy/live/Dockerfile -t "$IMAGE" .
-docker run --rm "$IMAGE" preflight --offline
+restore_checkout() {
+  if [ "$MOVED" -ne 1 ]; then
+    return 0
+  fi
+  if [ -n "$PREV_BRANCH" ]; then
+    git checkout --quiet "$PREV_BRANCH" || echo "warning: could not check out $PREV_BRANCH again" >&2
+  else
+    git checkout --quiet --detach "$PREV_HEAD" || echo "warning: could not check out $PREV_HEAD again" >&2
+  fi
+  MOVED=0
+}
 
-# Flat book: the new image reads the live journal and asks Coinbase (same mounts as the service).
-rc=0
-EWBOT_IMAGE="$IMAGE" "${COMPOSE[@]}" run --rm --no-deps -T live status --json --exchange --require-flat || rc=$?
-if [ "$rc" -eq 3 ]; then
-  echo "refusing: not flat - send /flatten in Telegram (or wait for the trade to close), then deploy again" >&2
-  exit 3
-elif [ "$rc" -ne 0 ]; then
-  echo "refusing: could not check the book (exit $rc: Coinbase or the journal unreadable, see above) - deploy again later" >&2
-  exit 2
-fi
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    restore_checkout
+  fi
+}
 
-docker image tag "$IMAGE" ewbot-live:current
-"${COMPOSE[@]}" up -d --force-recreate
-echo "deployed $IMAGE (tagged ewbot-live:current); follow the start with: ${COMPOSE[*]} logs -f live"
+wait_up() {  # $1: seconds. 0 once a runtime started after this call has journaled its loop heartbeat
+  local limit="$1" since now elapsed
+  since="$(date +%s)"
+  while :; do
+    sleep 10
+    now="$(date +%s)"
+    elapsed=$((now - since))
+    # --max-age below the time since the swap: only the new runtime's heartbeat counts, never the old one's
+    if "${COMPOSE[@]}" exec -T live ewbot live status --json --max-age "$((elapsed - 1))" </dev/null >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$elapsed" -ge "$limit" ]; then
+      return 1
+    fi
+  done
+}
+
+main() {
+  local recover=0 confirmed=0 tag="" arg root changes untracked image minute rc answer first wait_s why
+  for arg in "$@"; do
+    case "$arg" in
+      --recover) recover=1 ;;
+      --i-understand) confirmed=1 ;;
+      -*) refuse "unknown option $arg ($USAGE)" ;;
+      *) if [ -n "$tag" ]; then refuse "$USAGE"; fi; tag="$arg" ;;
+    esac
+  done
+  if [ -z "$tag" ] || { [ "$confirmed" -eq 1 ] && [ "$recover" -eq 0 ]; }; then
+    refuse "$USAGE"
+  fi
+
+  root="$(git rev-parse --show-toplevel)"
+  cd "$root"
+  git fetch --quiet --tags origin master || refuse "git fetch failed"
+  git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null || refuse "no tag $tag"
+  git merge-base --is-ancestor "$tag^{commit}" origin/master || refuse "$tag is not on origin/master"
+  # a git status that fails counts as a dirty checkout
+  changes="$(git status --porcelain --untracked-files=no)" || changes="git status failed"
+  if [ -n "$changes" ]; then
+    refuse "the checkout has local changes"
+  fi
+  untracked="$(git status --porcelain --untracked-files=all -- "${TREE[@]}")" || untracked="git status failed"
+  if [ -n "$untracked" ]; then
+    refuse "untracked files under ${TREE[*]} (they would enter the image or the deploy): remove them - git status"
+  fi
+
+  PREV_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+  PREV_HEAD="$(git rev-parse --verify HEAD)"
+  trap on_exit EXIT
+  MOVED=1
+  git checkout --quiet --detach "$tag"
+
+  image="ewbot-live:$tag"
+  docker build --pull -f deploy/live/Dockerfile -t "$image" . || refuse "the image $image did not build"
+  # The new image's preflight with the service's real configuration, before anything runs on it.
+  EWBOT_IMAGE="$image" "${COMPOSE[@]}" run --rm --no-deps -T live preflight --offline </dev/null \
+    || refuse "$image failed its preflight with the service's configuration (see above)"
+
+  if [ "$recover" -eq 1 ]; then
+    echo "--recover: no flat-book check - the new runtime takes over what the journal and Coinbase hold:" >&2
+    EWBOT_IMAGE="$image" "${COMPOSE[@]}" run --rm --no-deps -T live status --json --exchange </dev/null \
+      || echo "(the book could not be read)" >&2
+    if [ "$confirmed" -eq 0 ]; then
+      printf 'type "recover %s" to deploy it over the open book: ' "$tag" >&2
+      answer=""
+      read -r answer || true
+      if [ "$answer" != "recover $tag" ]; then
+        refuse "--recover not confirmed"
+      fi
+    fi
+  fi
+
+  # Last check before the swap: never across the hour's cycle (hh:00:30) and its entries (sent until hh:05:00).
+  minute="$(date -u +%M)"
+  if [ "$((10#$minute))" -ge 58 ] || [ "$((10#$minute))" -le 5 ]; then
+    refuse "it is hh:$minute UTC: no swap from hh:58 to hh:05 (the hour's cycle and its entries) - run it again from hh:06"
+  fi
+
+  if [ "$recover" -eq 0 ]; then
+    # Flat book: the new image reads the live journal and asks Coinbase (the service's mounts).
+    rc=0
+    EWBOT_IMAGE="$image" "${COMPOSE[@]}" run --rm --no-deps -T live status --json --exchange --require-flat \
+      </dev/null || rc=$?
+    if [ "$rc" -eq 3 ]; then
+      refuse "not flat - send /flatten in Telegram (or wait for the trade to close), then deploy again" 3
+    elif [ "$rc" -ne 0 ]; then
+      refuse "could not check the book (exit $rc: Coinbase or the journal unreadable, see above) - deploy again later"
+    fi
+  fi
+
+  first=1
+  if docker image inspect ewbot-live:current >/dev/null 2>&1; then
+    docker image tag ewbot-live:current ewbot-live:previous
+    first=0
+  fi
+  docker image tag "$image" ewbot-live:current
+  # EWBOT_IMAGE pinned: an EWBOT_IMAGE in deploy/live/.env never decides what runs
+  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || echo "warning: up -d failed" >&2
+  wait_s="$UP_WAIT_S"
+  if [ "$first" -eq 1 ]; then
+    wait_s="$FIRST_UP_WAIT_S"
+  fi
+  if wait_up "$wait_s"; then
+    MOVED=0
+    echo "deployed $image (tagged ewbot-live:current; the one before is ewbot-live:previous); follow it with: ${COMPOSE[*]} logs -f live"
+    return 0
+  fi
+  echo "$image: no loop heartbeat ${wait_s}s after the start - read ${COMPOSE[*]} logs live" >&2
+  if [ "$recover" -eq 1 ] || [ "$first" -eq 1 ]; then
+    MOVED=0
+    why="no previous image"
+    if [ "$recover" -eq 1 ]; then
+      why="--recover"
+    fi
+    echo "not rolled back ($why): $image keeps starting - fix it now (runbook, Deploying a new version)" >&2
+    exit 5
+  fi
+  restore_checkout
+  docker image tag ewbot-live:previous ewbot-live:current
+  EWBOT_IMAGE=ewbot-live:current "${COMPOSE[@]}" up -d --force-recreate || echo "warning: up -d failed" >&2
+  if wait_up "$UP_WAIT_S"; then
+    echo "rolled back: ewbot-live:current is the previous image again and it is up ($image kept for a look)" >&2
+    exit 4
+  fi
+  echo "the previous image is not up either - act now (runbook, Deploying a new version)" >&2
+  exit 5
+}
+
+main "$@"
 ```
 
 **File: `deploy/live/backup.sh`**
 
 ```bash
 #!/usr/bin/env bash
-# Daily encrypted journal backup (Plan 3 spec 5.2), run by ewbot-backup.timer (docs/live-trading.md).
-# A consistent SQLite copy is made inside the running container (ewbot live backup), encrypted with age
-# to EWBOT_BACKUP_AGE_RECIPIENT (the private key stays off the VPS) and copied with rclone to
-# EWBOT_BACKUP_REMOTE (default r2:ewbot-backups, a Cloudflare R2 bucket). Settings: /etc/ewbot/backup.env.
+# Daily encrypted journal backup (Plan 3 spec 5.2), run by ewbot-backup.timer (docs/live-trading.md, "Backups").
+# A consistent SQLite copy of the journal is made by the image (ewbot live backup: inside the running container, or
+# in a one-off container of it when the service is stopped), encrypted with age to EWBOT_BACKUP_AGE_RECIPIENT (the
+# private key stays off the VPS) and copied with rclone to EWBOT_BACKUP_REMOTE (default r2:ewbot-backups, a
+# Cloudflare R2 bucket). Every run pings its own healthchecks.io check EWBOT_BACKUP_PING_URL - /start, then success
+# or /fail with the exit code -, so a backup that fails, hangs or never runs is alerted. Settings: the root-only file
+# /etc/ewbot/backup.env (systemd's EnvironmentFile; never in the repository).
 set -euo pipefail
 
-: "${EWBOT_BACKUP_AGE_RECIPIENT:?set EWBOT_BACKUP_AGE_RECIPIENT (an age1... public key) in /etc/ewbot/backup.env}"
+PING="${EWBOT_BACKUP_PING_URL:-}"
 REMOTE="${EWBOT_BACKUP_REMOTE:-r2:ewbot-backups}"
 DATA="${EWBOT_DATA_DIR:-/var/lib/ewbot}"
+COMPOSE=(docker compose -f "$(dirname "$0")/docker-compose.yml")
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 NAME="journal-$STAMP.sqlite"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; rm -f "$DATA/backup/$NAME"' EXIT
 
-docker compose -f "$(dirname "$0")/docker-compose.yml" exec -T live ewbot live backup --out "/data/backup/$NAME"
+ping_check() {  # $1: "" (success), /start or /fail; $2: the body (a failure's exit code). Never fails the backup.
+  if [ -n "$PING" ]; then
+    curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${2:-}" "$PING$1" || echo "warning: healthchecks.io ping $1 failed" >&2
+  fi
+}
+
+on_exit() {
+  local rc=$?
+  rm -rf "$WORK"
+  rm -f "$DATA/backup/$NAME"
+  if [ "$rc" -ne 0 ]; then
+    echo "backup failed (exit $rc)" >&2
+    ping_check /fail "backup.sh exit $rc"
+  fi
+}
+trap on_exit EXIT
+trap 'exit 143' TERM  # systemd's TimeoutStartSec: the EXIT trap still reports the failure
+
+if [ -z "$PING" ]; then
+  echo "warning: EWBOT_BACKUP_PING_URL is not set in /etc/ewbot/backup.env - a failed backup alerts nobody" >&2
+fi
+ping_check /start
+if [ -z "${EWBOT_BACKUP_AGE_RECIPIENT:-}" ]; then
+  echo "set EWBOT_BACKUP_AGE_RECIPIENT (an age1... public key) in /etc/ewbot/backup.env" >&2
+  exit 1
+fi
+
+running="$("${COMPOSE[@]}" ps --status running --quiet live)"
+if [ -n "$running" ]; then
+  "${COMPOSE[@]}" exec -T live ewbot live backup --out "/data/backup/$NAME" </dev/null
+else  # the service is stopped (e.g. docker compose stop live): a one-off container of the same image and mounts
+  "${COMPOSE[@]}" run --rm --no-deps -T live backup --out "/data/backup/$NAME" </dev/null
+fi
 age -r "$EWBOT_BACKUP_AGE_RECIPIENT" -o "$WORK/$NAME.age" "$DATA/backup/$NAME"
 rclone copy "$WORK/$NAME.age" "$REMOTE/"
 echo "backup uploaded: $REMOTE/$NAME.age"
+ping_check ""
 ```
 
 **File: `deploy/live/ewbot-backup.service`**
 
 ```ini
-# /etc/systemd/system/ewbot-backup.service (docs/live-trading.md, "Backups")
+# /etc/systemd/system/ewbot-backup.service (docs/live-trading.md, "Backups"). If the runtime's user is not ewbot
+# (uid 1000 was taken), change User= and the home directory in ExecStart= to that user's.
 [Unit]
 Description=ewbot live journal backup (encrypted, off-site)
 After=docker.service
@@ -17466,8 +17933,11 @@ Requires=docker.service
 [Service]
 Type=oneshot
 User=ewbot
+# root-only (mode 600): read by systemd, not by the user or the container
 EnvironmentFile=/etc/ewbot/backup.env
 ExecStart=/usr/bin/bash /home/ewbot/elliott-wave-btc-bot/deploy/live/backup.sh
+# a hung run is stopped (backup.sh then pings /fail) instead of holding back every later one
+TimeoutStartSec=30min
 ```
 
 **File: `deploy/live/ewbot-backup.timer`**
@@ -17484,6 +17954,14 @@ RandomizedDelaySec=300
 
 [Install]
 WantedBy=timers.target
+```
+
+**File: `deploy/live/.gitignore`**
+
+```text
+# deploy/live/.env: the VPS's non-secret compose settings (EWBOT_EXPIRY, EWBOT_LIVE_EDIT_STOPS, EWBOT_PAPER_REPO),
+# never committed (docs/live-trading.md, One-time setup step 8).
+/.env
 ```
 
 ```bash
@@ -17537,24 +18015,26 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    ```
 
    Do not enable automatic reboots: reboot by hand when the book is flat (see Weekly checks).
-3. **Docker Engine and the compose plugin** from Docker's apt repository (<https://docs.docker.com/engine/install/ubuntu/>), then a user `ewbot` with uid 1000 that runs everything:
+3. **Docker Engine and the compose plugin** from Docker's apt repository (<https://docs.docker.com/engine/install/ubuntu/>), then a user `ewbot` with uid 1000 that runs everything (the group `systemd-journal` lets it read the container log, which goes to the systemd journal):
 
    ```bash
-   sudo useradd --uid 1000 --create-home --shell /bin/bash ewbot   # if uid 1000 is taken, use that user instead
-   sudo usermod -aG docker ewbot
+   sudo useradd --uid 1000 --create-home --shell /bin/bash ewbot
+   sudo usermod -aG docker,systemd-journal ewbot
    sudo install -d -m 700 -o 1000 -g 1000 /var/lib/ewbot /etc/ewbot
    ```
+
+   If uid 1000 is taken (`getent passwd 1000`: some images give it to their default user), use that user instead of `ewbot` everywhere below, and in your copy of `deploy/live/ewbot-backup.service` (step 11) change `User=` and the home directory in `ExecStart=` to that user's. The container always runs as uid 1000.
 4. **Coinbase CDP API key** (spec 3.4). In <https://portal.cdp.coinbase.com> → API Keys → Secret API Keys → Create:
    - signature algorithm **ECDSA**;
    - permissions **View** and **Trade** only, never **Transfer** (the runtime refuses to start with a transfer key and treats one found later as a major incident). For SHADOW a **View**-only key is enough; create the View + Trade key when CANARY is approved;
    - **IP allowlist**: the VPS's public IPv4 only;
-   - download the key JSON and copy it to the VPS, then lock it down (`chmod 600`):
+   - download the key JSON and send it from your laptop straight into its place, owned by uid 1000 with mode 600 (the runtime refuses any other: `chmod 600`), through your admin login on the VPS (`ewbot` has no SSH key and no password):
 
    ```bash
-   scp cdp_api_key.json ewbot@<vps>:/tmp/cdp_api_key.json
-   sudo install -m 600 -o 1000 -g 1000 /tmp/cdp_api_key.json /etc/ewbot/cdp_api_key.json && rm /tmp/cdp_api_key.json
+   ssh <admin>@<vps> 'sudo install -m 600 -o 1000 -g 1000 /dev/stdin /etc/ewbot/cdp_api_key.json' < cdp_api_key.json
    ```
-   Delete the downloaded copy from your laptop once the VPS has it. Note the key's creation date for the expiry reminder.
+
+   If sudo asks for a password there (`a terminal is required`), log in (`ssh <admin>@<vps>`), run the same `sudo install …` command, paste the file's content and press Ctrl-D. The key never lands in `/tmp` or a home directory. Delete the downloaded copy from your laptop once the VPS has it. Note the key's creation date for the expiry reminder.
 5. **Health check** (spec 5.1 `VPS 다운`). At <https://healthchecks.io> create a check `ewbot-live` with period **1 minute** and grace **2 minutes** (3 silent minutes alert), add the **Telegram** integration to it and keep the **email** integration (your account address) on it too, and copy its ping URL. The email is the channel that works when Telegram does not. Telegram counts as unusable when the command thread has been failing, dead or hung for 10 minutes, a message has failed to go out for 10 minutes, messages have waited 10 minutes without a send attempt (a stuck sender), or Telegram refused 3 messages in a row (e.g. the bot was blocked). The runtime then sends the check a `/fail` with the reason (`[LIVE] 텔레그램 사용 불가 - ...`) and withholds its success pings for at most 30 minutes, so the check stays down; after that the pings resume - so a hung runtime or a dead VPS still trips the check - and the `/fail` is repeated every 3 hours while Telegram stays unusable. A healthchecks.io alert therefore means the VPS or the runtime is down, or Telegram is unusable: only the latter comes with a `/fail` body.
 6. **GitHub token for the audit** (spec 3.5). A fine-grained personal access token at <https://github.com/settings/personal-access-tokens/new>: resource owner `taejunoh`, only the repository `elliott-wave-btc-bot`, permission **Contents: Read-only**, expiry 1 year.
 7. **Secrets file** `/etc/ewbot/live.env` (owned by uid 1000, mode 600; the runtime refuses another owner, any other mode or anything but a regular file). Create it empty with the right mode, then edit it (nothing goes to the shell history):
@@ -17571,7 +18051,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    EWBOT_HEALTHCHECK_URL=<the ping URL of step 5>
    ```
 
-   One `KEY=VALUE` per line, only these four keys; `export ` before a key and one pair of matching quotes around a value are accepted, comments go on lines of their own. An unknown key, a key twice or a value with a space or a quote (e.g. a trailing `# note`) is refused at start, named by line and key, never by value. These secrets are read only from this file: `TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN` or `EWBOT_HEALTHCHECK_URL` in the container's environment (compose, `deploy/live/.env`) is refused. `EWBOT_HEALTHCHECK_URL` must be the `https://` ping URL. SHADOW may start without Telegram and the health check (the preflight's `alerts` line warns); CANARY and FULL refuse to start without the bot token, the chat id and the health-check URL.
+   One `KEY=VALUE` per line, only these four keys; `export ` before a key and one pair of matching quotes around a value are accepted, comments go on lines of their own. An unknown key, a key twice or a value with a space or a quote (e.g. a trailing `# note`) is refused at start, named by line and key, never by value. These secrets are read only from this file: `TELEGRAM_BOT_TOKEN`, `EWBOT_GITHUB_TOKEN` or `EWBOT_HEALTHCHECK_URL` in the container's environment (an `environment:` entry of the compose file) is refused at start. `deploy/live/.env` (step 8) only fills the compose file's `${…}` settings: a secret written there never reaches the runtime - it is ignored, not refused - and sits in a plain file, so never put one there. `EWBOT_HEALTHCHECK_URL` must be the `https://` ping URL. SHADOW may start without Telegram and the health check (the preflight's `alerts` line warns); CANARY and FULL refuse to start without the bot token, the chat id and the health-check URL.
 
    Commands are taken only from a **private chat** with the bot: `TELEGRAM_CHAT_ID` must be its id, a positive number (your own Telegram user id); a group or channel id (negative) or an `@name` is refused at start. If the paper runtime reports to a group, use your private chat with the bot here. Only this runtime may read the bot's updates: no webhook on the bot, no second runtime with the same token, and do not run a `getUpdates` request by hand while it runs (Telegram answers the runtime with HTTP 409, alerted as `[텔레그램 명령 수신 이상] … 충돌`). Sending (`sendMessage`, as the paper runtime does) is not affected.
 8. **Repository checkout** on the VPS (a read-only deploy key: <https://github.com/taejunoh/elliott-wave-btc-bot/settings/keys>):
@@ -17582,12 +18062,12 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    git clone git@github.com:taejunoh/elliott-wave-btc-bot.git ~/elliott-wave-btc-bot
    ```
 
-   Non-secret settings go to `~/elliott-wave-btc-bot/deploy/live/.env` (read by compose; not committed): `EWBOT_EXPIRY`, `EWBOT_LIVE_EDIT_STOPS` (`0` or `1`) and `EWBOT_PAPER_REPO` (`owner/repo`). Never a secret, and no product: the runtime trades `BIP-20DEC30-CDE` on signals from `BTC-USD`, both fixed (`EWBOT_FUTURES_PRODUCT` / `EWBOT_SPOT_PRODUCT` are refused). For example the expiry reminders (30 days ahead, in the daily summary; the contract's own two dates - its 2030-12-20 expiry and 2030-09-21, from which the preflight refuses to start on it, 90 days before - are reminded without a setting):
+   Non-secret settings go to `~/elliott-wave-btc-bot/deploy/live/.env` (read by compose for the `${…}` settings of `deploy/live/docker-compose.yml`; never committed: `deploy/live/.gitignore`): `EWBOT_EXPIRY`, `EWBOT_LIVE_EDIT_STOPS` (`0` or `1`) and `EWBOT_PAPER_REPO` (`owner/repo`). Never a secret (step 7), no `EWBOT_IMAGE` (deploy.sh starts `ewbot-live:current` whatever it says) and no product: the runtime trades `BIP-20DEC30-CDE` on signals from `BTC-USD`, both fixed (`EWBOT_FUTURES_PRODUCT` / `EWBOT_SPOT_PRODUCT` in the container's environment are refused). For example the expiry reminders (30 days ahead, in the daily summary; the contract's own two dates - its 2030-12-20 expiry and 2030-09-21, from which the preflight refuses to start on it, 90 days before - are reminded without a setting):
 
    ```
    EWBOT_EXPIRY=coinbase=2027-10-03,github=2027-10-03
    ```
-9. **Fund the futures account** with enough for one contract's margin plus buffer (about $500). SHADOW's previews run against the real account: an unfunded account fails gate ③.
+9. **Fund the futures account** with enough for one contract's margin plus buffer (about $500). SHADOW's previews run against the real account: an unfunded account fails gate ③. The account is the bot's alone: never hold a `BIP-20DEC30-CDE` position or order of your own in it. The runtime takes a position it does not know for a foreign one - it closes it, or adopts it when the engine holds the same side (in CANARY a failure that pauses entries) - and a journal that was never CANARY or FULL refuses to start beside it (`[시작 거부] 실계좌에 …`).
 10. **First deployment**: tag the merged commit on `master` (for example `live-v1`, `git tag live-v1 origin/master && git push origin live-v1` on your laptop), then on the VPS:
 
     ```bash
@@ -17595,13 +18075,33 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     docker compose -f deploy/live/docker-compose.yml logs -f live
     ```
 
-    The first start downloads the candle history (a few minutes), records stage SHADOW and sends `[LIVE] [시작]` to Telegram. Check `docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight` (all five checks `ok`: fingerprint, lock, alerts, key, product).
-11. **Backups** (spec 5.2): daily, encrypted with [age](https://github.com/FiloSottile/age) and copied with rclone to a Cloudflare R2 bucket.
-    - On your laptop: `age-keygen -o ewbot-backup.key` — keep this private key offline; note the `age1...` public key it prints.
-    - In Cloudflare: an R2 bucket `ewbot-backups` and an R2 API token with Object Read & Write on that bucket only.
-    - On the VPS: `sudo apt-get install -y age rclone`, then `sudo -u ewbot rclone config` → new remote `r2`, type S3, provider Cloudflare, the token's access key / secret and the account endpoint.
-    - `/etc/ewbot/backup.env` (mode 600): `EWBOT_BACKUP_AGE_RECIPIENT=age1...` and optionally `EWBOT_BACKUP_REMOTE=r2:ewbot-backups`.
-    - Install and start the timer:
+    deploy.sh checks the tag, builds the image, runs its preflight with the service's configuration, starts it and waits for its loop heartbeat - up to 10 minutes this first time: the first start downloads the candle history (a few minutes) -; the runtime records stage SHADOW and sends `[LIVE] [시작]` to Telegram. Check `docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight` (all five checks `ok`: fingerprint, lock, alerts, key, product).
+11. **Backups** (spec 5.2): daily, encrypted with [age](https://github.com/FiloSottile/age), copied with rclone to a Cloudflare R2 bucket and watched by a healthchecks.io check of their own.
+    - On your laptop: `age-keygen -o ewbot-backup.key` — keep this private key offline (the VPS never has it: a restore is decrypted on the laptop); note the `age1...` public key it prints.
+    - In Cloudflare: an R2 bucket `ewbot-backups` and an R2 API token with Object Read & Write on that bucket only. In the bucket's settings add an object lifecycle rule that deletes objects after 90 days and, where R2 offers it, a bucket lock (retention) rule of 30 days: a token stolen from the VPS can then neither delete nor overwrite the recent backups.
+    - At healthchecks.io a second check `ewbot-backup`: period **1 day**, grace **2 hours**, the same Telegram and email integrations; copy its ping URL. Every run pings it at its start and at its end - `/fail` with the exit code when it failed -, so a backup that fails, hangs or never runs is alerted.
+    - On the VPS: `sudo apt-get install -y age rclone`, then the rclone remote `r2` (type `s3`, provider `Cloudflare`, the token's access key and secret, the endpoint `https://<account id>.r2.cloudflarestorage.com`) with `no_check_bucket = true`: a token scoped to one bucket may not check for the bucket, and without that line every upload fails with AccessDenied.
+
+    ```bash
+    sudo -u ewbot rclone config                                  # n (new remote), name r2, s3, Cloudflare, the keys, the endpoint
+    sudo -u ewbot rclone config update r2 no_check_bucket true   # the r2 section now holds: no_check_bucket = true
+    sudo -u ewbot rclone lsf r2:ewbot-backups                    # answers (empty at first), no AccessDenied
+    ```
+
+    - `/etc/ewbot/backup.env`, owned by root with mode 600 (systemd reads it for the backup service; neither `ewbot` nor the container can), never in the repository:
+
+    ```bash
+    sudo install -m 600 -o root -g root /dev/null /etc/ewbot/backup.env
+    sudo nano /etc/ewbot/backup.env
+    ```
+
+    ```
+    EWBOT_BACKUP_AGE_RECIPIENT=age1...
+    EWBOT_BACKUP_PING_URL=<the ping URL of the ewbot-backup check>
+    ```
+
+    and optionally `EWBOT_BACKUP_REMOTE=r2:ewbot-backups`.
+    - Install and start the timer, then run one backup now:
 
     ```bash
     sudo cp ~ewbot/elliott-wave-btc-bot/deploy/live/ewbot-backup.service ~ewbot/elliott-wave-btc-bot/deploy/live/ewbot-backup.timer /etc/systemd/system/
@@ -17609,13 +18109,14 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     sudo systemctl start ewbot-backup.service && journalctl -u ewbot-backup.service -n 20
     ```
 
-    Restore: download the newest `journal-*.sqlite.age`, `age -d -i ewbot-backup.key -o journal.sqlite journal-...sqlite.age`, stop the service, copy it to `/var/lib/ewbot/journal.sqlite` (owner 1000), start the service: the restart recovery reconciles it with Coinbase.
+    The log ends with `backup uploaded: r2:ewbot-backups/journal-….sqlite.age` and the `ewbot-backup` check turns up. A backup is made inside the running container, or in a one-off container of the same image while the service is stopped; a run that hangs is stopped after 30 minutes (`TimeoutStartSec`) and reported as failed. Restoring: see "Restoring the journal" - do it once during SHADOW (the restore drill).
 
 ## Daily operation
 
 - Telegram commands (only from your private chat with the bot, `TELEGRAM_CHAT_ID`; messages from anyone else, forwarded messages, edits and commands addressed to another bot are ignored): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` sent within 60 s of it (entries pause and the close is recorded first, then sent at market at every poll until the position is gone - the brackets rest until Coinbase takes it, and while the market is closed it goes out at the reopen; the answer says what happened: `전량 청산 완료`, `장이 열려 있지 않아 청산 대기` or `청산 요청 - …`, still being sent, with `[전량 청산 완료]` when it is done; `/resume` does not cancel it), `/help`. Every command is answered. A command sent more than 2 minutes before the runtime reads it (for example while it restarted) is not acted on: the answer is `오래된 명령 무시: /…` - send it again if you still want it (the ages come from Telegram's message dates and the VPS clock, which Ubuntu keeps synchronised: `timedatectl` shows `System clock synchronized: yes`). The first start ignores whatever was sent to the bot before. Delivery is at most once: a command the runtime fetched right before a crash or a restart is lost without an answer - if no answer comes within a minute, check `/status` and send it again.
 - **Telegram and health-check alerts.** `[텔레그램 명령 수신 이상]` means the command thread failed 5 polls in a row (the reason: `HTTP 401` - the bot token was refused; `HTTP 409` - another process or a webhook reads this bot's updates; a network error), was in conflict with another poller (`충돌`, HTTP 409), had stopped and was started again, or stopped answering (`응답 없음`: a hung request; it is not replaced automatically, since the hung thread would keep polling beside a new one - restart the container: `docker compose -f deploy/live/docker-compose.yml restart live`); `[텔레그램 복구]` that commands work again. While it lasts the commands may not arrive: use the VPS (`ewbot live status`, and the emergency procedures). `[외부 감시 핑 실패]` means three healthchecks.io pings in a row failed (`HTTP 404`: a wrong ping URL - fix `EWBOT_HEALTHCHECK_URL`): a dead VPS would then go unreported; `[외부 감시 핑 복구]` that they work again.
-- Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes).
+- Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes). A container that runs but is `unhealthy` has a hung loop, and Docker never restarts an unhealthy container by itself: `docker compose -f deploy/live/docker-compose.yml restart live` at once (a hung loop runs no cycle anyway), then report it with the log.
+- The container log goes to the systemd journal: `docker compose -f deploy/live/docker-compose.yml logs live` shows the running container's, `journalctl -t ewbot-live` every container's - also those a deploy, a rollback or a restart replaced (a crashed release's traceback, the messages logged at a stop).
 - **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker, on Coinbase's public market-data endpoint (`wss://advanced-trade-ws.coinbase.com`: no API key, TLS certificate and host name verified); the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket futures price for 5 minutes while the market is open (with the reconnect failures and the last error; `server error: ...` means Coinbase refused the subscription), `[가격 피드 복구]` that futures prices are back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect) and the margin check is skipped - never reduced on a stand-in price - with one `[증거금 점검: 가격 없음]` alert until a price is back. `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives; three such reads in a row are an incident (`[중대 사건] 잔고 이상이 3회 연속`) that pauses new entries - the position and its brackets stay, nothing is closed. Check the balance in the Coinbase app, then `/resume`. `[15:30 증거금 점검] 조회 실패` means the 15:30 check could not read the position or the balance; it is retried every minute until 16:00.
 - **Paper comparison alerts** (from minute 50, against the paper ledger up to the last bar whose cycle ended OK, so a held or failed cycle is never a mismatch). `[판단 불일치 확인 중]` (`AUDIT_PENDING`): a decision one runtime recorded and the other not; it becomes `[판단 불일치]` (`AUDIT_MISMATCH`, a major incident) only if the next hourly comparison still finds it. A decision both recorded differently, or a paper ledger on another strategy fingerprint, is `[판단 불일치]` at once. `[판단 불일치: 봉 수정]` (`AUDIT_REVISION`): the two runtimes decided on different candles for that bar - equal up to the paper's previous run, different at it (Coinbase changed the bar between the live fetch at hh:00:30 and the paper run at :37); no incident, and an explained cause (as in the paper runtime's criterion 4): the comparison gates do not count it - their detail shows it (`봉 수정 N건 (원인 설명됨, 미반영)`). Compare that bar in both candle caches (the live cache on the VPS, the paper runtime's in its workflow) anyway. A revision is only recognised at the bar where the two candle histories part: a later decision it changed counts as unexplained. `[모의매매 대조 실패]`: the paper ledger could not be read or is not a valid paper ledger; the gates are unmet until a comparison succeeds again (`[모의매매 대조 복구]`).
 - The daily summary (09:00 New York) shows the stage, the position, the cycle, the paper comparison, the fills of the last 24 h (entry slippage vs. the engine's reference, stop slippage vs. the stop price, measured fees vs. the paper cost model; funding is part of the balance change) and the margin.
@@ -17634,7 +18135,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    docker compose -f deploy/live/docker-compose.yml exec live ewbot live stage canary --confirm
    ```
 
-   The command prints every gate and refuses while one is unmet or the book is not flat. The running container restarts itself into CANARY within a minute; Telegram shows `[단계 변경]` and a new `[시작] 단계 CANARY`.
+   The command prints every gate and refuses while one is unmet or the book is not flat. The running container restarts itself into CANARY within a minute; Telegram shows `[단계 변경]` and a new `[시작] 단계 CANARY`. Then delete the View-only key in the CDP portal: no process uses it any more.
 3. **CANARY → FULL**: only after all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades) and the CANARY gates are met, with your approval. Before it, check by hand what no gate can see: re-check the spec §2 Coinbase facts against Coinbase's current documentation (spec §8: the product - 0.01 BTC, $5 tick, whole contracts -, the intraday and overnight margin rates, the order types `market_market_ioc`, `trigger_bracket_gtc`, `close_position` and `orders/preview`, the triggered bracket stop's 5% limit, the rate limits, the fee tier, the session hours and maintenance) and record the result, and that the trade key's IP allowlist still holds only the VPS's IPv4. Then `... exec live ewbot live stage full --confirm`.
 4. **Demotion** (any time): `... exec live ewbot live stage shadow --confirm` (or `canary`). It is written first - the running runtime sizes new entries and adoptions for the lower stage from its next order - and then the command reports whether the book is flat: with a position open the runtime keeps protecting and managing it and restarts into the new stage once flat (`book not flat …`). A restart before the book is flat (a crash, a reboot, `docker compose restart`) never hides it behind SHADOW's virtual book: while the journal still holds something real - the open trade, an order of unknown outcome - or Coinbase shows a position or orders of ours, the process starts again on the real account in the last real stage, with that stage's preflight (the trade key, the alerts) and no new entry (`[시작] 단계 CANARY (기록된 단계 SHADOW: …)`); `/flatten` closes the real position, and once flat it restarts into SHADOW.
 5. **Restarting a stint**, with the book flat: `... exec live ewbot live stage shadow --restart --confirm` - SHADOW after a fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`: a gate that can no longer pass, such as a late cycle, a failed preview or an unresolved restart) - or `... stage canary --restart --confirm` - CANARY after a CANARY failure, once its cause is fixed. Every gate of the stage counts from the restart; `/resume` lifts a pause. Run it outside hh:59 to hh:03: the running runtime restarts itself into the new stint within a minute, and a restart across the top of the hour can make that hour's cycle late (gate ②). That restart is the new stint's first start (`재시작 복구 1회 (첫 시작 포함)`): gate ④ still needs one manual restart after it.
@@ -17656,9 +18157,9 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - **Close everything now**: `/flatten`, then `/flatten_confirm` (an answer `청산 요청 - …` means the runtime keeps sending the close at every poll: `[전량 청산 완료]` follows once the account is flat). If Telegram does not answer: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` and, if the runtime is down, close the position and cancel the orders in the Coinbase app (a manual intervention: the runtime alerts it and CANARY gate ④ records it).
 - **Stop trading but keep the protection**: `/pause`, or `docker compose -f deploy/live/docker-compose.yml stop live` (the brackets stay on Coinbase and keep protecting). A stop is graceful: the runtime finishes its current one-second tick, sends `[종료]` and exits 0 - no `[중단]`, no health-check `/fail` (healthchecks.io reports the silence after 3 minutes). Compose runs it under an init (`init: true`), so the signal reaches it, and gives it `stop_grace_period` 150 s before killing it.
-- **`[중단]`** (the runtime stopped on an unexpected error; Docker starts it again): the container log has the traceback (secrets redacted), healthchecks.io a `/fail` with the error's type only. The same error type is alerted once an hour, across restarts, and an error that repeats within 15 minutes waits before exiting - 1, 2, 4 … up to 30 minutes - so a crash loop stays sparse. Read the traceback, then fix it (a new tag) or `docker compose -f deploy/live/docker-compose.yml stop live`; the brackets protect an open position meanwhile.
+- **`[중단]`** (the runtime stopped on an unexpected error; Docker starts it again): the container log has the traceback (secrets redacted), healthchecks.io a `/fail` with the error's type only. The same error type is alerted once an hour, across restarts, and an error that repeats within 15 minutes waits before exiting - 1, 2, 4 … up to 30 minutes - so a crash loop stays sparse. Read the traceback, then fix it (a new tag) and deploy it - with a position open the plain deploy refuses (exit 3) and a crash-looping runtime cannot act on `/flatten`, so use `bash deploy/live/deploy.sh --recover <tag>` (the fixed tag, or the last one that ran well; "Deploying a new version") - or `docker compose -f deploy/live/docker-compose.yml stop live`; the brackets protect an open position meanwhile.
 - **An order failure not resolved in time** (`[주문 실패 미해결]`, `ORDER_UNRESOLVED`; in CANARY `[CANARY 실패] ORDER_UNRESOLVED: paused`): a bracket that could not be replaced within 30 s, or a close or a reduction that did not go through by the next poll. Read the order events (`BRACKET_FAILED`, `CLOSE_FAILED`, `CLOSE_UNCONFIRMED`, `REDUCE_FAILED`, `ACTION_ERROR`) and check the position's brackets in the Coinbase app before `/resume`. A failure the runtime resolved in time (`ORDER_RESOLVED`, e.g. one 429 on a stop move replaced at the next poll, or - in an hour without a decision - a bracket seen resting over the whole position at the next poll) is no CANARY failure. An unresolved failure, like a manual intervention, is recorded once per episode, not at every poll: the episode ends at the first poll where the trade has no failure left inside its time (one whose fix awaits its confirmation does not count; a fix still not confirmed 2 polls and 10 minutes later is itself unresolved) - a later failure is a new incident, pauses again and in FULL restarts the cap's 30 days -, and with a restart or a stage change; while no trade is open every failure is its own episode.
-- **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app. If the alert came with a `/fail` body `텔레그램 사용 불가 - ...`, the runtime was running when it sent it but cannot be reached on Telegram - check that it still runs (`docker compose ... ps`; its pings resume within 30 minutes of the `/fail`, so a check that stays down longer means it stopped) - and then check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
+- **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app and follow "Recovering from VPS loss". If the alert came with a `/fail` body `텔레그램 사용 불가 - ...`, the runtime was running when it sent it but cannot be reached on Telegram - check that it still runs (`docker compose ... ps`; its pings resume within 30 minutes of the `/fail`, so a check that stays down longer means it stopped) - and then check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
 - **API key leaked or a transfer-permission alert**: delete the key in the CDP portal at once (open brackets stay), create a new View + Trade key bound to the VPS IP, replace the file and restart.
 - **A start refused by the preflight** (fingerprint, lock, alerts, key, product): the message names the failing check. A start that cannot read the product or the session from Coinbase for 5 minutes (an outage after the preflight passed) is refused the same way (`[시작 거부] … 조회 실패`) and waits 10 minutes before Docker starts it again. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag. A Coinbase key file the SDK cannot read is refused like a missing one. A start that finds a position or orders of ours on Coinbase while the journal was never CANARY or FULL (a lost or replaced journal) is refused too (`[시작 거부] 실계좌에 …`): restore the journal from the backup, or close them in the Coinbase app. A start refused by the settings (`refusing: ...` in the log: a secrets-file line, a secret in the environment, a setting out of range - named by variable, file and line, never by value) waits 10 minutes before Docker starts it again: fix the file or `deploy/live/.env` and `docker compose -f deploy/live/docker-compose.yml restart live`.
 - **Breaker or incident pause**: read `/status` and the latest journal events, fix the cause, then `/resume`. `/resume` re-bases only the breaker that tripped (the day's reference after −3%, the peak after −15% - which also marks the day), as the median of the `/resume` balance read and the next two; a `/pause` → `/resume` without a trip changes neither. If the balance cannot be read at that moment, the reply says so and a tripped breaker still blocks entries: send `/resume` again. The latest journal events:
@@ -17667,15 +18168,67 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
   docker compose -f deploy/live/docker-compose.yml exec live python -c "from ewbot.live.journal import Journal; [print(e['ts'], e['kind'], e['data']) for e in Journal('/data/journal.sqlite').events()[-40:]]"
   ```
 
+## Restoring the journal
+
+The journal holds the open trade, the order intents, the stage history and the gates' records; Coinbase holds the position and its brackets. A restore puts back the newest backup (up to a day old) and the start's recovery reconciles it with Coinbase.
+
+1. On your laptop (the age key never leaves it): download the newest `journal-*.sqlite.age` from the R2 bucket and decrypt it:
+
+   ```bash
+   age -d -i ewbot-backup.key -o journal.sqlite journal-<stamp>.sqlite.age
+   ```
+
+2. Send it to the VPS through your admin login, owned by uid 1000 with mode 600 (as the key in setup step 4), then delete `journal.sqlite` on the laptop:
+
+   ```bash
+   ssh <admin>@<vps> 'sudo install -m 600 -o 1000 -g 1000 /dev/stdin /var/lib/ewbot/journal.restore' < journal.sqlite
+   ```
+
+3. On the VPS, as `ewbot`, exactly in this order. The runtime keeps the journal in SQLite's WAL mode: a `journal.sqlite-wal` or `journal.sqlite-shm` left from the old journal (after a kill, an out-of-memory or a power loss) would be replayed into the restored file and corrupt it silently.
+
+   ```bash
+   cd ~/elliott-wave-btc-bot
+   docker compose -f deploy/live/docker-compose.yml stop live   # the container (not ewbot-backup.service)
+   rm -f /var/lib/ewbot/journal.sqlite-wal /var/lib/ewbot/journal.sqlite-shm
+   install -m 600 -o 1000 -g 1000 /var/lib/ewbot/journal.restore /var/lib/ewbot/journal.sqlite && rm /var/lib/ewbot/journal.restore
+   docker compose -f deploy/live/docker-compose.yml start live
+   ```
+
+   On a new VPS there is no container yet: skip the stop and the start, `deploy.sh --recover` starts it ("Recovering from VPS loss").
+4. Check `[시작]` in Telegram and `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status`. What happened after the backup is not in the restored journal: a trade opened since is a position the journal does not know (adopted when the engine holds it - in CANARY a failure that pauses entries: check, then `/resume` - or closed), a trade that closed since is found closed, and the hours since the backup have no cycle (SHADOW ② fails: restart the stint, `ewbot live stage shadow --restart --confirm`).
+
+**Restore drill** (once during SHADOW, with the book flat, outside hh:59 to hh:03): take a backup (`sudo systemctl start ewbot-backup.service`), restore it by steps 1–4 and check that `ewbot live status` shows the same stage, cycles and gates as before. It proves the age key, the R2 copy and this sequence before they are needed (and counts as a restart for SHADOW ④).
+
+## Recovering from VPS loss
+
+The brackets on Coinbase keep protecting an open position while the VPS is gone (spec 5.1), but nothing moves its stop, syncs its TP1 or closes it at the engine's exit, and nothing new is entered. Check the position and its brackets in the Coinbase app first; if it cannot wait for the steps below, close it there (a manual intervention: CANARY ④).
+
+1. A new VPS: One-time setup steps 1–3 and 8, with its own public IPv4.
+2. A new CDP key (setup step 4: View + Trade in CANARY and FULL, View only in SHADOW) with the **new** IPv4 in its IP allowlist: the old key's allowlist holds the old address, so Coinbase refuses it from the new VPS. Delete the old key in the CDP portal (it was on the lost disk) and send the new one to `/etc/ewbot/cdp_api_key.json` as in step 4.
+3. `/etc/ewbot/live.env` (step 7: the same bot, chat and health-check URL) and `deploy/live/.env` (step 8). If the old VPS may be in someone else's hands rather than just gone, also replace the GitHub token (step 6) and the R2 token, and delete the old deploy key.
+4. Backups on the new VPS (step 11: rclone, `/etc/ewbot/backup.env`, the timer).
+5. Restore the newest backup: "Restoring the journal", steps 1–3.
+6. Start the runtime on it without the flat-book check - the plain deploy refuses the open position (exit 3):
+
+   ```bash
+   cd ~/elliott-wave-btc-bot && bash deploy/live/deploy.sh --recover <the tag that ran before>
+   ```
+
+   Type `recover <tag>` when asked. It still checks the tag, the checkout and the preflight and keeps out of hh:58 to hh:05; the first start downloads the candle history, so it waits up to 10 minutes for the heartbeat.
+7. Verify: `[시작]` in Telegram, `/status` answered, `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status --exchange` (the position and the open orders as in the Coinbase app), the healthchecks.io checks up again; then "Restoring the journal", step 4.
+
 ## Deploying a new version
 
 - The image verifies Coinbase's TLS certificates with the base image's CA store (`ca-certificates`, part of `python:3.12.13-slim-bookworm`); the build stops if `/etc/ssl/certs/ca-certificates.crt` is missing (a new base image without it): keep the pinned base, or install `ca-certificates` in the Dockerfile.
-- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` refuses a tag off `master`, a dirty checkout, an image whose offline preflight fails (fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`) and any open trade, position or resting order (exit 3), or a book it could not check (exit 2). Rollback = deploy the previous tag.
+- Only tags on `master`, only with a flat book: `bash deploy/live/deploy.sh <tag>` (as `ewbot`, in the checkout). Nothing changes and the checkout goes back where it was when it refuses (exit 2) a missing tag or one off `master`, local changes or untracked files under `src/`, `deploy/`, `pyproject.toml`, `uv.lock` or `holdout.lock`, an image that does not build or fails its offline preflight with the service's own configuration (a one-off container of the new image with the service's mounts, secrets file, key file, user and read-only root: fingerprint `e0435223…`, lock file `6530175541c1…` with lock `d1be04baa06c…`, the settings, the alerts the journal's stage needs), the minutes hh:58 to hh:05 UTC (the hour's cycle at hh:00:30 and its entries until hh:05: run it again from hh:06) or a book it could not check; or (exit 3) any open trade, order of unknown outcome, standing flatten, position or resting order.
+- The swap keeps the running image as `ewbot-live:previous`, tags the new one `ewbot-live:current`, recreates the container and waits up to 3 minutes (10 on a first deployment) for the new runtime's loop heartbeat. Without one it starts `ewbot-live:previous` again with the previous checkout: exit 4 when that one is up again - read the failed release's log (`journalctl -t ewbot-live`) before the next try -, exit 5 when it is not either (act now: the logs, "Emergency procedures"). Rollback by hand = deploy the previous tag.
+- `deploy.sh --recover <tag>` deploys while a position is open, for two cases only: a release that crash-loops while it holds a position (`[중단]` again and again, `/flatten` not acted on) and a new VPS after a VPS loss. It skips only the flat-book check (it prints the book instead), asks you to type `recover <tag>` (`--i-understand` skips the question) and never rolls back by itself (exit 5 when the new runtime does not come up); the new runtime takes over the position and its brackets through the restart recovery. Spec 5.2 allows deploys only with a flat book: this is the documented exception for bringing the runtime back.
 - A change to any strategy-fingerprinted file (`types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/`, `risk/`) is refused by the preflight and would reset the paper runtime's out-of-sample counter: never deploy one.
 
 ## Weekly checks
 
-- `df -h /var/lib/ewbot`, `docker system df` (prune old images: `docker image prune`), `journalctl -u ewbot-backup.service -n 5`, the newest backup in R2.
+- `df -h /var/lib/ewbot` and `docker system df`. Keep the images of `ewbot-live:current` and `ewbot-live:previous` (in `docker image ls ewbot-live` a tag with the same IMAGE ID as one of them stays), remove the older release tags (`docker image rm ewbot-live:<old tag>`), then `docker image prune -f` (dangling images) and `docker builder prune -f --filter until=720h` (build cache older than 30 days; the next build downloads what it needs again).
+- `journalctl -u ewbot-backup.service -n 5`, the `ewbot-backup` check up, the newest backup in R2.
 - Pending updates are installed by unattended-upgrades; if `/var/run/reboot-required` exists, reboot only with a flat book (`/flatten` not needed if no trade is open), then check `[시작]` in Telegram.
 - Expiry reminders arrive 30 days ahead in the daily summary: from `EWBOT_EXPIRY` the Coinbase API key, the GitHub audit token and the Cloudflare Workers trigger token of the paper runtime; without a setting the contract's expiry (`BIP-20DEC30-CDE 만기`) and the day the preflight starts refusing it (`BIP-20DEC30-CDE 시작 점검 거부`).
 - Coinbase's notices for `BIP-20DEC30-CDE` (a delisting, a new expiry): the preflight checks the contract's expiry (`contract_expiry` no earlier than 2030-12-20 and more than 90 days away) only when the runtime starts.
@@ -17689,14 +18242,19 @@ VPS about $5–7 a month; healthchecks.io, R2 (a few MB) and Telegram are free a
 
 ```bash
 uv run --group live pytest tests/live/test_deploy.py -q
-command -v shellcheck >/dev/null && shellcheck deploy/live/deploy.sh deploy/live/backup.sh && echo shellcheck-ok || echo 'shellcheck not installed (optional)'
-if command -v docker >/dev/null; then docker build -q -f deploy/live/Dockerfile -t ewbot-live:plan3-check . && docker run --rm ewbot-live:plan3-check preflight --offline; else echo 'docker not available (optional)'; fi
+command -v shellcheck >/dev/null && shellcheck --enable=check-extra-masked-returns deploy/live/deploy.sh deploy/live/backup.sh && echo shellcheck-ok || echo 'shellcheck not installed (optional)'
+if command -v docker >/dev/null; then
+  docker build -q -f deploy/live/Dockerfile -t ewbot-live:plan3-check .
+  RO=(--rm --read-only --tmpfs /tmp --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges:true --network none --init)
+  docker run "${RO[@]}" ewbot-live:plan3-check preflight --offline
+  docker run "${RO[@]}" ewbot-live:plan3-check status --json --max-age 180 >/dev/null || echo "health check without a journal: exit $?"
+else echo 'docker not available (optional)'; fi
 uv run --group live pytest -q
 uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print(current_fingerprint())"
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `12 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file; the full suite `1071 passed, 1 skipped` without a candle cache (`1072 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `46 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1106 passed, 1 skipped` without a candle cache (`1107 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -17731,7 +18289,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `1072 passed` with the real cache (`1071 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `1107 passed` with the real cache (`1106 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
@@ -17747,7 +18305,7 @@ Expected: `epoch 1 of 1` with the baseline fingerprint, `discrepancies … (unex
 
 - [ ] **Step 3: VPS, keys and secrets (user, with the controller reading along)**
 
-Follow `docs/live-trading.md` → One-time setup, steps 1–9: Ubuntu 24.04 US-East VPS (SSH keys only, ufw), unattended-upgrades, Docker, user `ewbot` (uid 1000), `/var/lib/ewbot` and `/etc/ewbot` (mode 700); a **View-only** CDP key bound to the VPS IP for SHADOW (`/etc/ewbot/cdp_api_key.json`, mode 600); healthchecks.io check (period 1 min, grace 2 min, Telegram and email integrations: the email reaches the user when Telegram is unusable); the fine-grained GitHub token (Contents: read on this repository); `/etc/ewbot/live.env` (owned by uid 1000, mode 600, only its four keys; `TELEGRAM_CHAT_ID` = the user's private chat with the bot, a positive id; no webhook or second poller on the bot); `timedatectl` shows the clock synchronised (command ages use it); the repository checkout with a read-only deploy key; `deploy/live/.env` with `EWBOT_EXPIRY` (the API key and the tokens - the contract's own dates are reminded without a setting; never a secret or a product there: both are refused); about $500 in the futures account. The user types every secret; the controller never sees one.
+Follow `docs/live-trading.md` → One-time setup, steps 1–9: Ubuntu 24.04 US-East VPS (SSH keys only, ufw), unattended-upgrades, Docker, user `ewbot` (uid 1000; groups `docker` and `systemd-journal`), `/var/lib/ewbot` and `/etc/ewbot` (mode 700); a **View-only** CDP key bound to the VPS IP for SHADOW (`/etc/ewbot/cdp_api_key.json`, owned by uid 1000, mode 600, sent through the admin login with `sudo install -m 600 -o 1000 -g 1000 /dev/stdin …`, never through `/tmp`); healthchecks.io check (period 1 min, grace 2 min, Telegram and email integrations: the email reaches the user when Telegram is unusable); the fine-grained GitHub token (Contents: read on this repository); `/etc/ewbot/live.env` (owned by uid 1000, mode 600, only its four keys; `TELEGRAM_CHAT_ID` = the user's private chat with the bot, a positive id; no webhook or second poller on the bot); `timedatectl` shows the clock synchronised (command ages use it); the repository checkout with a read-only deploy key; `deploy/live/.env` with `EWBOT_EXPIRY` (the API key and the tokens - the contract's own dates are reminded without a setting; never a secret or a product there: `.env` only fills the compose file's settings, so neither reaches the runtime, and a secret would sit in a plain file); about $500 in the futures account, which holds no position or order of the user's own (runbook step 9: never hold a manual BIP position in it - the runtime closes or adopts a position it does not know, and a journal never CANARY or FULL refuses to start beside one). The user types every secret; the controller never sees one.
 
 The contract's expiry is checked by hand once (the preflight cannot settle it): `GET /market/products/BIP-20DEC30-CDE` reported `contract_expiry` 2089-12-30T16:00:00Z, `contract_expiry_type` `EXPIRING` and `contract_expiry_name` 2030-12 on 2026-10-03, while the id says 20 Dec 2030 and Coinbase calls it a perp; the preflight refuses only an expiry before 2030-12-20 or within 90 days. The user confirms on Coinbase (the product's page, the help center's nano Bitcoin perp-style futures article) which expiry applies and that no delisting or earlier expiry is announced; the controller records the answer in the project notes. If an expiry before 2030-12-20 is announced, stop before SHADOW: a new contract needs a plan change.
 
@@ -17760,7 +18318,7 @@ docker compose -f deploy/live/docker-compose.yml logs --tail 50 live
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live status
 ```
 
-Expected: the preflight prints five `ok` lines (fingerprint `e0435223a3f9`, lock `file sha256 6530175541c1, sha256 d1be04baa06c`, alerts `Telegram alerts and commands, heartbeat`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts, expires 2030-12-20 at the earliest`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11) and run the backup service once.
+Expected: deploy.sh ends with `deployed ewbot-live:live-v1 …` (exit 0) once the new runtime has journaled its loop heartbeat (up to 10 minutes on this first deployment: the candle history); the preflight prints five `ok` lines (fingerprint `e0435223a3f9`, lock `file sha256 6530175541c1, sha256 d1be04baa06c`, alerts `Telegram alerts and commands, heartbeat`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts, expires 2030-12-20 at the earliest`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11: the `ewbot-backup` healthchecks.io check - period 1 day, grace 2 hours -, the R2 bucket's lifecycle and lock rules, rclone with `no_check_bucket = true`, the root-only `/etc/ewbot/backup.env` with the age recipient and the check's ping URL) and run the backup service once: its log ends with `backup uploaded: …` and the `ewbot-backup` check turns up.
 
 - [ ] **Step 5: Re-record the private-endpoint fixtures (first SHADOW week, controller)**
 
@@ -17794,11 +18352,11 @@ Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account i
 
 - [ ] **Step 6: Run SHADOW for at least 14 days (controller watches, user restarts once)**
 
-Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④ - at any time except hh:00 to hh:03, while that hour's cycle runs (gate ② counts every hour of the stage; a restart never rewrites an hour already decided, but a runtime down across a bar close fails it) -: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. The stop is graceful: Telegram shows `[종료] …`, then `[시작]`, never `[중단]`, and healthchecks.io gets no `/fail` (report either if it does). Any `[판단 불일치]`, `[판단 불일치: 봉 수정]`, `[판단 불일치 확인 중]` that the next hour does not clear, `[모의매매 대조 실패]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over: `ewbot live stage shadow --restart --confirm` (flat book, outside hh:59 to hh:03: the runtime restarts itself into the new stint within a minute) - every SHADOW gate then counts from the restart, and that self-restart is the stint's first start, so gate ④ needs one more manual restart. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
+Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④ - at any time except hh:00 to hh:03, while that hour's cycle runs (gate ② counts every hour of the stage; a restart never rewrites an hour already decided, but a runtime down across a bar close fails it) -: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. The stop is graceful: Telegram shows `[종료] …`, then `[시작]`, never `[중단]`, and healthchecks.io gets no `/fail` (report either if it does). Also once during SHADOW, with the book flat and outside hh:59 to hh:03, the restore drill (runbook, "Restoring the journal"): a fresh backup, decrypted on the user's laptop, restored with the WAL-safe sequence (`docker compose … stop live`, `rm -f` `journal.sqlite-wal` and `journal.sqlite-shm`, `install -m 600 -o 1000 -g 1000` the restored file, `docker compose … start live`); `ewbot live status` then shows the same stage, cycles and gates. Every later deploy runs outside hh:58 to hh:05 UTC and ends with exit 0; an exit 4 (rolled back) or 5 is investigated first (`journalctl -t ewbot-live`). Any `[판단 불일치]`, `[판단 불일치: 봉 수정]`, `[판단 불일치 확인 중]` that the next hour does not clear, `[모의매매 대조 실패]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over: `ewbot live stage shadow --restart --confirm` (flat book, outside hh:59 to hh:03: the runtime restarts itself into the new stint within a minute) - every SHADOW gate then counts from the restart, and that self-restart is the stint's first start, so gate ④ needs one more manual restart. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
 
 - [ ] **Step 7: CANARY gate (around 2026-10-30; user approves explicitly)**
 
-Preconditions (spec §6.1): every SHADOW gate `충족` in `ewbot live status`; the paper runtime's criteria 1, 2 and 4 met (`ewbot paper status` on a worktree of `paper`); the user's explicit approval in the conversation. Then the user creates a **View + Trade** CDP key (never Transfer) bound to the VPS IP and replaces `/etc/ewbot/cdp_api_key.json` (mode 600). No gate can check the IP binding (spec §6.1 `거래 권한 키가 VPS IP에 묶여 있다`): the user confirms in the CDP portal that the key's IP allowlist holds only the VPS's IPv4 and says so in the conversation (the controller records it). Then, with the book flat:
+Preconditions (spec §6.1): every SHADOW gate `충족` in `ewbot live status`; the paper runtime's criteria 1, 2 and 4 met (`ewbot paper status` on a worktree of `paper`); the user's explicit approval in the conversation. Then the user creates a **View + Trade** CDP key (never Transfer) bound to the VPS IP and replaces `/etc/ewbot/cdp_api_key.json` (mode 600, through the admin login as in the runbook's step 4). No gate can check the IP binding (spec §6.1 `거래 권한 키가 VPS IP에 묶여 있다`): the user confirms in the CDP portal that the key's IP allowlist holds only the VPS's IPv4 and says so in the conversation (the controller records it). Then, with the book flat:
 
 ```bash
 docker compose -f deploy/live/docker-compose.yml restart live
@@ -17806,7 +18364,7 @@ docker compose -f deploy/live/docker-compose.yml exec live ewbot live preflight
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live stage canary --confirm
 ```
 
-Expected: the preflight's key line reads `view=True trade=True transfer=False` and its alerts line `Telegram alerts and commands, heartbeat` (CANARY refuses to start without them); the stage command prints every gate `[충족]` and `stage SHADOW -> CANARY recorded`; within a minute Telegram shows `[단계 변경] SHADOW → CANARY` and a new `[시작] 단계 CANARY`. If any gate is `[미충족]`, the command refuses: do not work around it.
+Expected: the preflight's key line reads `view=True trade=True transfer=False` and its alerts line `Telegram alerts and commands, heartbeat` (CANARY refuses to start without them); the stage command prints every gate `[충족]` and `stage SHADOW -> CANARY recorded`; within a minute Telegram shows `[단계 변경] SHADOW → CANARY` and a new `[시작] 단계 CANARY`. If any gate is `[미충족]`, the command refuses: do not work around it. Once `[시작] 단계 CANARY` shows, the user deletes the View-only key in the CDP portal (no process uses it any more).
 
 - [ ] **Step 8: CANARY confirmations (controller records the answers in the project notes)**
 
