@@ -3,8 +3,8 @@
 
 Accepted only from a private chat with the bot whose chat id is the configured TELEGRAM_CHAT_ID (the user's own
 id) and whose sender is that user: group, channel and edited messages, forwarded messages, messages via a bot
-and commands addressed to another bot (`/pause@other_bot`; `/pause@<this bot>` only when getMe named it) are
-ignored. A background thread long-polls getUpdates and queues `Command(word, sent)`; the runtime executes them on
+and commands addressed to another bot (`/pause@other_bot`; `/pause@<this bot>` once getMe has named it - asked
+before the polls until it answers, again after 60 s doubling to 30 min) are ignored. A background thread long-polls getUpdates and queues `Command(word, sent)`; the runtime executes them on
 its main loop, so no trading state is shared across threads. `sent` is the message's Telegram date: the runtime
 ignores a command that is old by the time it would run (live/runtime.py COMMAND_MAX_AGE_S) and times the
 /flatten confirmation on the messages, not on when it handled them.
@@ -18,7 +18,7 @@ returns what is unconfirmed, and the runtime's age check still applies.
 The thread never dies of an error: every exception is counted (`failures` in a row, `last_error`; `conflicts`
 counts HTTP 409 - another getUpdates poller or a webhook on this bot), waited out (5 s doubling to 60 s, or
 HTTP 429's retry_after; stop() ends the wait) and printed to stderr once per change of state; `alive` tells the
-runtime whether the thread runs. The HTTP layer's exceptions may contain the bot token (it is part of the URL),
+runtime whether the thread runs and `overdue(now)` how far it is behind its own schedule (a hung request). The HTTP layer's exceptions may contain the bot token (it is part of the URL),
 so only their type name, the HTTP status and Telegram's own `description` are ever reported."""
 
 from __future__ import annotations
@@ -41,6 +41,9 @@ POLL_TIMEOUT_S = 25
 ERROR_BACKOFF_S = 5.0
 MAX_BACKOFF_S = 60.0
 MAX_RETRY_AFTER_S = 300.0
+ME_RETRY_S = 60.0  # getMe asked again after this, doubling up to ME_RETRY_MAX_S, until it answers
+ME_RETRY_MAX_S = 1800.0
+ME_TIMEOUT_S = 10.0
 FORWARDED = ("forward_origin", "forward_from", "forward_from_chat", "forward_sender_name", "forward_date")
 HINTS = {401: "the bot token was refused", 409: "another getUpdates poller or a webhook uses this bot"}
 
@@ -98,13 +101,18 @@ class TelegramControl:
         self.clock = clock
         self._stop = threading.Event()
         self.sleep = sleep if sleep is not None else self._stop.wait  # the back-off pause (stop() ends it)
-        self.bot: str | None = None  # this bot's username, from getMe when the thread starts
+        self.bot: str | None = None  # this bot's username, from getMe (asked until it answers)
         self.ignored = 0  # updates not from the user's private chat (or forwarded, edited, via a bot)
         self.skipped = 0  # backlog updates skipped on the first start
         self.failures = 0  # failed polls in a row
         self.conflicts = 0  # HTTP 409 answers so far
         self.last_error: str | None = None
         self.last_ok: float | None = None
+        self.started: float | None = None  # start() time
+        self.last_poll_end: float | None = None  # the latest poll's end, ok or failed
+        self.wait_s = 0.0  # the back-off after that poll
+        self._me_failures = 0
+        self._me_next = 0.0
         self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------ Telegram calls
@@ -182,13 +190,23 @@ class TelegramControl:
         self.journal.put(OFFSET_KEY, {"offset": max(ids) + 1 if ids else None, "ts": self.clock()})
         return []
 
-    def _username(self) -> str | None:
+    def _learn_name(self) -> None:
+        """getMe -> `bot`. A failure (bare /commands only meanwhile) is asked again after ME_RETRY_S doubling."""
+        name: Any = None
+        why = "no username"
         try:
-            name = _dict(self._call("getMe", {}, 10)).get("username")
-        except Exception as exc:  # noqa: BLE001 - without the name only bare /commands are accepted
-            print(f"[LIVE] telegram getMe failed ({self._why(exc)}): only bare /commands are accepted", file=sys.stderr)
-            return None
-        return name if isinstance(name, str) and name else None
+            name = _dict(self._call("getMe", {}, ME_TIMEOUT_S)).get("username")
+        except Exception as exc:  # noqa: BLE001 - never a failed poll: the commands go on, bare only
+            why = self._why(exc)
+        if isinstance(name, str) and name:
+            if self._me_failures:
+                print(f"[LIVE] telegram getMe ok after {self._me_failures} failures", file=sys.stderr)
+            self.bot, self._me_failures = name, 0
+            return
+        if self._me_failures == 0:
+            print(f"[LIVE] telegram getMe failed ({why}): only bare /commands until it answers", file=sys.stderr)
+        self._me_failures += 1
+        self._me_next = self.clock() + min(ME_RETRY_S * 2.0 ** min(self._me_failures - 1, 10), ME_RETRY_MAX_S)
 
     # ------------------------------------------------------------------ the thread
     @staticmethod
@@ -196,7 +214,10 @@ class TelegramControl:
         return str(exc) if isinstance(exc, ControlError) else type(exc).__name__
 
     def poll_once(self, commands: queue.Queue[Command]) -> None:
-        """One long poll; its commands go to `commands`. Any error is counted and waited out, never raised."""
+        """One long poll (getMe first while the bot's name is unknown and due); its commands go to `commands`. Any
+        error is counted and waited out, never raised."""
+        if self.bot is None and self.clock() >= self._me_next:
+            self._learn_name()
         try:
             batch = self.fetch()
         except Exception as exc:  # noqa: BLE001 - the thread must outlive any error (type name only: the token)
@@ -210,18 +231,27 @@ class TelegramControl:
             wait = min(ERROR_BACKOFF_S * 2.0 ** min(self.failures - 1, 10), MAX_BACKOFF_S)
             if isinstance(exc, ControlError) and exc.retry_after:
                 wait = min(max(exc.retry_after, 1.0), MAX_RETRY_AFTER_S)
+            self.wait_s, self.last_poll_end = wait, self.clock()
             self.sleep(wait)
             return
         if self.failures:
             print(f"[LIVE] telegram commands ok again after {self.failures} failed polls", file=sys.stderr)
         self.failures = 0
-        self.last_ok = self.clock()
+        self.wait_s = 0.0
+        self.last_ok = self.last_poll_end = self.clock()
         for cmd in batch:
             commands.put(cmd)
 
+    def overdue(self, now: float) -> float:
+        """Seconds the running thread is behind its own schedule: the next poll ends at the latest one's end (or
+        start()) plus its back-off, a getMe and one long poll (timeout + 10 s each way). 0 while it keeps time;
+        growing when a request hangs - the thread cannot be replaced then (the hung request would keep polling)."""
+        ref = self.last_poll_end if self.last_poll_end is not None else self.started
+        if ref is None:
+            return 0.0
+        return max(0.0, now - (ref + self.wait_s + ME_TIMEOUT_S + self.timeout + 10))
+
     def run(self, commands: queue.Queue[Command]) -> None:
-        if self.bot is None:
-            self.bot = self._username()
         while not self._stop.is_set():
             self.poll_once(commands)
 
@@ -231,6 +261,7 @@ class TelegramControl:
 
     def start(self, commands: queue.Queue[Command]) -> threading.Thread:
         self._stop.clear()
+        self.started, self.last_poll_end, self.wait_s = self.clock(), None, 0.0
         th = threading.Thread(target=self.run, args=(commands,), name="ewbot-telegram", daemon=True)
         th.start()
         self._thread = th

@@ -2,19 +2,27 @@
 "[LIVE]" (the paper runtime's start with "[ewbot paper]").
 
 Never on the trading loop: a call only queues the message and returns at once (it never blocks or raises); a
-background thread (`start()`) sends the queue in order, one attempt at a time. A failed send keeps the message
-at the head of the queue and retries it after a pause that doubles from 2 s to 60 s, for up to 30 minutes
-(MAX_AGE_S) after it was queued; its full text goes to stderr on its first failure, and so does every message
-that is dropped, so the container log always has it. The queue holds MAX_PENDING messages: when it is full the
-oldest waiting one is dropped (`dropped` counts them). The same (kind, text) is never queued twice and is sent
-at most once per 10 minutes, counted from its delivery (a failed send is never deduplicated away). A message is
-cut to MAX_CHARS with "…(잘림)" (Telegram refuses more than 4096); one delivered a minute or more late says so.
-`failing_since` (the first failure of the current run, None after a delivery), `pending` and `last_error` let
-the runtime tell that Telegram is down. Without a sender every message goes to stderr."""
+background thread (`start()`) sends the queue in order, one attempt at a time. A send that fails for a reason
+that may pass - a transport error, HTTP 429 or 5xx - keeps the message at the head of the queue and retries it
+after a pause that doubles from 2 s to 60 s, for up to 30 minutes (MAX_AGE_S) after it was queued. A message
+Telegram refuses outright (any other HTTP 4xx) is dropped at once, so it never holds the messages behind it;
+`refusals` counts such refusals in a row (a delivery resets it). Every message's full text reaches stderr when
+its send first fails, when it is dropped and when it is still undelivered at flush timeout or stop(), so the
+container log always has it. The queue holds MAX_PENDING messages: when it is full the oldest waiting one is
+dropped (`dropped` counts them). The same (kind, text) is never queued twice and is sent at most once per 10
+minutes, counted from its delivery (a failed send is never deduplicated away). A message is cut to MAX_CHARS
+with "…(잘림)" (Telegram refuses more than 4096); one delivered a minute or more late says so.
+
+For the runtime's view of Telegram: `failing_since` is when the oldest waiting message that has failed at least
+once was queued (None when no waiting message has failed: it clears when that message is delivered or dropped),
+`oldest_pending` when the oldest waiting message was queued and `last_attempt` when the worker last tried one -
+waiting messages with no attempt for minutes mean a stuck or never-started worker. Without a sender every
+message goes to stderr."""
 
 from __future__ import annotations
 
 import collections
+import re
 import sys
 import threading
 import time
@@ -33,6 +41,13 @@ RETRY_BASE_S = 2.0
 RETRY_MAX_S = 60.0
 LATE_NOTE_S = 60.0
 RECENT = 50  # delivered texts kept in `sent`
+_HTTP = re.compile(r"telegram HTTP (\d{3})")  # paper TelegramSender's SendError for a reply that is not ok
+
+
+def refused(error: str) -> bool:
+    """A send error Telegram will give again for the same message: HTTP 4xx other than 429 (flood control)."""
+    m = _HTTP.search(error)
+    return m is not None and 400 <= int(m.group(1)) < 500 and int(m.group(1)) != 429
 
 
 def _units(text: str) -> int:
@@ -59,7 +74,9 @@ class _Message:
     body: str
     created: float
     seq: int
-    logged: bool = False
+    failed: bool = False  # a send of it has failed (retried)
+    logged: bool = False  # its text is in stderr
+    final: bool = False  # reported undelivered at flush timeout or stop()
 
 
 class LiveNotifier:
@@ -82,14 +99,25 @@ class LiveNotifier:
         self.sent: collections.deque[str] = collections.deque(maxlen=RECENT)
         self.sent_count = 0
         self.dropped = 0
-        self.failures = 0  # failed sends in a row
-        self.failing_since: float | None = None
+        self.failures = 0  # failed sends in a row (the retry pause)
+        self.refusals = 0  # messages refused (HTTP 4xx but 429) in a row
+        self.last_attempt: float | None = None
         self.last_error: str | None = None
 
     @property
     def pending(self) -> int:
         with self._cond:
             return len(self._pending)
+
+    @property
+    def oldest_pending(self) -> float | None:
+        with self._cond:
+            return self._pending[0].created if self._pending else None
+
+    @property
+    def failing_since(self) -> float | None:
+        with self._cond:
+            return next((m.created for m in self._pending if m.failed), None)
 
     def __call__(self, kind: str, text: str) -> bool:
         """Queue a message. False when it is already queued or was delivered within dedupe_s, or without a
@@ -136,6 +164,7 @@ class LiveNotifier:
                 self._inflight = None
                 self._drop(m, f"not delivered in {MAX_AGE_S / 60:.0f} min")
             return 0.0
+        self.last_attempt = now
         text = m.body + (f" ({late / 60:.0f}분 지연)" if late >= LATE_NOTE_S else "")
         _, sent, errors = deliver([make_event(m.kind, int(m.created), m.seq, text)], [], self.sender, attempts=1)
         with self._cond:
@@ -147,12 +176,16 @@ class LiveNotifier:
                 self._last[m.key] = now
                 self.sent.append(text)
                 self.sent_count += 1
-                self.failures, self.failing_since = 0, None
+                self.failures = self.refusals = 0
                 self._cond.notify_all()
                 return 0.0
-            self.failures += 1
-            self.failing_since = now if self.failing_since is None else self.failing_since
             self.last_error = errors[0] if errors else "send failed"
+            if refused(self.last_error):  # never accepted on a retry: out of the way at once
+                self.refusals += 1
+                self._drop(m, f"refused: {self.last_error}")
+                return 0.0
+            self.failures += 1
+            m.failed = True
             if not m.logged:
                 m.logged = True
                 print(f"[LIVE] telegram send failed, retrying ({self.last_error}): {m.body}", file=sys.stderr)
@@ -182,18 +215,28 @@ class LiveNotifier:
             self._thread.start()
         return self._thread
 
+    def _report_undelivered(self, why: str) -> None:  # with self._cond held
+        for m in self._pending:
+            if not m.final:
+                m.final = True
+                print(f"[LIVE] telegram message not delivered ({why}): {m.body}", file=sys.stderr)
+
     def flush(self, timeout: float) -> bool:
-        """Wait up to `timeout` seconds for the queue to empty (the worker sends it); True when it did."""
+        """Wait up to `timeout` seconds for the queue to empty (the worker sends it); True when it did, else every
+        message still waiting goes to stderr."""
         end = time.monotonic() + timeout
         with self._cond:
             while self._pending:
                 left = end - time.monotonic()
                 if left <= 0:
+                    self._report_undelivered("flush timed out")
                     return False
                 self._cond.wait(left)
         return True
 
     def stop(self) -> None:
+        """Stop the worker; every message still waiting goes to stderr."""
         self._stop.set()
         with self._cond:
+            self._report_undelivered("stopped")
             self._cond.notify_all()

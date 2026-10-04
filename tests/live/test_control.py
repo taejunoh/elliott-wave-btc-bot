@@ -19,6 +19,7 @@ from ewbot.live.control import (
 )
 from ewbot.live.health import Heartbeat, fail_url
 from ewbot.live.notify import LiveNotifier, fit
+from ewbot.paper.notify import SendError
 from tests.live.helpers import Clock, journal
 from tests.paper.helpers import FakeSender
 
@@ -38,17 +39,21 @@ class Resp:
 
 class Session:
     """getUpdates (and heartbeat GETs) answer from `answers` in order, then with empty batches; getMe answers
-    with the bot `ewbot_bot`; POSTs answer from `posts`."""
+    with the bot `ewbot_bot` (after `me_failures` connection errors); POSTs answer from `posts`."""
 
-    def __init__(self, answers: list, posts: list | None = None) -> None:
+    def __init__(self, answers: list, posts: list | None = None, me_failures: int = 0) -> None:
         self.answers = answers
         self.posts = posts or []
+        self.me_failures = me_failures
         self.calls: list[tuple] = []
 
     def get(self, url, params=None, timeout=None):
         self.calls.append(("GET", url, dict(params or {}), timeout))
-        if url.endswith("/getMe"):
-            a: Any = Resp(200, {"ok": True, "result": {"id": 5, "is_bot": True, "username": "ewbot_bot"}})
+        if url.endswith("/getMe") and self.me_failures:
+            self.me_failures -= 1
+            a: Any = requests.exceptions.ConnectionError("getMe down")
+        elif url.endswith("/getMe"):
+            a = Resp(200, {"ok": True, "result": {"id": 5, "is_bot": True, "username": "ewbot_bot"}})
         elif self.answers:
             a = self.answers.pop(0)
         else:
@@ -189,7 +194,8 @@ def test_poll_failures_are_counted_reported_once_per_change_and_backed_off(tmp_p
     jr.close()
 
 
-def test_the_thread_survives_any_error_and_stop_ends_its_wait(tmp_path):
+def test_the_thread_survives_any_error_and_stop_ends_its_wait(tmp_path, monkeypatch):
+    monkeypatch.setattr("ewbot.live.control.ERROR_BACKOFF_S", 60.0)  # a back-off far longer than the test waits
     jr = journal(tmp_path)
     jr.put(OFFSET_KEY, {"offset": 1, "ts": time.time()})
     s = Session([ok(upd(1, "　")), ok({"message": {"chat": {"id": 42}, "text": "/pause"}}),  # no update_id
@@ -204,14 +210,13 @@ def test_the_thread_survives_any_error_and_stop_ends_its_wait(tmp_path):
 
     jr.put = broken  # type: ignore[method-assign]
     s.answers.append(ok(upd(3, "/status")))
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 10
     while c.failures == 0 and time.monotonic() < deadline:
         time.sleep(0.01)
     assert c.failures == 1 and c.last_error == "OperationalError" and c.alive and q.empty()
-    t0 = time.monotonic()
-    c.stop()  # ends the 5 s back-off at once
-    th.join(2)
-    assert not th.is_alive() and not c.alive and time.monotonic() - t0 < 1.5
+    c.stop()  # ends the 60 s back-off: the thread is gone long before it would have ended
+    th.join(15)
+    assert not th.is_alive() and not c.alive
     jr.close()
 
 
@@ -221,20 +226,32 @@ def test_the_notifier_queues_and_never_blocks_its_caller(capsys):
 
     def hanging(text: str) -> None:  # Telegram not answering
         entered.set()
-        gate.wait(5)
+        gate.wait(30)
         texts.append(text)
 
     n = LiveNotifier(hanging, max_pending=3)
     n.start()
-    t0 = time.monotonic()
     assert n("STOP_GAP", "a")
-    assert entered.wait(2)
+    assert entered.wait(10)
     assert n("BREAKER", "b") and n("X", "c") and n("X", "d") and n("X", "e")  # full: the oldest waiting ones go
-    assert time.monotonic() - t0 < 0.5 and n.dropped == 2 and n.pending == 3
+    assert texts == [] and n.dropped == 2 and n.pending == 3  # every call returned while the send still hangs
     assert "dropped (queue full): [LIVE] b" in capsys.readouterr().err  # the container log keeps it
     gate.set()
-    assert n.flush(5) and texts == ["[LIVE] a", "[LIVE] d", "[LIVE] e"]
+    assert n.flush(30) and texts == ["[LIVE] a", "[LIVE] d", "[LIVE] e"]
     n.stop()
+
+
+def test_undelivered_messages_go_to_the_log_on_shutdown(capsys):
+    gate = threading.Event()
+    n = LiveNotifier(lambda text: gate.wait(30))  # Telegram hangs
+    n.start()
+    n("A", "first (in flight)")
+    n("FATAL", "[중단] RuntimeError: boom")
+    assert not n.flush(0.2)
+    n.stop()
+    err = capsys.readouterr().err
+    assert err.count("[LIVE] first (in flight)") == 1 and err.count("[LIVE] [중단] RuntimeError: boom") == 1
+    gate.set()
 
 
 def test_a_failed_send_is_kept_retried_and_printed_never_deduplicated_away(capsys):
@@ -243,20 +260,83 @@ def test_a_failed_send_is_kept_retried_and_printed_never_deduplicated_away(capsy
     n = LiveNotifier(sender, clock=clock)
     alert = "[중대 사건] 거래 1이 60초 넘게 보호되지 않음"
     assert n("INCIDENT", alert) and not n("INCIDENT", alert)  # queued once
-    assert n.pump() == 2.0 and (n.failing_since, n.pending) == (1_000.0, 1)
+    assert (n.failing_since, n.oldest_pending, n.last_attempt) == (None, 1_000.0, None)  # queued, not tried yet
+    assert n.pump() == 2.0 and (n.failing_since, n.pending, n.last_attempt) == (1_000.0, 1, 1_000.0)
     assert f"[LIVE] {alert}" in capsys.readouterr().err  # the full text is in the container log
     clock.now += 2
     assert n.pump() == 4.0 and capsys.readouterr().err == ""  # printed once per message
     clock.now += 64
     assert n.pump() == 0.0 and sender.texts == [f"[LIVE] {alert} (1분 지연)"]
-    assert n.failing_since is None and n.pump() is None and not n("INCIDENT", alert)  # delivered: deduplicated now
+    assert n.failing_since is None and n.oldest_pending is None and n.pump() is None
+    assert not n("INCIDENT", alert)  # delivered: deduplicated now
     clock.now += 601
     assert n("INCIDENT", alert)
     stale = LiveNotifier(FakeSender(fail=99), clock=clock)
     stale("X", "y")
     stale.pump()
+    assert stale.failing_since == clock.now
     clock.now += 1_801  # kept for 30 minutes at most
-    assert stale.pump() == 0.0 and (stale.pending, stale.dropped) == (0, 1)
+    assert stale.pump() == 0.0 and (stale.pending, stale.dropped, stale.failing_since) == (0, 1, None)  # cleared
+
+
+def test_a_refused_message_is_dropped_at_once_and_never_holds_the_queue(capsys):
+    clock = Clock(0.0)
+    texts: list[str] = []
+    answers = {"bad": "telegram HTTP 400: {\"ok\":false,\"description\":\"Bad Request: message text is empty\"}",
+               "blocked": "telegram HTTP 403: {\"ok\":false,\"description\":\"Forbidden: bot was blocked by the user\"}",
+               "flood": "telegram HTTP 429: {\"ok\":false,\"parameters\":{\"retry_after\":5}}",
+               "gateway": "telegram HTTP 502: <html>"}
+
+    def sender(text: str) -> None:
+        for word, error in answers.items():
+            if word in text:
+                raise SendError(error)
+        texts.append(text)
+
+    n = LiveNotifier(sender, clock=clock)
+    n("AUDIT_MISMATCH", "bad text")
+    n("STOP_GAP", "[손절 갭] 시장가 청산")
+    assert n.pump() == 0.0 and n.pump() == 0.0 and texts == ["[LIVE] [손절 갭] 시장가 청산"]  # at once, not in 30 min
+    assert (n.dropped, n.failing_since, n.refusals, n.pending) == (1, None, 0, 0)  # a delivery resets refusals
+    err = capsys.readouterr().err
+    assert "HTTP 400" in err and "[LIVE] bad text" in err  # the refused text is in the container log
+    for word in ("flood", "gateway"):  # 429 and 5xx are retried
+        n("X", word)
+        assert n.pump() > 0 and n.pending == 1 and n.failing_since == clock.now
+        answers.pop(word)
+        assert n.pump() == 0.0 and n.pending == 0
+    for i in range(3):
+        n("X", f"blocked {i}")
+        assert n.pump() == 0.0
+    assert n.refusals == 3 and n.pending == 0  # the runtime counts this as Telegram unusable
+
+
+def test_get_me_is_retried_and_a_thread_that_stops_answering_is_overdue(tmp_path, capsys):
+    jr = journal(tmp_path)
+    jr.put(OFFSET_KEY, {"offset": 1, "ts": 0.0})
+    clock = Clock(0.0)
+    s = Session([], me_failures=2)
+    c = TelegramControl(TOKEN, "42", jr, session=s, clock=clock, sleep=lambda wait: None)
+    q: queue.Queue[Command] = queue.Queue()
+
+    def asked() -> int:
+        return sum(1 for call in s.calls if call[1].endswith("/getMe"))
+
+    for t, calls in ((0.0, 1), (10.0, 1), (70.0, 2), (150.0, 2), (200.0, 3)):  # again after 60 s, then 120 s
+        clock.now = t
+        c.poll_once(q)
+        assert asked() == calls
+    assert c.bot == "ewbot_bot" and c.failures == 0  # getMe failing never counts as a failed poll
+    clock.now = 300.0
+    c.poll_once(q)
+    assert asked() == 3  # known: not asked again
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 2 and "getMe failed" in err[0] and "getMe ok" in err[1]
+    assert c.overdue(300.0 + 45) == 0.0 and c.overdue(300.0 + 45 + 120) == 120.0  # a long poll takes up to 35 s
+    s.answers.append(Resp(429, {"ok": False, "description": "Too Many Requests", "parameters": {"retry_after": 200}}))
+    c.poll_once(q)  # waits 200 s: no lateness while it waits
+    assert c.overdue(300.0 + 200 + 45) == 0.0 and c.overdue(300.0 + 200 + 45 + 60) == 60.0
+    jr.close()
 
 
 def test_live_notifier_prefixes_truncates_dedupes_and_prunes():
