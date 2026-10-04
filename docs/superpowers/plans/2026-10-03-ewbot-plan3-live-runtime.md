@@ -19,9 +19,9 @@
 - Frozen inputs: params only from `holdout.lock`; config = `holdout_config(BotConfig(), params)`; replay from the first cached bar with `start_ts = HOLDOUT_START`; signals from the spot `BTC-USD` hourly candles of the public Coinbase Exchange API (`data.coinbase_history.update_cache`, as the paper runtime); no CLI option changes any of it.
 - Product `BIP-20DEC30-CDE`: `contract_size 0.01`, `price_increment 5`, `base_increment 1`, margin rates intraday ≈ 0.10, overnight 0.21025 long / 0.256625 short (recorded 2026-10-03). Orders: `market_market_ioc` entries/closes, `trigger_bracket_gtc` protection, `close_position` exits, `orders/preview` in SHADOW.
 - Stages: SHADOW = no real order, CANARY sizing (1 contract, skipped above 2% risk) on virtual fills with real previews; CANARY = 1 contract, skip when the 1-contract risk > 2% of equity; FULL = `risk.sizing.size_contracts(real equity, entry, stop, direction, CONSERVATIVE, risk_mult, costs)` capped at 3 for the first 30 days of FULL.
-- Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s (no price once the last good one is older than 60 s; a connection without a message for 15 s is reopened, a feed without a futures price for 5 minutes while the market is open is alerted); heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min); daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour.
+- Timing: cycle at hh:00:30 for the bar that closed at hh:00, retried every 15 s, held at +120 s (protection kept); an entry is never sent later than +300 s after its bar's close; poll every 10 s while a trade is open or an intent is pending (60 s otherwise); stop gap = price beyond the stop's 5% limit for 10 s (Coinbase places a triggered bracket stop as a limit 5% beyond it, Create Order reference; spec §4.2 assumed 1%); unprotected > 60 s = major incident; WebSocket silent > 60 s → REST price every 10 s (no price once the last good one is older than 60 s; a connection without a message for 15 s is reopened, a feed without a futures price for 5 minutes while the market is open is alerted); heartbeat every 60 s (healthchecks.io period 1 min, grace 2 min; Telegram unusable for 10 minutes → one `/fail` and no success ping until it works); Telegram alerts are queued and sent by a background thread (never awaited; a protective action goes before its alert), commands come only from the user's private chat, a command sent more than 120 s before the loop reads it is ignored and `/flatten_confirm` counts within 60 s of `/flatten` by the messages' dates; daily summary 09:00 New York; overnight-margin report 15:30 New York; paper audit from minute 50 of each hour.
 - Safety limits: one position; margin projected at the overnight rate: entry refused above 70%, warning at 80%, reduce back to ≤ 70% at 90% (only on a real futures price, never on a stand-in); real-account breakers −3% from the New York day's opening equity and −15% from the peak → flatten and pause, each reference the median of three balance reads (the day's first three; after a `/resume` that re-based it, that read and the next two) and each breaker tripping on two breaching reads in a row (a balance that is not a finite amount above 0 is no reading, and three in a row are an incident that pauses entries; `/resume` re-bases only the breaker that tripped).
-- Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name.
+- Secrets only in `/etc/ewbot/cdp_api_key.json` and `/etc/ewbot/live.env` (mode 600, refused otherwise), mounted read-only; never in the repository, the image or a log; HTTP exceptions that may carry a token are reduced to their type name (healthchecks.io gets an exception's type name only).
 - Tests never touch the network, a real account, the real `data/cache` or `<repo>/holdout.lock`: `SimExchange`, recorded JSON fixtures, fake sessions, synthetic candles (`tests.paper.helpers.synth_frame`) and temp-dir locks. Exception: `check_fingerprint()` hashes the working tree's strategy files (read-only), as the paper fingerprint test does.
 - Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -65,9 +65,9 @@
 | `src/ewbot/live/executor.py` | 7 | intent-before-send, entries, brackets, closes, reductions, restart recovery |
 | `src/ewbot/live/watchdog.py` | 8 | stop gap, margin status, account breakers, session watch, price source |
 | `src/ewbot/live/feed.py` | 8 | WebSocket ticker feed (Coinbase's public endpoint, no key, `websockets` client with verified TLS), gaps, reconnect backoff |
-| `src/ewbot/live/notify.py` | 9 | `[LIVE]` Telegram notifier (paper `TelegramSender`, dedupe) |
-| `src/ewbot/live/control.py` | 9 | Telegram commands (long poll, allowlisted chat, persisted offset) |
-| `src/ewbot/live/health.py` | 9 | heartbeat pings (healthchecks.io) |
+| `src/ewbot/live/notify.py` | 9 | `[LIVE]` Telegram notifier (paper `TelegramSender`; queued, sent by a background thread with retries; dedupe) |
+| `src/ewbot/live/control.py` | 9 | Telegram commands (long poll, the user's private chat only, dated commands, persisted offset; the thread never dies) |
+| `src/ewbot/live/health.py` | 9 | heartbeat pings and `/fail` (healthchecks.io) |
 | `src/ewbot/live/audit.py` | 10 | paper-ledger fetch (GitHub contents API) and decision comparison |
 | `src/ewbot/live/stage.py` | 10 | stages, gates, pause, incidents, transitions |
 | `src/ewbot/live/settings.py` | 11 | settings from the environment, secrets files (mode 600) |
@@ -95,16 +95,16 @@
 | 6 | Reconcile planner | 29 |
 | 7 | Executor: intent-before-send, protection, closes, recovery | 65 |
 | 8 | Watchdog and WebSocket feed | 27 |
-| 9 | `[LIVE]` notifier, Telegram control, heartbeat | 6 |
+| 9 | `[LIVE]` notifier, Telegram control, heartbeat | 10 |
 | 10 | Paper audit, stages and gates | 9 |
-| 11 | Settings and preflight | 7 |
-| 12 | `ShadowExchange` and the runtime loop | 25 |
-| 13 | CLI `ewbot live …` and production wiring | 8 |
+| 11 | Settings and preflight | 8 |
+| 12 | `ShadowExchange` and the runtime loop | 27 |
+| 13 | CLI `ewbot live …` and production wiring | 9 |
 | 14 | Parity and chaos integration tests | 26 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 11 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 357 more tests, `977 passed, 1 skipped` (`978 passed` with the cache), about 80 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 365 more tests, `985 passed, 1 skipped` (`986 passed` with the cache), about 80 s.
 
 ---
 
@@ -8126,9 +8126,9 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.paper.notify` (`Sender`, `deliver`, `make_event`; import only), `ewbot.live.journal.Journal`, `requests`, `tests.paper.helpers.FakeSender`, `tests.live.helpers` (`Clock`, `journal`).
-- Produces (`ewbot.live.notify`): `PREFIX = "[LIVE]"`, `class LiveNotifier(sender, *, clock=time.time, sleep=time.sleep, dedupe_s=600.0)`, callable `(kind, text) -> bool` (never raises; the same `(kind, text)` at most once per 10 minutes; prints to stderr without a sender).
-- Produces (`ewbot.live.control`): `COMMANDS = ("/status", "/pause", "/resume", "/flatten", "/flatten_confirm", "/help")`, `OFFSET_KEY = "telegram_offset"`, `class ControlError(RuntimeError)`, `command_word(text) -> str | None`, `class TelegramControl(token, chat_id, journal, *, session=None, timeout=25, sleep=time.sleep)` with `fetch() -> list[str]`, `run(queue)`, `start(queue) -> Thread`, `stop()`, attribute `ignored`.
-- Produces (`ewbot.live.health`): `class Heartbeat(url, *, session=None, clock=time.time, interval=60.0, timeout=10.0)` with `beat() -> bool`, `fail(message)`, attributes `url`, `failures`.
+- Produces (`ewbot.live.notify`): `PREFIX = "[LIVE]"`, `DEDUPE_S = 600.0`, `MAX_CHARS = 4000`, `MAX_PENDING = 100`, `MAX_AGE_S = 1800.0`, `fit(text, limit=MAX_CHARS) -> str` (cut in UTF-16 code units, Telegram's measure, ending `…(잘림)`); `class LiveNotifier(sender, *, clock=time.time, sleep=None, dedupe_s=600.0, max_pending=100)`, callable `(kind, text) -> bool` (only queues: never blocks or raises; False for a duplicate - queued, or delivered within `dedupe_s`, counted from the delivery - or without a sender: then stderr; a full queue drops its oldest waiting message), `pump() -> float | None` (one delivery attempt of the oldest message: None when idle, 0.0 after a delivery or a drop, else the pause before the retry - 2 s doubling to 60 s; a message is kept `MAX_AGE_S`; its full text goes to stderr on its first failure and when dropped; one delivered 60 s or more late ends with `(N분 지연)`), `run()`, `start() -> Thread | None` (the sending thread; none without a sender), `flush(timeout) -> bool`, `stop()` (`sleep=None`: the retry pause waits on the stop event), attributes `pending`, `sent` (the latest 50 texts), `sent_count`, `dropped`, `failures`, `failing_since`, `last_error`.
+- Produces (`ewbot.live.control`): `COMMANDS = ("/status", "/pause", "/resume", "/flatten", "/flatten_confirm", "/help")`, `OFFSET_KEY = "telegram_offset"` (stored as `{"offset", "ts"}`), `OFFSET_MAX_AGE_S = 86_400.0`, `ERROR_BACKOFF_S = 5.0`, `MAX_BACKOFF_S = 60.0`, `class ControlError(RuntimeError)` (`status`, `retry_after`; its message is a type name or the HTTP status with Telegram's `description`, never the token, and it is raised outside any `except` block, so neither `__cause__` nor `__context__` holds the original), NamedTuple `Command(word, sent)` (`sent`: the message's Telegram date), `command_word(text, bot=None) -> str | None` (total; `/cmd@<bot>` only for this bot's username), `class TelegramControl(token, chat_id, journal, *, session=None, timeout=25, sleep=None, clock=time.time)` with `fetch() -> list[Command]` (messages of the private chat `chat_id` from that user only - no group, channel, edited, forwarded or via-bot message, no command addressed to another bot; the offset stored once per batch, before the batch is returned: at most once; the first start - no stored offset - skips the backlog with getUpdates offset -1 and acts on nothing; an offset stored more than `OFFSET_MAX_AGE_S` ago is not sent), `poll_once(queue)` (never raises: a failure is counted, printed to stderr once per change of state and waited out - 5 s doubling to 60 s, HTTP 429's `retry_after`), `run(queue)` (getMe once for `bot`, then polls until `stop()`), `start(queue) -> Thread`, `stop()` (`sleep=None`: the back-off waits on the stop event, so `stop()` ends it), property `alive`, attributes `bot`, `ignored`, `skipped`, `failures` (in a row), `conflicts` (HTTP 409 answers), `last_error`, `last_ok`.
+- Produces (`ewbot.live.health`): `fail_url(url) -> str` (`<url>/fail`, a query string kept); `class Heartbeat(url, *, session=None, clock=time.time, interval=60.0, timeout=5.0)` with `beat() -> bool` (an exception or an HTTP status of 400 or more is a failure; stderr once per change of state), `fail(message) -> bool`, attributes `url`, `failures` (in a row), `last_error`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -8138,13 +8138,24 @@ EOF
 from __future__ import annotations
 
 import queue
+import sqlite3
+import threading
+import time
+import traceback
+from typing import Any
 
 import pytest
 import requests
 
-from ewbot.live.control import ControlError, TelegramControl, command_word
-from ewbot.live.health import Heartbeat
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.control import (
+    OFFSET_KEY,
+    Command,
+    ControlError,
+    TelegramControl,
+    command_word,
+)
+from ewbot.live.health import Heartbeat, fail_url
+from ewbot.live.notify import LiveNotifier, fit
 from tests.live.helpers import Clock, journal
 from tests.paper.helpers import FakeSender
 
@@ -8152,7 +8163,7 @@ TOKEN = "123456:SECRET-TOKEN"
 
 
 class Resp:
-    def __init__(self, status: int, body) -> None:
+    def __init__(self, status: int, body: Any) -> None:
         self.status_code = status
         self._body = body
 
@@ -8163,105 +8174,265 @@ class Resp:
 
 
 class Session:
-    def __init__(self, answers: list) -> None:
+    """getUpdates (and heartbeat GETs) answer from `answers` in order, then with empty batches; getMe answers
+    with the bot `ewbot_bot`; POSTs answer from `posts`."""
+
+    def __init__(self, answers: list, posts: list | None = None) -> None:
         self.answers = answers
+        self.posts = posts or []
         self.calls: list[tuple] = []
 
-    def _next(self):
-        a = self.answers.pop(0)
-        if isinstance(a, Exception):
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(("GET", url, dict(params or {}), timeout))
+        if url.endswith("/getMe"):
+            a: Any = Resp(200, {"ok": True, "result": {"id": 5, "is_bot": True, "username": "ewbot_bot"}})
+        elif self.answers:
+            a = self.answers.pop(0)
+        else:
+            time.sleep(0.01)  # a long poll that brought nothing
+            a = ok()
+        if isinstance(a, BaseException):
             raise a
         return a
 
-    def get(self, url, params=None, timeout=None):
-        self.calls.append(("GET", url, params))
-        return self._next()
-
     def post(self, url, data=None, timeout=None, json=None):
-        self.calls.append(("POST", url, data))
-        return self._next()
+        self.calls.append(("POST", url, data, timeout))
+        a = self.posts.pop(0)
+        if isinstance(a, BaseException):
+            raise a
+        return a
 
 
-def upd(uid: int, chat: int, text: str) -> dict:
-    return {"update_id": uid, "message": {"message_id": uid, "chat": {"id": chat}, "text": text}}
+def ok(*updates: dict) -> Resp:
+    return Resp(200, {"ok": True, "result": list(updates)})
+
+
+def upd(uid: int, text: str, *, chat: int = 42, sender: int = 42, date: int = 1_000, kind: str = "private",
+        **extra: Any) -> dict:
+    msg = {"message_id": uid, "date": date, "chat": {"id": chat, "type": kind},
+           "from": {"id": sender, "is_bot": False}, "text": text, **extra}
+    return {"update_id": uid, "message": msg}
 
 
 def test_command_words():
-    assert command_word("/pause") == "/pause" and command_word("/Flatten_Confirm@ewbot_bot") == "/flatten_confirm"
-    assert command_word("/status please") == "/status"
-    assert command_word("pause") is None and command_word("/rm -rf") is None and command_word("") is None
+    assert command_word("/pause") == "/pause" and command_word("/Flatten_Confirm") == "/flatten_confirm"
+    assert command_word("/status please") == "/status" and command_word("  /help\n") == "/help"
+    assert command_word("/Flatten_Confirm@EwBot_Bot", "ewbot_bot") == "/flatten_confirm"
+    assert command_word("/pause@other_bot", "ewbot_bot") is None  # addressed to another bot
+    assert command_word("/pause@ewbot_bot") is None  # this bot's name unknown (getMe failed): bare commands only
+    assert command_word("pause") is None and command_word("/rm -rf") is None and command_word("/flatten_confirmed") is None
+    for blank in ("", "   ", "　", "\xa0", "\n"):
+        assert command_word(blank) is None
 
 
-def test_only_the_allowlisted_chat_is_obeyed_and_the_offset_persists(tmp_path):
+def test_only_the_users_private_chat_is_obeyed_and_the_offset_is_stored_once_per_batch(tmp_path):
     jr = journal(tmp_path)
-    s = Session([Resp(200, {"ok": True, "result": [upd(10, 42, "/pause"), upd(11, 999, "/flatten_confirm"),
-                                                   upd(12, 42, "hello"), upd(13, 42, "/status@ewbot_bot")]}),
-                 Resp(200, {"ok": True, "result": []})])
-    c = TelegramControl(TOKEN, "42", jr, session=s)
-    assert c.fetch() == ["/pause", "/status"] and c.ignored == 1
-    assert jr.get("telegram_offset") == 14
-    TelegramControl(TOKEN, "42", jr, session=s).fetch()  # a restart resumes after update 13
-    assert s.calls[1][2]["offset"] == 14 and s.calls[0][1].endswith("/getUpdates")
+    jr.put(OFFSET_KEY, {"offset": 10, "ts": 4_000.0})  # a running bot: updates up to 9 were handled
+    s = Session([ok(upd(10, "/pause", date=4_990), upd(11, "/flatten_confirm", chat=999, sender=999),
+                    upd(12, "hello"), upd(13, "/status@ewbot_bot", date=4_995),
+                    upd(14, "/resume", sender=777),  # someone else
+                    upd(15, "/resume", chat=-100, kind="group"),
+                    upd(16, "/pause", forward_origin={"type": "user"}), upd(17, "/pause", forward_date=4_000),
+                    upd(18, "/pause", via_bot={"id": 5}), upd(19, "/pause@other_bot"),
+                    {"update_id": 20, "edited_message": upd(20, "/flatten_confirm")["message"]},
+                    {"update_id": 21, "channel_post": {"chat": {"id": 42, "type": "channel"}, "text": "/flatten"}})])
+    writes: list[str] = []
+    put = jr.put
+    jr.put = lambda key, value: (writes.append(key), put(key, value))  # type: ignore[method-assign]
+    c = TelegramControl(TOKEN, "42", jr, session=s, clock=Clock(5_000.0))
+    c.bot = "ewbot_bot"  # getMe's answer (run() asks once)
+    assert c.fetch() == [Command("/pause", 4_990.0), Command("/status", 4_995.0)] and c.ignored == 8
+    assert writes == [OFFSET_KEY] and jr.get(OFFSET_KEY) == {"offset": 22, "ts": 5_000.0}  # once, before the batch
+    TelegramControl(TOKEN, "42", jr, session=s, clock=Clock(5_010.0)).fetch()  # a restart resumes after update 21
+    params = s.calls[-1][2]
+    assert s.calls[-1][1].endswith("/getUpdates") and params["offset"] == 22 and params["allowed_updates"] == '["message"]'
     jr.close()
+
+
+def test_the_first_start_skips_the_backlog_and_a_day_old_offset_is_not_sent(tmp_path):
+    jr = journal(tmp_path)
+    clock = Clock(100_000.0)
+    s = Session([ok(upd(7, "/flatten", date=20_000)), ok(upd(8, "/status", date=99_990))])
+    c = TelegramControl(TOKEN, "42", jr, session=s, clock=clock)
+    assert c.fetch() == [] and c.skipped == 1  # yesterday's /flatten is never acted on
+    assert (s.calls[0][2]["offset"], s.calls[0][2]["timeout"]) == (-1, 0)  # Telegram drops all but the newest
+    assert jr.get(OFFSET_KEY) == {"offset": 8, "ts": 100_000.0}
+    assert c.fetch() == [Command("/status", 99_990.0)] and s.calls[1][2]["offset"] == 8
+    clock.now += 86_401  # a day without any update: the stored offset is not sent (updates are kept 24 h at most)
+    assert c.fetch() == [] and "offset" not in s.calls[2][2]
+    empty = TelegramControl(TOKEN, "42", journal(tmp_path, "j2.sqlite"), session=Session([]), clock=clock)
+    assert empty.fetch() == [] and empty.skipped == 0 and empty.journal.get(OFFSET_KEY)["offset"] is None
+    empty.fetch()  # primed: an ordinary long poll from now on
+    assert "offset" not in empty.session.calls[1][2] and empty.session.calls[1][2]["timeout"] == 25
+    jr.close()
+    empty.journal.close()
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    out: list[BaseException] = []
+    todo: list[BaseException | None] = [exc]
+    while todo:
+        e = todo.pop()
+        if e is not None and e not in out:
+            out.append(e)
+            todo += [e.__cause__, e.__context__]
+    return out
 
 
 def test_errors_never_carry_the_token(tmp_path):
     jr = journal(tmp_path)
-    s = Session([requests.exceptions.ConnectionError(f"https://api.telegram.org/bot{TOKEN}/getUpdates"),
-                 Resp(401, {"ok": False, "description": "Unauthorized"})])
-    c = TelegramControl(TOKEN, "42", jr, session=s)
-    for _ in range(2):
+    jr.put(OFFSET_KEY, {"offset": 1, "ts": 0.0})
+    leak = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    s = Session([requests.exceptions.ConnectionError(leak), Resp(200, ValueError(leak)),
+                 Resp(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})])
+    c = TelegramControl(TOKEN, "42", jr, session=s, clock=Clock(0.0))
+    for _ in range(3):
         with pytest.raises(ControlError) as err:
             c.fetch()
-        assert TOKEN not in str(err.value) and err.value.__cause__ is None
+        assert _chain(err.value) == [err.value]  # neither __cause__ nor __context__ keeps the original
+        text = str(err.value) + repr(err.value) + "".join(traceback.format_exception(err.value))
+        assert TOKEN not in text and "SECRET" not in text
     jr.close()
 
 
-def test_run_queues_commands_and_backs_off_on_errors(tmp_path):
+def test_poll_failures_are_counted_reported_once_per_change_and_backed_off(tmp_path, capsys):
     jr = journal(tmp_path)
+    jr.put(OFFSET_KEY, {"offset": 1, "ts": 0.0})
+    conflict = {"ok": False, "error_code": 409,
+                "description": "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"}
+    s = Session([Resp(409, conflict), Resp(409, conflict), Resp(401, {"ok": False, "description": "Unauthorized"}),
+                 Resp(429, {"ok": False, "description": "Too Many Requests: retry after 30", "parameters": {"retry_after": 30}}),
+                 Resp(502, requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)),
+                 ok(upd(1, "/status", date=0))])
     waits: list[float] = []
-    c = TelegramControl(TOKEN, "42", jr, sleep=waits.append, session=None)
-    answers = [ControlError("x"), ["/status"], ["/pause", "/resume"]]
-
-    def fake_fetch():
-        a = answers.pop(0)
-        if isinstance(a, Exception):
-            raise a
-        if not answers:
-            c.stop()
-        return a
-
-    c.fetch = fake_fetch  # type: ignore[method-assign]
-    q: queue.Queue[str] = queue.Queue()
-    c.run(q)
-    assert [q.get_nowait() for _ in range(3)] == ["/status", "/pause", "/resume"] and waits == [5.0]
+    c = TelegramControl(TOKEN, "42", jr, session=s, clock=Clock(0.0), sleep=waits.append)
+    q: queue.Queue[Command] = queue.Queue()
+    c.poll_once(q)
+    assert c.last_error is not None and c.last_error.startswith("getUpdates failed: HTTP 409: Conflict: terminated by other")
+    assert c.last_error.endswith("(another getUpdates poller or a webhook uses this bot)")
+    c.poll_once(q)
+    c.poll_once(q)
+    assert c.last_error == "getUpdates failed: HTTP 401: Unauthorized (the bot token was refused)"
+    c.poll_once(q)
+    c.poll_once(q)
+    assert (c.failures, c.conflicts, c.last_error) == (5, 2, "getUpdates failed: HTTP 502")  # the status, not JSONDecodeError
+    assert waits == [5.0, 10.0, 20.0, 30.0, 60.0]  # doubling to 60 s; HTTP 429: Telegram's retry_after
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 4 and "HTTP 409" in lines[0] and "HTTP 401" in lines[1] and "HTTP 429" in lines[2]
+    assert "HTTP 502" in lines[3]  # the second 409 in a row is not printed again
+    c.poll_once(q)
+    assert c.failures == 0 and c.last_ok == 0.0 and q.get_nowait() == Command("/status", 0.0)
+    assert capsys.readouterr().err == "[LIVE] telegram commands ok again after 5 failed polls\n"
     jr.close()
 
 
-def test_live_notifier_prefixes_dedupes_and_never_raises():
+def test_the_thread_survives_any_error_and_stop_ends_its_wait(tmp_path):
+    jr = journal(tmp_path)
+    jr.put(OFFSET_KEY, {"offset": 1, "ts": time.time()})
+    s = Session([ok(upd(1, "　")), ok({"message": {"chat": {"id": 42}, "text": "/pause"}}),  # no update_id
+                 ok(upd(2, "/flatten", date=int(time.time())))])
+    c = TelegramControl(TOKEN, "42", jr, session=s)
+    q: queue.Queue[Command] = queue.Queue()
+    th = c.start(q)
+    assert q.get(timeout=5).word == "/flatten" and c.alive and c.bot == "ewbot_bot"
+
+    def broken(key, value):
+        raise sqlite3.OperationalError("database is locked")
+
+    jr.put = broken  # type: ignore[method-assign]
+    s.answers.append(ok(upd(3, "/status")))
+    deadline = time.monotonic() + 5
+    while c.failures == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert c.failures == 1 and c.last_error == "OperationalError" and c.alive and q.empty()
+    t0 = time.monotonic()
+    c.stop()  # ends the 5 s back-off at once
+    th.join(2)
+    assert not th.is_alive() and not c.alive and time.monotonic() - t0 < 1.5
+    jr.close()
+
+
+def test_the_notifier_queues_and_never_blocks_its_caller(capsys):
+    entered, gate = threading.Event(), threading.Event()
+    texts: list[str] = []
+
+    def hanging(text: str) -> None:  # Telegram not answering
+        entered.set()
+        gate.wait(5)
+        texts.append(text)
+
+    n = LiveNotifier(hanging, max_pending=3)
+    n.start()
+    t0 = time.monotonic()
+    assert n("STOP_GAP", "a")
+    assert entered.wait(2)
+    assert n("BREAKER", "b") and n("X", "c") and n("X", "d") and n("X", "e")  # full: the oldest waiting ones go
+    assert time.monotonic() - t0 < 0.5 and n.dropped == 2 and n.pending == 3
+    assert "dropped (queue full): [LIVE] b" in capsys.readouterr().err  # the container log keeps it
+    gate.set()
+    assert n.flush(5) and texts == ["[LIVE] a", "[LIVE] d", "[LIVE] e"]
+    n.stop()
+
+
+def test_a_failed_send_is_kept_retried_and_printed_never_deduplicated_away(capsys):
+    clock = Clock(1_000.0)
+    sender = FakeSender(fail=2)
+    n = LiveNotifier(sender, clock=clock)
+    alert = "[중대 사건] 거래 1이 60초 넘게 보호되지 않음"
+    assert n("INCIDENT", alert) and not n("INCIDENT", alert)  # queued once
+    assert n.pump() == 2.0 and (n.failing_since, n.pending) == (1_000.0, 1)
+    assert f"[LIVE] {alert}" in capsys.readouterr().err  # the full text is in the container log
+    clock.now += 2
+    assert n.pump() == 4.0 and capsys.readouterr().err == ""  # printed once per message
+    clock.now += 64
+    assert n.pump() == 0.0 and sender.texts == [f"[LIVE] {alert} (1분 지연)"]
+    assert n.failing_since is None and n.pump() is None and not n("INCIDENT", alert)  # delivered: deduplicated now
+    clock.now += 601
+    assert n("INCIDENT", alert)
+    stale = LiveNotifier(FakeSender(fail=99), clock=clock)
+    stale("X", "y")
+    stale.pump()
+    clock.now += 1_801  # kept for 30 minutes at most
+    assert stale.pump() == 0.0 and (stale.pending, stale.dropped) == (0, 1)
+
+
+def test_live_notifier_prefixes_truncates_dedupes_and_prunes():
     clock = Clock(1_000.0)
     sender = FakeSender()
-    n = LiveNotifier(sender, clock=clock, sleep=lambda s: None)
-    assert n("ENTRY", "진입 W3 롱") and sender.texts == ["[LIVE] 진입 W3 롱"]
+    n = LiveNotifier(sender, clock=clock)
+    assert n("ENTRY", "진입 W3 롱") and n.pump() == 0.0 and sender.texts == ["[LIVE] 진입 W3 롱"]
     assert not n("ENTRY", "진입 W3 롱")  # within 10 minutes
     clock.now += 601
-    assert n("ENTRY", "진입 W3 롱") and len(sender.texts) == 2
-    failing = LiveNotifier(FakeSender(fail=5), clock=clock, sleep=lambda s: None)
-    assert failing("X", "y") is False
-    assert LiveNotifier(None, clock=clock)("X", "y") is False
+    assert n("ENTRY", "진입 W3 롱") and n.pump() == 0.0 and len(sender.texts) == 2
+    assert n("DAILY", "x" * 5_000) and n.pump() == 0.0
+    assert len(sender.texts[-1]) == 4_000 and sender.texts[-1].endswith("…(잘림)")  # Telegram's limit is 4096
+    assert len(fit("😀" * 3_000).encode("utf-16-le")) // 2 <= 4_000  # counted in UTF-16 units, as Telegram does
+    for i in range(1_000):
+        n("COMMAND", f"reply {i}")
+        n.pump()
+    clock.now += 601
+    assert n("COMMAND", "one more") and len(n._last) == 0  # entries older than 10 minutes are pruned
+    assert n.pump() == 0.0 and n.sent_count == 1_004 and len(n.sent) == 50
+    assert LiveNotifier(None, clock=clock)("X", "y") is False  # no sender: stderr only
 
 
-def test_heartbeat_pings_once_a_minute_and_survives_errors():
+def test_heartbeat_pings_once_a_minute_and_logs_state_changes(capsys):
     clock = Clock(0.0)
-    s = Session([Resp(200, {}), requests.exceptions.ConnectionError("down"), Resp(200, {}), Resp(200, {})])
-    hb = Heartbeat("https://hc-ping.com/abc", session=s, clock=clock)
-    assert hb.beat() and not hb.beat()
+    s = Session([Resp(200, {}), Resp(404, {}), requests.exceptions.ConnectionError("down"), Resp(200, {})],
+                posts=[Resp(200, {})])
+    hb = Heartbeat("https://hc-ping.com/abc?create=1", session=s, clock=clock)
+    assert hb.beat() and not hb.beat() and s.calls[0][3] == 5.0
     clock.now = 60.0
-    assert not hb.beat() and hb.failures == 1
+    assert not hb.beat() and (hb.failures, hb.last_error) == (1, "HTTP 404")  # e.g. a wrong check UUID
     clock.now = 120.0
+    assert not hb.beat() and (hb.failures, hb.last_error) == (2, "ConnectionError")
+    clock.now = 180.0
     assert hb.beat() and hb.failures == 0
-    hb.fail("fatal: boom")
-    assert s.calls[-1] == ("POST", "https://hc-ping.com/abc/fail", b"fatal: boom")
+    assert capsys.readouterr().err.splitlines() == ["[LIVE] heartbeat failed: HTTP 404",
+                                                    "[LIVE] heartbeat ok again after 2 failed pings"]
+    assert hb.fail("fatal: boom")
+    assert s.calls[-1][:3] == ("POST", "https://hc-ping.com/abc/fail?create=1", b"fatal: boom")
+    assert fail_url("https://hc-ping.com/abc/") == "https://hc-ping.com/abc/fail"
     assert Heartbeat(None).beat() is False and Heartbeat("  ").url is None
 ```
 
@@ -8278,141 +8449,446 @@ Expected: collection error `ModuleNotFoundError: No module named 'ewbot.live.con
 **File: `src/ewbot/live/notify.py`**
 
 ```python
-"""[LIVE] Telegram notifications (Plan 3 spec 3.5): the paper runtime's TelegramSender and delivery
-with retries, prefixed "[LIVE]" (the paper runtime's messages start with "[ewbot paper]"). A failed
-send never raises into the trading loop; the same (kind, text) is sent at most once per 10 minutes."""
+"""[LIVE] Telegram notifications (Plan 3 spec 3.5): the paper runtime's TelegramSender, messages prefixed
+"[LIVE]" (the paper runtime's start with "[ewbot paper]").
+
+Never on the trading loop: a call only queues the message and returns at once (it never blocks or raises); a
+background thread (`start()`) sends the queue in order, one attempt at a time. A failed send keeps the message
+at the head of the queue and retries it after a pause that doubles from 2 s to 60 s, for up to 30 minutes
+(MAX_AGE_S) after it was queued; its full text goes to stderr on its first failure, and so does every message
+that is dropped, so the container log always has it. The queue holds MAX_PENDING messages: when it is full the
+oldest waiting one is dropped (`dropped` counts them). The same (kind, text) is never queued twice and is sent
+at most once per 10 minutes, counted from its delivery (a failed send is never deduplicated away). A message is
+cut to MAX_CHARS with "…(잘림)" (Telegram refuses more than 4096); one delivered a minute or more late says so.
+`failing_since` (the first failure of the current run, None after a delivery), `pending` and `last_error` let
+the runtime tell that Telegram is down. Without a sender every message goes to stderr."""
 
 from __future__ import annotations
 
+import collections
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 from ewbot.paper.notify import Sender, deliver, make_event
 
 PREFIX = "[LIVE]"
 DEDUPE_S = 600.0
-SEND_ATTEMPTS = 2  # keeps a Telegram outage from stalling the loop for more than ~1 s per message
+MAX_CHARS = 4000  # Telegram's limit is 4096 UTF-16 code units: room for the delay note
+TRUNCATED = "…(잘림)"
+MAX_PENDING = 100
+MAX_AGE_S = 1800.0  # a message is retried for 30 minutes, then dropped (it is in the container log)
+RETRY_BASE_S = 2.0
+RETRY_MAX_S = 60.0
+LATE_NOTE_S = 60.0
+RECENT = 50  # delivered texts kept in `sent`
+
+
+def _units(text: str) -> int:
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def fit(text: str, limit: int = MAX_CHARS) -> str:
+    """`text`, or its start with TRUNCATED, within `limit` UTF-16 code units (Telegram's measure)."""
+    if _units(text) <= limit:
+        return text
+    room, used, out = limit - _units(TRUNCATED), 0, []
+    for ch in text:
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > room:
+            break
+        out.append(ch)
+    return "".join(out) + TRUNCATED
+
+
+@dataclass(eq=False)
+class _Message:
+    kind: str
+    key: tuple[str, str]
+    body: str
+    created: float
+    seq: int
+    logged: bool = False
 
 
 class LiveNotifier:
     def __init__(self, sender: Sender | None, *, clock: Callable[[], float] = time.time,
-                 sleep: Callable[[float], None] = time.sleep, dedupe_s: float = DEDUPE_S) -> None:
+                 sleep: Callable[[float], object] | None = None, dedupe_s: float = DEDUPE_S,
+                 max_pending: int = MAX_PENDING) -> None:
         self.sender = sender
         self.clock = clock
-        self.sleep = sleep
         self.dedupe_s = dedupe_s
-        self._last: dict[tuple[str, str], float] = {}
-        self.sent: list[str] = []
+        self.max_pending = max_pending
+        self._stop = threading.Event()
+        self.sleep = sleep if sleep is not None else self._stop.wait  # the worker's pause (stop() ends it)
+        self._cond = threading.Condition()
+        self._pending: collections.deque[_Message] = collections.deque()
+        self._queued: set[tuple[str, str]] = set()
+        self._inflight: _Message | None = None
+        self._last: dict[tuple[str, str], float] = {}  # delivery time per (kind, text), kept dedupe_s
+        self._seq = 0
+        self._thread: threading.Thread | None = None
+        self.sent: collections.deque[str] = collections.deque(maxlen=RECENT)
+        self.sent_count = 0
+        self.dropped = 0
+        self.failures = 0  # failed sends in a row
+        self.failing_since: float | None = None
+        self.last_error: str | None = None
+
+    @property
+    def pending(self) -> int:
+        with self._cond:
+            return len(self._pending)
 
     def __call__(self, kind: str, text: str) -> bool:
+        """Queue a message. False when it is already queued or was delivered within dedupe_s, or without a
+        sender (then it is printed to stderr)."""
         now = self.clock()
         key = (kind, text)
-        last = self._last.get(key)
-        if last is not None and now - last < self.dedupe_s:
-            return False
-        self._last[key] = now
-        body = f"{PREFIX} {text}"
+        body = fit(f"{PREFIX} {text}")
+        with self._cond:
+            self._last = {k: t for k, t in self._last.items() if now - t < self.dedupe_s}
+            if key in self._queued or key in self._last:
+                return False
+            if self.sender is None:
+                self._last[key] = now
+                print(body, file=sys.stderr)
+                return False
+            if len(self._pending) >= self.max_pending:
+                self._drop(next((m for m in self._pending if m is not self._inflight), None), "queue full")
+            self._seq += 1
+            self._pending.append(_Message(kind, key, body, now, self._seq))
+            self._queued.add(key)
+            self._cond.notify_all()
+        return True
+
+    def _drop(self, m: _Message | None, why: str) -> None:  # with self._cond held
+        if m is None or m not in self._pending:
+            return
+        self._pending.remove(m)
+        self._queued.discard(m.key)
+        self.dropped += 1
+        print(f"[LIVE] telegram message dropped ({why}): {m.body}", file=sys.stderr)
+        self._cond.notify_all()
+
+    def pump(self) -> float | None:
+        """One delivery attempt for the oldest queued message (the worker thread's step; tests call it directly).
+        None when nothing is queued, 0.0 after a delivery or a drop, else the pause before the next attempt."""
+        with self._cond:
+            if not self._pending or self.sender is None:
+                return None
+            m = self._inflight = self._pending[0]
+        now = self.clock()
+        late = now - m.created
+        if late > MAX_AGE_S:
+            with self._cond:
+                self._inflight = None
+                self._drop(m, f"not delivered in {MAX_AGE_S / 60:.0f} min")
+            return 0.0
+        text = m.body + (f" ({late / 60:.0f}분 지연)" if late >= LATE_NOTE_S else "")
+        _, sent, errors = deliver([make_event(m.kind, int(m.created), m.seq, text)], [], self.sender, attempts=1)
+        with self._cond:
+            self._inflight = None
+            if sent:
+                if m in self._pending:
+                    self._pending.remove(m)
+                self._queued.discard(m.key)
+                self._last[m.key] = now
+                self.sent.append(text)
+                self.sent_count += 1
+                self.failures, self.failing_since = 0, None
+                self._cond.notify_all()
+                return 0.0
+            self.failures += 1
+            self.failing_since = now if self.failing_since is None else self.failing_since
+            self.last_error = errors[0] if errors else "send failed"
+            if not m.logged:
+                m.logged = True
+                print(f"[LIVE] telegram send failed, retrying ({self.last_error}): {m.body}", file=sys.stderr)
+            return min(RETRY_BASE_S * 2.0 ** min(self.failures - 1, 10), RETRY_MAX_S)
+
+    def run(self) -> None:
+        """The worker: sends while anything is queued, until stop(). Never raises."""
+        while not self._stop.is_set():
+            with self._cond:
+                if not self._pending:
+                    self._cond.wait(1.0)
+                    continue
+            try:
+                pause = self.pump()
+            except Exception as exc:  # noqa: BLE001 - the worker must outlive any error
+                self.last_error = type(exc).__name__
+                pause = RETRY_MAX_S
+            if pause:
+                self.sleep(pause)
+
+    def start(self) -> threading.Thread | None:
         if self.sender is None:
-            print(body, file=sys.stderr)
-            return False
-        event = make_event(kind, int(now), len(self.sent), body)
-        _, sent, errors = deliver([event], [], self.sender, attempts=SEND_ATTEMPTS, sleep=self.sleep)
-        if sent:
-            self.sent.append(body)
-            return True
-        print(f"[LIVE] telegram send failed: {errors}", file=sys.stderr)
-        return False
+            return None
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(target=self.run, name="ewbot-notify", daemon=True)
+            self._thread.start()
+        return self._thread
+
+    def flush(self, timeout: float) -> bool:
+        """Wait up to `timeout` seconds for the queue to empty (the worker sends it); True when it did."""
+        end = time.monotonic() + timeout
+        with self._cond:
+            while self._pending:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
 ```
 
 **File: `src/ewbot/live/control.py`**
 
 ```python
 """Telegram commands (Plan 3 spec 3.2 `control`): /status, /pause, /resume, /flatten (confirmed with
-/flatten_confirm within 60 s) and /help, accepted only from the configured chat id.
+/flatten_confirm sent within 60 s of it) and /help.
 
-A background thread long-polls getUpdates and queues the command words; the runtime executes them on
-its own thread, so no trading state is shared across threads. The update offset is stored in the
-journal: a restart never replays an old command. Exceptions from the HTTP layer may contain the bot
-token (it is part of the URL), so only their type name is ever reported."""
+Accepted only from a private chat with the bot whose chat id is the configured TELEGRAM_CHAT_ID (the user's own
+id) and whose sender is that user: group, channel and edited messages, forwarded messages, messages via a bot
+and commands addressed to another bot (`/pause@other_bot`; `/pause@<this bot>` only when getMe named it) are
+ignored. A background thread long-polls getUpdates and queues `Command(word, sent)`; the runtime executes them on
+its main loop, so no trading state is shared across threads. `sent` is the message's Telegram date: the runtime
+ignores a command that is old by the time it would run (live/runtime.py COMMAND_MAX_AGE_S) and times the
+/flatten confirmation on the messages, not on when it handled them.
+
+The update offset is stored in the journal with the time it was stored, once per batch and before the batch is
+handed over: a crash can lose a command (at most once), never repeat one. On the first start (no stored offset)
+the backlog is skipped without acting on it. A stored offset older than 24 h is not sent (Telegram keeps
+updates 24 h at most, and may number the next update at random after a week without any): getUpdates then
+returns what is unconfirmed, and the runtime's age check still applies.
+
+The thread never dies of an error: every exception is counted (`failures` in a row, `last_error`; `conflicts`
+counts HTTP 409 - another getUpdates poller or a webhook on this bot), waited out (5 s doubling to 60 s, or
+HTTP 429's retry_after; stop() ends the wait) and printed to stderr once per change of state; `alive` tells the
+runtime whether the thread runs. The HTTP layer's exceptions may contain the bot token (it is part of the URL),
+so only their type name, the HTTP status and Telegram's own `description` are ever reported."""
 
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import requests
 
 from ewbot.live.journal import Journal
 
-UPDATES_API = "https://api.telegram.org/bot{token}/getUpdates"
+API = "https://api.telegram.org/bot{token}/{method}"
 COMMANDS = ("/status", "/pause", "/resume", "/flatten", "/flatten_confirm", "/help")
 OFFSET_KEY = "telegram_offset"
+OFFSET_MAX_AGE_S = 86_400.0
 POLL_TIMEOUT_S = 25
 ERROR_BACKOFF_S = 5.0
+MAX_BACKOFF_S = 60.0
+MAX_RETRY_AFTER_S = 300.0
+FORWARDED = ("forward_origin", "forward_from", "forward_from_chat", "forward_sender_name", "forward_date")
+HINTS = {401: "the bot token was refused", 409: "another getUpdates poller or a webhook uses this bot"}
 
 
 class ControlError(RuntimeError):
-    """getUpdates failed (the message never contains the token)."""
+    """A Telegram call failed. The message never contains the token: an exception's type name, or the HTTP
+    status with Telegram's description. `status` and `retry_after` (HTTP 429) when Telegram answered."""
+
+    def __init__(self, message: str, status: int | None = None, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
-def command_word(text: str) -> str | None:
-    """'/pause@ewbot_bot now' -> '/pause'; anything that is not a known command -> None."""
-    if not text:
+class Command(NamedTuple):
+    word: str  # one of COMMANDS
+    sent: float  # the message's Telegram date (Unix seconds)
+
+
+def command_word(text: str, bot: str | None = None) -> str | None:
+    """'/pause now' -> '/pause'; '/pause@<bot>' only when `bot` is this bot's username (unknown: bare commands
+    only); anything that is not a known command -> None."""
+    parts = (text or "").split()
+    if not parts:
         return None
-    word = text.strip().split()[0].split("@")[0].lower()
+    word, _, target = parts[0].partition("@")
+    if target and (bot is None or target.lower() != bot.lower()):
+        return None
+    word = word.lower()
     return word if word in COMMANDS else None
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _stored_offset(stored: Any, now: float) -> int | None:
+    """The stored offset when it is an update id stored at most OFFSET_MAX_AGE_S ago, else None (not sent)."""
+    s = _dict(stored)
+    off, ts = s.get("offset"), s.get("ts")
+    if not isinstance(off, int) or isinstance(off, bool) or not isinstance(ts, (int, float)):
+        return None
+    return off if now - float(ts) <= OFFSET_MAX_AGE_S else None
 
 
 class TelegramControl:
     def __init__(self, token: str, chat_id: str, journal: Journal, *, session: Any | None = None,
-                 timeout: int = POLL_TIMEOUT_S, sleep: Callable[[float], None] = time.sleep) -> None:
-        self._url = UPDATES_API.format(token=token)
-        self.chat_id = str(chat_id)
+                 timeout: int = POLL_TIMEOUT_S, sleep: Callable[[float], object] | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
+        self._token = token
+        self.chat_id = str(chat_id).strip()
         self.journal = journal
         self.session = session if session is not None else requests.Session()
         self.timeout = timeout
-        self.sleep = sleep
-        self.ignored = 0
+        self.clock = clock
         self._stop = threading.Event()
+        self.sleep = sleep if sleep is not None else self._stop.wait  # the back-off pause (stop() ends it)
+        self.bot: str | None = None  # this bot's username, from getMe when the thread starts
+        self.ignored = 0  # updates not from the user's private chat (or forwarded, edited, via a bot)
+        self.skipped = 0  # backlog updates skipped on the first start
+        self.failures = 0  # failed polls in a row
+        self.conflicts = 0  # HTTP 409 answers so far
+        self.last_error: str | None = None
+        self.last_ok: float | None = None
+        self._thread: threading.Thread | None = None
 
-    def fetch(self) -> list[str]:
-        params: dict[str, Any] = {"timeout": self.timeout, "allowed_updates": '["message"]'}
-        offset = self.journal.get(OFFSET_KEY)
-        if offset is not None:
-            params["offset"] = int(offset)
+    # ------------------------------------------------------------------ Telegram calls
+    def _call(self, method: str, params: dict[str, Any], timeout: float) -> Any:
+        """GET a Bot API method -> its result. Raises ControlError outside any except block, so neither its
+        __cause__ nor its __context__ holds the token-bearing exception."""
+        failed: str | None = None
+        status: int | None = None
+        resp: Any = None
+        data: Any = None
         try:
-            resp = self.session.get(self._url, params=params, timeout=self.timeout + 10)
-            data = resp.json()
+            resp = self.session.get(API.format(token=self._token, method=method), params=params, timeout=timeout)
+            status = int(resp.status_code)
         except Exception as exc:  # noqa: BLE001 - the URL holds the token: type name only
-            raise ControlError(f"getUpdates failed: {type(exc).__name__}") from None
-        if not isinstance(data, dict) or not data.get("ok"):
-            raise ControlError(f"getUpdates failed: HTTP {getattr(resp, 'status_code', '?')}")
-        out: list[str] = []
-        for upd in data.get("result") or []:
-            self.journal.put(OFFSET_KEY, int(upd["update_id"]) + 1)
-            msg = upd.get("message") or {}
-            if str((msg.get("chat") or {}).get("id")) != self.chat_id:
-                self.ignored += 1
-                continue
-            cmd = command_word(msg.get("text") or "")
+            failed = type(exc).__name__
+        if failed is None:
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001 - not JSON (an HTML error page): the status tells
+                data = None
+        if failed is not None:
+            raise ControlError(f"{method} failed: {failed}")
+        body = _dict(data)
+        if body.get("ok") is True:
+            return body.get("result")
+        desc = str(body.get("description") or "")[:120]
+        if self._token:
+            desc = desc.replace(self._token, "<token>")
+        retry = _dict(body.get("parameters")).get("retry_after")
+        hint = HINTS.get(status or 0)
+        raise ControlError(f"{method} failed: HTTP {status}" + (f": {desc}" if desc else "") + (f" ({hint})" if hint else ""),
+                           status=status, retry_after=float(retry) if isinstance(retry, (int, float)) else None)
+
+    def _ids(self, result: Any) -> tuple[list[dict[str, Any]], list[int]]:
+        updates = [u for u in (result if isinstance(result, list) else []) if isinstance(u, dict)]
+        ids = [u["update_id"] for u in updates if isinstance(u.get("update_id"), int) and not isinstance(u["update_id"], bool)]
+        return updates, ids
+
+    def _accept(self, upd: dict[str, Any]) -> Command | None:
+        msg = upd.get("message")
+        chat, sender = _dict(_dict(msg).get("chat")), _dict(_dict(msg).get("from"))
+        if (not isinstance(msg, dict) or chat.get("type") != "private" or str(chat.get("id")) != self.chat_id
+                or str(sender.get("id")) != self.chat_id or any(f in msg for f in FORWARDED)
+                or "via_bot" in msg or not isinstance(msg.get("date"), (int, float))):
+            self.ignored += 1
+            return None
+        text = msg.get("text")
+        word = command_word(text if isinstance(text, str) else "", self.bot)
+        return None if word is None else Command(word, float(msg["date"]))
+
+    def fetch(self) -> list[Command]:
+        """One getUpdates long poll -> the user's commands, in order. Raises on any failure."""
+        stored = self.journal.get(OFFSET_KEY)
+        if stored is None:
+            return self._skip_backlog()
+        params: dict[str, Any] = {"timeout": self.timeout, "allowed_updates": '["message"]'}
+        offset = _stored_offset(stored, self.clock())
+        if offset is not None:
+            params["offset"] = offset
+        updates, ids = self._ids(self._call("getUpdates", params, self.timeout + 10))
+        if ids:  # once per batch, before anything is handed over: a crash loses a command, never repeats one
+            self.journal.put(OFFSET_KEY, {"offset": max(ids) + 1, "ts": self.clock()})
+        out: list[Command] = []
+        for upd in updates:
+            cmd = self._accept(upd)
             if cmd is not None:
                 out.append(cmd)
         return out
 
-    def run(self, commands: queue.Queue[str]) -> None:
-        while not self._stop.is_set():
-            try:
-                for cmd in self.fetch():
-                    commands.put(cmd)
-            except ControlError:
-                self.sleep(ERROR_BACKOFF_S)
+    def _skip_backlog(self) -> list[Command]:
+        """First start: offset -1 makes Telegram drop every waiting update but the newest; the offset after it is
+        stored and nothing is acted on (an empty backlog stores no update id: from now on ordinary polls)."""
+        _, ids = self._ids(self._call("getUpdates", {"offset": -1, "timeout": 0, "allowed_updates": '["message"]'}, 15))
+        self.skipped += len(ids)
+        self.journal.put(OFFSET_KEY, {"offset": max(ids) + 1 if ids else None, "ts": self.clock()})
+        return []
 
-    def start(self, commands: queue.Queue[str]) -> threading.Thread:
+    def _username(self) -> str | None:
+        try:
+            name = _dict(self._call("getMe", {}, 10)).get("username")
+        except Exception as exc:  # noqa: BLE001 - without the name only bare /commands are accepted
+            print(f"[LIVE] telegram getMe failed ({self._why(exc)}): only bare /commands are accepted", file=sys.stderr)
+            return None
+        return name if isinstance(name, str) and name else None
+
+    # ------------------------------------------------------------------ the thread
+    @staticmethod
+    def _why(exc: Exception) -> str:
+        return str(exc) if isinstance(exc, ControlError) else type(exc).__name__
+
+    def poll_once(self, commands: queue.Queue[Command]) -> None:
+        """One long poll; its commands go to `commands`. Any error is counted and waited out, never raised."""
+        try:
+            batch = self.fetch()
+        except Exception as exc:  # noqa: BLE001 - the thread must outlive any error (type name only: the token)
+            why = self._why(exc)
+            if self.failures == 0 or why != self.last_error:
+                print(f"[LIVE] telegram commands: {why} (retrying)", file=sys.stderr)
+            self.last_error = why  # before the count: the runtime reads them from another thread
+            if isinstance(exc, ControlError) and exc.status == 409:
+                self.conflicts += 1
+            self.failures += 1
+            wait = min(ERROR_BACKOFF_S * 2.0 ** min(self.failures - 1, 10), MAX_BACKOFF_S)
+            if isinstance(exc, ControlError) and exc.retry_after:
+                wait = min(max(exc.retry_after, 1.0), MAX_RETRY_AFTER_S)
+            self.sleep(wait)
+            return
+        if self.failures:
+            print(f"[LIVE] telegram commands ok again after {self.failures} failed polls", file=sys.stderr)
+        self.failures = 0
+        self.last_ok = self.clock()
+        for cmd in batch:
+            commands.put(cmd)
+
+    def run(self, commands: queue.Queue[Command]) -> None:
+        if self.bot is None:
+            self.bot = self._username()
+        while not self._stop.is_set():
+            self.poll_once(commands)
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, commands: queue.Queue[Command]) -> threading.Thread:
+        self._stop.clear()
         th = threading.Thread(target=self.run, args=(commands,), name="ewbot-telegram", daemon=True)
         th.start()
+        self._thread = th
         return th
 
     def stop(self) -> None:
@@ -8425,20 +8901,31 @@ class TelegramControl:
 """Heartbeat to an external monitor (Plan 3 spec 3.2 `health`, 5.1 `VPS 다운`).
 
 Every minute the runtime's main loop GETs EWBOT_HEALTHCHECK_URL (for example a healthchecks.io check
-with period 1 min and grace 2 min, so 3 silent minutes alert through its Telegram integration).
-The ping is sent from the main loop only, so a hung loop stops the pings as surely as a dead VPS.
-A failed ping is reported once to stderr and never raises; `fail()` pings `<url>/fail` on a fatal exit."""
+with period 1 min and grace 2 min, so 3 silent minutes alert through its integrations). The ping is sent
+from the main loop only, so a hung loop stops the pings as surely as a dead VPS; it times out after 5 s.
+A failed ping - an exception (its type name) or an HTTP status of 400 or more (the status, e.g. 404 for a
+wrong check UUID) - never raises: it counts in `failures` (in a row, alerted by the runtime) and
+`last_error`, and stderr gets one line when the pings start failing and one when they work again.
+`fail(message)` POSTs `<url>/fail` (a query string kept) with a short message that names no secret: on a
+fatal exit, and when Telegram has been unusable for 10 minutes (live/runtime.py)."""
 
 from __future__ import annotations
 
 import sys
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 INTERVAL_S = 60.0
-TIMEOUT_S = 10.0
+TIMEOUT_S = 5.0
+
+
+def fail_url(url: str) -> str:
+    """https://hc-ping.com/<uuid>?create=1 -> https://hc-ping.com/<uuid>/fail?create=1."""
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(path=parts.path.rstrip("/") + "/fail"))
 
 
 class Heartbeat:
@@ -8451,6 +8938,7 @@ class Heartbeat:
         self.timeout = timeout
         self.last: float | None = None
         self.failures = 0
+        self.last_error: str | None = None
 
     def beat(self) -> bool:
         if self.url is None:
@@ -8459,21 +8947,32 @@ class Heartbeat:
         if self.last is not None and now - self.last < self.interval:
             return False
         self.last = now
+        error: str | None = None
         try:
-            ok = int(self.session.get(self.url, timeout=self.timeout).status_code) < 400
-        except Exception as exc:  # noqa: BLE001 - monitoring must never stop trading
-            print(f"[LIVE] heartbeat failed: {type(exc).__name__}", file=sys.stderr)
-            ok = False
-        self.failures = 0 if ok else self.failures + 1
-        return ok
+            status = int(self.session.get(self.url, timeout=self.timeout).status_code)
+            if status >= 400:
+                error = f"HTTP {status}"
+        except Exception as exc:  # noqa: BLE001 - monitoring must never stop trading (the URL is a secret)
+            error = type(exc).__name__
+        if error is None:
+            if self.failures:
+                print(f"[LIVE] heartbeat ok again after {self.failures} failed pings", file=sys.stderr)
+            self.failures = 0
+            return True
+        if self.failures == 0:
+            print(f"[LIVE] heartbeat failed: {error}", file=sys.stderr)
+        self.failures += 1
+        self.last_error = error
+        return False
 
-    def fail(self, message: str) -> None:
+    def fail(self, message: str) -> bool:
         if self.url is None:
-            return
+            return False
         try:
-            self.session.post(self.url.rstrip("/") + "/fail", data=message[:500].encode("utf-8"), timeout=self.timeout)
-        except Exception:  # noqa: BLE001 - best effort on the way down
-            pass
+            r = self.session.post(fail_url(self.url), data=message[:500].encode("utf-8"), timeout=self.timeout)
+            return int(r.status_code) < 400
+        except Exception:  # noqa: BLE001 - best effort
+            return False
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -8482,7 +8981,7 @@ class Heartbeat:
 uv run --group live pytest tests/live/test_control.py -q
 ```
 
-Expected: `6 passed`.
+Expected: `10 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -9062,7 +9561,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.backtest.holdout` (`DEFAULT_LOCK_PATH`, `lock_digest`), `ewbot.backtest.walkforward` (`HOLDOUT_START`, `grid_combos`), `ewbot.config.BotConfig`, `ewbot.paper.fingerprint` (`fingerprint_of`, `tree_files`), `ewbot.live.exchange`, `tests.paper.helpers` (`make_lock`, `synth_frame`), `tests.live.helpers` (`Clock`, `sim`).
-- Produces (`ewbot.live.settings`): `class SettingsError(RuntimeError)`, frozen `LiveSettings(data_dir=Path("/data"), key_file=None, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, telegram_token=None, telegram_chat=None, healthcheck_url=None, github_token=None, paper_repo=None, edit_stops=False, expiry={})` with `.journal_path` (`data_dir/journal.sqlite`) and `.cache_dir` (`data_dir/cache`); `check_private(path)`, `read_env_file(path) -> dict`, `parse_expiry(text) -> dict[name, ISO date]`, `load_settings(environ=None) -> LiveSettings` (environment: `EWBOT_LIVE_DIR`, `EWBOT_COINBASE_KEY_FILE`, `EWBOT_SECRETS_FILE`, `EWBOT_FUTURES_PRODUCT`, `EWBOT_SPOT_PRODUCT`, `EWBOT_PAPER_REPO`, `EWBOT_LIVE_EDIT_STOPS`, `EWBOT_EXPIRY`; secrets file keys `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `EWBOT_GITHUB_TOKEN`, `EWBOT_HEALTHCHECK_URL`).
+- Produces (`ewbot.live.settings`): `class SettingsError(RuntimeError)`, frozen `LiveSettings(data_dir=Path("/data"), key_file=None, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, telegram_token=None, telegram_chat=None, healthcheck_url=None, github_token=None, paper_repo=None, edit_stops=False, expiry={})` with `.journal_path` (`data_dir/journal.sqlite`) and `.cache_dir` (`data_dir/cache`); `check_private(path)`, `read_env_file(path) -> dict`, `parse_expiry(text) -> dict[name, ISO date]`, `private_chat(value) -> str | None` (`TELEGRAM_CHAT_ID` must be a positive number - the user's private chat with the bot, the only chat commands come from - and is returned canonical; a group or channel id or an @name is a `SettingsError`), `load_settings(environ=None) -> LiveSettings` (environment: `EWBOT_LIVE_DIR`, `EWBOT_COINBASE_KEY_FILE`, `EWBOT_SECRETS_FILE`, `EWBOT_FUTURES_PRODUCT`, `EWBOT_SPOT_PRODUCT`, `EWBOT_PAPER_REPO`, `EWBOT_LIVE_EDIT_STOPS`, `EWBOT_EXPIRY`; secrets file keys `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `EWBOT_GITHUB_TOKEN`, `EWBOT_HEALTHCHECK_URL`).
 - Produces (`ewbot.live.preflight`): `BASELINE_FINGERPRINT`, `LOCK_SHA256`, `FINGERPRINT_FILES = 25`, `CONTRACT_SIZE = 0.01`, `PRICE_INCREMENT = 5.0`, `BASE_INCREMENT = 1.0`; frozen `Check(name, ok, detail)`; `class PreflightError(RuntimeError)` (`.checks`); `check_fingerprint(files=None, expected=BASELINE_FINGERPRINT) -> Check`, `check_lock(path=DEFAULT_LOCK_PATH, expected=LOCK_SHA256) -> (Check, lock dict | None)`, `check_key(perms, stage) -> Check`, `check_product(spec, expected_id) -> Check`, `run_preflight(exchange | None, stage, lock_path=DEFAULT_LOCK_PATH, files=None, expected_lock=LOCK_SHA256) -> (list[Check], lock | None)` (names in order `fingerprint`, `lock`, `key`, `product`; `exchange=None` runs the first two), `require(checks)`.
 
 - [ ] **Step 1: Write the failing test**
@@ -9189,6 +9688,18 @@ def test_settings_read_secrets_only_from_private_files(tmp_path):
     assert defaults.data_dir == Path("/data") and defaults.key_file is None and not defaults.edit_stops
     with pytest.raises(SettingsError):
         parse_expiry("coinbase:2027-10-01")
+
+
+def test_telegram_commands_come_only_from_a_private_chat(tmp_path):
+    secrets = tmp_path / "live.env"
+    env = {"EWBOT_SECRETS_FILE": str(secrets)}
+    for chat in ("-1001234567890", "-42", "@ewbot_alerts", "0", "42a"):  # a channel or group id, a name
+        secrets.write_text(f"TELEGRAM_BOT_TOKEN=123:abc\nTELEGRAM_CHAT_ID={chat}\n", encoding="utf-8")
+        secrets.chmod(0o600)
+        with pytest.raises(SettingsError, match="private chat"):
+            load_settings(env)
+    secrets.write_text("TELEGRAM_CHAT_ID=0042\n", encoding="utf-8")
+    assert load_settings(env).telegram_chat == "42"  # as Telegram writes the chat id
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -9211,7 +9722,10 @@ on the VPS that only their owner may read (mode 600, refused otherwise), mounted
 container and never stored in the repository, the image or a log:
   EWBOT_COINBASE_KEY_FILE  the CDP API key JSON as downloaded ({"name": ..., "privateKey": ...})
   EWBOT_SECRETS_FILE       KEY=VALUE lines: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EWBOT_GITHUB_TOKEN,
-                           EWBOT_HEALTHCHECK_URL (values in the secrets file win over the environment)."""
+                           EWBOT_HEALTHCHECK_URL (values in the secrets file win over the environment).
+TELEGRAM_CHAT_ID must be a positive number: the user's private chat with the bot (its id is the user's own id),
+the only chat Telegram commands are taken from (live/control.py); a group or channel id (negative) or an @name
+is refused."""
 
 from __future__ import annotations
 
@@ -9288,6 +9802,17 @@ def parse_expiry(text: str) -> dict[str, str]:
     return out
 
 
+def private_chat(value: str | None) -> str | None:
+    """TELEGRAM_CHAT_ID as the canonical positive number of a private chat (None when unset)."""
+    if value is None:
+        return None
+    if not (value.isascii() and value.isdigit() and int(value) > 0):
+        raise SettingsError("TELEGRAM_CHAT_ID must be the positive id of your private chat with the bot (your Telegram "
+                            "user id): commands are taken only from a private chat - not a group or channel id "
+                            "(negative) or an @name")
+    return str(int(value))
+
+
 def load_settings(environ: Mapping[str, str] | None = None) -> LiveSettings:
     env = os.environ if environ is None else environ
     secrets: dict[str, str] = {}
@@ -9308,7 +9833,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> LiveSettings:
         futures_id=env.get("EWBOT_FUTURES_PRODUCT", FUTURES_PRODUCT).strip() or FUTURES_PRODUCT,
         spot_id=env.get("EWBOT_SPOT_PRODUCT", SPOT_PRODUCT).strip() or SPOT_PRODUCT,
         telegram_token=get("TELEGRAM_BOT_TOKEN"),
-        telegram_chat=get("TELEGRAM_CHAT_ID"),
+        telegram_chat=private_chat(get("TELEGRAM_CHAT_ID")),
         healthcheck_url=get("EWBOT_HEALTHCHECK_URL"),
         github_token=get("EWBOT_GITHUB_TOKEN"),
         paper_repo=(env.get("EWBOT_PAPER_REPO", "").strip() or None),
@@ -9451,7 +9976,7 @@ def require(checks: list[Check]) -> None:
 uv run --group live pytest tests/live/test_preflight.py -q
 ```
 
-Expected: `7 passed`.
+Expected: `8 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -9477,7 +10002,7 @@ EOF
 **Interfaces:**
 - Consumes: every module of Tasks 1–11; `ewbot.data.candles` (`fill_gaps`, `load_1h`), `ewbot.execution.costs.fee` (the paper cost model, for the cost report), `tests.paper.helpers` (`FakeFetch`, `make_lock`, `synth_frame`, `ts`), `tests.live.helpers`.
 - Produces (`ewbot.live.shadow`): `class ShadowExchange(SimExchange)(real: Exchange, journal, *, clock=time.time, alert=None)`: real `product/session/quote/balance/key_permissions` (so its `FAULT_METHODS` leaves them out: their faults are injected on `real`); `restore(trade)` puts an open virtual position (`reconcile.expected_contracts`) back after a restart; `place_market`, `place_bracket`, `close_position` journal a `PREVIEW` event (`kind, client_order_id, ok, errors, warnings, ...`) from the real preview, alert `PREVIEW_FAILED` on errors, then fill virtually.
-- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue | None = None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin (never acted on without a futures price: one `MARGIN` alert and `MARGIN_NO_PRICE` event per episode; the 15:30 report and the daily summary show the entry price instead only when it is usable), and the WebSocket feed: no futures tick for `FEED_ALERT_S` while the session is OPEN → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back; the 15:30 report's reads are retried every minute until 16:00, the first failure alerted, and the day is marked done only once they succeed), `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now) -> reply` (`/resume` re-bases only a breaker that tripped, `AccountGuard.reset`, from the median of that read and the next two; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int`, `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
+- Produces (`ewbot.live.runtime`): constants `CYCLE_OFFSET_S = 30`, `CYCLE_RETRY_S = 15`, `DATA_DEADLINE_S = 120`, `ENTRY_DEADLINE_S = 300`, `POLL_ACTIVE_S = 10.0`, `POLL_IDLE_S = 60.0`, `AUDIT_MINUTE = 50`, `DAILY_HOUR_NY = 9`, `MARGIN_CHECK_NY = (15, 30)`, `FLATTEN_CONFIRM_S = 60.0` (between the messages' Telegram dates), `COMMAND_MAX_AGE_S = 120.0`, `CONTROL_ALERT_FAILURES = 5`, `TELEGRAM_DOWN_S = 600.0`, `HEARTBEAT_ALERT_FAILURES = 3`, `EXPIRY_WARN_DAYS = 30`, `SNAPSHOT_TRIES = 3`, `FEED_ALERT_S = 300.0`, `BAD_EQUITY_PAUSE_READS = 3`, journal keys `HEARTBEAT_KEY = "heartbeat"`, `AUDIT_KEY = "audit"`; dataclass `LiveDeps(journal, exchange, lock, fetch: Callable[[Path], Path], cache_dir, notify=no-op, clock=time.time, sleep=time.sleep, feed=None, heartbeat=None, commands: Queue[Command] | None = None, control=None, paper_ledger: Callable[[], dict] | None = None, edit_stops=False, expiry={})` (`lock` is the preflight-checked holdout lock: the runtime builds its configuration with `target.frozen_config(lock)` and passes the lock to `compute_target`; there is no configuration or start field); `class LiveRuntime(deps)` with `startup() -> recovery dict` (`executor.recover()` never raises on a failed exchange read: `RECOVERY_ERROR`, counted `unknown`, so SHADOW gate ④ sees that restart as unresolved; a trade it rebuilds opens at its entry order's creation, so a long outage shows as `PROTECT_SLOW`), `cycle(bar_ts, now) -> "OK"|"LATE"|"ERROR"`, `reconcile(now)` (first `executor.resolve_reduce()`, then position and open orders as one state - the position read again after the orders, the pair used only when both reads agree, `SNAPSHOT_TRIES` times, else `ExchangeError` and the poll is skipped; `REDUCE_NOT_SEEN` is alerted; its `PlanContext` carries the stage maximum `max_contracts`: 1 in SHADOW/CANARY, `stage.full_cap` in FULL; `UNEXPLAINED_REDUCTION` is alerted, and it, `UNPROTECTED_60S` and the `FOREIGN_ORDERS` / `UNKNOWN_POSITION` / `EXCESS_POSITION` alerts go to `on_incident`, as does an `ADOPTED` event of the pass: a foreign position taken over, or a provisional trade settled as foreign), `poll(now)`, `watch(now)`, `minute(now)` (first the Telegram command thread - started again when it died; a dead thread, `CONTROL_ALERT_FAILURES` failed polls in a row or a new HTTP 409 is alerted once per episode, `TELEGRAM_DOWN` / `TELEGRAM_UP` - and the external heartbeat: when the command thread, or the notifier with messages waiting, has been failing for `TELEGRAM_DOWN_S`, `heartbeat.fail` once (`TELEGRAM_UNUSABLE`) and no success ping until Telegram works again; otherwise `heartbeat.beat()`, and `HEARTBEAT_ALERT_FAILURES` failed pings in a row alerted once, `HEARTBEAT_FAILING`; then the account breakers - a balance that is not a finite amount above 0 is one `BAD_EQUITY` alert and event per episode, never a breaker sample nor a margin check, and `BAD_EQUITY_PAUSE_READS` of them in a row are a `BAD_EQUITY` incident that pauses entries (no flatten; protection stays) -, the margin (never acted on without a futures price: one `MARGIN` alert and `MARGIN_NO_PRICE` event per episode; the 15:30 report and the daily summary show the entry price instead only when it is usable), and the WebSocket feed: no futures tick for `FEED_ALERT_S` while the session is OPEN → one `FEED` alert per outage with its reconnect failures and last error, `FEED_DOWN` / `FEED_UP` events, and an alert when it is back; the 15:30 report's reads are retried every minute until 16:00, the first failure alerted, and the day is marked done only once they succeed), `run_audit(now) -> AuditResult | None`, `costs(since) -> {fills, slippage_bps, stop_slippage_bps, fees, model_fees}` (journals `BRACKET_FILL` for every leg that left the book), `daily(now)`, `handle(cmd, now, sent=None) -> reply` (`sent`: the message's Telegram date, `now` when not given; `/flatten_confirm` counts only when sent within `FLATTEN_CONFIRM_S` of its `/flatten`; the loop handles the queue's `Command`s and ignores one sent more than `COMMAND_MAX_AGE_S` before it reads it: `COMMAND_STALE` event and the reply `오래된 명령 무시: /…`; `/resume` re-bases only a breaker that tripped, `AccountGuard.reset`, from the median of that read and the next two; the reply names it), `tick()`, `run_forever(max_ticks=None) -> int` (alerts are only queued - `deps.notify` is the background `LiveNotifier` - and every protective action, a stop-gap or unprotected close, a breaker's pause and flatten, a margin reduction, an incident's pause, is taken before its alert), `flat() -> bool`, attributes `cfg`, `stage`, `target`, `executor`, `prices`, `guard`, `active`, `exit_code`, `done_bar`, `next_try`; module functions `status_lines(journal, now) -> list[str]` (journal only) and `audit_from_journal(journal) -> AuditResult | None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9499,6 +10024,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from ewbot.live.control import Command
 from ewbot.live.journal import Journal
 from ewbot.live.runtime import LiveDeps, LiveRuntime
 from ewbot.live.sim import SimExchange
@@ -9521,7 +10047,7 @@ class Harness:
         if stage is not None and self.journal.stage()[1] is None:  # None: a fresh journal without a stage
             self.journal.set_stage(stage, "test", start - stage_days * 86_400)
         self.alerts = Alerts()
-        self.commands: queue.Queue[str] = queue.Queue()
+        self.commands: queue.Queue[Command] = queue.Queue()
         self.fetch = FakeFetch(self.df, self.clock)
         self.by_ts = self.df.set_index("ts")
         self.rt = self.make_runtime()
@@ -9567,12 +10093,15 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
 
+from ewbot.live.control import Command
 from ewbot.live.exchange import Balance, ExchangeError, KeyPermissions, Order, Position, RateLimited, Unavailable
 from ewbot.live.feed import TickerFeed
+from ewbot.live.health import Heartbeat
 from ewbot.live.reconcile import pending_position
 from ewbot.live.runtime import audit_from_journal, status_lines
 from ewbot.live.shadow import ShadowExchange
@@ -9598,6 +10127,19 @@ def h(tmp_path):
 def entered(h: Harness) -> None:
     h.at(ENTRY_BAR + 30)
     assert h.ex.position() is not None
+
+
+def alerts_with_positions(h: Harness) -> list[tuple[str, str, Position | None]]:
+    """From now on every alert is also recorded with the exchange position at the moment it was queued."""
+    out: list[tuple[str, str, Position | None]] = []
+    alerts = h.rt.d.notify
+
+    def note(kind: str, text: str) -> None:
+        out.append((kind, text, h.ex.position()))
+        alerts(kind, text)
+
+    h.rt.d.notify = note
+    return out
 
 
 def test_startup_records_the_initial_stage_and_the_recovery(tmp_path):
@@ -9641,13 +10183,13 @@ def test_a_late_bar_is_retried_then_the_decision_is_held(tmp_path):
 
 
 def test_a_paused_runtime_records_the_skipped_entry(h):
-    h.commands.put("/pause")
+    h.commands.put(Command("/pause", ENTRY_BAR + 25))
     h.at(ENTRY_BAR + 30)
     assert h.ex.position() is None and paused(h.journal)["reason"] == "user /pause"
     skip = h.journal.events(kind="SKIP")[0]["data"]
     assert skip["signal_ts"] == SIGNAL and "일시 정지" in skip["reason"]
     guard = h.rt.guard.state()
-    h.commands.put("/resume")
+    h.commands.put(Command("/resume", ENTRY_BAR + 39))
     h.at(ENTRY_BAR + 40)
     assert paused(h.journal) is None and h.rt.guard.state() == guard  # no breaker tripped: nothing re-based
 
@@ -9667,23 +10209,43 @@ def test_flatten_needs_a_confirmation_within_sixty_seconds(h):
 def test_a_failing_command_is_reported_and_the_loop_goes_on(h):
     entered(h)
     h.ex.fail_next("position", RateLimited("429"))
-    h.commands.put("/flatten")
-    h.commands.put("/flatten_confirm")
+    h.commands.put(Command("/flatten", ENTRY_BAR + 45))
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 48))
     h.at(ENTRY_BAR + 50)
     assert any("/flatten_confirm 실패" in t for k, t in h.alerts.items if k == "COMMAND")
-    h.commands.put("/flatten")
-    h.commands.put("/flatten_confirm")
+    h.commands.put(Command("/flatten", ENTRY_BAR + 55))
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 58))
     h.at(ENTRY_BAR + 60)
     assert h.ex.position() is None
 
 
+def test_old_commands_are_ignored_and_the_confirmation_is_timed_on_the_messages(h):
+    entered(h)
+    h.commands.put(Command("/flatten", ENTRY_BAR - 570))  # sent while the runtime was down, read 10 minutes later
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 30))
+    h.at(ENTRY_BAR + 40)
+    replies = [t for k, t in h.alerts.items if k == "COMMAND"]
+    assert replies[0].startswith("오래된 명령 무시: /flatten (610초 전에 보냄")
+    assert replies[1].startswith("확인할 /flatten 요청이 없음") and h.ex.position() is not None
+    h.commands.put(Command("/flatten", ENTRY_BAR + 45))  # sent 61 s apart, read together
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 106))
+    h.at(ENTRY_BAR + 110)
+    assert h.ex.position() is not None and paused(h.journal) is None
+    h.commands.put(Command("/flatten", ENTRY_BAR + 120))  # sent 50 s apart, read 100 s after the /flatten
+    h.commands.put(Command("/flatten_confirm", ENTRY_BAR + 170))
+    h.at(ENTRY_BAR + 220)
+    assert h.ex.position() is None and paused(h.journal)["reason"] == "user /flatten"
+    assert [e["data"]["cmd"] for e in h.journal.events(kind="COMMAND_STALE")] == ["/flatten"]
+
+
 def test_the_stop_gap_watchdog_closes_after_ten_seconds(h):
     entered(h)
+    seen = alerts_with_positions(h)
     h.price(25_000.0)  # far below the stop's 5% limit (25_255.75): the bracket cannot fill
     assert h.ex.position() is not None
     for k in range(1, 12):
         h.at(ENTRY_BAR + 40 + k)
-    assert h.ex.position() is None and "STOP_GAP" in h.alerts.kinds()
+    assert h.ex.position() is None and [(k, p) for k, _, p in seen if k == "STOP_GAP"] == [("STOP_GAP", None)]  # closed first
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_GAP"
 
 
@@ -9693,9 +10255,10 @@ def test_an_unprotected_position_through_its_stop_is_closed_at_once(h):
     assert h.ex.position() is not None and h.ex.open_orders() == []
     h.at(ENTRY_BAR + 40)  # the poll observes the gap in protection
     assert h.rt.executor.trade().unprotected_since == ENTRY_BAR + 40
+    seen = alerts_with_positions(h)
     h.price(26_580.0)  # through the 26_585 stop, inside its 5% limit: a resting stop would have filled
     h.at(ENTRY_BAR + 51)  # the next REST price (no WebSocket feed here: polled every 10 s)
-    assert h.ex.position() is None and "STOP_UNPROTECTED" in h.alerts.kinds()
+    assert h.ex.position() is None and [p for k, _, p in seen if k == "STOP_UNPROTECTED"] == [None]  # closed first
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_UNPROTECTED"
 
 
@@ -9716,11 +10279,13 @@ def test_the_account_breaker_flattens_and_pauses(h):
     h.at(ENTRY_BAR + 90)
     h.at(ENTRY_BAR + 150)  # three reads: the day's reference (their median)
     h.ex.cash -= 400.0  # equity 10_000 -> ~9_600: the daily -3% breaker
+    seen = alerts_with_positions(h)
     h.at(ENTRY_BAR + 210)
     assert h.ex.position() is not None and paused(h.journal) is None  # one breaching balance read is not enough
     h.at(ENTRY_BAR + 270)  # the next minute's read breaches again
     assert h.ex.position() is None and paused(h.journal)["reason"] == "breaker DAILY_LOSS"
-    assert "BREAKER" in h.alerts.kinds() and h.journal.events(kind="INCIDENT")[-1]["data"]["kind"] == "BREAKER"
+    assert [p for k, _, p in seen if k == "BREAKER"] == [None]  # flattened before the alert
+    assert h.journal.events(kind="INCIDENT")[-1]["data"]["kind"] == "BREAKER"
     peak = h.rt.guard.state()["peak"]
     assert h.rt.handle("/resume", ENTRY_BAR + 280).endswith("(지금과 다음 두 번 조회의 중앙값): DAILY_LOSS")
     g = h.rt.guard.state()
@@ -9783,9 +10348,11 @@ def test_margin_warns_then_reduces(tmp_path):
     hs.at(ENTRY_BAR + 100)
     assert "MARGIN" in hs.alerts.kinds() and hs.ex.position().contracts == 3
     hs.ex.cash = 170.0  # ~99% -> reduce to <= 70%
+    seen = alerts_with_positions(hs)
     hs.at(ENTRY_BAR + 170)
     assert hs.ex.position().contracts == 2 and hs.rt.executor.trade().contracts == 2
     assert [e["data"]["reason"] for e in hs.journal.events(kind="REDUCED")] == ["MARGIN"]
+    assert [p.contracts for k, t, p in seen if t.startswith("[증거금 축소]")] == [2]  # reduced before the alert
     hs.journal.close()
 
 
@@ -9822,6 +10389,70 @@ def test_a_feed_without_futures_prices_is_alerted_once_per_outage(h):
     assert h.alerts.kinds().count("FEED") == 2 and [e["kind"] for e in h.journal.events()
                                                     if e["kind"].startswith("FEED")] == ["FEED_DOWN", "FEED_UP"]
     assert h.journal.events(kind="FEED_UP")[-1]["data"]["down_s"] == 480.0  # since +510, the close included
+
+
+class FakeControl:
+    """The attributes of live.control.TelegramControl the runtime watches."""
+
+    def __init__(self) -> None:
+        self.alive, self.failures, self.conflicts, self.last_error, self.starts = True, 0, 0, None, 0
+
+    def start(self, commands: Any) -> None:
+        self.starts += 1
+        self.alive = True
+
+
+class Pings:
+    """healthchecks.io: GET pings answer `status`; POSTs (/fail) are recorded."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Any]] = []
+        self.status = 200
+
+    def get(self, url: str, timeout: float | None = None) -> Any:
+        self.calls.append(("GET", url, None))
+        return SimpleNamespace(status_code=self.status)
+
+    def post(self, url: str, data: Any = None, timeout: float | None = None) -> Any:
+        self.calls.append(("POST", url, data))
+        return SimpleNamespace(status_code=200)
+
+
+def test_the_telegram_thread_is_watched_and_reported_out_of_band(h):
+    control, pings = FakeControl(), Pings()
+    h.rt = h.make_runtime(control=control, heartbeat=Heartbeat("https://hc-ping.com/check", session=pings, clock=h.clock))
+    t0 = ENTRY_BAR + 100
+
+    def minute(k: int) -> list[str]:
+        h.clock.now = t0 + 60 * k
+        h.rt.minute(h.clock.now)
+        return [x for kind, x in h.alerts.items if kind == "TELEGRAM"]
+
+    assert minute(0) == [] and pings.calls == [("GET", "https://hc-ping.com/check", None)]
+    control.alive = False  # the thread died
+    assert minute(1)[-1].startswith("[텔레그램 명령 수신 이상] 명령 수신 스레드가 멈춰 다시 시작함") and control.starts == 1
+    assert minute(2)[-1] == "[텔레그램 복구] 명령 수신 정상"  # it runs again
+    control.failures, control.last_error = 5, "getUpdates failed: HTTP 401: Unauthorized (the bot token was refused)"
+    for k in range(3, 15):  # twelve minutes of failed polls: one alert; at 10 minutes one /fail, then no success ping
+        texts = minute(k)
+    assert len(texts) == 3 and "getUpdates 5회 연속 실패" in texts[-1] and "HTTP 401" in texts[-1]
+    posts = [c for c in pings.calls if c[0] == "POST"]
+    assert len(posts) == 1 and posts[0][1] == "https://hc-ping.com/check/fail" and "HTTP 401" in posts[0][2].decode()
+    assert pings.calls[-1][0] == "POST" and len(pings.calls) == 14  # pings at 0-12, the /fail at 13, nothing at 14
+    control.failures = 0
+    assert minute(15)[-1] == "[텔레그램 복구] 명령 수신 정상" and pings.calls[-1][0] == "GET"
+    control.conflicts = 2  # another getUpdates poller on this bot token
+    assert "HTTP 409" in minute(16)[-1]
+    pings.status = 404  # the check's URL is wrong: three failed pings are alerted once (on Telegram)
+    for k in range(17, 21):
+        minute(k)
+    assert [x for kind, x in h.alerts.items if kind == "HEARTBEAT"] == [
+        "[외부 감시 핑 실패] healthchecks.io 핑이 3회 연속 실패 (HTTP 404): VPS가 멈춰도 경보가 오지 않을 수 있음"]
+    pings.status = 200
+    minute(21)
+    assert h.alerts.items[-1] == ("HEARTBEAT", "[외부 감시 핑 복구] healthchecks.io 핑 정상")
+    assert [e["kind"] for e in h.journal.events() if e["kind"].startswith("TELEGRAM")] == [
+        "TELEGRAM_DOWN", "TELEGRAM_UP", "TELEGRAM_DOWN", "TELEGRAM_UNUSABLE", "TELEGRAM_UP", "TELEGRAM_DOWN", "TELEGRAM_UP"]
 
 
 def test_a_failed_read_at_the_overnight_margin_check_is_retried_not_lost(h):
@@ -10163,10 +10794,15 @@ class ShadowExchange(SimExchange):
 
 ```python
 """The live runtime (Plan 3 spec 3.2 `scheduler`, 4.1, 5.1, 5.2): one process, one main loop, ticking
-every second. Only the WebSocket feed and the Telegram long-poll run in their own threads; they hand
-data over (prices, queued commands), and every trading decision is taken on the main loop.
+every second. Only the WebSocket feed, the Telegram long-poll and the Telegram sender run in their own
+threads; they hand data over (prices, queued commands, queued alerts), and every trading decision is taken
+on the main loop. An alert is only queued (live/notify.py sends it), so Telegram never delays the loop, and
+every protective action - a stop-gap or unprotected close, a breaker flatten, a margin reduction, a pause -
+is taken before its alert.
 
-  commands  Telegram /status /pause /resume /flatten /flatten_confirm /help (live/control.py)
+  commands  Telegram /status /pause /resume /flatten /flatten_confirm /help (live/control.py); a command sent
+            more than 2 minutes before the loop reaches it is ignored with a reply (sent again if wanted),
+            and /flatten_confirm counts only when sent within 60 s of its /flatten (the messages' dates)
   watch     every second while a trade is open: the stop-gap check on the futures price, and an
             immediate close when no stop rests (refused bracket) and the price is through the stop
   poll      every 10 s while a trade is open (60 s otherwise, at once after a WebSocket resync): a reduce
@@ -10175,7 +10811,12 @@ data over (prices, queued commands), and every trading decision is taken on the 
             both reads agree: a fill between the reads never pairs a stale position with a vanished
             leg), observed and reconciled against the last target (protection right after fills, the
             TP1 break-even, deferred closes)
-  minute    journal heartbeat, external heartbeat, session state, account breakers (a balance that is not
+  minute    journal heartbeat; the Telegram command thread (started again when it died; a dead thread, 5
+            failed polls in a row or a conflict with another poller alerted once per episode), and the
+            external heartbeat: a success ping while Telegram works - Telegram unusable for 10 minutes
+            sends healthchecks.io one /fail (its email reaches the user without Telegram) and withholds
+            the pings until it works again; 3 failed pings in a row are alerted. Then session state,
+            account breakers (a balance that is not
             a finite amount above 0 is alerted, never a sample; three such reads in a row are an incident
             that pauses entries), margin (80% warn, 90% reduce; never acted on without a futures price), the
             WebSocket feed's health (no futures price for 5 minutes while the session is OPEN: alerted once
@@ -10204,6 +10845,7 @@ import pandas as pd
 from ewbot.data.candles import fill_gaps, load_1h
 from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
+from ewbot.live.control import Command
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, Order, Position, ProductSpec, SessionInfo
 from ewbot.live.executor import Executor
 from ewbot.live.feed import usable_price
@@ -10243,7 +10885,11 @@ POLL_IDLE_S = 60.0
 AUDIT_MINUTE = 50
 DAILY_HOUR_NY = 9
 MARGIN_CHECK_NY = (15, 30)
-FLATTEN_CONFIRM_S = 60.0
+FLATTEN_CONFIRM_S = 60.0  # /flatten_confirm must be sent within this of its /flatten (Telegram message dates)
+COMMAND_MAX_AGE_S = 120.0  # a command sent longer ago than this when the loop reaches it is ignored, with a reply
+CONTROL_ALERT_FAILURES = 5  # failed getUpdates polls in a row that are alerted
+TELEGRAM_DOWN_S = 600.0  # Telegram unusable this long: healthchecks.io /fail, success pings withheld until it works
+HEARTBEAT_ALERT_FAILURES = 3  # failed healthchecks.io pings in a row that are alerted (on Telegram)
 EXPIRY_WARN_DAYS = 30
 SNAPSHOT_TRIES = 3  # position / orders / position reads until both position reads agree
 FEED_ALERT_S = 300.0  # no WebSocket futures price this long while OPEN is alerted (the watchdog's prices come from REST)
@@ -10264,7 +10910,8 @@ class LiveDeps:
     sleep: Callable[[float], None] = time.sleep
     feed: Any | None = None  # live.feed.TickerFeed
     heartbeat: Any | None = None  # live.health.Heartbeat
-    commands: queue.Queue[str] | None = None
+    commands: queue.Queue[Command] | None = None
+    control: Any | None = None  # live.control.TelegramControl: watched every minute, started again when it died
     paper_ledger: Callable[[], dict[str, Any]] | None = None
     edit_stops: bool = False
     expiry: dict[str, str] = field(default_factory=dict)
@@ -10300,17 +10947,21 @@ class LiveRuntime:
         self.last_poll: float | None = None
         self.last_minute: float | None = None
         self.active = False
-        self.flatten_until: float | None = None
+        self.flatten_sent: float | None = None  # the Telegram date of a /flatten awaiting its /flatten_confirm
         self.exit_code: int | None = None
         self.bad_equity_reads = 0  # balance reads in a row that were not an observation
         self.feed_down_since: float | None = None
         self.feed_failures = 0  # the feed's failure count when this outage began
         self.feed_alerted = False
         self.margin_no_price = False  # the margin check was skipped for want of a futures price (alerted once)
+        self.tg_down_since: float | None = None  # a Telegram command-thread problem (alerted) since then
+        self.tg_conflicts = 0  # the control's HTTP 409 count at the last minute
+        self.hc_failed = False  # healthchecks.io got a /fail for Telegram: success pings withheld
+        self.hb_alerted = False  # failing healthchecks.io pings were alerted
 
     # ------------------------------------------------------------------ helpers
     def alert(self, kind: str, text: str) -> None:
-        self.d.notify(kind, text)
+        self.d.notify(kind, text)  # queued (live/notify.py sends it from its own thread): never waits on Telegram
 
     def _once(self, key: str, value: Any = True) -> bool:
         """True when the journal's `key` is not `value` yet (and records it): periodic jobs keep one row
@@ -10474,15 +11125,15 @@ class LiveRuntime:
             elif kind == "TP1_FILLED":
                 self.alert(kind, f"[TP1 체결] 거래 {data['trade_id']} · 잔여 {data['contracts']}계약 · 손절 본전으로")
             elif kind == "UNPROTECTED_60S":
-                self.alert(kind, f"[중대 사건] 거래 {data['trade_id']}가 60초 넘게 보호되지 않음")
                 self._incident(kind, now)
+                self.alert(kind, f"[중대 사건] 거래 {data['trade_id']}가 60초 넘게 보호되지 않음")
             elif kind == "REDUCE_NOT_SEEN":
                 self.alert(kind, f"[경고] 거래 {data['trade_id']}: 체결된 수량 축소({data['reason']} {data['filled']}계약)가 "
                                  f"1분 넘게 포지션에 반영되지 않음 - 포지션 {data['position']}계약 기준으로 정리")
             elif kind == "UNEXPLAINED_REDUCTION":
+                self._incident(kind, now)
                 self.alert(kind, f"[경고] 거래 {data['trade_id']}: 주문 없이 {data['expected']}계약 → "
                                  f"{data['position']}계약 (손절 유지, 남은 수량 보호)")
-                self._incident(kind, now)
         ctx = self._ctx(now)
         actions = plan(self.target, seen, pos, orders, ctx)
         self.executor.execute(actions, ctx)
@@ -10530,24 +11181,27 @@ class LiveRuntime:
         if isinstance(self.ex, ShadowExchange):
             self.ex.set_prices(price)  # the virtual brackets see every price the watchdog sees
         if t.unprotected_since is not None and t.direction * (price - t.stop_price) <= 0:
-            # no resting stop (e.g. the venue refused the bracket) and the price is through the stop
-            self.alert("STOP_UNPROTECTED", f"[손절] 보호 주문 없이 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}을 지남: 시장가 청산")
+            # no resting stop (e.g. the venue refused the bracket) and the price is through the stop: close, then alert
             self.journal.add_event(now, "STOP_UNPROTECTED", {"trade_id": t.trade_id, "price": price, "stop": t.stop_price})
-            self.executor.close("STOP_UNPROTECTED", self._ctx(now))
+            try:
+                self.executor.close("STOP_UNPROTECTED", self._ctx(now))
+            finally:
+                self.alert("STOP_UNPROTECTED", f"[손절] 보호 주문 없이 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}을 지남: 시장가 청산")
             return
         if not self.gap.check(t.direction, t.stop_price, price, now):
             return
-        self.alert("STOP_GAP", f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 {STOP_LIMIT_OFFSET:.0%} 지정가를 10초 넘게 지남: 시장가 청산")
         self.journal.add_event(now, "STOP_GAP", {"trade_id": t.trade_id, "price": price, "stop": t.stop_price})
-        self.executor.close("STOP_GAP", self._ctx(now))
-        self.gap.reset()
+        try:
+            self.executor.close("STOP_GAP", self._ctx(now))
+            self.gap.reset()
+        finally:
+            self.alert("STOP_GAP", f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 {STOP_LIMIT_OFFSET:.0%} 지정가를 10초 넘게 지남: 시장가 청산")
 
     # ------------------------------------------------------------------ every minute
     def minute(self, now: float) -> None:
         self.last_minute = now
         self.journal.put(HEARTBEAT_KEY, now)
-        if self.d.heartbeat is not None:
-            self.d.heartbeat.beat()
+        self._telegram_health(now)
         try:
             was_open = self.session is not None and self.session.is_open
             self.session = self.ex.session()
@@ -10578,6 +11232,68 @@ class LiveRuntime:
             self.alert("STAGE", f"[단계 변경] {self.stage} → {stage}: 재시작해 적용")
             self.exit_code = 0
 
+    def _control_problem(self) -> str | None:
+        """What is wrong with the Telegram command thread this minute (a dead thread is started again), or None."""
+        c = self.d.control
+        if c is None:
+            return None
+        conflicts, self.tg_conflicts = c.conflicts - self.tg_conflicts, c.conflicts
+        if not c.alive:
+            if self.d.commands is not None:
+                c.start(self.d.commands)
+            return f"명령 수신 스레드가 멈춰 다시 시작함 (마지막 오류 {c.last_error or '-'})"
+        if c.failures >= CONTROL_ALERT_FAILURES:
+            return f"getUpdates {c.failures}회 연속 실패 ({c.last_error or '-'})"
+        if conflicts > 0:
+            return f"getUpdates 충돌 {conflicts}회 (HTTP 409: 같은 봇 토큰으로 다른 프로세스나 웹훅이 명령을 받음)"
+        return None
+
+    def _telegram_health(self, now: float) -> None:
+        """The Telegram command thread and the external heartbeat (spec 3.2 `control`, `health`). A command-thread
+        problem - the thread died (it is started again), CONTROL_ALERT_FAILURES failed polls in a row (e.g. HTTP 401:
+        the token refused) or a new HTTP 409 (another poller or a webhook on this bot: commands would be split) - is
+        alerted once per episode and once more when it is over. When it, or the notifier with messages waiting, has
+        been failing for TELEGRAM_DOWN_S, healthchecks.io gets one /fail naming it (the check's email reaches the user
+        without Telegram) and no success ping until Telegram works again, so the check stays down meanwhile (a
+        failed /fail still brings it down after its grace). Otherwise the minute's success ping goes out (from this
+        loop: a hung loop stops it), and HEARTBEAT_ALERT_FAILURES failed pings in a row are alerted once."""
+        problem = self._control_problem()
+        if problem is None and self.tg_down_since is not None:
+            self.journal.add_event(now, "TELEGRAM_UP", {"down_s": now - self.tg_down_since})
+            self.alert("TELEGRAM", "[텔레그램 복구] 명령 수신 정상")
+            self.tg_down_since = None
+        elif problem is not None and self.tg_down_since is None:
+            self.tg_down_since = now
+            self.journal.add_event(now, "TELEGRAM_DOWN", {"problem": problem})
+            self.alert("TELEGRAM", f"[텔레그램 명령 수신 이상] {problem} - 명령이 듣지 않으면 VPS에서 ewbot live status")
+        down: list[str] = []
+        if problem is not None and self.tg_down_since is not None and now - self.tg_down_since >= TELEGRAM_DOWN_S:
+            down.append(f"명령 수신: {problem}")
+        n: Any = self.d.notify  # live.notify.LiveNotifier (tests: a recorder without these attributes)
+        failing, waiting = getattr(n, "failing_since", None), getattr(n, "pending", 0)
+        if failing is not None and waiting and now - failing >= TELEGRAM_DOWN_S:
+            down.append(f"알림 전송: {getattr(n, 'last_error', None) or '-'}")
+        hb = self.d.heartbeat
+        if down:
+            if not self.hc_failed:
+                self.journal.add_event(now, "TELEGRAM_UNUSABLE", {"reasons": down})
+                if hb is not None:
+                    hb.fail("[LIVE] 텔레그램이 10분 넘게 안 됨 - " + "; ".join(down))
+            self.hc_failed = True
+            return  # no success ping while Telegram is unusable: the check stays down until it works again
+        self.hc_failed = False
+        if hb is None:
+            return
+        hb.beat()
+        if hb.failures >= HEARTBEAT_ALERT_FAILURES and not self.hb_alerted:
+            self.hb_alerted = True
+            self.journal.add_event(now, "HEARTBEAT_FAILING", {"failures": hb.failures, "error": hb.last_error})
+            self.alert("HEARTBEAT", f"[외부 감시 핑 실패] healthchecks.io 핑이 {hb.failures}회 연속 실패 "
+                                    f"({hb.last_error}): VPS가 멈춰도 경보가 오지 않을 수 있음")
+        elif hb.failures == 0 and self.hb_alerted:
+            self.hb_alerted = False
+            self.alert("HEARTBEAT", "[외부 감시 핑 복구] healthchecks.io 핑 정상")
+
     def _money(self, now: float) -> None:
         try:
             equity = self.ex.balance().equity
@@ -10598,13 +11314,15 @@ class LiveRuntime:
                                        "(보호 주문과 청산은 계속, 재개는 /resume)")
             return
         self.bad_equity_reads = 0
-        if trip is not None:
-            self.alert("BREAKER", f"[실계좌 손실 한도] {trip}: 전량 청산하고 일시 정지 (자산 {equity:,.2f} USD)")
+        if trip is not None:  # pause and flatten first, alert second
             self.journal.add_event(now, "BREAKER", {"kind": trip, "equity": equity})
             if paused(self.journal) is None:
                 pause(self.journal, f"breaker {trip}", now)
-            self._incident("BREAKER", now)
-            self.executor.flatten(f"BREAKER_{trip}", self._ctx(now))
+            try:
+                self.executor.flatten(f"BREAKER_{trip}", self._ctx(now))
+            finally:
+                self._incident("BREAKER", now)
+                self.alert("BREAKER", f"[실계좌 손실 한도] {trip}: 전량 청산하고 일시 정지 (자산 {equity:,.2f} USD)")
             return
         t = self.executor.trade()
         try:
@@ -10626,11 +11344,13 @@ class LiveRuntime:
         if st.level == "WARN" and self._once("marginwarn", int(now) // H1):
             self.alert("MARGIN", f"[증거금 경고] 오버나이트 기준 {st.ratio:.0%} (80% 이상)")
         elif st.level == "REDUCE" and st.reduce_by > 0:
-            self.alert("MARGIN", f"[증거금 축소] 오버나이트 기준 {st.ratio:.0%}: {st.reduce_by}계약 축소")
-            if st.reduce_by >= pos.contracts:
-                self.executor.close("MARGIN", self._ctx(now))
-            else:
-                self.executor.reduce(st.reduce_by, "MARGIN", self._ctx(now))
+            try:
+                if st.reduce_by >= pos.contracts:
+                    self.executor.close("MARGIN", self._ctx(now))
+                else:
+                    self.executor.reduce(st.reduce_by, "MARGIN", self._ctx(now))
+            finally:
+                self.alert("MARGIN", f"[증거금 축소] 오버나이트 기준 {st.ratio:.0%}: {st.reduce_by}계약 축소")
 
     def _feed_health(self, now: float) -> None:
         """The watchdog's WebSocket price: no futures tick for FEED_ALERT_S while the session is OPEN - a dead
@@ -10760,7 +11480,10 @@ class LiveRuntime:
             pass
 
     # ------------------------------------------------------------------ Telegram commands
-    def handle(self, cmd: str, now: float) -> str:
+    def handle(self, cmd: str, now: float, sent: float | None = None) -> str:
+        """One Telegram command. `sent` is the message's Telegram date (`now` when not given): /flatten_confirm
+        counts only when sent within FLATTEN_CONFIRM_S of the /flatten it confirms."""
+        sent = now if sent is None else float(sent)
         stamp = datetime.fromtimestamp(now, NY).strftime("%H:%M:%S")
         if cmd == "/status":
             reply = "\n".join(status_lines(self.journal, now))
@@ -10779,13 +11502,13 @@ class LiveRuntime:
             elif rebased is None:
                 reply += " · 잔고를 읽지 못해 손실 한도 기준은 그대로 (발동 중이면 다시 /resume)"
         elif cmd == "/flatten":
-            self.flatten_until = now + FLATTEN_CONFIRM_S
+            self.flatten_sent = sent
             reply = "60초 안에 /flatten_confirm 을 보내면 전량 청산하고 일시 정지합니다"
         elif cmd == "/flatten_confirm":
-            if self.flatten_until is None or now > self.flatten_until:
+            if self.flatten_sent is None or not 0.0 <= sent - self.flatten_sent <= FLATTEN_CONFIRM_S:
                 reply = "확인할 /flatten 요청이 없음 (먼저 /flatten)"
             else:
-                self.flatten_until = None
+                self.flatten_sent = None
                 pause(self.journal, "user /flatten", now)
                 ok = self.executor.flatten("USER_FLATTEN", self._ctx(now))
                 reply = "전량 청산 완료, 일시 정지" if ok else "청산 요청을 보냈으나 아직 확인되지 않음 (계속 재시도)"
@@ -10800,10 +11523,14 @@ class LiveRuntime:
         q = self.d.commands
         while q is not None and not q.empty():
             cmd = q.get_nowait()
+            if now - cmd.sent > COMMAND_MAX_AGE_S:  # e.g. sent while the runtime restarted: never acted on late
+                self.journal.add_event(now, "COMMAND_STALE", {"cmd": cmd.word, "sent": cmd.sent})
+                self.alert("COMMAND", f"오래된 명령 무시: {cmd.word} ({now - cmd.sent:.0f}초 전에 보냄 - 필요하면 다시 보내 주세요)")
+                continue
             try:
-                self.handle(cmd, now)
+                self.handle(cmd.word, now, cmd.sent)
             except ExchangeError as exc:
-                self.alert("COMMAND", f"{cmd} 실패: {str(exc)[:200]} (다시 보내 주세요)")
+                self.alert("COMMAND", f"{cmd.word} 실패: {str(exc)[:200]} (다시 보내 주세요)")
 
     def tick(self) -> None:
         now = self.clock()
@@ -10877,7 +11604,7 @@ def audit_from_journal(journal: Journal) -> AuditResult | None:
 uv run --group live pytest tests/live/test_runtime.py -q
 ```
 
-Expected: `25 passed`.
+Expected: `27 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -10902,8 +11629,8 @@ EOF
 
 **Interfaces:**
 - Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
-- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier`, `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `price_feed(settings) -> TickerFeed | None` (the ticker feed on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), dataclass `Wired(runtime, feed, control, heartbeat, notify)`, `build(settings, lock, real, journal) -> Wired` (hands the preflight-checked lock to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`.
-- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm]`, `backup --out PATH`; `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`. Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
+- Produces (`ewbot.live.app`): `real_exchange(settings) -> Exchange` (raises `SettingsError` without a key file), `stage_exchange(real, journal, stage, notify)` (`ShadowExchange` in SHADOW), `notifier(settings) -> LiveNotifier` (its sending thread started), `redact(text, settings) -> str` (the bot token, the GitHub token and the health-check URL replaced by `<secret>`), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None`, `price_feed(settings) -> TickerFeed | None` (the ticker feed on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, notify=None) -> Wired` (hands the preflight-checked lock to `LiveDeps`, and the Telegram control so the runtime watches it; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit test also `Heartbeat`, `notifier` and `TelegramControl`.
+- Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm]`, `backup --out PATH`; `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse), test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256)`, `cmd_live(args) -> int`; `live run` closes the wiring on every exit and, on a fatal one, sends healthchecks.io `/fail` with the exception's type name only (a third party) and Telegram the type and `redact`ed text. Exit codes: 0 ok; 1 no journal / heartbeat older than `--max-age`; 2 refused (settings, preflight, stage gate); 3 `--require-flat` found a trade, position or resting order.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -10912,7 +11639,10 @@ EOF
 ```python
 from __future__ import annotations
 
+import dataclasses
 import json
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -10920,12 +11650,14 @@ from ewbot import cli
 from ewbot.cli import build_parser, main
 from ewbot.live import app as live_app
 from ewbot.live.exchange import KeyPermissions
+from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
+from ewbot.live.notify import LiveNotifier
 from ewbot.live.runtime import LiveRuntime
 from ewbot.live.settings import LiveSettings, SettingsError
 from ewbot.live.sim import SimExchange
 from tests.live.helpers import Clock
-from tests.paper.helpers import FakeFetch, make_lock, synth_frame, ts
+from tests.paper.helpers import FakeFetch, FakeSender, make_lock, synth_frame, ts
 
 NOW = ts("2024-03-13 23:00") + 30
 
@@ -11011,6 +11743,52 @@ def test_run_status_and_backup(live_env, monkeypatch, capsys, tmp_path):
     assert (tmp_path / "bk" / "j.sqlite").exists()
 
 
+def test_a_fatal_exit_tells_healthchecks_only_the_exception_type_and_stops_the_threads(live_env, monkeypatch):
+    settings, _, _ = live_env
+    token = "123456:SECRET-TOKEN"
+    s = dataclasses.replace(settings, telegram_token=token, telegram_chat="42", healthcheck_url="https://hc-ping.com/u1")
+    monkeypatch.setattr(cli, "_live_settings", lambda: s)
+    posts: list[tuple[str, Any]] = []
+    pings = SimpleNamespace(get=lambda url, timeout=None: SimpleNamespace(status_code=200),
+                            post=lambda url, data=None, timeout=None: posts.append((url, data)) or SimpleNamespace(status_code=200))
+    monkeypatch.setattr(live_app, "Heartbeat", lambda url: Heartbeat(url, session=pings))
+    sender = FakeSender()
+
+    def started(_s: LiveSettings) -> LiveNotifier:  # the real notifier on a fake Telegram
+        n = LiveNotifier(sender)
+        n.start()
+        return n
+
+    monkeypatch.setattr(live_app, "notifier", started)
+
+    class Control:  # no Telegram long poll in tests
+        made: list[Any] = []
+
+        def __init__(self, token: str, chat: str, journal: Journal) -> None:
+            self.running = False
+            Control.made.append(self)
+
+        def start(self, commands: Any) -> None:
+            self.running = True
+
+        def stop(self) -> None:
+            self.running = False
+
+    monkeypatch.setattr(live_app, "TelegramControl", Control)
+    watched: list[Any] = []
+
+    def crash(self: LiveRuntime, max_ticks: int | None = None) -> int:
+        watched.append(self.d.control)
+        raise RuntimeError(f"connect https://api.telegram.org/bot{token}/getUpdates failed")
+
+    monkeypatch.setattr(LiveRuntime, "run_forever", crash)
+    with pytest.raises(RuntimeError):
+        main(["live", "run"])
+    assert posts == [("https://hc-ping.com/u1/fail", "[LIVE] 중단: RuntimeError".encode())]  # never the exception's text
+    assert watched == Control.made and not Control.made[0].running  # the runtime watches it; stopped on the way out
+    assert sender.texts == ["[LIVE] [중단] RuntimeError: connect https://api.telegram.org/bot<secret>/getUpdates failed"]
+
+
 def test_status_without_a_journal(live_env, capsys):
     assert main(["live", "status"]) == 1 and "no journal" in capsys.readouterr().err
     assert main(["live", "status", "--json", "--exchange", "--require-flat"]) == 0  # first deployment
@@ -11083,7 +11861,7 @@ from typing import Any, Callable
 from ewbot.data.coinbase_history import update_cache
 from ewbot.live.audit import AuditError, fetch_paper_ledger
 from ewbot.live.coinbase import CoinbaseExchange
-from ewbot.live.control import TelegramControl
+from ewbot.live.control import Command, TelegramControl
 from ewbot.live.exchange import Exchange
 from ewbot.live.feed import TickerFeed, public_ws_factory
 from ewbot.live.health import Heartbeat
@@ -11109,8 +11887,19 @@ def stage_exchange(real: Exchange, journal: Journal, stage: str, notify: Callabl
 
 
 def notifier(s: LiveSettings) -> LiveNotifier:
+    """The [LIVE] notifier with its sending thread started: a call only queues, the loop never waits on Telegram."""
     sender = TelegramSender(s.telegram_token, s.telegram_chat) if s.telegram_token and s.telegram_chat else None
-    return LiveNotifier(sender)
+    notify = LiveNotifier(sender)
+    notify.start()
+    return notify
+
+
+def redact(text: str, s: LiveSettings) -> str:
+    """`text` with the settings' secrets (bot token, GitHub token, health-check URL) replaced by <secret>."""
+    for secret in (s.telegram_token, s.github_token, s.healthcheck_url):
+        if secret:
+            text = text.replace(secret, "<secret>")
+    return text
 
 
 def paper_fetcher(s: LiveSettings) -> Callable[[], dict[str, Any]] | None:
@@ -11145,20 +11934,31 @@ class Wired:
     heartbeat: Heartbeat
     notify: LiveNotifier
 
+    def close(self, flush_s: float = 10.0) -> None:
+        """Shutdown: stop the Telegram poller (its long poll ends with the process: a command fetched but not yet
+        handled is lost - at most once) and the price feed, then give the queued messages up to flush_s to go out."""
+        if self.control is not None:
+            self.control.stop()
+        if self.feed is not None:
+            self.feed.stop()
+        self.notify.flush(flush_s)
+        self.notify.stop()
 
-def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journal) -> Wired:
-    notify = notifier(s)
+
+def build(s: LiveSettings, lock: dict[str, Any], real: Exchange, journal: Journal,
+          notify: LiveNotifier | None = None) -> Wired:
+    notify = notifier(s) if notify is None else notify
     stage, _ = journal.stage()
     ex = stage_exchange(real, journal, stage, notify)
     feed = price_feed(s)
-    commands: queue.Queue[str] = queue.Queue()
+    commands: queue.Queue[Command] = queue.Queue()
     control = (TelegramControl(s.telegram_token, s.telegram_chat, journal)
                if s.telegram_token and s.telegram_chat else None)
     heartbeat = Heartbeat(s.healthcheck_url)
     deps = LiveDeps(
         journal=journal, exchange=ex, lock=lock,
         fetch=lambda cache_dir: update_cache(s.spot_id, Path(cache_dir)), cache_dir=s.cache_dir, notify=notify,
-        clock=time.time, sleep=time.sleep, feed=feed, heartbeat=heartbeat, commands=commands,
+        clock=time.time, sleep=time.sleep, feed=feed, heartbeat=heartbeat, commands=commands, control=control,
         paper_ledger=paper_fetcher(s), edit_stops=s.edit_stops, expiry=s.expiry,
     )
     rt = LiveRuntime(deps)
@@ -11318,13 +12118,15 @@ def _live_run(s: LiveSettings) -> int:
         notify("PREFLIGHT", "[시작 거부] 시작 점검 실패: " + "; ".join(f"{c.name}: {c.detail}" for c in checks if not c.ok))
         time.sleep(LIVE_REFUSAL_WAIT_S)
         return 2
-    wired = live_app.build(s, lock, real, journal)
+    wired = live_app.build(s, lock, real, journal, notify)
     try:
         return wired.runtime.run_forever()
     except BaseException as exc:
-        wired.heartbeat.fail(f"{type(exc).__name__}: {exc}")
-        notify("FATAL", f"[중단] {type(exc).__name__}: {str(exc)[:300]}")
+        wired.heartbeat.fail(f"[LIVE] 중단: {type(exc).__name__}")  # a third party: the type name only, never the text
+        notify("FATAL", f"[중단] {type(exc).__name__}: {live_app.redact(str(exc), s)[:300]}")
         raise
+    finally:
+        wired.close()  # stops the Telegram poller and the feed, lets the queued messages go out
 
 
 def _live_preflight(s: LiveSettings, args: argparse.Namespace) -> int:
@@ -11470,7 +12272,7 @@ uv run --group live pytest tests/live/test_cli_live.py tests/paper/test_cli_pape
 uv run ewbot live --help
 ```
 
-Expected: `34 passed` (8 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, backup`.
+Expected: `35 passed` (9 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, backup`.
 
 - [ ] **Step 5: Commit**
 
@@ -11932,7 +12734,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `346 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `354 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -12329,9 +13131,10 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - One Docker container on a US-East VPS runs `ewbot live run` (`deploy/live/docker-compose.yml`, `restart: unless-stopped`). It trades the frozen strategy (params from the committed `holdout.lock`, conservative risk) on the Coinbase CFM future `BIP-20DEC30-CDE` (0.01 BTC per contract, $5 tick). Signals come from the same spot BTC-USD hourly candles as the paper runtime.
 - Every hour at hh:00:30 it replays the whole engine (as the paper runtime does) and reads the target after the bar that just closed: the position the engine holds, its stop and TPs, an exit or an entry queued at that close. It then makes the Coinbase account match that target (`src/ewbot/live/reconcile.py`): market entries, two `trigger_bracket_gtc` orders as protection (TP1 size + stop, the rest + TP2 + stop; one bracket for 1 contract), stop moves, TP1 break-even, closes. If the bar has not arrived 2 minutes after the close, the decision is held and the resting brackets keep protecting the position.
-- Between cycles: every second the stop-gap watchdog (the bracket's stop fills as a limit 5% beyond the stop, Coinbase's trigger_bracket rule; if the price is past that limit for 10 s, the position is closed at market); every 10 s while a trade is open the position and orders are re-read and protection is repaired; every minute the session state, the account breakers (−3% from the New York day's opening, −15% from the peak - each reference the median of three balance reads, each breaker tripping on two breaching reads in a row: flatten and pause), the overnight-margin projection (80% warns, 90% reduces to 70%), the WebSocket price feed's health, the heartbeat to healthchecks.io and the stage-change check; at 15:30 New York an overnight-margin report; at 09:00 New York the daily summary; from minute 50 of every hour the comparison of the live engine decisions with the paper ledger.
+- Between cycles: every second the stop-gap watchdog (the bracket's stop fills as a limit 5% beyond the stop, Coinbase's trigger_bracket rule; if the price is past that limit for 10 s, the position is closed at market); every 10 s while a trade is open the position and orders are re-read and protection is repaired; every minute the session state, the account breakers (−3% from the New York day's opening, −15% from the peak - each reference the median of three balance reads, each breaker tripping on two breaching reads in a row: flatten and pause), the overnight-margin projection (80% warns, 90% reduces to 70%), the WebSocket price feed's health, the Telegram command thread's health, the heartbeat to healthchecks.io and the stage-change check; at 15:30 New York an overnight-margin report; at 09:00 New York the daily summary; from minute 50 of every hour the comparison of the live engine decisions with the paper ledger.
 - Everything is recorded in the SQLite journal `/var/lib/ewbot/journal.sqlite`: every order intent before it is sent (deterministic `client_order_id`, so a restart never doubles an order), events, the engine decisions, the cycles and the stage history.
 - The GitHub Actions paper runtime keeps running as the independent audit. Telegram messages of the live runtime start with `[LIVE]`, the paper runtime's with `[ewbot paper]`.
+- Telegram never holds up trading: alerts are queued and sent by a background thread (every protective action - a stop-gap close, a breaker flatten, a margin reduction, a pause - is taken first, its alert queued after it). A message that fails is retried (2 s doubling to 60 s) for up to 30 minutes and its full text is written to the container log at once (`docker compose ... logs live | grep '\[LIVE\]'`); a message delivered a minute or more late ends with `(N분 지연)`, one longer than Telegram allows is cut with `…(잘림)`. The queue holds 100 messages (the oldest waiting one is dropped, into the log, when it is full).
 
 ## Stages (spec 6)
 
@@ -12381,7 +13184,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
    sudo install -m 600 -o 1000 -g 1000 /tmp/cdp_api_key.json /etc/ewbot/cdp_api_key.json && rm /tmp/cdp_api_key.json
    ```
    Delete the downloaded copy from your laptop once the VPS has it. Note the key's creation date for the expiry reminder.
-5. **Health check** (spec 5.1 `VPS 다운`). At <https://healthchecks.io> create a check `ewbot-live` with period **1 minute** and grace **2 minutes** (3 silent minutes alert), add the **Telegram** integration to it, and copy its ping URL.
+5. **Health check** (spec 5.1 `VPS 다운`). At <https://healthchecks.io> create a check `ewbot-live` with period **1 minute** and grace **2 minutes** (3 silent minutes alert), add the **Telegram** integration to it and keep the **email** integration (your account address) on it too, and copy its ping URL. The email is the channel that works when Telegram does not: when Telegram has been unusable for 10 minutes (the command thread failing or dead, or messages not going out) the runtime sends the check one `/fail` with the reason (`[LIVE] 텔레그램이 10분 넘게 안 됨 - ...`) and stops its success pings until Telegram works again, so the check stays down meanwhile; once Telegram works the pings resume and the check comes back up. A healthchecks.io alert therefore means the VPS or the runtime is down, or Telegram is unusable: the `/fail` body says which.
 6. **GitHub token for the audit** (spec 3.5). A fine-grained personal access token at <https://github.com/settings/personal-access-tokens/new>: resource owner `taejunoh`, only the repository `elliott-wave-btc-bot`, permission **Contents: Read-only**, expiry 1 year.
 7. **Secrets file** `/etc/ewbot/live.env` (mode 600; the runtime refuses any other mode). Create it empty with the right mode, then edit it (nothing goes to the shell history):
 
@@ -12392,10 +13195,12 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
    ```
    TELEGRAM_BOT_TOKEN=<the paper runtime's bot token>
-   TELEGRAM_CHAT_ID=<the same chat id>
+   TELEGRAM_CHAT_ID=<the same chat id: your private chat with the bot>
    EWBOT_GITHUB_TOKEN=<the fine-grained token of step 6>
    EWBOT_HEALTHCHECK_URL=<the ping URL of step 5>
    ```
+
+   Commands are taken only from a **private chat** with the bot: `TELEGRAM_CHAT_ID` must be its id, a positive number (your own Telegram user id); a group or channel id (negative) or an `@name` is refused at start. If the paper runtime reports to a group, use your private chat with the bot here. Only this runtime may read the bot's updates: no webhook on the bot, no second runtime with the same token, and do not run a `getUpdates` request by hand while it runs (Telegram answers the runtime with HTTP 409, alerted as `[텔레그램 명령 수신 이상] … 충돌`). Sending (`sendMessage`, as the paper runtime does) is not affected.
 8. **Repository checkout** on the VPS (a read-only deploy key: <https://github.com/taejunoh/elliott-wave-btc-bot/settings/keys>):
 
    ```bash
@@ -12435,7 +13240,8 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 ## Daily operation
 
-- Telegram commands (only from `TELEGRAM_CHAT_ID`): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` within 60 s (close at market - the brackets go with the position - and pause), `/help`.
+- Telegram commands (only from your private chat with the bot, `TELEGRAM_CHAT_ID`; messages from anyone else, forwarded messages, edits and commands addressed to another bot are ignored): `/status`, `/pause` (no new entries; protection and exits continue), `/resume`, `/flatten` then `/flatten_confirm` sent within 60 s of it (close at market - the brackets go with the position - and pause), `/help`. Every command is answered. A command sent more than 2 minutes before the runtime reads it (for example while it restarted) is not acted on: the answer is `오래된 명령 무시: /…` - send it again if you still want it (the ages come from Telegram's message dates and the VPS clock, which Ubuntu keeps synchronised: `timedatectl` shows `System clock synchronized: yes`). The first start ignores whatever was sent to the bot before. Delivery is at most once: a command the runtime fetched right before a crash or a restart is lost without an answer - if no answer comes within a minute, check `/status` and send it again.
+- **Telegram and health-check alerts.** `[텔레그램 명령 수신 이상]` means the command thread failed 5 polls in a row (the reason: `HTTP 401` - the bot token was refused; `HTTP 409` - another process or a webhook reads this bot's updates; a network error), was in conflict with another poller (`충돌`, HTTP 409), or had stopped and was started again; `[텔레그램 복구]` that commands work again. While it lasts the commands may not arrive: use the VPS (`ewbot live status`, and the emergency procedures). `[외부 감시 핑 실패]` means three healthchecks.io pings in a row failed (`HTTP 404`: a wrong ping URL - fix `EWBOT_HEALTHCHECK_URL`): a dead VPS would then go unreported; `[외부 감시 핑 복구]` that they work again.
 - Status on the VPS: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` (stage, position, last cycle, audit, heartbeat and the current stage's gates). `docker compose ... ps` shows the container's health (the Docker health check fails when the loop heartbeat is older than 3 minutes).
 - **Price feed and balance alerts.** The watchdog's prices come from the Coinbase WebSocket ticker, on Coinbase's public market-data endpoint (`wss://advanced-trade-ws.coinbase.com`: no API key, TLS certificate and host name verified); the feed reconnects by itself (a connection silent for 15 s is reopened, backoff 1 s to 60 s) and falls back to REST quotes every 10 s while it is silent. `[가격 피드 끊김]` means no WebSocket futures price for 5 minutes while the market is open (with the reconnect failures and the last error; `server error: ...` means Coinbase refused the subscription), `[가격 피드 복구]` that futures prices are back; nothing to do unless it persists (check the VPS network and `docker compose ... logs live`). With neither a WebSocket nor a REST price for 60 s the stop-gap check waits (the resting brackets still protect) and the margin check is skipped - never reduced on a stand-in price - with one `[증거금 점검: 가격 없음]` alert until a price is back. `[잔고 이상]` means Coinbase returned a balance that is not a finite amount above 0: that read is ignored (no breaker sample, no margin check) until a normal one arrives; three such reads in a row are an incident (`[중대 사건] 잔고 이상이 3회 연속`) that pauses new entries - the position and its brackets stay, nothing is closed. Check the balance in the Coinbase app, then `/resume`. `[15:30 증거금 점검] 조회 실패` means the 15:30 check could not read the position or the balance; it is retried every minute until 16:00.
 - The daily summary (09:00 New York) shows the stage, the position, the cycle, the paper comparison, the fills of the last 24 h (entry slippage vs. the engine's reference, stop slippage vs. the stop price, measured fees vs. the paper cost model; funding is part of the balance change) and the margin.
@@ -12474,7 +13280,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 
 - **Close everything now**: `/flatten`, then `/flatten_confirm`. If Telegram does not answer: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status` and, if the runtime is down, close the position and cancel the orders in the Coinbase app (a manual intervention: the runtime alerts it and CANARY gate ④ records it).
 - **Stop trading but keep the protection**: `/pause`, or `docker compose -f deploy/live/docker-compose.yml stop live` (the brackets stay on Coinbase and keep protecting).
-- **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app.
+- **Heartbeat alert from healthchecks.io**: SSH in, `docker compose ... ps` and `... logs --tail 200 live`. If the VPS is gone, the brackets still protect the position: check it in the Coinbase app. If the alert's `/fail` body says `텔레그램이 10분 넘게 안 됨`, the runtime is trading but cannot be reached on Telegram: check `... logs live | grep 'telegram'` (`HTTP 401`: replace the bot token; `HTTP 409`: stop the other poller or delete the webhook; network errors: Telegram or the VPS network). Meanwhile: `ewbot live status` on the VPS, `docker compose -f deploy/live/docker-compose.yml stop live` to stop trading (the brackets stay on Coinbase) and the Coinbase app to close a position.
 - **API key leaked or a transfer-permission alert**: delete the key in the CDP portal at once (open brackets stay), create a new View + Trade key bound to the VPS IP, replace the file and restart.
 - **A start refused by the preflight** (fingerprint, lock, key, product): the message names the failing check. Never edit a strategy-fingerprinted file to fix it; redeploy the previous tag.
 - **Breaker or incident pause**: read `/status` and the latest journal events, fix the cause, then `/resume`. `/resume` re-bases only the breaker that tripped (the day's reference after −3%, the peak after −15% - which also marks the day), as the median of the `/resume` balance read and the next two; a `/pause` → `/resume` without a trip changes neither. If the balance cannot be read at that moment, the reply says so and a tripped breaker still blocks entries: send `/resume` again. The latest journal events:
@@ -12511,7 +13317,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `977 passed, 1 skipped` without a candle cache (`978 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `11 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`; the full suite `985 passed, 1 skipped` without a candle cache (`986 passed` with `data/cache/BTC-USD_1h.parquet`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -12546,7 +13352,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `978 passed` with the real cache (`977 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `986 passed` with the real cache (`985 passed, 1 skipped` without); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
@@ -12562,7 +13368,7 @@ Expected: `epoch 1 of 1` with the baseline fingerprint, `discrepancies … (unex
 
 - [ ] **Step 3: VPS, keys and secrets (user, with the controller reading along)**
 
-Follow `docs/live-trading.md` → One-time setup, steps 1–9: Ubuntu 24.04 US-East VPS (SSH keys only, ufw), unattended-upgrades, Docker, user `ewbot` (uid 1000), `/var/lib/ewbot` and `/etc/ewbot` (mode 700); a **View-only** CDP key bound to the VPS IP for SHADOW (`/etc/ewbot/cdp_api_key.json`, mode 600); healthchecks.io check (period 1 min, grace 2 min, Telegram integration); the fine-grained GitHub token (Contents: read on this repository); `/etc/ewbot/live.env` (mode 600); the repository checkout with a read-only deploy key; `deploy/live/.env` with `EWBOT_EXPIRY`; about $500 in the futures account. The user types every secret; the controller never sees one.
+Follow `docs/live-trading.md` → One-time setup, steps 1–9: Ubuntu 24.04 US-East VPS (SSH keys only, ufw), unattended-upgrades, Docker, user `ewbot` (uid 1000), `/var/lib/ewbot` and `/etc/ewbot` (mode 700); a **View-only** CDP key bound to the VPS IP for SHADOW (`/etc/ewbot/cdp_api_key.json`, mode 600); healthchecks.io check (period 1 min, grace 2 min, Telegram and email integrations: the email reaches the user when Telegram is unusable); the fine-grained GitHub token (Contents: read on this repository); `/etc/ewbot/live.env` (mode 600; `TELEGRAM_CHAT_ID` = the user's private chat with the bot, a positive id; no webhook or second poller on the bot); `timedatectl` shows the clock synchronised (command ages use it); the repository checkout with a read-only deploy key; `deploy/live/.env` with `EWBOT_EXPIRY`; about $500 in the futures account. The user types every secret; the controller never sees one.
 
 - [ ] **Step 4: Deploy and start SHADOW**
 
@@ -12573,7 +13379,7 @@ docker compose -f deploy/live/docker-compose.yml logs --tail 50 live
 docker compose -f deploy/live/docker-compose.yml exec live ewbot live status
 ```
 
-Expected: the preflight prints four `ok` lines (fingerprint `e0435223a3f9`, lock `d1be04baa06c`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up. Then set up the backups (runbook step 11) and run the backup service once.
+Expected: the preflight prints four `ok` lines (fingerprint `e0435223a3f9`, lock `d1be04baa06c`, key `view=True trade=False transfer=False`, product `BIP-20DEC30-CDE: 0.01 BTC/contract, $5 tick, whole contracts`); Telegram receives `[LIVE] [시작] 단계 SHADOW`; within the next hour the status shows a `마지막 사이클 … OK … 마감 후 N초` with N ≤ 120; healthchecks.io shows the check up; `/status` sent in the private chat is answered within seconds, and `docker compose -f deploy/live/docker-compose.yml logs live | grep -i telegram` shows no `HTTP 401` / `HTTP 409`. Then set up the backups (runbook step 11) and run the backup service once.
 
 - [ ] **Step 5: Re-record the private-endpoint fixtures (first SHADOW week, controller)**
 
@@ -12607,7 +13413,7 @@ Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account i
 
 - [ ] **Step 6: Run SHADOW for at least 14 days (controller watches, user restarts once)**
 
-Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). Once during SHADOW, restart for gate ④: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. Any `[판단 불일치]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
+Daily: the `[LIVE] [일일 요약]` (stage, cycle times, the paper comparison `불일치 0건`, previews), `ewbot live status` (the SHADOW gates). After a day or more without any message to the bot, `/status` must still be answered (the stored update offset is then older than 24 h and not sent; Telegram may renumber updates after a quiet week): if it is not, report it. Once during SHADOW, restart for gate ④: `docker compose -f deploy/live/docker-compose.yml restart live`, then check a second `RECOVERY` event without unresolved intents in the status. Any `[판단 불일치]`, `[사이클 오류]`, `[SHADOW preview 실패]` or `[루프 오류]` message is investigated before CANARY; a fix means a new tag, a flat-book deploy and, per spec §6.2, SHADOW starts over. The latency of the public candle after the close is not documented: if cycles end `HOLD` (`[판단 보류]`) because the bar arrives later than 2 minutes after the close, report it as a finding against gate ② and spec §4.1 — do not move the deadline in code.
 
 - [ ] **Step 7: CANARY gate (around 2026-10-30; user approves explicitly)**
 
