@@ -108,11 +108,12 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
     - On your laptop: `age-keygen -o ewbot-backup.key` — keep this private key offline (the VPS never has it: a restore is decrypted on the laptop); note the `age1...` public key it prints.
     - In Cloudflare: an R2 bucket `ewbot-backups` and an R2 API token with Object Read & Write on that bucket only. In the bucket's settings add an object lifecycle rule that deletes objects after 90 days and, where R2 offers it, a bucket lock (retention) rule of 30 days: a token stolen from the VPS can then neither delete nor overwrite the recent backups.
     - At healthchecks.io a second check `ewbot-backup`: period **1 day**, grace **2 hours**, the same Telegram and email integrations; copy its ping URL. Every run pings it at its start and at its end - `/fail` with the exit code when it failed -, so a backup that fails, hangs or never runs is alerted.
-    - On the VPS: `sudo apt-get install -y age rclone`, then the rclone remote `r2` (type `s3`, provider `Cloudflare`, the token's access key and secret, the endpoint `https://<account id>.r2.cloudflarestorage.com`) with `no_check_bucket = true`: a token scoped to one bucket may not check for the bucket, and without that line every upload fails with AccessDenied.
+    - On the VPS: `sudo apt-get install -y age rclone`, then the rclone remote `r2` (type `s3`, provider `Cloudflare`, the token's access key and secret, the endpoint `https://<account id>.r2.cloudflarestorage.com`) with `no_check_bucket = true`: a token scoped to one bucket may not check for the bucket, and without that line every upload fails with AccessDenied. Also `no_head = true`: with the bucket lock on, R2 gives every object a version id, and rclone's check after an upload (`HEAD …?versionId=…`) is answered `501 Not Implemented` (seen on 2026-10-05 with Ubuntu's rclone 1.60): the upload itself succeeded, but each run logs an error and uploads on its second attempt. The upload is still checked by its `Content-MD5`.
 
     ```bash
     sudo -u ewbot rclone config                                  # n (new remote), name r2, s3, Cloudflare, the keys, the endpoint
     sudo -u ewbot rclone config update r2 no_check_bucket true   # the r2 section now holds: no_check_bucket = true
+    sudo -u ewbot rclone config update r2 no_head true           # the r2 section now holds: no_head = true
     sudo -u ewbot rclone lsf r2:ewbot-backups                    # answers (empty at first), no AccessDenied
     ```
 
