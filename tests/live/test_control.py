@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import socket
 import sqlite3
 import threading
 import time
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 import requests
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NameResolutionError, NewConnectionError, ProtocolError
 
 from ewbot.live.control import (
     OFFSET_KEY,
@@ -18,12 +20,23 @@ from ewbot.live.control import (
     command_word,
 )
 from ewbot.live.health import Heartbeat, fail_url
-from ewbot.live.notify import LiveNotifier, fit
+from ewbot.live.notify import (
+    FLOOD,
+    REFUSED,
+    RESENT,
+    UNANSWERED,
+    UNSENT,
+    LiveNotifier,
+    TelegramError,
+    TelegramSender,
+    fit,
+)
 from ewbot.paper.notify import SendError
 from tests.live.helpers import Clock, journal
 from tests.paper.helpers import FakeSender
 
 TOKEN = "123456:SECRET-TOKEN"
+SEND_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 
 class Resp:
@@ -35,6 +48,10 @@ class Resp:
         if isinstance(self._body, Exception):
             raise self._body
         return self._body
+
+    @property
+    def text(self) -> str:
+        return str(self._body)
 
 
 class Session:
@@ -73,6 +90,48 @@ class Session:
 
 def ok(*updates: dict) -> Resp:
     return Resp(200, {"ok": True, "result": list(updates)})
+
+
+class Telegram:
+    """api.telegram.org as the live TelegramSender's session: sendMessage posts the text to `chat`, getMe answers.
+    Until clock time `back` Telegram takes every request but its answer times out (requests' ReadTimeout once the
+    15 s read timeout has passed on the clock) - a sendMessage is posted all the same. `fail` holds what the next
+    requests get instead: an exception (nothing posted) or a reply."""
+
+    def __init__(self, clock: Clock, back: float = 0.0, fail: list | None = None) -> None:
+        self.clock, self.back, self.fail = clock, back, list(fail or [])
+        self.chat: list[str] = []
+        self.calls: list[tuple[str, Any]] = []
+
+    def _answer(self, url: str, timeout: Any, text: str | None) -> Any:
+        method = url.rsplit("/", 1)[-1]
+        self.calls.append((method, timeout))
+        if self.fail:
+            a = self.fail.pop(0)
+            if isinstance(a, BaseException):
+                raise a
+            return a
+        if text is not None:
+            self.chat.append(text)
+        if self.clock.now < self.back:
+            self.clock.now += 15.0
+            raise requests.exceptions.ReadTimeout(f"{url}: Read timed out. (read timeout=15)")
+        return Resp(200, {"ok": True, "result": {"message_id": len(self.chat)} if text else {"username": "ewbot_bot"}})
+
+    def post(self, url, json=None, timeout=None):
+        return self._answer(url, timeout, json["text"])
+
+    def get(self, url, params=None, timeout=None):
+        return self._answer(url, timeout, None)
+
+
+def worker(n: LiveNotifier, clock: Clock) -> list[float]:
+    """The sending thread on a fake clock: an attempt, then its pause, until the queue is empty. The pauses."""
+    pauses: list[float] = []
+    while (pause := n.pump()) is not None:
+        pauses.append(pause)
+        clock.now += pause
+    return pauses
 
 
 def upd(uid: int, text: str, *, chat: int = 42, sender: int = 42, date: int = 1_000, kind: str = "private",
@@ -277,6 +336,7 @@ def test_a_failed_send_is_kept_retried_and_printed_never_deduplicated_away(capsy
     assert stale.failing_since == clock.now
     clock.now += 1_801  # kept for 30 minutes at most
     assert stale.pump() == 0.0 and (stale.pending, stale.dropped, stale.failing_since) == (0, 1, None)  # cleared
+    assert stale("X", "y")  # it never left: queued again at once
 
 
 def test_a_refused_message_is_dropped_at_once_and_never_holds_the_queue(capsys):
@@ -309,6 +369,166 @@ def test_a_refused_message_is_dropped_at_once_and_never_holds_the_queue(capsys):
         n("X", f"blocked {i}")
         assert n.pump() == 0.0
     assert n.refusals == 3 and n.pending == 0  # the runtime counts this as Telegram unusable
+
+
+def test_a_send_telegram_took_but_left_unanswered_goes_again_only_once_telegram_answers(capsys):
+    """2026-10-05 01:11 UTC: for two minutes Telegram took every sendMessage but its answer timed out (getMe's too).
+    Each ReadTimeout was retried as a failure - 2 s doubling - and one alert reached the chat six times, the last two
+    with (2분 지연). A send left unanswered may have been posted: getMe, which posts nothing, is asked before
+    anything more is sent, the message goes again only once Telegram answers, and says it may be a copy."""
+    clock = Clock(1_000.0)
+    tg = Telegram(clock, back=1_120.0)
+    n = LiveNotifier(TelegramSender(TOKEN, "42", session=tg), clock=clock)
+    alert = "[텔레그램 명령 수신 이상] getUpdates 5회 연속 실패 (getUpdates failed: ReadTimeout)"
+    assert n("TELEGRAM", alert)
+    pauses = worker(n, clock)
+    assert tg.chat == [f"[LIVE] {alert}", f"[LIVE] {alert} (4분 지연) {RESENT}"]  # not six copies
+    assert [m for m, _ in tg.calls] == ["sendMessage", "getMe", "getMe", "sendMessage"] and pauses == [60.0, 120.0, 0.0]
+    assert {t for _, t in tg.calls} == {(5.0, 15.0)}  # connect 5 s, read 15 s: a connect failure is told apart
+    err = capsys.readouterr().err
+    assert err.count(alert) == 1 and "(telegram sendMessage failed: ReadTimeout)" in err  # in the container log
+    assert (n.sent_count, n.unanswered, n.failing_since) == (1, 0, None) and not n("TELEGRAM", alert)
+
+
+def test_alerts_queued_while_telegram_hangs_wait_for_it_and_go_out_once_each():
+    clock = Clock(1_000.0)
+    tg = Telegram(clock, back=1_600.0)  # ten minutes
+    n = LiveNotifier(TelegramSender(TOKEN, "42", session=tg), clock=clock)
+    n("TELEGRAM", "first")
+    assert n.pump() == 60.0 and (n.failing_since, n.last_attempt, n.unanswered) == (1_000.0, 1_000.0, 1)
+    clock.now += 60.0
+    for i in range(3):
+        assert n("X", f"alert {i}")
+    assert not n("TELEGRAM", "first")  # still queued
+    seen = []
+    while (pause := n.pump()) is not None:
+        seen.append((pause, n.failing_since, n.last_attempt, n.pending))
+        clock.now += pause
+    assert seen == [(120.0, 1_000.0, 1_075.0, 4), (240.0, 1_000.0, 1_210.0, 4), (240.0, 1_000.0, 1_465.0, 4),
+                    (0.0, None, 1_720.0, 3), (0.0, None, 1_720.0, 2), (0.0, None, 1_720.0, 1), (0.0, None, 1_720.0, 0)]
+    assert tg.chat == ["[LIVE] first", f"[LIVE] first (12분 지연) {RESENT}",  # nothing sent while getMe hung
+                       "[LIVE] alert 0 (11분 지연)", "[LIVE] alert 1 (11분 지연)", "[LIVE] alert 2 (11분 지연)"]
+    assert [m for m, _ in tg.calls].count("getMe") == 4 and n.dropped == 0
+
+
+def test_a_message_whose_sends_go_unanswered_is_sent_three_times_at_most(capsys):
+    """A sender without getMe (any Sender): an unanswered send goes again after 60 s, then 120 s, each copy marked;
+    after the third the message is dropped as possibly posted, and the same alert is not queued again for 10
+    minutes."""
+    clock = Clock(1_000.0)
+    chat: list[str] = []
+
+    def takes_but_never_answers(text: str) -> None:
+        chat.append(text)
+        raise TelegramError("telegram sendMessage failed: ReadTimeout", UNANSWERED)
+
+    n = LiveNotifier(takes_but_never_answers, clock=clock)
+    alert = "[중대 사건] 거래 1이 60초 넘게 보호되지 않음"
+    assert n("INCIDENT", alert)
+    assert worker(n, clock) == [60.0, 120.0, 0.0]
+    assert chat == [f"[LIVE] {alert}", f"[LIVE] {alert} (1분 지연) {RESENT}", f"[LIVE] {alert} (3분 지연) {RESENT}"]
+    assert (n.pending, n.dropped, n.failing_since, n.sent_count) == (0, 1, None, 0)
+    err = capsys.readouterr().err
+    assert f"dropped (3 sends unanswered: Telegram may have posted it): [LIVE] {alert}" in err
+    assert not n("INCIDENT", alert)  # possibly in the chat already: not queued again for 10 minutes
+    clock.now += 601
+    assert n("INCIDENT", alert)
+
+
+def test_a_send_that_never_left_or_was_not_taken_goes_again_soon_unmarked():
+    clock = Clock(1_000.0)
+    flood = Resp(429, {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 7",
+                       "parameters": {"retry_after": 7}})
+    refused_conn = requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NewConnectionError(
+        None, "Failed to establish a new connection: [Errno 111] Connection refused")))  # as requests raises them
+    no_dns = requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NameResolutionError(
+        "api.telegram.org", None, socket.gaierror(8, "nodename nor servname provided, or not known"))))
+    connect_timeout = requests.exceptions.ConnectTimeout(MaxRetryError(None, SEND_URL, ConnectTimeoutError(
+        None, "Connection to api.telegram.org timed out. (connect timeout=5)")))
+    tg = Telegram(clock, fail=[flood, refused_conn, no_dns, connect_timeout])
+    n = LiveNotifier(TelegramSender(TOKEN, "42", session=tg), clock=clock)
+    n("STOP_MOVED", "[손절 이동] 70,000 → 71,000")
+    assert worker(n, clock) == [7.0, 4.0, 8.0, 16.0, 0.0]  # 429's retry_after, then 2 s doubling: as before
+    assert tg.chat == ["[LIVE] [손절 이동] 70,000 → 71,000"]  # one copy, no resend note
+    assert [m for m, _ in tg.calls] == ["sendMessage"] * 5  # no getMe: no send went unanswered
+    assert (n.unanswered, n.failures, n.failing_since) == (0, 0, None)
+
+
+def test_the_live_sender_places_each_outcome_and_never_carries_the_token():
+    clock = Clock(0.0)
+    cases: list[tuple[Any, str | None]] = [
+        (Resp(200, {"ok": True, "result": {"message_id": 1}}), None),
+        (requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NewConnectionError(None, SEND_URL))), UNSENT),
+        (requests.exceptions.ConnectTimeout(MaxRetryError(None, SEND_URL, ConnectTimeoutError(None, SEND_URL))), UNSENT),
+        (requests.exceptions.ReadTimeout(f"{SEND_URL}: Read timed out. (read timeout=15)"), UNANSWERED),
+        (requests.exceptions.ConnectionError(ProtocolError("Connection aborted.", ConnectionResetError(54, SEND_URL))),
+         UNANSWERED),  # reset after the request went out
+        (requests.exceptions.ChunkedEncodingError(SEND_URL), UNANSWERED),
+        (requests.exceptions.SSLError(MaxRetryError(None, SEND_URL, None)), UNANSWERED),
+        (RuntimeError(SEND_URL), UNANSWERED),  # anything else: it may have gone out
+        (Resp(200, ValueError(SEND_URL)), UNANSWERED),  # 200 but not Telegram's reply
+        (Resp(200, {"ok": False}), UNANSWERED),
+        (Resp(502, ValueError("<html>502 Bad Gateway</html>")), UNANSWERED),
+        (Resp(429, {"ok": False, "description": "Too Many Requests", "parameters": {"retry_after": 7}}), FLOOD),
+        (Resp(400, {"ok": False, "description": "Bad Request: message text is empty"}), REFUSED),
+        (Resp(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"}), REFUSED),
+    ]
+    tg = Telegram(clock, fail=[c for c, _ in cases])
+    send = TelegramSender(TOKEN, "42", session=tg)
+    for case, outcome in cases:
+        if outcome is None:
+            send("posted")
+            continue
+        with pytest.raises(TelegramError) as err:
+            send("x")
+        assert err.value.outcome == outcome, case
+        assert err.value.retry_after == (7.0 if outcome == FLOOD else None)
+        assert _chain(err.value) == [err.value]  # neither __cause__ nor __context__ keeps the original
+        text = str(err.value) + repr(err.value) + "".join(traceback.format_exception(err.value))
+        assert TOKEN not in text and "SECRET" not in text
+    assert "HTTP 403: " in str(err.value) and "bot was blocked" in str(err.value)
+    tg.fail = [Resp(200, {"ok": True, "result": {}}), Resp(401, {"ok": False, "description": "Unauthorized"}),
+               Resp(502, ValueError("<html>")), requests.exceptions.ReadTimeout(SEND_URL),
+               requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NewConnectionError(None, SEND_URL)))]
+    send.probe()
+    send.probe()  # answered: the send itself is refused, and counted as such
+    for outcome in (UNANSWERED, UNANSWERED, UNSENT):
+        with pytest.raises(TelegramError) as err:
+            send.probe()
+        assert err.value.outcome == outcome and TOKEN not in str(err.value) and _chain(err.value) == [err.value]
+    assert [m for m, _ in tg.calls[-5:]] == ["getMe"] * 5 and len(tg.chat) == 0  # getMe posts nothing
+
+
+def _loopback(hold: bool) -> int:
+    """A one-connection server on 127.0.0.1 that reads the request, then closes the connection at once or (`hold`)
+    keeps it a second without an answer."""
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def run() -> None:
+        conn, _ = srv.accept()
+        with conn, srv:
+            conn.recv(65_536)
+            if hold:
+                time.sleep(1.0)
+
+    threading.Thread(target=run, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def test_the_real_http_stack_tells_a_request_that_never_left_on_loopback_sockets():
+    """requests and urllib3 as installed, on loopback sockets only: nobody listening (the connection is refused) -
+    the request never left; a server that reads it and closes, or never answers - it went out."""
+    free = socket.create_server(("127.0.0.1", 0))
+    port = free.getsockname()[1]
+    free.close()
+    session = requests.Session()
+    session.trust_env = False  # never through a proxy
+    for p, outcome in ((port, UNSENT), (_loopback(False), UNANSWERED), (_loopback(True), UNANSWERED)):
+        send = TelegramSender(TOKEN, "42", session=session, timeout=(2.0, 0.3),
+                              api=f"http://127.0.0.1:{p}/bot{{token}}/{{method}}")
+        with pytest.raises(TelegramError) as err:
+            send("x")
+        assert err.value.outcome == outcome and TOKEN not in str(err.value), str(err.value)
 
 
 def test_get_me_is_retried_and_a_thread_that_stops_answering_is_overdue(tmp_path, capsys):

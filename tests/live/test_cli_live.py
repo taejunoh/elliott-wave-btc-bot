@@ -20,7 +20,7 @@ from ewbot.live.audit import AuditResult
 from ewbot.live.exchange import ExchangeError, KeyPermissions, Unavailable
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.notify import LiveNotifier, TelegramSender
 from ewbot.live.reconcile import is_ours
 from ewbot.live.runtime import FLATTEN_KEY, LiveRuntime
 from ewbot.live.settings import LiveSettings, Secret, SettingsError
@@ -561,6 +561,16 @@ def test_the_process_stage_never_hides_real_exposure(live_env, monkeypatch, caps
     ex.position = down
     assert live_app.process_stage(jr, ex)[0] == "CANARY"  # unreadable: real and managed, never hidden
     jr.close()
+
+
+def test_the_notifier_sends_with_the_live_sender_that_tells_a_send_that_never_left(live_env):
+    """Production sends through live.notify's TelegramSender (connect 5 s, read 15 s, a getMe probe), never the paper
+    runtime's: only it tells a send Telegram may have posted from one that never left (2026-10-05: six copies)."""
+    settings, _, _ = live_env
+    notify = live_app.notifier(dataclasses.replace(settings, **ALERTS))  # its thread waits: nothing is queued
+    sender = notify.sender
+    assert isinstance(sender, TelegramSender) and sender.timeout == (5.0, 15.0) and callable(sender.probe)
+    notify.stop()
 
 
 def test_build_wraps_only_shadow_and_reminds_of_the_contract(live_env):
