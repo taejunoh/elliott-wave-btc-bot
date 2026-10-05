@@ -241,6 +241,27 @@ def test_each_shadow_gate_can_fail(tmp_path):
     jr.close()
 
 
+def test_the_preview_gate_shows_brackets_refused_for_want_of_a_position_apart(tmp_path):
+    jr, now = shadow_journal(tmp_path)  # one passing preview (the entry's)
+    flat_only = {"kind": "BRACKET", "ok": False, "errors": ["PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION"]}
+    for k in range(3):  # the flat real account cannot check a bracket (2026-10-05): shown, never failing
+        jr.add_event(S0 + 10_901 + k, "PREVIEW_POSITION_DEPENDENT", flat_only)
+
+    def gate(j, at: float) -> Gate:
+        return {g.name: g for g in shadow_gates(j, at, good(at))}["③ 냈을 주문 전부 preview 통과"]
+
+    assert gate(jr, now) == Gate("③ 냈을 주문 전부 preview 통과", True,
+                                 "1/1, 포지션이 없어 확인 못 한 브래킷 3건 (CANARY 첫 거래에서 확인)")
+    jr.add_event(S0 + 11_000, "PREVIEW", {"kind": "BRACKET", "ok": False, "errors": ["PREVIEW_INVALID_BRACKET_PRICES"]})
+    assert not gate(jr, now).met and gate(jr, now).detail.startswith("1/2, ")  # any other refusal fails
+    jr.close()
+    only = journal(tmp_path, "only.sqlite")  # nothing the venue could check: not met
+    only.set_stage("SHADOW", "initial", S0)
+    only.add_event(S0 + 10, "PREVIEW_POSITION_DEPENDENT", flat_only)
+    assert not gate(only, S0 + DAY).met and gate(only, S0 + DAY).detail.startswith("0/0, ")
+    only.close()
+
+
 def test_the_signal_and_cycle_gates_count_the_stage_itself(tmp_path):
     jr = journal(tmp_path)
     jr.set_stage("SHADOW", "initial", S0)

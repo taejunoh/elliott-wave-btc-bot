@@ -12,6 +12,17 @@ is journaled as PREVIEW_UNVERIFIED, alerted, and asked again by `retry_previews`
 every decision cycle) until Coinbase answers - only an answer with errors is a failed PREVIEW; one still
 unanswered after PREVIEW_RETRY_LIMIT cycles is recorded failed (never verified).
 
+A bracket cannot be checked on the real account, which SHADOW keeps flat: Coinbase checks a bracket's size against
+the position before anything else (2026-10-05, the real flat account: a valid bracket, one with its stop on the wrong
+side, a marketable take-profit and 1000 contracts were all refused with the one code
+PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION). So a bracket first passes the virtual book's intake checks - whole
+contracts, the tick grid, the take-profit beyond the stop (SimExchange._rejected), the checks that need no position -
+before the real preview, and one they refuse is a failed PREVIEW without asking Coinbase; a bracket preview then
+refused with POSITION_DEPENDENT codes alone is journaled PREVIEW_POSITION_DEPENDENT - no verdict, no alert: SHADOW
+gate ③ shows it apart and the first CANARY trade confirms Coinbase takes our brackets. Any other refusal, or that code
+beside another one, is a failed PREVIEW; market orders and closes are previewed as before (Coinbase checks them on the
+flat account).
+
 On a restart `restore` puts the open virtual position back from the journal and reads the real quote first
 (best effort; so does every bracket placement): the virtual book never triggers or fills while it has no
 real futures price above 0. Virtual order ids carry a prefix new to every process (`v<n>-`, n counted in
@@ -48,6 +59,11 @@ PREVIEW_RETRY_LIMIT = 24  # cycles (hours) an unanswered preview is asked again 
 PRUNE_AFTER_S = 86_400.0  # a virtual order that ended this long ago is dropped (lookups need minutes, not days)
 FILLS_KEPT = 1000
 CALLS_KEPT = 1000
+# A bracket preview's refusals that only say the real account holds no (or too small a) position for it: the flat
+# account's answer to every bracket (2026-10-05). Not ORDER_SIZE_EXCEEDS_BRACKETED_POSITION (an order refused beside
+# resting brackets: executor.CLOSE_CONFLICTS), REDUCE_ONLY_INCREASED_POSITION_SIZE or POSITION_SIZE_INCREASE_REJECT
+# (an order on the wrong side of a position): they say something about the order.
+POSITION_DEPENDENT = frozenset({"PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION"})
 
 
 class ShadowExchange(SimExchange):
@@ -153,6 +169,11 @@ class ShadowExchange(SimExchange):
         return self.real.preview_market(side, size)
 
     def _preview(self, kind: str, client_order_id: str, **order: Any) -> None:
+        if kind == "BRACKET":  # the checks that need no position first: the flat real account cannot make them
+            reason = self._rejected(order["size"], order["side"], order["limit_price"], order["stop_price"])
+            if reason is not None:
+                self._verdict(kind, client_order_id, PreviewResult(False, (f"PREVIEW_{reason}",)), order, local=True)
+                return
         for attempt in range(PREVIEW_TRIES):
             try:
                 res = self._ask(kind, order)
@@ -166,9 +187,12 @@ class ShadowExchange(SimExchange):
 
     def _verdict(self, kind: str, client_order_id: str, res: PreviewResult, order: dict[str, Any],
                  **extra: Any) -> None:
-        self.journal.add_event(self.clock(), "PREVIEW", {"kind": kind, "client_order_id": client_order_id,
-                                                         "ok": res.ok, "errors": list(res.errors),
-                                                         "warnings": list(res.warnings), **order, **extra})
+        data = {"kind": kind, "client_order_id": client_order_id, "ok": res.ok, "errors": list(res.errors),
+                "warnings": list(res.warnings), **order, **extra}
+        if kind == "BRACKET" and not res.ok and res.errors and set(res.errors) <= POSITION_DEPENDENT:
+            self.journal.add_event(self.clock(), "PREVIEW_POSITION_DEPENDENT", data)  # refused for want of a position
+            return
+        self.journal.add_event(self.clock(), "PREVIEW", data)
         if not res.ok:
             self.alert("PREVIEW_FAILED", f"[SHADOW preview 실패] {kind} {client_order_id}: {', '.join(res.errors)}")
 

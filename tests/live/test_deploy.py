@@ -478,5 +478,8 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "손실 한도 기준 재설정 24시간", "never an `UNKNOWN_*` code", "a leg that still covers contracts",
                    "for 5 minutes", "paced and rate-limited apart",
                    # Telegram sends left unanswered (2026-10-05)
-                   "(재전송 - 중복일 수 있음)", "`getMe` check"):
+                   "(재전송 - 중복일 수 있음)", "`getMe` check",
+                   # bracket previews on the flat account (2026-10-05)
+                   "PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION", "포지션이 없어 확인 못 한 브래킷",
+                   "That Coinbase takes our brackets"):
         assert needle in text, needle

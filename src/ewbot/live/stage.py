@@ -29,7 +29,10 @@ clock step moves every window with it.
                 close (a bar with no cycle row at all while the futures session was recorded closed is excused:
                 a span from a SESSION event whose state is not OPEN to the next SESSION or STARTUP event, at most
                 SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due); (3) every would-be order
-                passed preview; (4) restart test: at least one restart recovered with no unresolved intent.
+                passed preview (at least one did; a bracket Coinbase refused only for want of a position - SHADOW's
+                real account is flat, live/shadow.py PREVIEW_POSITION_DEPENDENT - is counted in the detail, never
+                failing it: the first CANARY trade confirms the brackets); (4) restart test: at least one restart
+                recovered with no unresolved intent.
   CANARY start  SHADOW pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission.
   CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
                 closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
@@ -282,6 +285,10 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     signals = [d for d in journal.decisions() if d["kind"] == "SIGNAL" and known_at(d) > since]
     previews = journal.events(kind="PREVIEW", since=since)
     failed = [p for p in previews if not p["data"].get("ok")]
+    preview = f"{len(previews) - len(failed)}/{len(previews)}"
+    unverifiable = len(journal.events(kind="PREVIEW_POSITION_DEPENDENT", since=since))
+    if unverifiable:
+        preview += f", 포지션이 없어 확인 못 한 브래킷 {unverifiable}건 (CANARY 첫 거래에서 확인)"
     recoveries = journal.events(kind="RECOVERY", since=since)
     clean = [r for r in recoveries if not r["data"].get("unknown")]
     return [
@@ -290,7 +297,7 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
         # the first SHADOW audits the whole epoch; a restarted one counts the mismatches of its own decisions
         audit_gate(G_AUDIT, audit_result, since, now, after=since if _restarted(journal) else None),
         _cycle_gate(journal, since, now),
-        Gate(G_PREVIEW, bool(previews) and not failed, f"{len(previews) - len(failed)}/{len(previews)}"),
+        Gate(G_PREVIEW, bool(previews) and not failed, preview),
         Gate(G_RESTART, len(recoveries) >= 2 and len(clean) == len(recoveries),
              f"재시작 복구 {len(recoveries)}회 (첫 시작 포함), 미해결 {len(recoveries) - len(clean)}회"),
     ]
