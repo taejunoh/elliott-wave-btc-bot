@@ -476,5 +476,7 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "cfm/positions", "5–10 s on a 1-vCPU VPS", "at most 15 s",
                    # re-reviews: rebases kept visible, never UNKNOWN_* codes, a leg that still covers is kept
                    "손실 한도 기준 재설정 24시간", "never an `UNKNOWN_*` code", "a leg that still covers contracts",
-                   "for 5 minutes", "paced and rate-limited apart"):
+                   "for 5 minutes", "paced and rate-limited apart",
+                   # Telegram sends left unanswered (2026-10-05)
+                   "(재전송 - 중복일 수 있음)", "`getMe` check"):
         assert needle in text, needle

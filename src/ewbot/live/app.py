@@ -42,7 +42,7 @@ from ewbot.live.exchange import FUTURES_PRODUCT, SPOT_PRODUCT, Exchange, Exchang
 from ewbot.live.feed import TickerFeed, public_ws_factory
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.notify import LiveNotifier, TelegramSender
 from ewbot.live.preflight import EXPIRY_MARGIN_DAYS, PRODUCT_EXPIRY
 from ewbot.live.reconcile import is_ours
 from ewbot.live.runtime import FLATTEN_KEY, LiveDeps, LiveRuntime
@@ -50,7 +50,6 @@ from ewbot.live.settings import LiveSettings, SettingsError
 from ewbot.live.shadow import ShadowExchange
 from ewbot.paper.criteria import golive_status
 from ewbot.paper.ledger import Ledger
-from ewbot.paper.notify import TelegramSender
 
 REAL_STAGES = ("CANARY", "FULL")
 VIRTUAL_ORDER_ID = re.compile(r"v\d+-")  # live.shadow's virtual order ids: v<book>-<sim id>
@@ -176,7 +175,9 @@ def stage_exchange(real: Exchange, journal: Journal, stage: str, notify: Callabl
 
 
 def notifier(s: LiveSettings) -> LiveNotifier:
-    """The [LIVE] notifier with its sending thread started: a call only queues, the loop never waits on Telegram."""
+    """The [LIVE] notifier with its sending thread started: a call only queues, the loop never waits on Telegram.
+    Its sender is live.notify's own (connect 5 s, read 15 s), which tells a send that never left from one Telegram
+    may have posted."""
     sender = (TelegramSender(s.telegram_token.reveal(), s.telegram_chat)
               if s.telegram_token and s.telegram_chat else None)
     notify = LiveNotifier(sender)

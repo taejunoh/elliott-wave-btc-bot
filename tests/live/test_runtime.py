@@ -26,7 +26,7 @@ from ewbot.live.exchange import (
 )
 from ewbot.live.feed import Tick, TickerFeed
 from ewbot.live.health import Heartbeat
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.notify import RESENT, UNANSWERED, LiveNotifier, TelegramError
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.journal import Journal
 from ewbot.live.reconcile import PlanContext, pending_position
@@ -489,6 +489,52 @@ def test_a_notifier_that_cannot_deliver_counts_as_telegram_unusable(h):
     assert minute(25, pump=False) == "P"  # three refused in a row: unusable at once
     reasons = [e["data"]["reasons"][0] for e in h.journal.events(kind="TELEGRAM_UNUSABLE")]
     assert "알림 전송이 10분째 실패" in reasons[0] and "멈춤" in reasons[1] and "3건을 연속 거부" in reasons[2]
+
+
+def test_a_telegram_that_takes_sends_without_answering_is_unusable_after_10_minutes_and_gets_no_extra_copies(h):
+    """Telegram takes a send but leaves it unanswered for 15 minutes, getMe too: the worker waits 60 s doubling to
+    240 s between probes (longer than NOTIFY_STALL_S, never read as a stuck sender) and sends no copy meanwhile;
+    after 10 minutes Telegram is unusable (/fail) as for any failure; once getMe answers the message goes once
+    more, marked as a possible copy, and the pings resume."""
+    pings = Pings()
+    h.rt = h.make_runtime(heartbeat=Heartbeat("https://hc-ping.com/check", session=pings, clock=h.clock))
+    t0 = ENTRY_BAR + 100
+    h.clock.now = t0 - 60
+    h.rt.minute(h.clock.now)  # the day's summary and the first ping, before the notifier under test
+    back, chat = t0 + 900, []
+
+    class Hung:  # the live TelegramSender's errors while Telegram takes requests without answering them
+        def __call__(self, text: str) -> None:
+            chat.append(text)
+            if h.clock.now < back:
+                raise TelegramError("telegram sendMessage failed: ReadTimeout", UNANSWERED)
+
+        def probe(self) -> None:
+            if h.clock.now < back:
+                raise TelegramError("telegram getMe failed: ReadTimeout", UNANSWERED)
+
+    n = LiveNotifier(Hung(), clock=h.clock)
+    h.rt.d.notify = n
+    due: float | None = t0
+    h.clock.now = t0
+    n("X", "taken but unanswered")
+    calls, attempts = [], []
+    for k in range(17):
+        now = t0 + 60 * k
+        while due is not None and due <= now:  # the worker's attempts that fall in this minute, at their times
+            h.clock.now = due
+            pause = n.pump()
+            attempts.append(due - t0)
+            due = None if pause is None else due + pause
+        h.clock.now = now
+        before = len(pings.calls)
+        h.rt.minute(now)
+        calls.append("".join(c[0][0] for c in pings.calls[before:]))
+    assert attempts == [0, 60, 180, 420, 660, 900, 900]  # a send, four probes, then the resend (and idle)
+    assert calls == ["G"] * 10 + ["P", "", "", "", "", "G", "G"]  # failing 10 minutes: /fail, pings withheld
+    assert chat == ["[LIVE] taken but unanswered", f"[LIVE] taken but unanswered (15분 지연) {RESENT}"]
+    reasons = [e["data"]["reasons"] for e in h.journal.events(kind="TELEGRAM_UNUSABLE")]
+    assert reasons == [["알림 전송이 10분째 실패 (telegram getMe failed: ReadTimeout)"]]  # never "멈춤"
 
 
 def test_a_broken_telegram_check_never_skips_the_minute_and_loop_errors_are_redacted(h, capsys):
