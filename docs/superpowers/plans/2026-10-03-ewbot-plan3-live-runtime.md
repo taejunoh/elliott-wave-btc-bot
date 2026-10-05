@@ -89,7 +89,7 @@
 |---|---|---|
 | 1 | Exchange boundary and `SimExchange` | 25 |
 | 2 | SQLite journal | 10 |
-| 3 | Coinbase adapter, `live` dependency group, recorded fixtures | 111 |
+| 3 | Coinbase adapter, `live` dependency group, recorded fixtures | 120 |
 | 4 | Target state from the engine replay (+ allowlist line) | 14 |
 | 5 | Price mapping, stage sizing, margin projection | 25 |
 | 6 | Reconcile planner | 33 |
@@ -104,7 +104,7 @@
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 51 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 603 more tests, `1223 passed, 1 skipped` (`1224 passed` with the cache; two more skipped without `shellcheck`), about 105 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 612 more tests, `1232 passed, 1 skipped` (`1233 passed` with the cache; two more skipped without `shellcheck`), about 105 s.
 
 ---
 
@@ -1583,7 +1583,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `ewbot.live.exchange` (Task 1); `requests` (existing dependency); the SDK `coinbase.rest.RESTClient` (only in `CoinbaseExchange.from_key_file` and the SDK test; imported lazily, so `ewbot` still imports without the `live` group).
-- Produces (`ewbot.live.coinbase`): `API = "/api/v3/brokerage"`, `SESSION_PREFIX`, `POSITION_SIDE_PREFIX = "FUTURES_POSITION_SIDE_"`, `RETRY_AFTER_MAX_S = 10.0`, `RETRY_SLEEP_MAX_S = 15.0`, `CANCEL_DONE`, `class DuplicateClientOrderId(ExchangeError)`, `fmt_decimal(x) -> str`, `bad_size(size) -> bool`, `bad_price(price) -> bool`, `iso_ts(text) -> int | None`, `contract_expiry(text) -> int | None` (`future_product_details.contract_expiry` with a zone as epoch s, else None: `product()` reads it into `ProductSpec.expiry`), `retry_after_s(value, now=None) -> float` (delta-seconds or HTTP-date, clamped to [0, 10], garbage → 1), `map_error(exc) -> ExchangeError` (429 → `RateLimited`, 5xx and every other `requests` exception → `Unavailable` with the type name only, a 4xx naming `DUPLICATE_CLIENT_ORDER_ID` → `DuplicateClientOrderId`, anything else → `ExchangeError(type name)`), `parse_order(dict) -> Order` (sides `BUY`/`SELL` only), `parse_place(dict, client_order_id) -> PlaceResult` (reason: `new_order_failure_reason`, then the deprecated `error` and `preview_failure_reason`, then `failure_reason`, skipping `UNKNOWN_*`; `duplicate=True` when any of them is `DUPLICATE_CLIENT_ORDER_ID`; accepted without an order id, or a reply without a boolean `success` - not a create reply, so it says nothing about the order - → `Unavailable`), `class CoinbaseExchange(client, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, *, sleep=time.sleep, clock=time.time, attempts=3, backoff_s=1.0, min_remaining=2)` implementing `Exchange` with the SDK's generic `client.get(path, params=..., public=...)` / `client.post(path, data=...)`, and `CoinbaseExchange.from_key_file(key_file, futures_id, spot_id, timeout=10)`. Reads and `cancel` retry 3 times on 429 / 5xx / network errors; `place_market`, `place_bracket`, `close_position` and `edit_bracket` are sent once. These waits run on the runtime's loop: one call's waits - the pacing and the retries - add up to at most `RETRY_SLEEP_MAX_S` (a wait that would pass it raises the call's error instead), and while the last 429's Retry-After runs a new call raises `RateLimited` at once and sends nothing (a clock stepped back ignores it); the pacing and the 429 window are kept apart for the public market data and the private requests (`public=` of the SDK call), which the venue limits apart: a 429 on a quote never holds back a close. Only `ExchangeError` leaves the adapter (or `ValueError` for a side other than ±1): a reply of the wrong shape is an `ExchangeError`, one that is not a JSON object `Unavailable`. No amount that is not a finite number (`"NaN"`, `"inf"`, which Python reads as floats) leaves it: a required one (a size, a balance, a product increment, a position's contracts) is a wrong shape, an optional one (a fill price, a fee, a bracket's prices, the available margin) reads `None`, a position's average entry `0.0`. Refused locally without a request: sizes that are not whole contracts ≥ 1 (`INVALID_SIZE_PRECISION`), non-finite or ≤ 0 limit / stop prices (`INVALID_PRICE_PRECISION` / `INVALID_STOP_PRICE_PRECISION`). `position()` reads flat (None) only from the documented shape - a `positions` list of objects that each have a `product_id`, the product's one entry absent or at 0 contracts; no `positions` list, an entry without a `product_id`, the product's entry without a whole `number_of_contracts` (or, unless 0, without a side), or two entries for it are an `ExchangeError`, never flat -, maps `LONG`/`SHORT` only - the enum's full names `FUTURES_POSITION_SIDE_LONG` / `_SHORT` read the same - and takes `abs()` of the contract count; `open_orders()` asks for every resting status (`order_status` repeated); `quote()` raises `Unavailable` for an empty book, a top of book without a finite bid and ask above 0 or a crossed one (bid above ask); `balance()` requires `total_usd_balance`; a missing `can_transfer` reads `True`; `cancel()` raises `ExchangeError` for every order whose `results[].success` is false (except `DUPLICATE_CANCEL_REQUEST` / `ORDER_IS_FULLY_FILLED`) or that has no result - unless it reads back (`get_order`) as ended: the reason given for an order that already left the book is undocumented.
+- Produces (`ewbot.live.coinbase`): `API = "/api/v3/brokerage"`, `SESSION_PREFIX`, `POSITION_SIDE_PREFIX = "FUTURES_POSITION_SIDE_"`, `RETRY_AFTER_MAX_S = 10.0`, `RETRY_SLEEP_MAX_S = 15.0`, `RESTING_SWEEP = ("PENDING", "QUEUED", "OPEN", "EDIT_QUEUED", "CANCEL_QUEUED")`, `CANCEL_DONE`, `class DuplicateClientOrderId(ExchangeError)`, `fmt_decimal(x) -> str`, `bad_size(size) -> bool`, `bad_price(price) -> bool`, `iso_ts(text) -> int | None`, `contract_expiry(text) -> int | None` (`future_product_details.contract_expiry` with a zone as epoch s, else None: `product()` reads it into `ProductSpec.expiry`), `retry_after_s(value, now=None) -> float` (delta-seconds or HTTP-date, clamped to [0, 10], garbage → 1), `map_error(exc) -> ExchangeError` (429 → `RateLimited`, 5xx and every other `requests` exception → `Unavailable` with the type name only, a 4xx naming `DUPLICATE_CLIENT_ORDER_ID` → `DuplicateClientOrderId`, anything else → `ExchangeError(type name)`), `parse_order(dict) -> Order` (sides `BUY`/`SELL` only), `parse_place(dict, client_order_id) -> PlaceResult` (reason: `new_order_failure_reason`, then the deprecated `error` and `preview_failure_reason`, then `failure_reason`, skipping `UNKNOWN_*`; `duplicate=True` when any of them is `DUPLICATE_CLIENT_ORDER_ID`; accepted without an order id, or a reply without a boolean `success` - not a create reply, so it says nothing about the order - → `Unavailable`), `class CoinbaseExchange(client, futures_id=FUTURES_PRODUCT, spot_id=SPOT_PRODUCT, *, sleep=time.sleep, clock=time.time, attempts=3, backoff_s=1.0, min_remaining=2)` implementing `Exchange` with the SDK's generic `client.get(path, params=..., public=...)` / `client.post(path, data=...)`, and `CoinbaseExchange.from_key_file(key_file, futures_id, spot_id, timeout=10)`. Reads and `cancel` retry 3 times on 429 / 5xx / network errors; `place_market`, `place_bracket`, `close_position` and `edit_bracket` are sent once. These waits run on the runtime's loop: one call's waits - the pacing and the retries - add up to at most `RETRY_SLEEP_MAX_S` (a wait that would pass it raises the call's error instead; a call of several requests - the pages of a List Orders query, `open_orders()`' statuses - has one budget), and while the last 429's Retry-After runs a new call raises `RateLimited` at once and sends nothing (a clock stepped back ignores it); the pacing and the 429 window are kept apart for the public market data and the private requests (`public=` of the SDK call), which the venue limits apart: a 429 on a quote never holds back a close. Only `ExchangeError` leaves the adapter (or `ValueError` for a side other than ±1): a reply of the wrong shape is an `ExchangeError`, one that is not a JSON object `Unavailable`. No amount that is not a finite number (`"NaN"`, `"inf"`, which Python reads as floats) leaves it: a required one (a size, a balance, a product increment, a position's contracts) is a wrong shape, an optional one (a fill price, a fee, a bracket's prices, the available margin) reads `None`, a position's average entry `0.0`. Refused locally without a request: sizes that are not whole contracts ≥ 1 (`INVALID_SIZE_PRECISION`), non-finite or ≤ 0 limit / stop prices (`INVALID_PRICE_PRECISION` / `INVALID_STOP_PRICE_PRECISION`). `position()` reads flat (None) only from the documented shape - a `positions` list of objects that each have a `product_id`, the product's one entry absent or at 0 contracts; no `positions` list, an entry without a `product_id`, the product's entry without a whole `number_of_contracts` (or, unless 0, without a side), or two entries for it are an `ExchangeError`, never flat -, maps `LONG`/`SHORT` only - the enum's full names `FUTURES_POSITION_SIDE_LONG` / `_SHORT` read the same - and takes `abs()` of the contract count; `open_orders()` sends one List Orders request per resting status, in `RESTING_SWEEP`'s order (the venue refuses two active statuses in one request: HTTP 400 `INVALID_ARGUMENT`, the real venue on 2026-10-04), follows each through its pages and merges the replies by order id (an order in two replies keeps the later read); a status or a page it cannot read - refused, unanswered, without an `orders` list, `has_next` without a new cursor - fails the whole read (`ExchangeError`), never a partial book; `quote()` raises `Unavailable` for an empty book, a top of book without a finite bid and ask above 0 or a crossed one (bid above ask); `balance()` requires `total_usd_balance`; a missing `can_transfer` reads `True`; `cancel()` raises `ExchangeError` for every order whose `results[].success` is false (except `DUPLICATE_CANCEL_REQUEST` / `ORDER_IS_FULLY_FILLED`) or that has no result - unless it reads back (`get_order`) as ended: the reason given for an order that already left the book is undocumented.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2036,6 +2036,7 @@ import inspect
 import json
 from importlib import metadata
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import requests
@@ -2055,6 +2056,14 @@ from ewbot.live.exchange import OPEN_STATUSES, ExchangeError, Position, RateLimi
 
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "coinbase.json").read_text(encoding="utf-8"))
 FUT = "BIP-20DEC30-CDE"
+# The real venue's answer to the five resting statuses in one List Orders request (first SHADOW deploy, 2026-10-04,
+# `ewbot live status --exchange --require-flat` with the view-only key on the real account).
+VENUE_ACTIVE = ("OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED")
+MULTI_STATUS_REFUSAL = ('{"error":"INVALID_ARGUMENT","error_details":"Cannot pass multiple statuses when requesting '
+                        'active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or CANCEL_QUEUED)","message":"Cannot pass '
+                        'multiple statuses when requesting active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or '
+                        'CANCEL_QUEUED)"}')
+EMPTY_PAGE = {"orders": [], "sequence": "0", "has_next": False, "cursor": ""}
 
 
 def http_error(status: int, text: str = "", headers: dict | None = None) -> requests.exceptions.HTTPError:
@@ -2065,9 +2074,17 @@ def http_error(status: int, text: str = "", headers: dict | None = None) -> requ
     return requests.exceptions.HTTPError(f"{status}", response=resp)
 
 
+def statuses(params: dict | None) -> list[str]:
+    """The order_status values a List Orders request sends (requests repeats the key for each item of a list)."""
+    value = (params or {}).get("order_status")
+    return [] if value is None else [value] if isinstance(value, str) else list(value)
+
+
 class RecordedClient:
     """Stands in for coinbase.rest.RESTClient: answers get/post from recorded JSON by (method, path).
-    An answer may be a fixture name, a list (consumed in order; exceptions are raised) or a callable."""
+    An answer may be a fixture name, a list (consumed in order; exceptions are raised) or a callable.
+    Like the venue, a List Orders request with more than one status, one of them active, is refused with HTTP 400
+    before any recorded answer is used."""
 
     def __init__(self, routes: dict) -> None:
         self.routes = routes
@@ -2085,6 +2102,9 @@ class RecordedClient:
 
     def get(self, url_path, params=None, public=False, **kwargs):
         self.calls.append(("GET", url_path, params, public))
+        asked = statuses(params)
+        if url_path == API + "/orders/historical/batch" and len(asked) > 1 and set(asked) & set(VENUE_ACTIVE):
+            raise http_error(400, MULTI_STATUS_REFUSAL)
         return self._answer(("GET", url_path), params)
 
     def post(self, url_path, params=None, data=None, **kwargs):
@@ -2146,8 +2166,18 @@ def test_balance_is_cash_plus_unrealized_pnl_and_permissions():
     assert (k.can_view, k.can_trade, k.can_transfer, k.portfolio_type) == (True, True, False, "DEFAULT")
 
 
-def test_open_orders_follow_the_cursor_and_parse_brackets():
-    ex, client, _ = make({("GET", "/orders/historical/batch"): ["orders_open_page1", "orders_open_page2"]})
+def by_status(pages: dict[str, list]):
+    """A List Orders route: each status answered from its own pages (consumed in order), no orders otherwise."""
+    def answer(params):
+        (status,) = statuses(params)
+        queue = pages.get(status) or []
+        return queue.pop(0) if queue else EMPTY_PAGE
+    return answer
+
+
+def test_open_orders_follow_each_status_cursor_and_parse_brackets():
+    ex, client, _ = make({("GET", "/orders/historical/batch"): by_status({
+        "OPEN": ["orders_open_page1", EMPTY_PAGE], "CANCEL_QUEUED": ["orders_open_page2"]})})
     orders = ex.open_orders()
     assert [(o.client_order_id, o.kind, o.size, o.limit_price, o.stop_price, o.status) for o in orders] == [
         ("ewb-b-1790942400-tp1-1", "BRACKET", 1, 83500.0, 85900.0, "OPEN"),
@@ -2155,9 +2185,10 @@ def test_open_orders_follow_the_cursor_and_parse_brackets():
     ]
     assert all(o.is_open for o in orders)
     assert orders[0].side == 1 and orders[0].created_ts == 1791028841
-    assert client.calls[0][2]["product_ids"] == [FUT]
-    assert client.calls[0][2]["order_status"] == ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"]
-    assert client.calls[1][2]["cursor"] == "c-2"
+    assert all(c[2]["product_ids"] == [FUT] and c[2]["limit"] == 250 for c in client.calls)
+    assert [(statuses(c[2]), c[2]["cursor"]) for c in client.calls] == [
+        (["PENDING"], None), (["QUEUED"], None), (["OPEN"], None), (["OPEN"], "c-2"), (["EDIT_QUEUED"], None),
+        (["CANCEL_QUEUED"], None)]
 
 
 def test_find_and_get_order():
@@ -2524,9 +2555,11 @@ def test_a_refused_cancel_of_an_order_that_already_ended_is_no_error(status):
     assert client.calls[-1][:2] == ("GET", API + "/orders/historical/o-refused")
 
 
-def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypatch):
-    """List Orders takes order_status as an exploded array; SDK 1.8.4 passes the list to requests unchanged
-    (list_orders(order_status: Optional[List[str]])), which repeats the key. Needs the `live` group."""
+def test_the_pinned_sdk_sends_one_resting_status_per_request(monkeypatch):
+    """List Orders takes order_status as an exploded array: SDK 1.8.4 passes the list to requests unchanged
+    (list_orders(order_status: Optional[List[str]])), which repeats the key - and the venue refuses two active statuses
+    in one request (HTTP 400, 2026-10-04; the fake HTTP layer answers the same). Through the real SDK and requests,
+    each request carries one status and together every resting status. Needs the `live` group."""
     rest = pytest.importorskip("coinbase.rest")
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -2541,14 +2574,19 @@ def test_the_pinned_sdk_sends_every_open_status_as_a_repeated_parameter(monkeypa
     def fake_request(method, url, params=None, json=None, headers=None, timeout=None):
         urls.append(requests.Request(method, url, params=params).prepare().url)
         r = requests.Response()
-        r.status_code = 200
-        r._content = b'{"orders": [], "has_next": false, "cursor": ""}'
+        if len(parse_qs(urlsplit(urls[-1]).query).get("order_status", [])) > 1:  # the venue's rule
+            r.status_code, r._content = 400, MULTI_STATUS_REFUSAL.encode()
+        else:
+            r.status_code, r._content = 200, b'{"orders": [], "has_next": false, "cursor": ""}'
         return r
 
     monkeypatch.setattr(client.session, "request", fake_request)
+    with pytest.raises(requests.exceptions.HTTPError):  # the SDK's own call with two statuses: repeated, refused
+        client.list_orders(product_ids=[FUT], order_status=["OPEN", "CANCEL_QUEUED"])
+    urls.clear()
     assert CoinbaseExchange(client, FUT).open_orders() == []
-    query = urls[0].split("?", 1)[1]
-    assert [p.split("=")[1] for p in query.split("&") if p.startswith("order_status=")] == list(OPEN_STATUSES)
+    assert [parse_qs(urlsplit(u).query)["order_status"] for u in urls] == [
+        ["PENDING"], ["QUEUED"], ["OPEN"], ["EDIT_QUEUED"], ["CANCEL_QUEUED"]]
 
 
 # ---------------------------------------------------------------------------- Final fix (non-finite amounts, replies)
@@ -2701,6 +2739,79 @@ def test_a_429_on_public_market_data_never_holds_a_private_request():
     client.routes[("GET", API + "/market/product_book")] = ["book_bip"]
     now[0] += 6
     assert ex.quote(FUT).bid == 84655.0
+
+
+# ---------------------------------------------------------------------------- Hotfix (List Orders: one status each)
+def resting(*orders: tuple[str, str]) -> dict:
+    """One page holding a bracket of ours for each (order_id, status)."""
+    o = FIXTURES["orders_open_page1"]["orders"][0]
+    return {**EMPTY_PAGE, "orders": [{**o, "order_id": oid, "status": status} for oid, status in orders]}
+
+
+def test_open_orders_ask_one_resting_status_per_request():
+    """First SHADOW deploy (2026-10-04): Coinbase refused the five resting statuses in one List Orders request (HTTP 400
+    INVALID_ARGUMENT - the fake client answers the same), so the deploy's flat-book check could not read the book. Each
+    resting status is asked alone, in the order an order moves through them (placed, resting, an edit or a cancel
+    queued): an order that moves on between two requests is read in its later status."""
+    assert sorted(VENUE_ACTIVE) == sorted(OPEN_STATUSES)  # the venue's active statuses are the adapter's resting ones
+    ex, client, _ = make({("GET", "/orders/historical/batch"): by_status({})})
+    assert ex.open_orders() == []
+    assert [statuses(c[2]) for c in client.calls] == [["PENDING"], ["QUEUED"], ["OPEN"], ["EDIT_QUEUED"],
+                                                      ["CANCEL_QUEUED"]]
+
+
+def test_an_order_read_under_two_statuses_is_listed_once_as_last_read():
+    """An order whose cancel is queued between the OPEN request and the CANCEL_QUEUED one is in both replies: listed
+    once, as the later request read it (a queued cancel still rests: the executor never counts it as a leg)."""
+    ex, _, _ = make({("GET", "/orders/historical/batch"): by_status({
+        "OPEN": [resting(("o-1", "OPEN"), ("o-2", "OPEN"))], "CANCEL_QUEUED": [resting(("o-1", "CANCEL_QUEUED"))]})})
+    assert [(o.order_id, o.status) for o in ex.open_orders()] == [("o-1", "CANCEL_QUEUED"), ("o-2", "OPEN")]
+
+
+@pytest.mark.parametrize("failure", [
+    http_error(400, '{"error":"INVALID_ARGUMENT"}'),  # refused
+    http_error(503, "busy"),  # unavailable through every retry
+    {"sequence": "0", "has_next": False, "cursor": ""},  # no orders list: never read as none
+    {"orders": {"order_id": "o-x"}, "has_next": False, "cursor": ""},  # not a list
+    {"orders": [], "has_next": True, "cursor": ""},  # more pages, but no cursor to ask for them
+    {"orders": [], "has_next": True, "cursor": "c-again"},  # the same cursor again and again
+], ids=["refused", "unavailable", "no-orders", "orders-not-a-list", "no-cursor", "cursor-loop"])
+def test_open_orders_fail_closed_when_any_status_cannot_be_read(failure):
+    """Never a partial book read as complete: a status - or one of its pages - that cannot be read fails the whole read
+    (ExchangeError) whatever the other statuses answered, and nothing more is asked after it."""
+    for bad in OPEN_STATUSES:
+        def answer(params, bad=bad):
+            (status,) = statuses(params)
+            return failure if status == bad else resting((f"o-{status}", status))
+
+        ex, client, _ = make({("GET", "/orders/historical/batch"): answer})
+        with pytest.raises(ExchangeError):
+            ex.open_orders()
+        assert statuses(client.calls[-1][2]) == [bad]
+
+
+def test_the_requests_of_one_read_share_one_budget_of_waits():
+    """open_orders' five requests (and their pages), like find_order's pages, are one call of the adapter: their waits -
+    pacing and retries - add up to at most RETRY_SLEEP_MAX_S, then its error is raised (the loop reads again on its next
+    pass). A budget per request would hold the loop for 20 s here."""
+    asked: dict[str, int] = {}
+
+    def answer(params):
+        (status,) = statuses(params)
+        asked[status] = asked.get(status, 0) + 1
+        return http_error(429, "", {"Retry-After": "4"}) if asked[status] == 1 else EMPTY_PAGE
+
+    ex, client, slept = make({("GET", "/orders/historical/batch"): answer})
+    with pytest.raises(RateLimited):
+        ex.open_orders()
+    assert slept == [4.0, 4.0, 4.0] and len(client.calls) == 7  # the fourth status's wait would pass 15 s
+    pages: list = []
+    for n in range(4):
+        pages += [http_error(429, "", {"Retry-After": "4"}), {**EMPTY_PAGE, "has_next": True, "cursor": f"c-{n}"}]
+    ex2, _, slept2 = make({("GET", "/orders/historical/batch"): pages})
+    with pytest.raises(RateLimited):
+        ex2.find_order("ewb-e-1-L", since_ts=0)
+    assert slept2 == [4.0, 4.0, 4.0]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2745,6 +2856,11 @@ wait that would pass it raises the call's error instead (the loop tries again on
 data and the private account and order endpoints apart: their pacing and their 429 windows are kept apart too, so a
 429 on a quote never holds back a close. A call so blocks the loop for at most
 RETRY_SLEEP_MAX_S plus its requests' own timeouts (10 s each), and in a 429 storm only the first call of a pass waits.
+A call of several requests - the pages of a List Orders query, open_orders' statuses - has one budget of waits.
+
+List Orders refuses two active statuses in one request (HTTP 400 INVALID_ARGUMENT "Cannot pass multiple statuses when
+requesting active orders", the real venue on 2026-10-04): open_orders() asks for each resting status alone
+(RESTING_SWEEP) and merges the replies by order id; any status or page it cannot read fails the whole read.
 
 Only ExchangeError (or ValueError for a side that is not +1/-1, a programming error) leaves this module:
 an unexpected reply shape is an ExchangeError, a reply that is not a JSON object - or an order reply without
@@ -2771,7 +2887,6 @@ import requests
 
 from ewbot.live.exchange import (
     FUTURES_PRODUCT,
-    OPEN_STATUSES,
     SPOT_PRODUCT,
     Balance,
     ExchangeError,
@@ -2802,12 +2917,24 @@ _REASON_FIELDS = ("new_order_failure_reason", "error", "preview_failure_reason")
 CANCEL_DONE = frozenset({"DUPLICATE_CANCEL_REQUEST", "ORDER_IS_FULLY_FILLED"})  # nothing rests any more
 RETRY_AFTER_MAX_S = 10.0  # never wait longer than the pacing cap on one 429
 RETRY_SLEEP_MAX_S = 15.0  # one call's waits (pacing and retries) add up to at most this: then its error is raised
+# open_orders' requests, one status each (OPEN_STATUSES), in the order an order moves through them - placed, resting, an
+# edit or a cancel queued -, so an order that moves on between two requests is read in its later status
+RESTING_SWEEP = ("PENDING", "QUEUED", "OPEN", "EDIT_QUEUED", "CANCEL_QUEUED")
 _PARSE_ERRORS = (KeyError, ValueError, TypeError, AttributeError, IndexError)
 
 
 class DuplicateClientOrderId(ExchangeError):
     """An HTTP 4xx whose body names DUPLICATE_CLIENT_ORDER_ID: an order with this id exists. The order
     calls turn it into PlaceResult(duplicate=True), so the executor looks the order up."""
+
+
+class _Waits:
+    """What one call of the adapter has waited so far (pacing and retries), shared by all its requests."""
+
+    __slots__ = ("slept",)
+
+    def __init__(self) -> None:
+        self.slept = 0.0
 
 
 @contextmanager
@@ -3063,21 +3190,23 @@ class CoinbaseExchange:
         self._wait_until[public] = self.clock() + min(max(wait, 0.0), RETRY_AFTER_MAX_S)
 
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
-              data: dict[str, Any] | None = None, public: bool = False, retry: bool = True) -> dict[str, Any]:
+              data: dict[str, Any] | None = None, public: bool = False, retry: bool = True,
+              waits: _Waits | None = None) -> dict[str, Any]:
+        """One request; `waits` is the budget of the call it belongs to (a call of several requests passes its own)."""
         tries = self.attempts if retry else 1
         left = self._limited_until[public] - self.clock()
         if 0 < left <= RETRY_AFTER_MAX_S:  # a 429's Retry-After still runs: nothing sent (a clock step back ignores it)
             raise RateLimited(f"rate limited: {left:.0f} s left of the last HTTP 429's Retry-After (nothing sent)",
                               retry_after=left)
-        slept = 0.0
+        waits = _Waits() if waits is None else waits
         for attempt in range(tries):
             delay = self._wait_until[public] - self.clock()
             if delay > 0:
-                if slept + delay > RETRY_SLEEP_MAX_S:
+                if waits.slept + delay > RETRY_SLEEP_MAX_S:
                     raise RateLimited(f"rate limited: the pacing wait of {delay:.0f} s passes the call's "
                                       f"{RETRY_SLEEP_MAX_S:.0f} s budget (nothing sent)", retry_after=delay)
                 self.sleep(delay)
-                slept += delay
+                waits.slept += delay
             try:
                 if method == "GET":
                     resp = self.client.get(API + path, params=params, public=public)
@@ -3092,10 +3221,10 @@ class CoinbaseExchange:
                 if not err.retryable or attempt == tries - 1:
                     raise err from None
                 wait = min(err.retry_after, RETRY_AFTER_MAX_S) if isinstance(err, RateLimited) else self.backoff_s * 2**attempt
-                if slept + wait > RETRY_SLEEP_MAX_S:  # the loop tries again on its next pass
+                if waits.slept + wait > RETRY_SLEEP_MAX_S:  # the loop tries again on its next pass
                     raise err from None
                 self.sleep(wait)
-                slept += wait
+                waits.slept += wait
                 continue
             self._limited_until[public] = 0.0  # answered: no 429 runs any more
             resp = dict(resp)
@@ -3177,23 +3306,42 @@ class CoinbaseExchange:
             side = str(p.get("side") or "").removeprefix(POSITION_SIDE_PREFIX)
             return Position(_side_of(side, _POSITION_SIDES, "position"), n, _opt(p.get("avg_entry_price")) or 0.0)
 
-    def _orders(self, params: dict[str, Any]) -> list[Order]:
+    def _orders(self, params: dict[str, Any], waits: _Waits | None = None) -> list[Order]:
+        """Every page of a List Orders query, one budget of waits for all of them. A page that cannot be read or
+        followed - no `orders` list (the reference requires it), `has_next` without a new cursor - is an
+        ExchangeError: never a partial list read as complete."""
+        waits = _Waits() if waits is None else waits
         out: list[Order] = []
         cursor: str | None = None
+        asked: set[str] = set()
         while True:
-            page = self._call("GET", "/orders/historical/batch",
+            page = self._call("GET", "/orders/historical/batch", waits=waits,
                               params={**params, "product_ids": [self.futures_id], "limit": 250, "cursor": cursor})
             with _parsing("orders"):
-                out += [parse_order(o) for o in page.get("orders") or []]
-                cursor = page.get("cursor") or None
-                more = bool(page.get("has_next"))
-            if not more or not cursor:
-                return out
+                orders = page["orders"]
+                if not isinstance(orders, list):
+                    raise TypeError("orders is not a list")
+                out += [parse_order(o) for o in orders]
+                if not page.get("has_next"):
+                    return out
+                cursor = str(page.get("cursor") or "")
+                if not cursor or cursor in asked:
+                    raise ValueError("has_next without a new cursor")
+                asked.add(cursor)
 
     def open_orders(self) -> list[Order]:
-        """Every resting order: order_status is a repeated query parameter (List Orders reference,
-        `explode: true`; SDK 1.8.4 list_orders takes `order_status: List[str]`)."""
-        return [o for o in self._orders({"order_status": list(OPEN_STATUSES)}) if o.is_open]
+        """Every resting order. List Orders refuses two active statuses in one request (HTTP 400, 2026-10-04; the
+        legacy reference: OPEN cannot be paired with another status), and none of them is documented to cover another:
+        one request per resting status (RESTING_SWEEP, `order_status` a one-item list - SDK 1.8.4 list_orders takes
+        `List[str]`), each followed through its pages, merged by order id - an order in two replies moved on between
+        them and keeps the later read. The requests are one call: their waits share RETRY_SLEEP_MAX_S, and the first
+        status that cannot be read fails the read (ExchangeError) - never a book read without it."""
+        waits = _Waits()
+        found: dict[str, Order] = {}
+        for status in RESTING_SWEEP:
+            for o in self._orders({"order_status": [status]}, waits):
+                found[o.order_id] = o
+        return [o for o in found.values() if o.is_open]
 
     def get_order(self, order_id: str) -> Order:
         reply = self._call("GET", f"/orders/historical/{order_id}")
@@ -3346,7 +3494,7 @@ class CoinbaseExchange:
 uv run --group live pytest tests/live/test_coinbase.py -q
 ```
 
-Expected: `111 passed` (with `uv run pytest` and without the group the two SDK tests are skipped: `109 passed, 2 skipped`).
+Expected: `120 passed` (with `uv run pytest` and without the group the two SDK tests are skipped: `118 passed, 2 skipped`).
 
 - [ ] **Step 5: Commit**
 
@@ -19908,7 +20056,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `552 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `561 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -21229,7 +21377,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `51 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1223 passed, 1 skipped` without a candle cache (`1224 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `51 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1232 passed, 1 skipped` without a candle cache (`1233 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -21264,7 +21412,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `1224 passed` with the real cache (`1223 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `1233 passed` with the real cache (`1232 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
@@ -21311,9 +21459,9 @@ out = {
     "balance_summary": c.get(p + "/cfm/balance_summary"),
     "key_permissions": c.get(p + "/key_permissions"),
     "orders_history": c.get(p + "/orders/historical/batch", params={"product_ids": ["BIP-20DEC30-CDE"], "limit": 5}),
-    "orders_open": c.get(p + "/orders/historical/batch", params={
-        "product_ids": ["BIP-20DEC30-CDE"], "limit": 5,
-        "order_status": ["OPEN", "PENDING", "QUEUED", "EDIT_QUEUED", "CANCEL_QUEUED"]}),  # open_orders()' filter
+    "orders_open": {s: c.get(p + "/orders/historical/batch", params={
+        "product_ids": ["BIP-20DEC30-CDE"], "limit": 5, "order_status": [s]})
+        for s in ("PENDING", "QUEUED", "OPEN", "EDIT_QUEUED", "CANCEL_QUEUED")},  # open_orders(): one status each
     "preview_ok": c.post(p + "/orders/preview", data={"product_id": "BIP-20DEC30-CDE", "side": "BUY",
                                                       "order_configuration": {"market_market_ioc": {"base_size": "1"}}}),
 }
@@ -21324,7 +21472,7 @@ print(sorted(out))
 EOF
 ```
 
-Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account identifier, and diff its keys and value formats against the fixture entries. A difference in a field the parsers read (`side`, `number_of_contracts`, `avg_entry_price`, `total_usd_balance`, `unrealized_pnl`, `available_margin`, `can_*`, `order_configuration`, `status`, `filled_size`, `average_filled_price`, `total_fees`, `errs`) is a bug: update the fixture with the real shape, adapt `live/coinbase.py`, rerun the tests, redeploy (flat book). If `orders_open` is refused (HTTP 4xx), Coinbase does not combine `order_status` values: make `open_orders()` send one request per resting status before CANARY. The flat account's `positions` reply must have the documented shape (`{"positions": []}`, or entries with a `product_id`): another shape is refused - the start then reports the account unreadable and `ewbot live status --exchange` `unexpected positions reply` - and is fixed before the SHADOW days count.
+Copy `/var/lib/ewbot/recorded-private.json` to your laptop, remove any account identifier, and diff its keys and value formats against the fixture entries. A difference in a field the parsers read (`side`, `number_of_contracts`, `avg_entry_price`, `total_usd_balance`, `unrealized_pnl`, `available_margin`, `can_*`, `order_configuration`, `status`, `filled_size`, `average_filled_price`, `total_fees`, `errs`) is a bug: update the fixture with the real shape, adapt `live/coinbase.py`, rerun the tests, redeploy (flat book). Coinbase refuses two resting `order_status` values in one request (HTTP 400 `INVALID_ARGUMENT`, the first deploy's flat-book check on 2026-10-04), so `orders_open` holds one reply per resting status, asked as `open_orders()` asks (Step 8); a status refused on its own (HTTP 4xx) is a bug - every read of the book fails closed until it is fixed. The flat account's `positions` reply must have the documented shape (`{"positions": []}`, or entries with a `product_id`): another shape is refused - the start then reports the account unreadable and `ewbot live status --exchange` `unexpected positions reply` - and is fixed before the SHADOW days count.
 
 - [ ] **Step 6: Run SHADOW for at least 14 days (controller watches, user restarts once)**
 
@@ -21344,4 +21492,4 @@ Expected: the preflight's key line reads `view=True trade=True transfer=False` a
 
 - [ ] **Step 8: CANARY confirmations (controller records the answers in the project notes)**
 
-During CANARY, confirm the spec §6.2 unknowns from the journal and the Coinbase order history: duplicate `client_order_id` behaviour; whether the brackets survive the Friday 17:00–18:00 New York close; whether `orders/edit` moves a bracket stop (then set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy with a flat book); the limit of the first triggered bracket stop (the reference says 5% beyond the stop: `STOP_LIMIT_OFFSET`, also the stop-gap threshold); the reason codes Coinbase gives for a bracket refused because it would exceed the position and for a close refused while brackets rest (`OVERLAP_REFUSALS`, `CLOSE_CONFLICTS` in `live/executor.py`; the `BRACKET_FAILED` / `CLOSE_FAILED` events carry them: add a code to `EWBOT_OVERLAP_REFUSALS` / `EWBOT_CLOSE_CONFLICTS` in `deploy/live/.env` and restart - no code change, no flat book needed; the `[시작]` alert lists the codes added); that brackets - a triggered stop resting as a limit included - only reduce at fill time, so a bracket left after a close cannot open or flip a position (closes are sent with the brackets resting); whether a sized `close_position` (a reduction) is refused while our brackets cover the position, and the code it gives (add it to `EWBOT_CLOSE_CONFLICTS`); right after the first CANARY fill, the raw `GET /api/v3/brokerage/cfm/positions` reply compared with the fixture field by field (`positions`, `product_id`, `number_of_contracts`, `side`, `avg_entry_price`: a reply of another shape is refused, never read as flat); whether the breakers could read the futures balance alone - `cfm/balance_summary`'s futures fields, and whether Coinbase's automatic transfers between the spot and futures balances move money by themselves (until then the account's whole USD balance is the breakers' equity and every deliberate money movement needs `ewbot live rebase --confirm`); the actual fee tier (`GET /api/v3/brokerage/transaction_summary`); what Coinbase does with a bracket whose stop is already through the market when it is placed (refused - its code - or triggered at once, as the simulator does); how long it shows a bracket fill in the orders before the position (the runbook's "Before FULL" list); whether Coinbase accepts or refuses placing and cancelling brackets during the weekly Friday halt and the quarterly maintenance, and the code it gives (until known, a stop move refused while the session is not OPEN is judged by the protection still resting); the measured costs in the daily summaries vs. the paper cost model. After a CANARY failure (entries paused) the user decides: `/resume`, and, once the cause is fixed and the book flat, `ewbot live stage canary --restart --confirm` to count toward the CANARY pass again from then (without it the failed stint keeps FULL closed). CANARY passes with ≥ 3 closed trades (or 90 days) and every CANARY gate `충족` (`ewbot live status`). FULL is not part of this month's schedule: it needs all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades), the CANARY gates and the user's approval (`ewbot live stage full --confirm`). Two FULL preconditions are not machine-checkable and are recorded in the project notes before it: the spec §2 Coinbase facts re-checked against Coinbase's current documentation (spec §8 `FULL 전에 §2를 다시 확인한다`: product, margin rates, order types, the triggered stop's limit, rate limits, fees, session hours) and the trade key's IP allowlist still holding only the VPS's IPv4 (runbook, Stage transitions).
+During CANARY, confirm the spec §6.2 unknowns from the journal and the Coinbase order history: duplicate `client_order_id` behaviour; whether the brackets survive the Friday 17:00–18:00 New York close; whether `orders/edit` moves a bracket stop (then set `EWBOT_LIVE_EDIT_STOPS=1` in `deploy/live/.env` and redeploy with a flat book); the limit of the first triggered bracket stop (the reference says 5% beyond the stop: `STOP_LIMIT_OFFSET`, also the stop-gap threshold); the reason codes Coinbase gives for a bracket refused because it would exceed the position and for a close refused while brackets rest (`OVERLAP_REFUSALS`, `CLOSE_CONFLICTS` in `live/executor.py`; the `BRACKET_FAILED` / `CLOSE_FAILED` events carry them: add a code to `EWBOT_OVERLAP_REFUSALS` / `EWBOT_CLOSE_CONFLICTS` in `deploy/live/.env` and restart - no code change, no flat book needed; the `[시작]` alert lists the codes added); that brackets - a triggered stop resting as a limit included - only reduce at fill time, so a bracket left after a close cannot open or flip a position (closes are sent with the brackets resting); whether a sized `close_position` (a reduction) is refused while our brackets cover the position, and the code it gives (add it to `EWBOT_CLOSE_CONFLICTS`); right after the first CANARY fill, the raw `GET /api/v3/brokerage/cfm/positions` reply compared with the fixture field by field (`positions`, `product_id`, `number_of_contracts`, `side`, `avg_entry_price`: a reply of another shape is refused, never read as flat); whether the breakers could read the futures balance alone - `cfm/balance_summary`'s futures fields, and whether Coinbase's automatic transfers between the spot and futures balances move money by themselves (until then the account's whole USD balance is the breakers' equity and every deliberate money movement needs `ewbot live rebase --confirm`); the actual fee tier (`GET /api/v3/brokerage/transaction_summary`); what Coinbase does with a bracket whose stop is already through the market when it is placed (refused - its code - or triggered at once, as the simulator does); how long it shows a bracket fill in the orders before the position (the runbook's "Before FULL" list); whether Coinbase accepts or refuses placing and cancelling brackets during the weekly Friday halt and the quarterly maintenance, and the code it gives (until known, a stop move refused while the session is not OPEN is judged by the protection still resting); the measured costs in the daily summaries vs. the paper cost model. List Orders: two active `order_status` values in one request were refused on 2026-10-04 by the real venue (HTTP 400 `INVALID_ARGUMENT` "Cannot pass multiple statuses when requesting active orders (OPEN, PENDING, QUEUED, EDIT_QUEUED, or CANCEL_QUEUED)", the first SHADOW deploy's flat-book check; the reference does not say that one status covers another), so `open_orders()` asks for each resting status alone - `RESTING_SWEEP`: PENDING, QUEUED, OPEN, EDIT_QUEUED, CANCEL_QUEUED, the order an order moves through them; five private requests a read, more only past 250 orders a status -, merges the replies by order id (the later read kept), shares one 15 s budget of waits across them and fails the read when any status cannot be read; record from the CANARY order history which statuses our orders show (a queued cancel under `CANCEL_QUEUED` only, never under `OPEN` too), and whether a List Orders without a status but with a `start_date` - `find_order`, the lookup of an order whose answer was lost - lists an order that still rests (the legacy reference said `start_date` and `end_date` do not apply to open orders). After a CANARY failure (entries paused) the user decides: `/resume`, and, once the cause is fixed and the book flat, `ewbot live stage canary --restart --confirm` to count toward the CANARY pass again from then (without it the failed stint keeps FULL closed). CANARY passes with ≥ 3 closed trades (or 90 days) and every CANARY gate `충족` (`ewbot live status`). FULL is not part of this month's schedule: it needs all four Plan 1 §9.6 criteria (incl. 50 out-of-sample trades), the CANARY gates and the user's approval (`ewbot live stage full --confirm`). Two FULL preconditions are not machine-checkable and are recorded in the project notes before it: the spec §2 Coinbase facts re-checked against Coinbase's current documentation (spec §8 `FULL 전에 §2를 다시 확인한다`: product, margin rates, order types, the triggered stop's limit, rate limits, fees, session hours) and the trade key's IP allowlist still holding only the VPS's IPv4 (runbook, Stage transitions).
