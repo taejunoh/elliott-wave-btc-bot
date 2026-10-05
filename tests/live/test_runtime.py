@@ -21,6 +21,7 @@ from ewbot.live.exchange import (
     Order,
     PlaceResult,
     Position,
+    PreviewResult,
     RateLimited,
     Unavailable,
 )
@@ -1685,6 +1686,109 @@ def test_a_shadow_cycle_asks_again_for_an_unanswered_entry_preview(tmp_path):
     gates = {g.name: g for g in shadow_gates(hs.journal, ENTRY_BAR + 3640, None)}
     assert gates["③ 냈을 주문 전부 preview 통과"].met
     hs.journal.close()
+
+
+POSITION_REFUSAL = "PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION"
+PREVIEW_GATE = "③ 냈을 주문 전부 preview 통과"
+
+
+class FlatAccount(SimExchange):
+    """The real account of SHADOW as Coinbase answered on 2026-10-05 (flat, View key): a market preview is checked -
+    size, funds -, while every bracket preview is refused with POSITION_REFUSAL alone, whatever the bracket (valid,
+    its stop on the wrong side, a marketable take-profit, 1000 contracts): Coinbase checks a bracket's size against
+    the position before anything else. `bracket_errors` replaces that answer."""
+
+    bracket_errors: tuple[str, ...] = (POSITION_REFUSAL,)
+
+    def preview_bracket(self, side: int, size: int, limit_price: float, stop_price: float) -> PreviewResult:
+        self._fault("preview_bracket")
+        return PreviewResult(False, self.bracket_errors)
+
+
+def flat_shadow(tmp_path, name: str = "journal.sqlite") -> tuple[ShadowExchange, FlatAccount, Journal, Clock,
+                                                                  list[str]]:
+    """A ShadowExchange over a FlatAccount, its journal in SHADOW; the alert kinds it sends."""
+    clock = Clock(1_000.0)
+    real = FlatAccount(clock=clock)
+    real.set_prices(60_000.0, 60_010.0)
+    jr = journal(tmp_path, name)
+    jr.set_stage("SHADOW", "test", 0.0)
+    alerts: list[str] = []
+    return ShadowExchange(real, jr, clock=clock, alert=lambda k, t: alerts.append(k)), real, jr, clock, alerts
+
+
+def preview_gate(jr: Journal, now: float):
+    return {g.name: g for g in shadow_gates(jr, now, None)}[PREVIEW_GATE]
+
+
+def test_shadow_gate_3_is_met_when_coinbase_refuses_the_brackets_only_for_want_of_a_position(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="SHADOW")
+    real = FlatAccount(clock=hs.clock)  # stands in for the flat Coinbase account
+    alerts: list[str] = []
+    hs.ex = ShadowExchange(real, hs.journal, clock=hs.clock, alert=lambda k, t: alerts.append(k))
+    hs.rt = hs.make_runtime()
+    opening = float(hs.bar(ENTRY_BAR)["open"])
+    real.set_prices(opening, opening)
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)  # the entry and its bracket, both previewed on the real account
+    gate = preview_gate(hs.journal, ENTRY_BAR + 40)
+    assert gate.met, gate.detail
+    assert gate.detail == "1/1, 포지션이 없어 확인 못 한 브래킷 1건 (CANARY 첫 거래에서 확인)"
+    assert [(e["data"]["kind"], e["data"]["ok"]) for e in hs.journal.events(kind="PREVIEW")] == [("MARKET", True)]
+    assert [(e["data"]["kind"], e["data"]["errors"]) for e in hs.journal.events(kind="PREVIEW_POSITION_DEPENDENT")] == [
+        ("BRACKET", [POSITION_REFUSAL])]
+    assert alerts == [] and hs.ex.position().contracts == 1 and len(hs.ex.open_orders()) == 1  # protected virtually
+    assert real.orders == {} and real.position() is None
+    assert not {"place_market", "place_bracket", "edit_bracket", "cancel", "close_position"} & set(real.calls)
+    hs.journal.close()
+
+
+def test_any_other_preview_refusal_still_fails_gate_3(tmp_path):
+    for i, (kind, errors) in enumerate([
+            ("BRACKET", ("PREVIEW_INVALID_BRACKET_PRICES",)),  # another refusal
+            ("BRACKET", (POSITION_REFUSAL, "PREVIEW_INSUFFICIENT_FUNDS_FOR_FUTURES")),  # mixed with another one
+            ("BRACKET", ("PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION",)),  # brackets resting: not a flat account's
+            ("BRACKET", ()),  # refused without a reason
+            ("MARKET", (POSITION_REFUSAL,))]):  # a market preview stays strict
+        sh, real, jr, clock, alerts = flat_shadow(tmp_path, f"journal-{i}.sqlite")
+        if kind == "BRACKET":
+            real.bracket_errors = errors
+        else:
+            real.preview_errors = errors
+        assert sh.place_market("ewb-e-1-L", 1, 1).ok
+        assert sh.place_bracket("ewb-b-1-tp1-1", -1, 1, 61_000.0, 59_000.0).ok  # the virtual book takes it
+        assert not preview_gate(jr, clock.now).met and alerts == ["PREVIEW_FAILED"], (kind, errors)
+        jr.close()
+
+
+def test_a_bracket_the_venue_model_refuses_fails_gate_3_without_asking_coinbase(tmp_path):
+    # the flat account would answer each of these POSITION_REFUSAL like a valid one: the size, the tick grid and the
+    # sides are checked before the real preview (the virtual book's intake, SimExchange._rejected)
+    for i, (side, size, tp, stop, code) in enumerate([
+            (-1, 1, 59_000.0, 61_000.0, "PREVIEW_INVALID_BRACKET_PRICES"),  # a long's stop above its take-profit
+            (1, 1, 61_000.0, 59_000.0, "PREVIEW_INVALID_BRACKET_PRICES"),  # a short's stop below its take-profit
+            (-1, 1, 61_002.0, 59_000.0, "PREVIEW_INVALID_PRICE_PRECISION"),  # off the $5 tick
+            (-1, 1, 61_000.0, 59_001.0, "PREVIEW_INVALID_STOP_PRICE_PRECISION"),
+            (-1, 1.5, 61_000.0, 59_000.0, "PREVIEW_INVALID_SIZE_PRECISION")]):
+        sh, real, jr, clock, alerts = flat_shadow(tmp_path, f"journal-{i}.sqlite")
+        assert sh.place_market("ewb-e-1-x", -side, 1).ok
+        assert not sh.place_bracket("ewb-b-1-tp1-1", side, size, tp, stop).ok  # refused virtually too
+        assert "preview_bracket" not in real.calls and not jr.events(kind="PREVIEW_POSITION_DEPENDENT")
+        assert [e["data"]["errors"] for e in jr.events(kind="PREVIEW") if not e["data"]["ok"]] == [[code]], code
+        assert not preview_gate(jr, clock.now).met and alerts == ["PREVIEW_FAILED"]
+        jr.close()
+
+
+def test_a_bracket_preview_answered_later_for_want_of_a_position_is_set_apart_too(tmp_path):
+    sh, real, jr, clock, alerts = flat_shadow(tmp_path)
+    assert sh.place_market("ewb-e-1-L", 1, 1).ok
+    real.fail_next("preview_bracket", Unavailable("503"), times=2)  # both tries unanswered
+    assert sh.place_bracket("ewb-b-1-tp1-1", -1, 1, 61_000.0, 59_000.0).ok
+    assert alerts == ["PREVIEW_UNVERIFIED"] and not jr.events(kind="PREVIEW_POSITION_DEPENDENT")
+    assert sh.retry_previews() == 0  # the next cycle: answered, for want of a position only
+    assert [e["data"]["retried"] for e in jr.events(kind="PREVIEW_POSITION_DEPENDENT")] == [True]
+    assert preview_gate(jr, clock.now).met and alerts == ["PREVIEW_UNVERIFIED"]
+    jr.close()
 
 
 def test_the_shadow_book_stays_bounded(tmp_path):
