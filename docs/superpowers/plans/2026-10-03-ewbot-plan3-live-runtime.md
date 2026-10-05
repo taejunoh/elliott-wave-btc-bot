@@ -65,7 +65,7 @@
 | `src/ewbot/live/executor.py` | 7 | intent-before-send, entries, brackets, closes, reductions, restart recovery |
 | `src/ewbot/live/watchdog.py` | 8 | stop gap, margin status, account breakers, session watch, price source |
 | `src/ewbot/live/feed.py` | 8 | WebSocket ticker feed (Coinbase's public endpoint, no key, `websockets` client with verified TLS), gaps, reconnect backoff |
-| `src/ewbot/live/notify.py` | 9 | `[LIVE]` Telegram notifier (paper `TelegramSender`; queued, sent by a background thread with retries; dedupe) |
+| `src/ewbot/live/notify.py` | 9 | `[LIVE]` Telegram notifier (its own sendMessage client, which tells a send that never left from one Telegram may have posted; queued, sent by a background thread with retries - a send left unanswered goes again, marked as a possible copy, only once getMe answers; dedupe) |
 | `src/ewbot/live/control.py` | 9 | Telegram commands (long poll, the user's private chat only, dated commands, persisted offset; the thread never dies) |
 | `src/ewbot/live/health.py` | 9 | heartbeat pings and `/fail` (healthchecks.io) |
 | `src/ewbot/live/audit.py` | 10 | paper-ledger fetch (GitHub contents API) and decision comparison |
@@ -95,16 +95,16 @@
 | 6 | Reconcile planner | 33 |
 | 7 | Executor: intent-before-send, protection, closes, recovery | 83 |
 | 8 | Watchdog and WebSocket feed | 30 |
-| 9 | `[LIVE]` notifier, Telegram control, heartbeat | 14 |
+| 9 | `[LIVE]` notifier, Telegram control, heartbeat | 20 |
 | 10 | Paper audit, stages and gates | 21 |
 | 11 | Settings and preflight | 28 |
-| 12 | `ShadowExchange` and the runtime loop | 96 |
-| 13 | CLI `ewbot live …` and production wiring | 32 |
+| 12 | `ShadowExchange` and the runtime loop | 97 |
+| 13 | CLI `ewbot live …` and production wiring | 33 |
 | 14 | Parity and chaos integration tests | 30 |
 | 15 | Docker image, compose, deploy and backup scripts, runbook | 51 |
 | 16 | Manual checklist: merge, VPS, SHADOW, CANARY gate (controller and user only) | — |
 
-Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 612 more tests, `1232 passed, 1 skipped` (`1233 passed` with the cache; two more skipped without `shellcheck`), about 105 s.
+Baseline before Task 1: `uv run pytest -q` → `620 passed, 1 skipped` without a candle cache (`621 passed` when `data/cache/BTC-USD_1h.parquet` exists). After Task 15: 620 more tests, `1240 passed, 1 skipped` (`1241 passed` with the cache; two more skipped without `shellcheck`), about 105 s.
 
 ---
 
@@ -9518,8 +9518,8 @@ EOF
 - Test: `tests/live/test_control.py`
 
 **Interfaces:**
-- Consumes: `ewbot.paper.notify` (`Sender`, `deliver`, `make_event`; import only), `ewbot.live.journal.Journal`, `requests`, `tests.paper.helpers.FakeSender`, `tests.live.helpers` (`Clock`, `journal`).
-- Produces (`ewbot.live.notify`): `PREFIX = "[LIVE]"`, `DEDUPE_S = 600.0`, `MAX_CHARS = 4000`, `MAX_PENDING = 100`, `MAX_AGE_S = 1800.0`, `fit(text, limit=MAX_CHARS) -> str` (cut in UTF-16 code units, Telegram's measure, ending `…(잘림)`), `refused(error) -> bool` (a send error Telegram gives again for the same message: HTTP 4xx other than 429); `class LiveNotifier(sender, *, clock=time.time, sleep=None, dedupe_s=600.0, max_pending=100)`, callable `(kind, text) -> bool` (only queues: never blocks or raises; False for a duplicate - queued, or delivered within `dedupe_s`, counted from the delivery, never longer after the wall clock stepped back - or without a sender: then stderr; a full queue drops its oldest waiting message), `pump() -> float | None` (one delivery attempt of the oldest message: None when idle, 0.0 after a delivery or a drop, else the pause before the retry - 2 s doubling to 60 s, for a network error, HTTP 429 or 5xx; a `refused` message is dropped at once, never holding the queue, and counted in `refusals`; a message is kept `MAX_AGE_S`; its full text goes to stderr on its first failure and when dropped; one delivered 60 s or more late ends with `(N분 지연)`), `run()`, `start() -> Thread | None` (the sending thread; none without a sender), `flush(timeout) -> bool`, `stop()` (at a flush timeout and at stop every undelivered text goes to stderr; `sleep=None`: the retry pause waits on the stop event), attributes `pending`, `oldest_pending` (when the oldest waiting message was queued), `failing_since` (when the oldest waiting message that has failed was queued; None when none has - it clears on delivery or drop), `last_attempt`, `refusals` (in a row; a delivery resets it), `sent` (the latest 50 texts), `sent_count`, `dropped`, `failures`, `last_error`.
+- Consumes: `ewbot.paper.notify` (`Sender`, `SendError`; import only), `ewbot.live.journal.Journal`, `requests` (and `urllib3.exceptions`, installed with it), `tests.paper.helpers.FakeSender`, `tests.live.helpers` (`Clock`, `journal`).
+- Produces (`ewbot.live.notify`): `PREFIX = "[LIVE]"`, `DEDUPE_S = 600.0`, `MAX_CHARS = 4000`, `RESENT = "(재전송 - 중복일 수 있음)"`, `MAX_PENDING = 100`, `MAX_AGE_S = 1800.0`, `RETRY_BASE_S = 2.0`, `RETRY_MAX_S = 60.0`, `UNANSWERED_BASE_S = 60.0`, `UNANSWERED_MAX_S = 240.0`, `MAX_SENDS = 3`, `CONNECT_TIMEOUT_S = 5.0`, `READ_TIMEOUT_S = 15.0`, the outcomes `UNSENT`, `FLOOD`, `REFUSED`, `UNANSWERED`; `fit(text, limit=MAX_CHARS) -> str` (cut in UTF-16 code units, Telegram's measure, ending `…(잘림)`), `refused(error) -> bool` (a send error Telegram gives again for the same message: HTTP 4xx other than 429), `unsent(exc) -> bool` (a requests exception for a request that never left: `ConnectTimeout`, or a `ConnectionError` over urllib3's `MaxRetryError` whose reason is a connect timeout - `NewConnectionError`: refused, unreachable, a DNS failure -; anything else may have gone out), `class TelegramError(SendError)` (`outcome`, `retry_after`; its message a type name or the HTTP status with the start of the reply, never the token), `outcome(exc) -> (outcome, note, retry_after)` (a `TelegramError` says; another `SendError` by its text - HTTP 429 FLOOD, another 4xx REFUSED, any other status UNANSWERED, `…: ConnectTimeout` UNSENT, any other request failure UNANSWERED; a requests exception by `unsent`, its type name only; any other exception UNSENT); `class TelegramSender(token, chat_id, session=None, *, timeout=(5.0, 15.0), api=TELEGRAM_API)` (callable `(text)`: sendMessage, returns when Telegram posted it - HTTP 200 and `"ok": true` -, else raises `TelegramError`: UNSENT when no connection was made, UNANSWERED when the request went out without a usable answer - the read timeout, a connection dropped once made, HTTP 5xx, a reply that is not ok: Telegram may have posted it -, FLOOD for HTTP 429 with its `retry_after`, REFUSED for any other 4xx; `probe()`: getMe, which posts nothing - returns when Telegram answers, any status below 500, else raises UNSENT or UNANSWERED; the token is never in an error: type names only, raised outside the `except` block, cut out of the reply); `class LiveNotifier(sender, *, clock=time.time, sleep=None, dedupe_s=600.0, max_pending=100)`, callable `(kind, text) -> bool` (only queues: never blocks or raises; False for a duplicate - queued, or delivered within `dedupe_s`, counted from the delivery or from a drop after a send Telegram may have posted, never longer after the wall clock stepped back - or without a sender: then stderr; a full queue drops its oldest waiting message), `pump() -> float | None` (one delivery attempt of the oldest message: None when idle, 0.0 after a delivery or a drop, else the pause before the retry; a failure placed by `outcome`: UNSENT or FLOOD - sent again unmarked after 2 s doubling to 60 s, at least the 429's `retry_after`; REFUSED - dropped at once, never holding the queue, and counted in `refusals`; UNANSWERED - until Telegram answers a send again (`unanswered`) every attempt starts with the sender's `probe()` when it has one and sends nothing unless it is answered, pausing 60 s doubling to 240 s; a send after an unanswered one ends with `RESENT`; after `MAX_SENDS` unanswered sends the message is dropped as possibly posted; a message is kept `MAX_AGE_S`; its full text goes to stderr on its first failure and when dropped; one delivered 60 s or more late ends with `(N분 지연)`), `run()`, `start() -> Thread | None` (the sending thread; none without a sender), `flush(timeout) -> bool`, `stop()` (at a flush timeout and at stop every undelivered text goes to stderr; `sleep=None`: the retry pause waits on the stop event), attributes `pending`, `oldest_pending` (when the oldest waiting message was queued), `failing_since` (when the oldest waiting message that has failed - a send, or the probe before it - was queued; None when none has - it clears on delivery or drop), `last_attempt` (a send or a probe), `refusals` (in a row; a delivery resets it), `unanswered` (sends and probes left unanswered since Telegram last answered a send), `sent` (the latest 50 texts), `sent_count`, `dropped`, `failures` (failed attempts in a row), `last_error`.
 - Produces (`ewbot.live.control`): `COMMANDS = ("/status", "/pause", "/resume", "/flatten", "/flatten_confirm", "/help")`, `OFFSET_KEY = "telegram_offset"` (stored as `{"offset", "ts"}`), `OFFSET_MAX_AGE_S = 86_400.0`, `ERROR_BACKOFF_S = 5.0`, `MAX_BACKOFF_S = 60.0`, `ME_RETRY_S = 60.0`, `ME_RETRY_MAX_S = 1800.0`, `class ControlError(RuntimeError)` (`status`, `retry_after`; its message is a type name or the HTTP status with Telegram's `description`, never the token, and it is raised outside any `except` block, so neither `__cause__` nor `__context__` holds the original), NamedTuple `Command(word, sent)` (`sent`: the message's Telegram date), `command_word(text, bot=None) -> str | None` (total; `/cmd@<bot>` only for this bot's username), `class TelegramControl(token, chat_id, journal, *, session=None, timeout=25, sleep=None, clock=time.time)` with `fetch() -> list[Command]` (messages of the private chat `chat_id` from that user only - no group, channel, edited, forwarded or via-bot message, no command addressed to another bot; the offset stored once per batch, before the batch is returned: at most once; the first start - no stored offset - skips the backlog with getUpdates offset -1 and acts on nothing; an offset stored more than `OFFSET_MAX_AGE_S` ago is not sent), `poll_once(queue)` (getMe first while `bot` is unknown and due - again after 60 s doubling to 30 min until it answers, never a failed poll; never raises: a failure is counted, printed to stderr once per change of state and waited out - 5 s doubling to 60 s, HTTP 429's `retry_after`), `overdue(now) -> float` (seconds the thread is behind its own schedule: the latest poll's end or `start()` + its back-off + a getMe and one long poll; grows while a request hangs), `run(queue)` (polls until `stop()`), `start(queue) -> Thread`, `stop()` (`sleep=None`: the back-off waits on the stop event, so `stop()` ends it), property `alive`, attributes `bot`, `ignored`, `skipped`, `failures` (in a row), `conflicts` (HTTP 409 answers), `last_error`, `last_ok`, `started`, `last_poll_end`, `wait_s`.
 - Produces (`ewbot.live.health`): `fail_url(url) -> str` (`<url>/fail`, a query string kept); `class Heartbeat(url, *, session=None, clock=time.time, interval=60.0, timeout=5.0)` with `beat() -> bool` (once per `interval` - a wall clock stepped back pings at once -; an exception or an HTTP status of 400 or more is a failure; stderr once per change of state), `fail(message) -> bool`, attributes `url`, `failures` (in a row), `last_error`.
 
@@ -9531,6 +9531,7 @@ EOF
 from __future__ import annotations
 
 import queue
+import socket
 import sqlite3
 import threading
 import time
@@ -9539,6 +9540,7 @@ from typing import Any
 
 import pytest
 import requests
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NameResolutionError, NewConnectionError, ProtocolError
 
 from ewbot.live.control import (
     OFFSET_KEY,
@@ -9548,12 +9550,23 @@ from ewbot.live.control import (
     command_word,
 )
 from ewbot.live.health import Heartbeat, fail_url
-from ewbot.live.notify import LiveNotifier, fit
+from ewbot.live.notify import (
+    FLOOD,
+    REFUSED,
+    RESENT,
+    UNANSWERED,
+    UNSENT,
+    LiveNotifier,
+    TelegramError,
+    TelegramSender,
+    fit,
+)
 from ewbot.paper.notify import SendError
 from tests.live.helpers import Clock, journal
 from tests.paper.helpers import FakeSender
 
 TOKEN = "123456:SECRET-TOKEN"
+SEND_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 
 class Resp:
@@ -9565,6 +9578,10 @@ class Resp:
         if isinstance(self._body, Exception):
             raise self._body
         return self._body
+
+    @property
+    def text(self) -> str:
+        return str(self._body)
 
 
 class Session:
@@ -9603,6 +9620,48 @@ class Session:
 
 def ok(*updates: dict) -> Resp:
     return Resp(200, {"ok": True, "result": list(updates)})
+
+
+class Telegram:
+    """api.telegram.org as the live TelegramSender's session: sendMessage posts the text to `chat`, getMe answers.
+    Until clock time `back` Telegram takes every request but its answer times out (requests' ReadTimeout once the
+    15 s read timeout has passed on the clock) - a sendMessage is posted all the same. `fail` holds what the next
+    requests get instead: an exception (nothing posted) or a reply."""
+
+    def __init__(self, clock: Clock, back: float = 0.0, fail: list | None = None) -> None:
+        self.clock, self.back, self.fail = clock, back, list(fail or [])
+        self.chat: list[str] = []
+        self.calls: list[tuple[str, Any]] = []
+
+    def _answer(self, url: str, timeout: Any, text: str | None) -> Any:
+        method = url.rsplit("/", 1)[-1]
+        self.calls.append((method, timeout))
+        if self.fail:
+            a = self.fail.pop(0)
+            if isinstance(a, BaseException):
+                raise a
+            return a
+        if text is not None:
+            self.chat.append(text)
+        if self.clock.now < self.back:
+            self.clock.now += 15.0
+            raise requests.exceptions.ReadTimeout(f"{url}: Read timed out. (read timeout=15)")
+        return Resp(200, {"ok": True, "result": {"message_id": len(self.chat)} if text else {"username": "ewbot_bot"}})
+
+    def post(self, url, json=None, timeout=None):
+        return self._answer(url, timeout, json["text"])
+
+    def get(self, url, params=None, timeout=None):
+        return self._answer(url, timeout, None)
+
+
+def worker(n: LiveNotifier, clock: Clock) -> list[float]:
+    """The sending thread on a fake clock: an attempt, then its pause, until the queue is empty. The pauses."""
+    pauses: list[float] = []
+    while (pause := n.pump()) is not None:
+        pauses.append(pause)
+        clock.now += pause
+    return pauses
 
 
 def upd(uid: int, text: str, *, chat: int = 42, sender: int = 42, date: int = 1_000, kind: str = "private",
@@ -9807,6 +9866,7 @@ def test_a_failed_send_is_kept_retried_and_printed_never_deduplicated_away(capsy
     assert stale.failing_since == clock.now
     clock.now += 1_801  # kept for 30 minutes at most
     assert stale.pump() == 0.0 and (stale.pending, stale.dropped, stale.failing_since) == (0, 1, None)  # cleared
+    assert stale("X", "y")  # it never left: queued again at once
 
 
 def test_a_refused_message_is_dropped_at_once_and_never_holds_the_queue(capsys):
@@ -9839,6 +9899,166 @@ def test_a_refused_message_is_dropped_at_once_and_never_holds_the_queue(capsys):
         n("X", f"blocked {i}")
         assert n.pump() == 0.0
     assert n.refusals == 3 and n.pending == 0  # the runtime counts this as Telegram unusable
+
+
+def test_a_send_telegram_took_but_left_unanswered_goes_again_only_once_telegram_answers(capsys):
+    """2026-10-05 01:11 UTC: for two minutes Telegram took every sendMessage but its answer timed out (getMe's too).
+    Each ReadTimeout was retried as a failure - 2 s doubling - and one alert reached the chat six times, the last two
+    with (2분 지연). A send left unanswered may have been posted: getMe, which posts nothing, is asked before
+    anything more is sent, the message goes again only once Telegram answers, and says it may be a copy."""
+    clock = Clock(1_000.0)
+    tg = Telegram(clock, back=1_120.0)
+    n = LiveNotifier(TelegramSender(TOKEN, "42", session=tg), clock=clock)
+    alert = "[텔레그램 명령 수신 이상] getUpdates 5회 연속 실패 (getUpdates failed: ReadTimeout)"
+    assert n("TELEGRAM", alert)
+    pauses = worker(n, clock)
+    assert tg.chat == [f"[LIVE] {alert}", f"[LIVE] {alert} (4분 지연) {RESENT}"]  # not six copies
+    assert [m for m, _ in tg.calls] == ["sendMessage", "getMe", "getMe", "sendMessage"] and pauses == [60.0, 120.0, 0.0]
+    assert {t for _, t in tg.calls} == {(5.0, 15.0)}  # connect 5 s, read 15 s: a connect failure is told apart
+    err = capsys.readouterr().err
+    assert err.count(alert) == 1 and "(telegram sendMessage failed: ReadTimeout)" in err  # in the container log
+    assert (n.sent_count, n.unanswered, n.failing_since) == (1, 0, None) and not n("TELEGRAM", alert)
+
+
+def test_alerts_queued_while_telegram_hangs_wait_for_it_and_go_out_once_each():
+    clock = Clock(1_000.0)
+    tg = Telegram(clock, back=1_600.0)  # ten minutes
+    n = LiveNotifier(TelegramSender(TOKEN, "42", session=tg), clock=clock)
+    n("TELEGRAM", "first")
+    assert n.pump() == 60.0 and (n.failing_since, n.last_attempt, n.unanswered) == (1_000.0, 1_000.0, 1)
+    clock.now += 60.0
+    for i in range(3):
+        assert n("X", f"alert {i}")
+    assert not n("TELEGRAM", "first")  # still queued
+    seen = []
+    while (pause := n.pump()) is not None:
+        seen.append((pause, n.failing_since, n.last_attempt, n.pending))
+        clock.now += pause
+    assert seen == [(120.0, 1_000.0, 1_075.0, 4), (240.0, 1_000.0, 1_210.0, 4), (240.0, 1_000.0, 1_465.0, 4),
+                    (0.0, None, 1_720.0, 3), (0.0, None, 1_720.0, 2), (0.0, None, 1_720.0, 1), (0.0, None, 1_720.0, 0)]
+    assert tg.chat == ["[LIVE] first", f"[LIVE] first (12분 지연) {RESENT}",  # nothing sent while getMe hung
+                       "[LIVE] alert 0 (11분 지연)", "[LIVE] alert 1 (11분 지연)", "[LIVE] alert 2 (11분 지연)"]
+    assert [m for m, _ in tg.calls].count("getMe") == 4 and n.dropped == 0
+
+
+def test_a_message_whose_sends_go_unanswered_is_sent_three_times_at_most(capsys):
+    """A sender without getMe (any Sender): an unanswered send goes again after 60 s, then 120 s, each copy marked;
+    after the third the message is dropped as possibly posted, and the same alert is not queued again for 10
+    minutes."""
+    clock = Clock(1_000.0)
+    chat: list[str] = []
+
+    def takes_but_never_answers(text: str) -> None:
+        chat.append(text)
+        raise TelegramError("telegram sendMessage failed: ReadTimeout", UNANSWERED)
+
+    n = LiveNotifier(takes_but_never_answers, clock=clock)
+    alert = "[중대 사건] 거래 1이 60초 넘게 보호되지 않음"
+    assert n("INCIDENT", alert)
+    assert worker(n, clock) == [60.0, 120.0, 0.0]
+    assert chat == [f"[LIVE] {alert}", f"[LIVE] {alert} (1분 지연) {RESENT}", f"[LIVE] {alert} (3분 지연) {RESENT}"]
+    assert (n.pending, n.dropped, n.failing_since, n.sent_count) == (0, 1, None, 0)
+    err = capsys.readouterr().err
+    assert f"dropped (3 sends unanswered: Telegram may have posted it): [LIVE] {alert}" in err
+    assert not n("INCIDENT", alert)  # possibly in the chat already: not queued again for 10 minutes
+    clock.now += 601
+    assert n("INCIDENT", alert)
+
+
+def test_a_send_that_never_left_or_was_not_taken_goes_again_soon_unmarked():
+    clock = Clock(1_000.0)
+    flood = Resp(429, {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 7",
+                       "parameters": {"retry_after": 7}})
+    refused_conn = requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NewConnectionError(
+        None, "Failed to establish a new connection: [Errno 111] Connection refused")))  # as requests raises them
+    no_dns = requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NameResolutionError(
+        "api.telegram.org", None, socket.gaierror(8, "nodename nor servname provided, or not known"))))
+    connect_timeout = requests.exceptions.ConnectTimeout(MaxRetryError(None, SEND_URL, ConnectTimeoutError(
+        None, "Connection to api.telegram.org timed out. (connect timeout=5)")))
+    tg = Telegram(clock, fail=[flood, refused_conn, no_dns, connect_timeout])
+    n = LiveNotifier(TelegramSender(TOKEN, "42", session=tg), clock=clock)
+    n("STOP_MOVED", "[손절 이동] 70,000 → 71,000")
+    assert worker(n, clock) == [7.0, 4.0, 8.0, 16.0, 0.0]  # 429's retry_after, then 2 s doubling: as before
+    assert tg.chat == ["[LIVE] [손절 이동] 70,000 → 71,000"]  # one copy, no resend note
+    assert [m for m, _ in tg.calls] == ["sendMessage"] * 5  # no getMe: no send went unanswered
+    assert (n.unanswered, n.failures, n.failing_since) == (0, 0, None)
+
+
+def test_the_live_sender_places_each_outcome_and_never_carries_the_token():
+    clock = Clock(0.0)
+    cases: list[tuple[Any, str | None]] = [
+        (Resp(200, {"ok": True, "result": {"message_id": 1}}), None),
+        (requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NewConnectionError(None, SEND_URL))), UNSENT),
+        (requests.exceptions.ConnectTimeout(MaxRetryError(None, SEND_URL, ConnectTimeoutError(None, SEND_URL))), UNSENT),
+        (requests.exceptions.ReadTimeout(f"{SEND_URL}: Read timed out. (read timeout=15)"), UNANSWERED),
+        (requests.exceptions.ConnectionError(ProtocolError("Connection aborted.", ConnectionResetError(54, SEND_URL))),
+         UNANSWERED),  # reset after the request went out
+        (requests.exceptions.ChunkedEncodingError(SEND_URL), UNANSWERED),
+        (requests.exceptions.SSLError(MaxRetryError(None, SEND_URL, None)), UNANSWERED),
+        (RuntimeError(SEND_URL), UNANSWERED),  # anything else: it may have gone out
+        (Resp(200, ValueError(SEND_URL)), UNANSWERED),  # 200 but not Telegram's reply
+        (Resp(200, {"ok": False}), UNANSWERED),
+        (Resp(502, ValueError("<html>502 Bad Gateway</html>")), UNANSWERED),
+        (Resp(429, {"ok": False, "description": "Too Many Requests", "parameters": {"retry_after": 7}}), FLOOD),
+        (Resp(400, {"ok": False, "description": "Bad Request: message text is empty"}), REFUSED),
+        (Resp(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"}), REFUSED),
+    ]
+    tg = Telegram(clock, fail=[c for c, _ in cases])
+    send = TelegramSender(TOKEN, "42", session=tg)
+    for case, outcome in cases:
+        if outcome is None:
+            send("posted")
+            continue
+        with pytest.raises(TelegramError) as err:
+            send("x")
+        assert err.value.outcome == outcome, case
+        assert err.value.retry_after == (7.0 if outcome == FLOOD else None)
+        assert _chain(err.value) == [err.value]  # neither __cause__ nor __context__ keeps the original
+        text = str(err.value) + repr(err.value) + "".join(traceback.format_exception(err.value))
+        assert TOKEN not in text and "SECRET" not in text
+    assert "HTTP 403: " in str(err.value) and "bot was blocked" in str(err.value)
+    tg.fail = [Resp(200, {"ok": True, "result": {}}), Resp(401, {"ok": False, "description": "Unauthorized"}),
+               Resp(502, ValueError("<html>")), requests.exceptions.ReadTimeout(SEND_URL),
+               requests.exceptions.ConnectionError(MaxRetryError(None, SEND_URL, NewConnectionError(None, SEND_URL)))]
+    send.probe()
+    send.probe()  # answered: the send itself is refused, and counted as such
+    for outcome in (UNANSWERED, UNANSWERED, UNSENT):
+        with pytest.raises(TelegramError) as err:
+            send.probe()
+        assert err.value.outcome == outcome and TOKEN not in str(err.value) and _chain(err.value) == [err.value]
+    assert [m for m, _ in tg.calls[-5:]] == ["getMe"] * 5 and len(tg.chat) == 0  # getMe posts nothing
+
+
+def _loopback(hold: bool) -> int:
+    """A one-connection server on 127.0.0.1 that reads the request, then closes the connection at once or (`hold`)
+    keeps it a second without an answer."""
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def run() -> None:
+        conn, _ = srv.accept()
+        with conn, srv:
+            conn.recv(65_536)
+            if hold:
+                time.sleep(1.0)
+
+    threading.Thread(target=run, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def test_the_real_http_stack_tells_a_request_that_never_left_on_loopback_sockets():
+    """requests and urllib3 as installed, on loopback sockets only: nobody listening (the connection is refused) -
+    the request never left; a server that reads it and closes, or never answers - it went out."""
+    free = socket.create_server(("127.0.0.1", 0))
+    port = free.getsockname()[1]
+    free.close()
+    session = requests.Session()
+    session.trust_env = False  # never through a proxy
+    for p, outcome in ((port, UNSENT), (_loopback(False), UNANSWERED), (_loopback(True), UNANSWERED)):
+        send = TelegramSender(TOKEN, "42", session=session, timeout=(2.0, 0.3),
+                              api=f"http://127.0.0.1:{p}/bot{{token}}/{{method}}")
+        with pytest.raises(TelegramError) as err:
+            send("x")
+        assert err.value.outcome == outcome and TOKEN not in str(err.value), str(err.value)
 
 
 def test_get_me_is_retried_and_a_thread_that_stops_answering_is_overdue(tmp_path, capsys):
@@ -9939,26 +10159,39 @@ Expected: collection error `ModuleNotFoundError: No module named 'ewbot.live.con
 **File: `src/ewbot/live/notify.py`**
 
 ```python
-"""[LIVE] Telegram notifications (Plan 3 spec 3.5): the paper runtime's TelegramSender, messages prefixed
-"[LIVE]" (the paper runtime's start with "[ewbot paper]").
+"""[LIVE] Telegram notifications (Plan 3 spec 3.5): messages prefixed "[LIVE]" (the paper runtime's start with
+"[ewbot paper]"), sent by this module's own sendMessage client (`TelegramSender`).
 
 Never on the trading loop: a call only queues the message and returns at once (it never blocks or raises); a
-background thread (`start()`) sends the queue in order, one attempt at a time. A send that fails for a reason
-that may pass - a transport error, HTTP 429 or 5xx - keeps the message at the head of the queue and retries it
-after a pause that doubles from 2 s to 60 s, for up to 30 minutes (MAX_AGE_S) after it was queued. A message
-Telegram refuses outright (any other HTTP 4xx) is dropped at once, so it never holds the messages behind it;
-`refusals` counts such refusals in a row (a delivery resets it). Every message's full text reaches stderr when
-its send first fails, when it is dropped and when it is still undelivered at flush timeout or stop(), so the
-container log always has it. The queue holds MAX_PENDING messages: when it is full the oldest waiting one is
-dropped (`dropped` counts them). The same (kind, text) is never queued twice and is sent at most once per 10
-minutes, counted from its delivery (a failed send is never deduplicated away; after the wall clock stepped back
-nothing is held back for the size of the step). A message is cut to MAX_CHARS
-with "…(잘림)" (Telegram refuses more than 4096); one delivered a minute or more late says so.
+background thread (`start()`) sends the queue in order, one attempt at a time. A send that fails is placed
+(`outcome`) by whether Telegram can have posted it:
+- UNSENT: no connection was made (a DNS failure, a refused connection, the 5 s connect timeout) - Telegram never
+  had it: sent again as it is after a pause that doubles from 2 s to 60 s;
+- FLOOD: HTTP 429 - not taken: sent again after that pause, at least Telegram's retry_after;
+- REFUSED: any other HTTP 4xx - Telegram gives the same answer again: the message is dropped at once, so it never
+  holds the messages behind it; `refusals` counts such refusals in a row (a delivery resets it);
+- UNANSWERED: the request went out and no usable answer came back (the 15 s read timeout, a connection dropped
+  after it was made, HTTP 5xx, a reply that is not Telegram's ok) - Telegram may have posted it (on 2026-10-05
+  one alert reached the chat six times while Telegram took every send but left its answer to time out). Until
+  Telegram answers a send again (`unanswered` > 0) every attempt first asks the sender's probe() - getMe, which
+  posts nothing - and sends nothing while that goes unanswered too, pausing 60 s doubling to 240 s; the message
+  goes again only once Telegram answers, ending RESENT ("may be a copy"), and after MAX_SENDS unanswered sends
+  it is dropped as possibly posted.
+A message is kept at most 30 minutes (MAX_AGE_S) after it was queued. Its full text reaches stderr when it first
+fails, when it is dropped and when it is still undelivered at flush timeout or stop(), so the container log
+always has it. The queue holds MAX_PENDING messages: when it is full the oldest waiting one is dropped (`dropped`
+counts every drop). The same (kind, text) is never queued twice and is sent at most once per 10 minutes, counted
+from its delivery - or from its drop after a send Telegram may have posted (a message that never reached
+Telegram is never deduplicated away; after the wall clock stepped back nothing is held back for the size of the
+step). A message is cut to MAX_CHARS with "…(잘림)" (Telegram refuses more than 4096); one delivered a minute or
+more late says so.
 
 For the runtime's view of Telegram: `failing_since` is when the oldest waiting message that has failed at least
-once was queued (None when no waiting message has failed: it clears when that message is delivered or dropped),
-`oldest_pending` when the oldest waiting message was queued and `last_attempt` when the worker last tried one -
-waiting messages with no attempt for minutes mean a stuck or never-started worker. Without a sender every
+once - a send, or the probe before it - was queued (None when no waiting message has failed: it clears when that
+message is delivered or dropped), `oldest_pending` when the oldest waiting message was queued and `last_attempt`
+when the worker last tried Telegram (a send or a probe) - waiting messages with no attempt for minutes mean a
+stuck or never-started worker. Any `Sender` may be used: a SendError is placed by its text (`outcome`), any other
+exception counts as UNSENT, and a sender without probe() is sent to again after the pause. Without a sender every
 message goes to stderr."""
 
 from __future__ import annotations
@@ -9969,27 +10202,146 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
-from ewbot.paper.notify import Sender, deliver, make_event
+import requests
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
+
+from ewbot.paper.notify import Sender, SendError
 
 PREFIX = "[LIVE]"
 DEDUPE_S = 600.0
-MAX_CHARS = 4000  # Telegram's limit is 4096 UTF-16 code units: room for the delay note
+MAX_CHARS = 4000  # Telegram's limit is 4096 UTF-16 code units: room for the delay and resend notes
 TRUNCATED = "…(잘림)"
+RESENT = "(재전송 - 중복일 수 있음)"  # sent again after a send Telegram left unanswered (and may have posted)
 MAX_PENDING = 100
 MAX_AGE_S = 1800.0  # a message is retried for 30 minutes, then dropped (it is in the container log)
-RETRY_BASE_S = 2.0
+RETRY_BASE_S = 2.0  # after a send that never left or was not taken: 2 s doubling to 60 s
 RETRY_MAX_S = 60.0
+UNANSWERED_BASE_S = 60.0  # after a send or a probe Telegram left unanswered: 60 s doubling to 240 s
+UNANSWERED_MAX_S = 240.0
+MAX_SENDS = 3  # unanswered sends of one message (each may have posted it), then it is dropped
 LATE_NOTE_S = 60.0
 RECENT = 50  # delivered texts kept in `sent`
-_HTTP = re.compile(r"telegram HTTP (\d{3})")  # paper TelegramSender's SendError for a reply that is not ok
+CONNECT_TIMEOUT_S = 5.0
+READ_TIMEOUT_S = 15.0
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+UNSENT, FLOOD, REFUSED, UNANSWERED = "unsent", "flood", "refused", "unanswered"
+_HTTP = re.compile(r"telegram HTTP (\d{3})")  # a SendError for a reply that is not ok (this module's and paper's)
+_RETRY_AFTER = re.compile(r"""['"]retry_after['"]\s*:\s*(\d+(?:\.\d+)?)""")
 
 
 def refused(error: str) -> bool:
     """A send error Telegram will give again for the same message: HTTP 4xx other than 429 (flood control)."""
     m = _HTTP.search(error)
     return m is not None and 400 <= int(m.group(1)) < 500 and int(m.group(1)) != 429
+
+
+def unsent(exc: BaseException) -> bool:
+    """Whether a request exception means the request never left: requests' ConnectTimeout, or a ConnectionError over
+    a connection that was never made (urllib3's NewConnectionError - refused, unreachable, a DNS failure - or its
+    connect timeout). A read timeout, a connection reset or closed once made, a TLS error, a reply that could not
+    be read: the request may have gone out."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    inner = exc.args[0] if isinstance(exc, requests.exceptions.ConnectionError) and exc.args else None
+    return isinstance(inner, MaxRetryError) and isinstance(inner.reason, ConnectTimeoutError)
+
+
+class TelegramError(SendError):
+    """A Telegram call that did not succeed: `outcome` (UNSENT, FLOOD, REFUSED or UNANSWERED) and `retry_after`
+    (HTTP 429's). Its message is the request's exception type name, or the HTTP status with the start of Telegram's
+    reply - never the token."""
+
+    def __init__(self, message: str, outcome: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.retry_after = retry_after
+
+
+def outcome(exc: BaseException) -> tuple[str, str, float | None]:
+    """(outcome, note, retry_after) of a failed send. A TelegramError says. Another SendError (the paper runtime's
+    style) by its text: HTTP 429 FLOOD (retry_after when the reply has it), another 4xx REFUSED, any other status
+    UNANSWERED; "...failed: ConnectTimeout" UNSENT, any other request failure UNANSWERED. A requests exception by
+    `unsent`, noted by its type name only (it may hold the URL, with the token). Any other exception - a sender
+    that does not tell - UNSENT, by its type name."""
+    if isinstance(exc, TelegramError):
+        return exc.outcome, str(exc), exc.retry_after
+    if isinstance(exc, SendError):
+        note = str(exc)
+        m = _HTTP.search(note)
+        if m is None:
+            return (UNSENT if note.endswith(": ConnectTimeout") else UNANSWERED), note, None
+        status = int(m.group(1))
+        if status == 429:
+            after = _RETRY_AFTER.search(note)
+            return FLOOD, note, float(after.group(1)) if after else None
+        return (REFUSED if 400 <= status < 500 else UNANSWERED), note, None
+    if isinstance(exc, requests.exceptions.RequestException):
+        return (UNSENT if unsent(exc) else UNANSWERED), type(exc).__name__, None
+    return UNSENT, type(exc).__name__, None
+
+
+class TelegramSender:
+    """The live runtime's sendMessage client (plain text, no parse mode, no link preview): returns when Telegram
+    posted the message (HTTP 200 with "ok": true), else raises TelegramError - UNSENT when no connection was made
+    (`timeout`'s connect part), UNANSWERED when the request went out without a usable answer (its read part, a
+    connection dropped once made, HTTP 5xx, any other reply that is not ok: Telegram may have posted it), FLOOD for
+    HTTP 429 (with its retry_after), REFUSED for any other HTTP 4xx. `probe()` asks getMe, which posts nothing: it
+    returns when Telegram answers (any HTTP status below 500) and raises TelegramError (UNSENT or UNANSWERED) when
+    it does not. The URL holds the bot token: a request's exception is reported by its type name only and the
+    TelegramError is raised outside the except block, so neither its __cause__ nor its __context__ holds the
+    original; the token is cut out of Telegram's reply too."""
+
+    def __init__(self, token: str, chat_id: str, session: Any | None = None, *,
+                 timeout: tuple[float, float] = (CONNECT_TIMEOUT_S, READ_TIMEOUT_S), api: str = TELEGRAM_API) -> None:
+        self._token = token
+        self._chat_id = chat_id
+        self._api = api
+        self.session = session if session is not None else requests.Session()
+        self.timeout = timeout
+
+    def _call(self, method: str, payload: dict[str, Any] | None) -> tuple[int, Any, str]:
+        """(HTTP status, JSON reply or None, the reply's start) of one Bot API call (a GET without a payload);
+        raises TelegramError when the request itself failed."""
+        failed: tuple[str, str] | None = None
+        status, body, reply = 0, None, ""
+        try:
+            url = self._api.format(token=self._token, method=method)
+            if payload is None:
+                resp = self.session.get(url, timeout=self.timeout)
+            else:
+                resp = self.session.post(url, json=payload, timeout=self.timeout)
+            status = int(resp.status_code)
+            try:
+                body = resp.json()
+            except ValueError:  # not JSON (requests' JSONDecodeError is a ValueError)
+                body = None
+            reply = str(resp.text)[:200]
+        except Exception as exc:  # noqa: BLE001 - the URL holds the token: type name only
+            failed = (UNSENT if unsent(exc) else UNANSWERED), type(exc).__name__
+        if failed is not None:
+            raise TelegramError(f"telegram {method} failed: {failed[1]}", failed[0])
+        if self._token:
+            reply = reply.replace(self._token, "<token>")
+        return status, body, reply
+
+    def __call__(self, text: str) -> None:
+        status, body, reply = self._call("sendMessage", {"chat_id": self._chat_id, "text": text,
+                                                         "disable_web_page_preview": True})
+        if status == 200 and isinstance(body, dict) and body.get("ok") is True:
+            return
+        if status == 429:
+            params = body.get("parameters") if isinstance(body, dict) else None
+            after = params.get("retry_after") if isinstance(params, dict) else None
+            wait = float(after) if isinstance(after, (int, float)) and not isinstance(after, bool) else None
+            raise TelegramError(f"telegram HTTP 429: {reply}", FLOOD, wait)
+        raise TelegramError(f"telegram HTTP {status}: {reply}", REFUSED if 400 <= status < 500 else UNANSWERED)
+
+    def probe(self) -> None:
+        status, _, _ = self._call("getMe", None)
+        if status >= 500:
+            raise TelegramError(f"telegram getMe HTTP {status}", UNANSWERED)
 
 
 def _units(text: str) -> int:
@@ -10016,7 +10368,8 @@ class _Message:
     body: str
     created: float
     seq: int
-    failed: bool = False  # a send of it has failed (retried)
+    failed: bool = False  # an attempt for it has failed (retried)
+    unanswered: int = 0  # its sends Telegram left unanswered (each may have posted it)
     logged: bool = False  # its text is in stderr
     final: bool = False  # reported undelivered at flush timeout or stop()
 
@@ -10041,7 +10394,8 @@ class LiveNotifier:
         self.sent: collections.deque[str] = collections.deque(maxlen=RECENT)
         self.sent_count = 0
         self.dropped = 0
-        self.failures = 0  # failed sends in a row (the retry pause)
+        self.failures = 0  # failed attempts in a row (a send or a probe)
+        self.unanswered = 0  # sends and probes Telegram left unanswered since it last answered a send
         self.refusals = 0  # messages refused (HTTP 4xx but 429) in a row
         self.last_attempt: float | None = None
         self.last_error: str | None = None
@@ -10088,13 +10442,17 @@ class LiveNotifier:
             return
         self._pending.remove(m)
         self._queued.discard(m.key)
+        if m.unanswered:  # Telegram may have posted it: deduplicated as if delivered
+            self._last[m.key] = self.clock()
         self.dropped += 1
         print(f"[LIVE] telegram message dropped ({why}): {m.body}", file=sys.stderr)
         self._cond.notify_all()
 
     def pump(self) -> float | None:
         """One delivery attempt for the oldest queued message (the worker thread's step; tests call it directly).
-        None when nothing is queued, 0.0 after a delivery or a drop, else the pause before the next attempt."""
+        None when nothing is queued, 0.0 after a delivery or a drop, else the pause before the next attempt. While
+        `unanswered`, the attempt starts with the sender's probe() when it has one and sends nothing unless
+        Telegram answers it."""
         with self._cond:
             if not self._pending or self.sender is None:
                 return None
@@ -10107,23 +10465,34 @@ class LiveNotifier:
                 self._drop(m, f"not delivered in {MAX_AGE_S / 60:.0f} min")
             return 0.0
         self.last_attempt = now
-        text = m.body + (f" ({late / 60:.0f}분 지연)" if late >= LATE_NOTE_S else "")
-        _, sent, errors = deliver([make_event(m.kind, int(m.created), m.seq, text)], [], self.sender, attempts=1)
+        text = (m.body + (f" ({late / 60:.0f}분 지연)" if late >= LATE_NOTE_S else "")
+                + (f" {RESENT}" if m.unanswered else ""))
+        probe = getattr(self.sender, "probe", None)
+        error: Exception | None = None
+        sent = False
+        try:
+            if self.unanswered and callable(probe):
+                probe()  # posts nothing: is Telegram answering again?
+            sent = True
+            self.sender(text)
+        except Exception as exc:  # noqa: BLE001 - placed by `outcome`
+            error = exc
         with self._cond:
             self._inflight = None
-            if sent:
+            if error is None:
                 if m in self._pending:
                     self._pending.remove(m)
                 self._queued.discard(m.key)
                 self._last[m.key] = now
                 self.sent.append(text)
                 self.sent_count += 1
-                self.failures = self.refusals = 0
+                self.failures = self.refusals = self.unanswered = 0
                 self._cond.notify_all()
                 return 0.0
-            self.last_error = errors[0] if errors else "send failed"
-            if refused(self.last_error):  # never accepted on a retry: out of the way at once
+            kind, self.last_error, retry_after = outcome(error)
+            if sent and kind == REFUSED:  # never accepted on a retry: out of the way at once
                 self.refusals += 1
+                self.unanswered = 0
                 self._drop(m, f"refused: {self.last_error}")
                 return 0.0
             self.failures += 1
@@ -10131,7 +10500,18 @@ class LiveNotifier:
             if not m.logged:
                 m.logged = True
                 print(f"[LIVE] telegram send failed, retrying ({self.last_error}): {m.body}", file=sys.stderr)
-            return min(RETRY_BASE_S * 2.0 ** min(self.failures - 1, 10), RETRY_MAX_S)
+            if sent and kind != UNANSWERED:  # never left, or not taken (429): sent again soon, as it is
+                if kind == FLOOD:
+                    self.unanswered = 0  # Telegram answered
+                pause = min(RETRY_BASE_S * 2.0 ** min(self.failures - 1, 10), RETRY_MAX_S)
+                return max(pause, min(retry_after or 0.0, MAX_AGE_S))
+            self.unanswered += 1  # the send, or the probe before it, went unanswered
+            if sent:
+                m.unanswered += 1
+                if m.unanswered >= MAX_SENDS:
+                    self._drop(m, f"{MAX_SENDS} sends unanswered: Telegram may have posted it")
+                    return 0.0
+            return min(UNANSWERED_BASE_S * 2.0 ** min(self.unanswered - 1, 10), UNANSWERED_MAX_S)
 
     def run(self) -> None:
         """The worker: sends while anything is queued, until stop(). Never raises."""
@@ -10547,7 +10927,7 @@ class Heartbeat:
 uv run --group live pytest tests/live/test_control.py -q
 ```
 
-Expected: `14 passed`.
+Expected: `20 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -13001,7 +13381,7 @@ from ewbot.live.exchange import (
 )
 from ewbot.live.feed import Tick, TickerFeed
 from ewbot.live.health import Heartbeat
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.notify import RESENT, UNANSWERED, LiveNotifier, TelegramError
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.journal import Journal
 from ewbot.live.reconcile import PlanContext, pending_position
@@ -13464,6 +13844,52 @@ def test_a_notifier_that_cannot_deliver_counts_as_telegram_unusable(h):
     assert minute(25, pump=False) == "P"  # three refused in a row: unusable at once
     reasons = [e["data"]["reasons"][0] for e in h.journal.events(kind="TELEGRAM_UNUSABLE")]
     assert "알림 전송이 10분째 실패" in reasons[0] and "멈춤" in reasons[1] and "3건을 연속 거부" in reasons[2]
+
+
+def test_a_telegram_that_takes_sends_without_answering_is_unusable_after_10_minutes_and_gets_no_extra_copies(h):
+    """Telegram takes a send but leaves it unanswered for 15 minutes, getMe too: the worker waits 60 s doubling to
+    240 s between probes (longer than NOTIFY_STALL_S, never read as a stuck sender) and sends no copy meanwhile;
+    after 10 minutes Telegram is unusable (/fail) as for any failure; once getMe answers the message goes once
+    more, marked as a possible copy, and the pings resume."""
+    pings = Pings()
+    h.rt = h.make_runtime(heartbeat=Heartbeat("https://hc-ping.com/check", session=pings, clock=h.clock))
+    t0 = ENTRY_BAR + 100
+    h.clock.now = t0 - 60
+    h.rt.minute(h.clock.now)  # the day's summary and the first ping, before the notifier under test
+    back, chat = t0 + 900, []
+
+    class Hung:  # the live TelegramSender's errors while Telegram takes requests without answering them
+        def __call__(self, text: str) -> None:
+            chat.append(text)
+            if h.clock.now < back:
+                raise TelegramError("telegram sendMessage failed: ReadTimeout", UNANSWERED)
+
+        def probe(self) -> None:
+            if h.clock.now < back:
+                raise TelegramError("telegram getMe failed: ReadTimeout", UNANSWERED)
+
+    n = LiveNotifier(Hung(), clock=h.clock)
+    h.rt.d.notify = n
+    due: float | None = t0
+    h.clock.now = t0
+    n("X", "taken but unanswered")
+    calls, attempts = [], []
+    for k in range(17):
+        now = t0 + 60 * k
+        while due is not None and due <= now:  # the worker's attempts that fall in this minute, at their times
+            h.clock.now = due
+            pause = n.pump()
+            attempts.append(due - t0)
+            due = None if pause is None else due + pause
+        h.clock.now = now
+        before = len(pings.calls)
+        h.rt.minute(now)
+        calls.append("".join(c[0][0] for c in pings.calls[before:]))
+    assert attempts == [0, 60, 180, 420, 660, 900, 900]  # a send, four probes, then the resend (and idle)
+    assert calls == ["G"] * 10 + ["P", "", "", "", "", "G", "G"]  # failing 10 minutes: /fail, pings withheld
+    assert chat == ["[LIVE] taken but unanswered", f"[LIVE] taken but unanswered (15분 지연) {RESENT}"]
+    reasons = [e["data"]["reasons"] for e in h.journal.events(kind="TELEGRAM_UNUSABLE")]
+    assert reasons == [["알림 전송이 10분째 실패 (telegram getMe failed: ReadTimeout)"]]  # never "멈춤"
 
 
 def test_a_broken_telegram_check_never_skips_the_minute_and_loop_errors_are_redacted(h, capsys):
@@ -17456,7 +17882,7 @@ def audit_from_journal(journal: Journal) -> AuditResult | None:
 uv run --group live pytest tests/live/test_runtime.py -q
 ```
 
-Expected: `96 passed`.
+Expected: `97 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -17480,8 +17906,8 @@ EOF
 - Test: `tests/live/test_cli_live.py`
 
 **Interfaces:**
-- Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`), `ewbot.paper.notify.TelegramSender`.
-- Produces (`ewbot.live.app`): `REAL_STAGES = ("CANARY", "FULL")`, `VIRTUAL_ORDER_ID` (`v<n>-`: live.shadow's virtual order ids), `FATAL_KEY = "fatal"`, `FATAL_REPEAT_S = 900.0`, `FATAL_WAIT_S = 60.0`, `FATAL_WAIT_MAX_S = 1800.0`, `FATAL_ALERT_S = 3600.0`, `FATAL_EXPOSED_WAIT_S = 120.0`, `OUTAGE_KEY = "outage_refusal"`, `OUTAGE_WAIT_S = 60.0`, `OUTAGE_ALERT_S = 3600.0`, `REFUSAL_KEY = "start_refusals"`, `REFUSAL_ALERT_S = 3600.0`, `CACHE_FILE = "BTC-USD_1h.parquet"`; `class RealExposure(RuntimeError)`, `class AccountUnreadable(RealExposure)`; `real_exchange(settings) -> Exchange` (a `SettingsError` without a key file and for any failure to set the exchange up - the SDK raises a bare `Exception` for a malformed key file -, its text redacted; the fixed products `FUTURES_PRODUCT`, `SPOT_PRODUCT`), `last_real_stage(journal) -> str | None`, `journal_exposure(journal) -> str | None` (the OPEN trade or a PENDING intent, unless order ids prove it virtual: there is one for its trade - intents, legs - and every one is a virtual book's), `account_exposure(real) -> (what | None, ours: bool)` (a position and orders of ours on the real account, and whether an order of ours rests; `ExchangeError` when unreadable), `process_stage(journal, real | None) -> (stage, why | None)` (CANARY and FULL as recorded; SHADOW only with nothing real left - a demoted journal's real open trade or PENDING intents, or orders of ours on the real account, an unreadable one counting as there, keep the process on the real account in the last real stage of the stage history, entries blocked by the journal's SHADOW cap, until it is flat and restarts; the account is the bot's only through orders of ours or the journal: a position with neither raises `RealExposure` (the user's own: never traded nor run beside); a journal never CANARY or FULL beside orders of ours raises `RealExposure`, beside an unreadable account `AccountUnreadable`; `real=None` - an offline preflight - reads the journal alone), `stage_exchange(real, journal, stage, notify)` (the real exchange for CANARY and FULL, `ShadowExchange` for any other stage), `notifier(settings) -> LiveNotifier` (its sending thread started), `heartbeat(settings) -> Heartbeat`, `redact(text, settings) -> str` (every form of the bot token, the GitHub token and the health-check URL - each `Secret` revealed here -, raw and URL-encoded, the URL's path - its UUID or ping key - and query wherever they appear, e.g. `url: /<uuid>/fail?…` in a requests error, replaced by `<secret>`), `fatal_report(exc, settings) -> str` (the traceback, `redact`ed), `fatal_backoff(journal | None, kind, now) -> (wait_s, alert)` (a fatal within `FATAL_REPEAT_S` of the previous one's exit - its time plus its wait, journaled - waits `FATAL_WAIT_S`, doubling with every repeat up to `FATAL_WAIT_MAX_S`, but at most `FATAL_EXPOSED_WAIT_S` while the journal shows something real to manage - a real open trade or order of unknown outcome, a standing flatten; its `[중단]` and `/fail` go out once per error type per `FATAL_ALERT_S`, across restarts - journaled under `FATAL_KEY`; without a usable journal the longest wait, alerted), `outage_alert(journal | None, now) -> bool` (a start refused for an outage is alerted once per `OUTAGE_ALERT_S` across restarts, `OUTAGE_KEY`), `refusal_alert(journal | None, why, now) -> bool` (any other start refusal is alerted once per `REFUSAL_ALERT_S` per reason - a digest of `why` - across restarts, `REFUSAL_KEY`), `candle_fetch(alert=None, journal=None, clock=time.time) -> Callable[[Path], Path]` (the runtime's candle download: `update_cache` for `SPOT_PRODUCT` after reading the cache it extends - one that cannot be read, a kill in the middle of its non-atomic write, is moved aside to `<file>.bad-<epoch s>`, `CACHE_SET_ASIDE` and `[캔들 캐시 손상]`, and the history downloaded again), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None` (None for any failure - the gates fail closed -, the reason redacted on stderr), `price_feed(settings) -> TickerFeed | None` (the ticker feed for `FUTURES_PRODUCT` and `SPOT_PRODUCT` on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), `contract_reminders() -> dict` (the contract's expiry `PRODUCT_EXPIRY` and the day the preflight starts refusing it, `EXPIRY_MARGIN_DAYS` before), `class StopRequest` (`installed()`: inside it SIGTERM and SIGINT set `requested` and the attached runtime's `stop_requested`, the previous handlers back after it; `attach(runtime)`; `wait(seconds)` in steps of at most 1 s, ending early on a stop), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, stage, notify=None) -> Wired` (`stage` is the preflight's, from `process_stage`, read once; hands the preflight-checked lock, `candle_fetch(notify, journal)`, the settings' refusal codes, the expiry reminders - the settings' and `contract_reminders()` - as a dict, the process stage, the Telegram control so the runtime watches it and `redact` for its error texts to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit and stop tests also `Heartbeat`, `notifier` and `TelegramControl`.
+- Consumes: every module of Tasks 1–12; `ewbot.data.coinbase_history.update_cache`, `ewbot.paper.criteria.golive_status`, `ewbot.paper.ledger` (`Ledger`, `LedgerError`).
+- Produces (`ewbot.live.app`): `REAL_STAGES = ("CANARY", "FULL")`, `VIRTUAL_ORDER_ID` (`v<n>-`: live.shadow's virtual order ids), `FATAL_KEY = "fatal"`, `FATAL_REPEAT_S = 900.0`, `FATAL_WAIT_S = 60.0`, `FATAL_WAIT_MAX_S = 1800.0`, `FATAL_ALERT_S = 3600.0`, `FATAL_EXPOSED_WAIT_S = 120.0`, `OUTAGE_KEY = "outage_refusal"`, `OUTAGE_WAIT_S = 60.0`, `OUTAGE_ALERT_S = 3600.0`, `REFUSAL_KEY = "start_refusals"`, `REFUSAL_ALERT_S = 3600.0`, `CACHE_FILE = "BTC-USD_1h.parquet"`; `class RealExposure(RuntimeError)`, `class AccountUnreadable(RealExposure)`; `real_exchange(settings) -> Exchange` (a `SettingsError` without a key file and for any failure to set the exchange up - the SDK raises a bare `Exception` for a malformed key file -, its text redacted; the fixed products `FUTURES_PRODUCT`, `SPOT_PRODUCT`), `last_real_stage(journal) -> str | None`, `journal_exposure(journal) -> str | None` (the OPEN trade or a PENDING intent, unless order ids prove it virtual: there is one for its trade - intents, legs - and every one is a virtual book's), `account_exposure(real) -> (what | None, ours: bool)` (a position and orders of ours on the real account, and whether an order of ours rests; `ExchangeError` when unreadable), `process_stage(journal, real | None) -> (stage, why | None)` (CANARY and FULL as recorded; SHADOW only with nothing real left - a demoted journal's real open trade or PENDING intents, or orders of ours on the real account, an unreadable one counting as there, keep the process on the real account in the last real stage of the stage history, entries blocked by the journal's SHADOW cap, until it is flat and restarts; the account is the bot's only through orders of ours or the journal: a position with neither raises `RealExposure` (the user's own: never traded nor run beside); a journal never CANARY or FULL beside orders of ours raises `RealExposure`, beside an unreadable account `AccountUnreadable`; `real=None` - an offline preflight - reads the journal alone), `stage_exchange(real, journal, stage, notify)` (the real exchange for CANARY and FULL, `ShadowExchange` for any other stage), `notifier(settings) -> LiveNotifier` (its sending thread started; it sends through `live.notify.TelegramSender`, never the paper runtime's), `heartbeat(settings) -> Heartbeat`, `redact(text, settings) -> str` (every form of the bot token, the GitHub token and the health-check URL - each `Secret` revealed here -, raw and URL-encoded, the URL's path - its UUID or ping key - and query wherever they appear, e.g. `url: /<uuid>/fail?…` in a requests error, replaced by `<secret>`), `fatal_report(exc, settings) -> str` (the traceback, `redact`ed), `fatal_backoff(journal | None, kind, now) -> (wait_s, alert)` (a fatal within `FATAL_REPEAT_S` of the previous one's exit - its time plus its wait, journaled - waits `FATAL_WAIT_S`, doubling with every repeat up to `FATAL_WAIT_MAX_S`, but at most `FATAL_EXPOSED_WAIT_S` while the journal shows something real to manage - a real open trade or order of unknown outcome, a standing flatten; its `[중단]` and `/fail` go out once per error type per `FATAL_ALERT_S`, across restarts - journaled under `FATAL_KEY`; without a usable journal the longest wait, alerted), `outage_alert(journal | None, now) -> bool` (a start refused for an outage is alerted once per `OUTAGE_ALERT_S` across restarts, `OUTAGE_KEY`), `refusal_alert(journal | None, why, now) -> bool` (any other start refusal is alerted once per `REFUSAL_ALERT_S` per reason - a digest of `why` - across restarts, `REFUSAL_KEY`), `candle_fetch(alert=None, journal=None, clock=time.time) -> Callable[[Path], Path]` (the runtime's candle download: `update_cache` for `SPOT_PRODUCT` after reading the cache it extends - one that cannot be read, a kill in the middle of its non-atomic write, is moved aside to `<file>.bad-<epoch s>`, `CACHE_SET_ASIDE` and `[캔들 캐시 손상]`, and the history downloaded again), `paper_fetcher(settings) -> Callable | None`, `paper_status(settings, now) -> dict | None` (None for any failure - the gates fail closed -, the reason redacted on stderr), `price_feed(settings) -> TickerFeed | None` (the ticker feed for `FUTURES_PRODUCT` and `SPOT_PRODUCT` on Coinbase's public endpoint, `feed.public_ws_factory()`: no key), `contract_reminders() -> dict` (the contract's expiry `PRODUCT_EXPIRY` and the day the preflight starts refusing it, `EXPIRY_MARGIN_DAYS` before), `class StopRequest` (`installed()`: inside it SIGTERM and SIGINT set `requested` and the attached runtime's `stop_requested`, the previous handlers back after it; `attach(runtime)`; `wait(seconds)` in steps of at most 1 s, ending early on a stop), dataclass `Wired(runtime, feed, control, heartbeat, notify)` with `close(flush_s=10.0)` (stops the Telegram poller and the feed, then gives the queued messages up to `flush_s` to go out), `build(settings, lock, real, journal, stage, notify=None) -> Wired` (`stage` is the preflight's, from `process_stage`, read once; hands the preflight-checked lock, `candle_fetch(notify, journal)`, the settings' refusal codes, the expiry reminders - the settings' and `contract_reminders()` - as a dict, the process stage, the Telegram control so the runtime watches it and `redact` for its error texts to `LiveDeps`; starts the feed and the Telegram threads). Tests replace `real_exchange`, `price_feed` (no WebSocket) and the module-level `update_cache`; the fatal-exit and stop tests also `Heartbeat`, `notifier` and `TelegramControl`.
 - Produces (`ewbot.cli`): sub-command `live` with `run`, `preflight [--offline]`, `status [--json] [--max-age S] [--exchange] [--require-flat]`, `stage {shadow,canary,full} [--confirm] [--restart]` (a promotion and `shadow|canary --restart` - a new stint of the current stage, which reads no key permissions - need a flat book before writing - the running runtime's flat, `_held(...)`: no open trade, order of unknown outcome or standing flatten in the journal, no position or resting order on Coinbase, what holds it printed - and are refused from hh:59 to hh:06 UTC (`CYCLE_WINDOW`, `_in_cycle_window(now)`: the hour's cycle could open a trade between the check and the write), a promotion also the new stage's alerts - the preflight's `alerts` check as the gate `ALERTS_GATE`; a demotion is written first and the flat book reported after; without a journal nothing is written), `rebase [--confirm]` (after a deliberate deposit or withdrawal: prints the breakers' references and the equity now and, with `--confirm`, journals `REBASE_KEY` and `REBASE_REQUESTED` for the runtime to apply at its next minute; refused unless the book is flat as the running runtime sees it - `_held`: an open trade, whose unrealized P&L would be folded into both references, an order of unknown outcome, a standing flatten and, when Coinbase can be read, a position or a resting order -; exit 1 without a journal), `backup --out PATH` (refused without a journal: never an empty copy) (the SHADOW and CANARY gates of `status` and the promotion gates of `stage` take the runtime's last stored audit, `audit_from_journal` - a failed one is unmet); `LIVE_REFUSAL_WAIT_S = 600.0` (a refused start waits before exiting so Docker's restarts stay sparse; its `[시작 거부]` goes out once an hour per reason, `refusal_alert`), `live status` and `live preflight` open the journal read-only (`Journal(read_only=True)`: a candidate image's probe never writes or migrates it), `ALERTS_GATE`, test seams `_live_settings() -> LiveSettings` and `_live_lock() -> (Path, sha256 field, file sha256)` (production: `DEFAULT_LOCK_PATH`, `LOCK_SHA256`, `LOCK_FILE_SHA256`; the tests pin their temp lock by its own field and file hash), `_exchange(settings) -> Exchange` (any failure to set the exchange up is a `SettingsError`), `cmd_live(args) -> int`; `live run` and `live preflight` run the preflight with the settings (the `alerts` check) and the lock-file pin, both for the process stage (`live_app.process_stage` - `live preflight --offline` on the journal alone -; `live run` reads it once and hands it to `build`; `live preflight` refuses, exit 2, where the run would); a `live run` refused - the settings, the exchange's setup, `RealExposure`, the preflight, or a runtime start that raised `StartupRefused` (Coinbase unreadable for `STARTUP_READ_MAX_S` after the preflight) - sends `[시작 거부]`, no healthchecks.io `/fail`, and waits `LIVE_REFUSAL_WAIT_S` before exit 2 - unless only Coinbase could not be read (`StartupRefused`, `AccountUnreadable`, preflight checks that all failed with `retry`): an outage, which waits `live_app.OUTAGE_WAIT_S` and is alerted once an hour (`outage_alert`); a settings refusal's wait runs under the stop handler too; the wiring is closed - the Telegram poller and the feed stopped, the queued messages flushed - before any wait and on every exit, and the journal closed; SIGTERM (`docker stop`) and SIGINT are a graceful stop (`live_app.StopRequest`: the runtime finishes its tick, `[종료]`, exit 0, no `/fail` or `[중단]`; a wait ends early), KeyboardInterrupt the same, SystemExit passes through; any other exception - `build`'s included - is fatal: healthchecks.io `/fail` with the type name only (a third party), Telegram the type and `redact`ed text, both once per error type an hour (`fatal_backoff`), stderr the `fatal_report`, a back-off wait when fatals repeat within 15 minutes of the previous one's exit (at most 2 minutes while the journal shows something real), exit 1. Exit codes: 0 ok (a stage change or a stop); 1 no journal (`status`, `stage`, `backup`) / heartbeat older than `--max-age`, or `live run` ended by a fatal exception; 2 refused (settings, the exchange's setup or a read `status --exchange` or `stage` needs, preflight, stage gate); 3 `--require-flat` found what the running runtime still manages (`LiveRuntime.flat`): an open trade, a PENDING intent or a standing flatten in the journal, or - with `--exchange` - a position or any resting order (`status --json` also reports `pending_intents` and `flatten`).
 
 - [ ] **Step 1: Write the failing test**
@@ -17511,7 +17937,7 @@ from ewbot.live.audit import AuditResult
 from ewbot.live.exchange import ExchangeError, KeyPermissions, Unavailable
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.notify import LiveNotifier, TelegramSender
 from ewbot.live.reconcile import is_ours
 from ewbot.live.runtime import FLATTEN_KEY, LiveRuntime
 from ewbot.live.settings import LiveSettings, Secret, SettingsError
@@ -18054,6 +18480,16 @@ def test_the_process_stage_never_hides_real_exposure(live_env, monkeypatch, caps
     jr.close()
 
 
+def test_the_notifier_sends_with_the_live_sender_that_tells_a_send_that_never_left(live_env):
+    """Production sends through live.notify's TelegramSender (connect 5 s, read 15 s, a getMe probe), never the paper
+    runtime's: only it tells a send Telegram may have posted from one that never left (2026-10-05: six copies)."""
+    settings, _, _ = live_env
+    notify = live_app.notifier(dataclasses.replace(settings, **ALERTS))  # its thread waits: nothing is queued
+    sender = notify.sender
+    assert isinstance(sender, TelegramSender) and sender.timeout == (5.0, 15.0) and callable(sender.probe)
+    notify.stop()
+
+
 def test_build_wraps_only_shadow_and_reminds_of_the_contract(live_env):
     settings, ex, lock = live_env
     jr = Journal(settings.journal_path)
@@ -18444,7 +18880,7 @@ from ewbot.live.exchange import FUTURES_PRODUCT, SPOT_PRODUCT, Exchange, Exchang
 from ewbot.live.feed import TickerFeed, public_ws_factory
 from ewbot.live.health import Heartbeat
 from ewbot.live.journal import Journal
-from ewbot.live.notify import LiveNotifier
+from ewbot.live.notify import LiveNotifier, TelegramSender
 from ewbot.live.preflight import EXPIRY_MARGIN_DAYS, PRODUCT_EXPIRY
 from ewbot.live.reconcile import is_ours
 from ewbot.live.runtime import FLATTEN_KEY, LiveDeps, LiveRuntime
@@ -18452,7 +18888,6 @@ from ewbot.live.settings import LiveSettings, SettingsError
 from ewbot.live.shadow import ShadowExchange
 from ewbot.paper.criteria import golive_status
 from ewbot.paper.ledger import Ledger
-from ewbot.paper.notify import TelegramSender
 
 REAL_STAGES = ("CANARY", "FULL")
 VIRTUAL_ORDER_ID = re.compile(r"v\d+-")  # live.shadow's virtual order ids: v<book>-<sim id>
@@ -18578,7 +19013,9 @@ def stage_exchange(real: Exchange, journal: Journal, stage: str, notify: Callabl
 
 
 def notifier(s: LiveSettings) -> LiveNotifier:
-    """The [LIVE] notifier with its sending thread started: a call only queues, the loop never waits on Telegram."""
+    """The [LIVE] notifier with its sending thread started: a call only queues, the loop never waits on Telegram.
+    Its sender is live.notify's own (connect 5 s, read 15 s), which tells a send that never left from one Telegram
+    may have posted."""
     sender = (TelegramSender(s.telegram_token.reveal(), s.telegram_chat)
               if s.telegram_token and s.telegram_chat else None)
     notify = LiveNotifier(sender)
@@ -19351,7 +19788,7 @@ uv run --group live pytest tests/live/test_cli_live.py tests/paper/test_cli_pape
 uv run ewbot live --help
 ```
 
-Expected: `58 passed` (32 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, rebase, backup`.
+Expected: `59 passed` (33 new, 6 paper CLI, 20 research CLI); the help lists `run, preflight, status, stage, rebase, backup`.
 
 - [ ] **Step 5: Commit**
 
@@ -20056,7 +20493,7 @@ No production code. (If Step 2 failed, fix the responsible module from Tasks 1�
 uv run --group live pytest tests/live -q
 ```
 
-Expected: `561 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
+Expected: `569 passed` (all live tests so far, about 30 s; the three parity walks take about 14 s).
 
 - [ ] **Step 5: Commit**
 
@@ -20567,7 +21004,9 @@ def test_the_runbook_covers_setup_stages_and_emergencies():
                    "cfm/positions", "5–10 s on a 1-vCPU VPS", "at most 15 s",
                    # re-reviews: rebases kept visible, never UNKNOWN_* codes, a leg that still covers is kept
                    "손실 한도 기준 재설정 24시간", "never an `UNKNOWN_*` code", "a leg that still covers contracts",
-                   "for 5 minutes", "paced and rate-limited apart"):
+                   "for 5 minutes", "paced and rate-limited apart",
+                   # Telegram sends left unanswered (2026-10-05)
+                   "(재전송 - 중복일 수 있음)", "`getMe` check"):
         assert needle in text, needle
 ```
 
@@ -21060,7 +21499,7 @@ Plan: `docs/superpowers/plans/2026-10-03-ewbot-plan3-live-runtime.md`.
 - Coinbase requests that are rate-limited or fail for a passing reason are retried, but one request's waits add up to at most 15 s (plus the requests' own 10 s timeouts) and while an HTTP 429's `Retry-After` runs a new request fails at once without being sent: in a 429 storm only the first request of a pass waits, the next pass tries again. The public market data (quotes) and the private account and order requests are paced and rate-limited apart: a 429 on a quote never holds back a close. A futures/spot quote more than 2% from 1 (a stale or one-sided book) or a crossed book (bid above ask) is no price: no stop move and no entry while it lasts (`[호가 이상]`, the resting brackets stay).
 - Everything is recorded in the SQLite journal `/var/lib/ewbot/journal.sqlite`: every order intent before it is sent (deterministic `client_order_id`, so a restart never doubles an order), events, the engine decisions, the cycles and the stage history.
 - The GitHub Actions paper runtime keeps running as the independent audit. Telegram messages of the live runtime start with `[LIVE]`, the paper runtime's with `[ewbot paper]`.
-- Telegram never holds up trading: alerts are queued and sent by a background thread (every protective action - a stop-gap close, a breaker flatten, a margin reduction, a pause - is taken first, its alert queued after it). A message that fails for a passing reason (network, HTTP 429 or 5xx) is retried (2 s doubling to 60 s) for up to 30 minutes and its full text is written to the container log at once (`docker compose ... logs live | grep '\[LIVE\]'`); a message Telegram refuses outright (any other HTTP 4xx) goes to the log and is dropped at once, so it never holds up the messages behind it; messages still waiting when the runtime stops go to the log too. A message delivered a minute or more late ends with `(N분 지연)`, one longer than Telegram allows is cut with `…(잘림)`. The queue holds 100 messages (the oldest waiting one is dropped, into the log, when it is full).
+- Telegram never holds up trading: alerts are queued and sent by a background thread (every protective action - a stop-gap close, a breaker flatten, a margin reduction, a pause - is taken first, its alert queued after it). A message that fails for a passing reason is retried for up to 30 minutes and its full text is written to the container log at once (`docker compose ... logs live | grep '\[LIVE\]'`): one that never reached Telegram (no connection within 5 s, a DNS failure) or was not taken (HTTP 429) is sent again soon (2 s doubling to 60 s, at least the 429's `retry_after`); one Telegram may have posted without answering (no answer within 15 s, a connection dropped, HTTP 5xx) is not sent again until Telegram answers a `getMe` check (asked 60 s doubling to 240 s apart, nothing else is sent meanwhile) and then ends with `(재전송 - 중복일 수 있음)` - the chat may hold it already -, and after 3 sends left unanswered it is not sent again (it is in the log); a message Telegram refuses outright (any other HTTP 4xx) goes to the log and is dropped at once, so it never holds up the messages behind it; messages still waiting when the runtime stops go to the log too. A message delivered a minute or more late ends with `(N분 지연)`, one longer than Telegram allows is cut with `…(잘림)`. The queue holds 100 messages (the oldest waiting one is dropped, into the log, when it is full).
 
 ## Stages (spec 6)
 
@@ -21377,7 +21816,7 @@ uv run python -c "from ewbot.paper.fingerprint import current_fingerprint; print
 git diff --stat docs/live-design -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: `51 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1232 passed, 1 skipped` without a candle cache (`1233 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
+Expected: `51 passed`; `shellcheck-ok` when installed; with Docker, the image builds (about 20 s on a warm cache) and, run as in production (read-only root, uid 1000, no capabilities, no network), its offline preflight prints `preflight fingerprint: ok - e0435223a3f9 over 25 files (baseline e0435223a3f9, 25 files)` and `preflight lock: ok - file sha256 6530175541c1, sha256 d1be04baa06c, params [2.0, 0.7, 0.5]`, then the `preflight alerts: ok - WARNING: …` of an image run without its secrets file, and its health check fails without a journal: `health check without a journal: exit 1`; the full suite `1240 passed, 1 skipped` without a candle cache (`1241 passed` with `data/cache/BTC-USD_1h.parquet`; two more skipped without `shellcheck`); the fingerprint `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`; the final `git diff --stat` prints nothing (every fingerprinted file, `backtest/`, `paper/`, the lock and the workflows are byte-identical; use `master` instead of `docs/live-design` when branching from `master`).
 
 - [ ] **Step 5: Commit**
 
@@ -21412,7 +21851,7 @@ uv run pytest tests/paper/test_fingerprint.py -q -k baseline
 git diff --stat master -- src/ewbot/types.py src/ewbot/config.py src/ewbot/indicators.py src/ewbot/data src/ewbot/waves src/ewbot/strategy src/ewbot/engine src/ewbot/execution src/ewbot/risk src/ewbot/backtest src/ewbot/paper holdout.lock .github
 ```
 
-Expected: clean tree; `1233 passed` with the real cache (`1232 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
+Expected: clean tree; `1241 passed` with the real cache (`1240 passed, 1 skipped` without; two more skipped without `shellcheck`); both fingerprint tripwires pass; the diff prints nothing.
 
 - [ ] **Step 2: Decisions, pull request, merge (controller, user approves)**
 
