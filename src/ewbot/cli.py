@@ -1,4 +1,4 @@
-"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout | paper | live.
+"""`ewbot` command line: fetch | backtest | compare | walkforward | holdout | paper | live | stratb.
 
 Holdout isolation: every research command (backtest, compare, walkforward) cuts the candle
 frame to ts < HOLDOUT_START (2024-01-01) right after loading it, before any engine run, benchmark or
@@ -7,7 +7,10 @@ report candle sees it, and an explicit --start at/after HOLDOUT_START or --end a
 depth). `holdout` is the one-shot evaluation. `paper run` (Plan 2) works on the period AFTER the
 holdout: it reads the params from the committed holdout.lock only and has no strategy or config
 options (ewbot.paper.runner). `live run | preflight | status | stage | rebase | backup` (Plan 3) runs and
-inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options."""
+inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options.
+`stratb fetch | backtest | walkforward | holdout lock | holdout run | paper run | paper status` (Plan 4) is
+strategy B (ewbot.stratb, ewbot.paperb) on BTC and ETH with its own 15m caches, lock (holdout-b.lock) and
+ledger (paper-b branch); its research commands never read a bar from 2024-01-01 on (data15 filters them out)."""
 
 from __future__ import annotations
 
@@ -54,6 +57,15 @@ from ewbot.paper.criteria import golive_status, status_lines
 from ewbot.paper.ledger import LedgerError, current_epoch, load_ledger
 from ewbot.paper.notify import deliver, failure_text, make_event, position_line, sender_from_env
 from ewbot.paper.runner import PaperEnv, PaperRunError, run_paper
+from ewbot.paperb.ledger import paper_count_b
+from ewbot.paperb.notify import b_head, position_lines_b
+from ewbot.paperb.runner import PaperBEnv, PaperBRunError, run_paper_b, status_lines_b
+from ewbot.stratb.config import combo_to_json, config_for, normalize_combo
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH as STRATB_LOCK
+from ewbot.stratb.data15 import cache_paths as b_cache_paths
+from ewbot.stratb.data15 import gap_report, load_caches_15m, lock_exists, update_caches_15m
+from ewbot.stratb.holdout import HoldoutBError, create_lock, run_holdout_b
+from ewbot.stratb.research import backtest_b, trades_by_asset, walk_forward_b
 from ewbot.types import H1
 
 DEFAULT_CONFIG = Path("config/default.yaml")
@@ -120,6 +132,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_rb.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
     p_bk = live_sub.add_parser("backup", help="consistent copy of the journal (SQLite online backup)")
     p_bk.add_argument("--out", type=Path, required=True)
+
+    p_b = sub.add_parser("stratb", help="strategy B (Plan 4): 15m data, research, one-shot holdout, paper trading")
+    b_sub = p_b.add_subparsers(dest="b_cmd", required=True)
+    b_cache = argparse.ArgumentParser(add_help=False)
+    b_cache.add_argument("--cache-dir", type=Path, default=Path("data/cache"))
+    b_sub.add_parser("fetch", parents=[b_cache], help="update the BTC and ETH 15m caches (before 2024 until the lock)")
+    p_bb = b_sub.add_parser("backtest", parents=[b_cache], help="one strategy-B backtest (BTC + ETH) before 2024")
+    p_bb.add_argument("--params", required=True, help="zz_k,z_lo,z_hi,tp1_r,ext,remainder e.g. 2.0,0.382,0.618,1.0,1.272,breakeven")
+    p_bb.add_argument("--start", default=None, help="UTC date YYYY-MM-DD (default: first bar)")
+    p_bb.add_argument("--end", default=None, help=f"UTC date YYYY-MM-DD, exclusive, at most {WF_END}")
+    p_bb.add_argument("--out", type=Path, default=Path("reports/stratb-backtest.json"))
+    p_bw = b_sub.add_parser("walkforward", parents=[b_cache], help="32-combo walk-forward 2017-01..2023-12 (A's rules)")
+    p_bw.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p_bw.add_argument("--out", type=Path, default=Path("reports/stratb-walkforward.json"))
+    p_bh = b_sub.add_parser("holdout", help="holdout-b.lock and the ONE-SHOT strategy-B holdout")
+    bh_sub = p_bh.add_subparsers(dest="bh_cmd", required=True)
+    p_bhl = bh_sub.add_parser("lock", parents=[b_cache], help="write holdout-b.lock from the walk-forward (commit it)")
+    p_bhl.add_argument("--params-from", type=Path, required=True, help="reports/stratb-walkforward.json")
+    p_bhr = bh_sub.add_parser("run", parents=[b_cache], help="run the holdout ONCE (the user's approval: --confirm)")
+    p_bhr.add_argument("--confirm", action="store_true")
+    p_bhr.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p_bp = b_sub.add_parser("paper", help="paper trading of strategy B (ledger on the paper-b branch)")
+    bp_sub = p_bp.add_subparsers(dest="bp_cmd", required=True)
+    p_bpr = bp_sub.add_parser("run", parents=[b_cache], help="one paper-B run; params come from holdout-b.lock only")
+    p_bpr.add_argument("--ledger-dir", type=Path, required=True)
+    p_bps = bp_sub.add_parser("status", help="print the paper-B ledger's status (read-only, no network)")
+    p_bps.add_argument("--ledger-dir", type=Path, required=True)
     return parser
 
 
@@ -860,6 +899,188 @@ def cmd_live(args: argparse.Namespace) -> int:
     return handlers[args.live_cmd](s, args)
 
 
+# ----------------------------------------------------------------------------- strategy B (Plan 4)
+
+
+def _b_params(text: str) -> tuple:
+    """"zz_k,z_lo,z_hi,tp1_r,ext,remainder" -> the grid combo; exit 2 when it is not one."""
+    parts = [x.strip() for x in text.split(",")]
+    try:
+        if len(parts) != 6:
+            raise ValueError(f"expected 6 values, got {len(parts)}")
+        return normalize_combo([parts[0], [parts[1], parts[2]], parts[3], parts[4], parts[5]])
+    except ValueError as exc:
+        _refuse(f"--params {text}: {exc}")
+
+
+def _b_dfs(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
+    """Every asset's 15m bars before 2024-01-01 (data15 filters the rest out while reading)."""
+    for path in b_cache_paths(args.cache_dir).values():
+        if not path.exists():
+            raise SystemExit(f"15m cache not found: {path} - run `ewbot stratb fetch` first")
+    dfs = load_caches_15m(args.cache_dir)
+    for a, df in dfs.items():
+        rep = gap_report(df)
+        print(f"[data] {a}: {rep.n} 15m bars before {WF_END}, {len(rep.missing_ts)} missing", file=sys.stderr)
+    return dfs
+
+
+def _b_write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(to_jsonable(obj), indent=1), encoding="utf-8")
+
+
+def _b_fetch(args: argparse.Namespace) -> int:
+    paths = update_caches_15m(args.cache_dir, lock_path=STRATB_LOCK)
+    for a, df in load_caches_15m(args.cache_dir).items():
+        rep = gap_report(df)
+        print(f"{a} cache: {paths[a]}\n{a} bars before {WF_END}: {rep.n}  missing: {len(rep.missing_ts)}  duplicate: "
+              f"{len(rep.duplicate_ts)}")
+    unlocked = "2024+ included (holdout-b.lock exists)" if lock_exists(STRATB_LOCK) else f"stops at {WF_END} (no lock)"
+    print(f"fetch window: {unlocked}")
+    return 0
+
+
+def _b_backtest(args: argparse.Namespace) -> int:
+    combo = _b_params(args.params)
+    start, end = _requested_window(args)
+    dfs = _b_dfs(args)
+    start = start if start is not None else min(int(df["ts"].iloc[0]) for df in dfs.values())
+    end = end if end is not None else max(int(df["ts"].iloc[-1]) for df in dfs.values()) + 900
+    res = backtest_b(dfs, config_for(combo), start, end)
+    m = compute_metrics(res.equity, res.trades, start, end)
+    _print_comparison({"B": dataclasses.asdict(m)})
+    by_asset = trades_by_asset([t for t in res.trades if start <= t.entry_ts < end])
+    print(f"trades by asset: {by_asset}")
+    _b_write_json(args.out, {"params": combo_to_json(combo), "window": [start, end], "metrics": m,
+                             "n_trades_by_asset": by_asset, "trades": list(res.trades), "events": list(res.events)})
+    print(f"json: {args.out}")
+    return 0
+
+
+def _b_walkforward(args: argparse.Namespace) -> int:
+    t0 = time.perf_counter()
+    wf = walk_forward_b(_b_dfs(args), args.workers)
+    _b_write_json(args.out, {k: v for k, v in wf.items() if k != "oos_trades"})
+    _print_comparison({"WF-OOS": wf["stitched_metrics"]})
+    chosen = None if wf["chosen_final"] is None else combo_to_json(wf["chosen_final"])
+    print(f"walk-forward B: {len(wf['folds'])} folds in {time.perf_counter() - t0:.0f}s; chosen_final = {chosen}; "
+          f"fallback = {wf['chosen_final_fallback']}; proceed = {wf['proceed']}; json: {args.out}")
+    if not wf["proceed"]:
+        print("spec 6.3: no holdout - the stitched out-of-sample return is negative or there is no final combo "
+              "from the last fold; strategy B ends here", file=sys.stderr)
+    return 0
+
+
+def _b_holdout_lock(args: argparse.Namespace) -> int:
+    wf = json.loads(Path(args.params_from).read_text(encoding="utf-8"))
+    if not wf.get("proceed") or not wf.get("chosen_final") or wf.get("chosen_final_fallback"):
+        _refuse(f"{args.params_from}: proceed is false (spec 6.3: negative out-of-sample, fallback or no pick); "
+                "strategy B ends without a holdout")
+    try:
+        lock = create_lock(wf["chosen_final"], _b_dfs(args), params_source=f"walkforward:{args.params_from}#chosen_final",
+                           now_ts=int(time.time()), lock_path=STRATB_LOCK)
+    except HoldoutBError as exc:
+        _refuse(str(exc))
+    print(f"holdout-b.lock written: {STRATB_LOCK} (sha256 {lock['sha256'][:12]}, params {lock['params']}, "
+          f"last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(lock['last_bar_ts']))} UTC).\n"
+          "Commit it NOW, before the holdout runs:\n"
+          f'  git add "{STRATB_LOCK}"\n  git commit -m "chore(stratb): lock the strategy-B holdout {lock["sha256"][:12]}"')
+    return 0
+
+
+def _b_holdout_run(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        print("refusing: the strategy-B holdout runs once, after the user's approval: re-run with --confirm",
+              file=sys.stderr)
+        return 2
+    if not lock_exists(STRATB_LOCK):
+        _refuse(f"{STRATB_LOCK} does not exist: `ewbot stratb holdout lock` first")
+    update_caches_15m(args.cache_dir, lock_path=STRATB_LOCK)
+    try:
+        out = run_holdout_b(confirm=True, cache_dir=args.cache_dir, lock_path=STRATB_LOCK, workers=args.workers)
+    except HoldoutBError as exc:
+        _refuse(str(exc))
+    fr = out["first_run"]
+    _print_comparison({k: fr["metrics"][k] for k in ("B", "BH", "B_cost_x1_5")})
+    print(f"trades by asset: {fr['n_trades_by_asset']}")
+    print(json.dumps(fr["criteria"], indent=1))
+    print(f"holdout {'PASSED' if fr['criteria']['passed'] else 'FAILED - strategy B ends (spec 6.5)'}; result in "
+          f"{STRATB_LOCK} first_run. Commit it:\n  git add \"{STRATB_LOCK}\"\n"
+          '  git commit -m "chore(stratb): record the strategy-B holdout run"')
+    return 0
+
+
+def _b_paper_env(args: argparse.Namespace) -> PaperBEnv:
+    """Production wiring (tests replace this function): real lock, Coinbase, git and Telegram."""
+    return PaperBEnv(ledger_dir=args.ledger_dir, cache_dir=args.cache_dir, sender=sender_from_env())
+
+
+def _b_alert_failure(env: PaperBEnv, stage: str, message: str) -> None:
+    if env.sender is None:
+        return
+    text = b_head(failure_text(stage, message, os.environ.get(RUN_URL_ENV)))
+    _, sent, errors = deliver([make_event("FAILURE", env.clock(), stage, text)], [], env.sender, sleep=env.sleep)
+    if not sent:
+        print(f"failure alert not sent: {errors}", file=sys.stderr)
+        return
+    marker = os.environ.get(FAILURE_MARKER_ENV)
+    if marker:
+        Path(marker).write_text(stage, encoding="utf-8")
+
+
+def _b_paper_run(args: argparse.Namespace) -> int:
+    env = _b_paper_env(args)
+    try:
+        out = run_paper_b(env)
+    except PaperBRunError as exc:
+        print(f"paper-B run failed at stage {exc.stage}: {exc.message}", file=sys.stderr)
+        _b_alert_failure(env, exc.stage, exc.message)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - alert on anything, then fail the step
+        traceback.print_exc()
+        _b_alert_failure(env, "unexpected", f"{type(exc).__name__}: {exc}")
+        return 1
+    print(f"paper-B run {out.run_id}: last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(out.last_bar_ts))} UTC, "
+          f"epoch {out.epoch_id}, paper {out.count['paper']}/{out.count['required']}, {out.new_decisions} new "
+          f"decision(s), {out.new_discrepancies} new discrepancy(ies), {len(out.sent)} sent, {out.pending} pending")
+    for note in out.notes:
+        print(f"note: {note}", file=sys.stderr)
+    return 0
+
+
+def _b_paper_status(args: argparse.Namespace) -> int:
+    try:
+        led = load_ledger(args.ledger_dir)
+    except LedgerError as exc:
+        print(f"ledger unreadable: {exc}", file=sys.stderr)
+        return 1
+    if led is None:
+        print(f"no ledger.json in {args.ledger_dir}", file=sys.stderr)
+        return 1
+    for line in status_lines_b(led, paper_count_b(led)) + position_lines_b(led.open_position):
+        print(line)
+    cur = current_epoch(led)
+    print(f"epoch {cur['id']} of {len(led.epochs)}: B fingerprint {cur['fingerprint'][:12]} "
+          f"(lock {led.baseline['fingerprint'][:12]})")
+    if led.runs:
+        r = led.runs[-1]
+        print(f"last run {r['id']}: last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(r['last_bar_ts']))} UTC, "
+              f"holdout data {'ok' if r['holdout_data_ok'] else 'MISMATCH (warned, not refused)'}, "
+              f"holdout trades recomputed {r['holdout_trades_recomputed']} (lock: {led.holdout['n_trades']['B']})")
+    print(f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)}, "
+          f"pending events {len(led.pending_events)}")
+    return 0
+
+
+def cmd_stratb(args: argparse.Namespace) -> int:
+    if args.b_cmd == "holdout":
+        return _b_holdout_lock(args) if args.bh_cmd == "lock" else _b_holdout_run(args)
+    if args.b_cmd == "paper":
+        return _b_paper_status(args) if args.bp_cmd == "status" else _b_paper_run(args)
+    return {"fetch": _b_fetch, "backtest": _b_backtest, "walkforward": _b_walkforward}[args.b_cmd](args)
+
+
 _COMMANDS = {
     "fetch": cmd_fetch,
     "backtest": cmd_backtest,
@@ -868,6 +1089,7 @@ _COMMANDS = {
     "holdout": cmd_holdout,
     "paper": cmd_paper,
     "live": cmd_live,
+    "stratb": cmd_stratb,
 }
 
 
