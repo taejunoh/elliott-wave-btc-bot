@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 전략 A를 전혀 건드리지 않고, 1시간봉 스윙 구조에서 피보나치 되돌림과 매물대가 겹치는 자리를 찾아 15분봉 RSI 다이버전스와 돌파를 확인한 뒤 진입하는 전략 B를 만들고, A와 같은 절차(2017~2023 워크포워드 → 2024-01-01 이후 홀드아웃 1회 → 모의매매)로 검증할 연구 코드와 모의매매 런타임(`paper-b`)을 만든다.
+**Goal:** 전략 A를 전혀 건드리지 않고, 1시간봉 스윙 구조에서 피보나치 되돌림과 매물대가 겹치는 자리를 찾아 15분봉 RSI 다이버전스와 돌파를 확인한 뒤 진입하는 전략 B를 BTC와 ETH 두 자산(파라미터 한 벌 공유, 한 계좌)에 만들고, A와 같은 절차(2017~2023 워크포워드 → 2024-01-01 이후 홀드아웃 1회 → 모의매매)로 검증할 연구 코드와 모의매매 런타임(`paper-b`)을 만든다.
 
-**Architecture:** 새 코드는 `src/ewbot/stratb/`(전략·연구, B 지문 대상)와 `src/ewbot/paperb/`(모의매매 런타임)에만 둔다. A의 모듈(비용, 사이징, 손실 한도, 지그재그, 지표, 성과 지표, 워크포워드 구간, 장부, 판단 대조, 알림)은 import만 한다. 15분봉 엔진은 마감된 봉으로만 판단하고(자른 데이터와 전체 데이터의 판단이 같음을 테스트), 시간 단위 자산 곡선을 내므로 A의 성과 지표 계산을 그대로 쓴다. 2024+ 데이터는 `holdout-b.lock`이 생기기 전에는 데이터 로더 단계에서 읽히지 않는다. 모의매매는 매 실행 2023-10-01부터 전체를 결정적으로 다시 계산하고, A의 장부 스키마와 불일치 분류로 `paper-b` 브랜치에 기록한다.
+**Architecture:** 새 코드는 `src/ewbot/stratb/`(전략·연구, B 지문 대상)와 `src/ewbot/paperb/`(모의매매 런타임)에만 둔다. A의 모듈(비용, 사이징, 손실 한도, 지그재그, 지표, 성과 지표, 워크포워드 구간, 장부, 판단 대조, 알림)은 import만 한다. 신호는 자산마다 그 자산의 15분봉으로 같은 규칙과 같은 파라미터로 내고, 15분봉 엔진은 BTC와 ETH를 한 계좌(현금과 손실 한도 공유, 자산마다 포지션 하나, 정해진 처리 순서)에서 돌리는 포트폴리오 엔진이다. 엔진은 마감된 봉으로만 판단하고(자른 데이터와 전체 데이터의 판단이 같음을 테스트), 시간 단위 자산 곡선을 내므로 A의 성과 지표 계산을 그대로 쓴다. 2024+ 데이터는 `holdout-b.lock`이 생기기 전에는 데이터 로더 단계에서 읽히지 않는다. 모의매매는 매 실행 2023-10-01부터 전체를 결정적으로 다시 계산하고, A의 장부 스키마와 불일치 분류로 `paper-b` 브랜치에 기록한다.
 
-**Tech Stack:** Python 3.12 (uv), 기존 의존성만(numpy, pandas 3, pyarrow, requests, PyYAML); pytest; GitHub Actions(`actions/checkout@v7`, `astral-sh/setup-uv` v10.2.0 커밋 `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Coinbase Exchange 공개 캔들 API(granularity 900); Telegram Bot API(A와 같은 봇·시크릿).
+**Tech Stack:** Python 3.12 (uv), 기존 의존성만(numpy, pandas 3, pyarrow, requests, PyYAML); pytest; GitHub Actions(`actions/checkout@v7`, `astral-sh/setup-uv` v10.2.0 커밋 `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Coinbase Exchange 공개 캔들 API(granularity 900, `BTC-USD`·`ETH-USD`); Telegram Bot API(A와 같은 봇·시크릿).
 
-**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`(사용자 승인 2026-10-07; 8절의 데이터 해시 항목은 같은 날 컨트롤러 결정으로 수정). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`, Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`.
+**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`(사용자 승인 2026-10-07; 8절의 데이터 해시 항목은 같은 날 컨트롤러 결정으로 수정; 같은 날 홀드아웃 실행 전에 사용자 승인으로 BTC+ETH로 개정 — 명세 1절 "개정 (2026-10-07)"). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`, Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
 ## Global Constraints
 
@@ -18,54 +18,55 @@
 - 만들 수 있는 것: `src/ewbot/stratb/**`, `src/ewbot/paperb/**`, `tests/stratb/**`, `tests/paperb/**`, `.github/workflows/paper-b.yml`, `docs/strategy-b.md`. 수정할 수 있는 것: `src/ewbot/cli.py`(`stratb` 하위 명령), `README.md`, `tests/paper/test_static.py`(Task 12에서 워크플로 목록 테스트 1개를 고치고 B 보호 테스트 2개를 추가: `ci.yml`은 `tests/paper/test_fingerprint.py`와 이 파일만 실행하므로 B의 CI 검사는 여기에 둔다).
 - A 지문은 `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`로 유지된다(`tests/paper/test_fingerprint.py`, `tests/stratb/test_isolation.py`, Task 13).
 - B 지문 = `src/ewbot/stratb/` 아래 모든 `*.py`의 sha256(A와 같은 형식: `ewbot.paper.fingerprint.fingerprint_of`). `paperb/`와 `cli.py`는 포함하지 않는다. 바뀌면 B의 모의매매 구간(epoch)만 새로 열린다.
-- **2024-01-01 00:00 UTC(`HOLDOUT_START = 1704067200`) 이후 데이터는 `holdout-b.lock`이 생기기 전에 읽을 수 없다**: `stratb.data15.load_15m`은 parquet을 읽을 때 걸러내고, `update_cache_15m`은 내려받지 않으며, `include_holdout=True`는 잠금 파일이 있어야 한다. 리터럴 `include_holdout=True`는 `stratb/holdout.py`와 `paperb/runner.py`에서만 쓴다. B 코드는 A의 `allow_holdout` 키워드와 `_init_worker`·`_map_tasks`·`check_before_holdout` 이름을 쓰지 않는다(A의 `tests/paper/test_static.py`가 `src/ewbot` 전체를 검사한다).
+- **2024-01-01 00:00 UTC(`HOLDOUT_START = 1704067200`) 이후 데이터는 `holdout-b.lock`이 생기기 전에 읽을 수 없다**(두 자산 모두): `stratb.data15.load_15m`은 parquet을 읽을 때 걸러내고, `fetch_15m`은 그런 구간을 요청 전에 거부하고, `update_cache_15m`은 내려받지 않으며, `include_holdout=True`는 잠금 파일이 있어야 한다. 리터럴 `include_holdout=True`는 `stratb/holdout.py`와 `paperb/runner.py`에서만 쓴다. B 코드는 A의 `allow_holdout` 키워드와 `_init_worker`·`_map_tasks`·`check_before_holdout` 이름을 쓰지 않는다(A의 `tests/paper/test_static.py`가 `src/ewbot` 전체를 검사한다).
 - 결정성: 판단은 마감된 15분봉으로만 하고, 데이터의 마지막 봉에서는 진입을 평가하지 않는다. 시각 t에서 자른 데이터의 판단은 전체 데이터의 t까지 판단과 같아야 한다.
 - 고정값(명세 5절): RSI 14, 피벗 좌우 3봉, 매물대 허용 ±0.25×ATR1h, 손절 여유 0.2×ATR15m, 최대 손절 2.5×ATR1h, 확인 기한 72시간, 시간 손절 48시간, ATR 14. 그리드 32개: `zz_k` (2.0, 3.0) × 되돌림 구간 ((0.382, 0.618), (0.5, 0.786)) × `tp1_r` (1.0, 1.5) × `e` (1.272, 1.618) × `remainder` (breakeven, original).
-- 위험·비용(명세 4.4, 6.2): 거래당 0.5%, 레버리지 상한 3배(`RiskProfile("stratb", 0.005, 3.0)`), A의 `BreakerParams()`(하루 −3%, 전체 −15%, 5연패 후 24시간 휴지), A의 `CostParams()`(수수료 0.05%, 슬리피지 0.05%, 펀딩 연 10%: 15분봉마다 시간당 값의 1/4), 초기 자금 10,000 USD, 0.01 BTC 정수 계약으로 내림.
+- 자산과 위험·비용(명세 1, 4.4, 6.2; 2026-10-07 개정): BTC(`BTC-USD` 신호, `BIP-20DEC30-CDE` 0.01 BTC 계약, 틱 $5)와 ETH(`ETH-USD` 신호, `ETP-20DEC30-CDE` 0.1 ETH 계약, 틱 $0.5), 파라미터 한 벌 공유, 자산마다 포지션 하나. 거래당 계좌 평가액의 0.5%, 레버리지 상한 포지션마다 3배(`RiskProfile("stratb", 0.005, 3.0)`)와 모든 포지션 합계 3배(`BConfig.max_total_leverage`), A의 `BreakerParams()`(하루 −3%, 전체 −15%, 5연패 후 24시간 휴지)를 계좌 단위로, A의 `CostParams()`(수수료 0.05%, 슬리피지 0.05%, 펀딩 연 10%: 15분봉마다 시간당 값의 1/4)에 자산별 계약 크기, 초기 자금 10,000 USD 하나, 자산별 정수 계약으로 내림. 같은 봉의 처리 순서는 해석 20.
 - `REPLAY_ANCHOR` = 2023-10-01 00:00 UTC(`1696118400`): 홀드아웃 실행과 모의매매 재계산의 시작점(명세 6.4).
-- 테스트는 네트워크, 실제 `data/cache`, 실제 `holdout-b.lock`·`holdout.lock`을 쓰지 않는다(합성 15분봉, 임시 git 저장소, 가짜 세션·발송기·수집기). 실제 데이터 수집은 Task 6b(2017~2023 거래 빈도 점검, 컨트롤러 수동)와 Task 14(수동, 사용자 승인)에서만, 워크포워드·잠금·홀드아웃은 Task 14에서만 한다.
+- 테스트는 네트워크, 실제 `data/cache`, 실제 `holdout-b.lock`·`holdout.lock`을 쓰지 않는다(합성 15분봉, 임시 git 저장소, 가짜 세션·발송기·수집기). 실제 데이터 수집은 Task 6b(2017~2023 거래 빈도 점검, 컨트롤러 수동; 2026-10-07 개정 뒤 두 자산으로 다시)와 Task 14(수동, 사용자 승인)에서만, 워크포워드·잠금·홀드아웃은 Task 14에서만 한다.
 - 모든 커밋 메시지는 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` 줄로 끝난다(`git commit -m "<제목>" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`).
 
 ## 명세 해석 (이 계획이 정함, 모든 작업에 구속력)
 
-1. **A의 워크포워드 규칙(실제 값, `src/ewbot/backtest/walkforward.py`를 2026-10-07에 확인).** 구간은 `folds()`: 학습 24개월, 확인 6개월, 6개월씩 이동, 첫 확인 2019-01-01, 마지막 확인 끝 2024-01-01로 10개다. 각 조합을 [2017-01-01, 2024-01-01)에서 **한 번** 돌리고(손실 한도 끔: `breakers.enabled=False`) 구간은 그 결과를 잘라 쓴다. 최소 거래 수는 학습 창에서 `MIN_TRAIN_TRADES = 12`건이고 Calmar가 유한해야 한다. 선택 점수는 그리드 이웃(모든 축에서 인덱스 차 ≤ 1, 자신 포함) 가운데 적격 조합의 Calmar 평균(plateau)이며, 자신을 뺀 이웃의 50%(`MIN_ELIGIBLE_NEIGHBOUR_FRAC`) 이상이 적격일 때만 고를 수 있고, 동점이면 자신의 Calmar, 그다음 작은 그리드 인덱스를 고른다. 표본 외 곡선은 각 구간 확인 창의 시간별 수익률을 이어 붙인 복리다. 최종 조합은 무언가를 고른 **마지막 구간**의 조합(`chosen_final`)이고, 그것이 마지막 구간이 아니면 `chosen_final_fallback`이다(A의 CLI는 이 경우 홀드아웃을 거부한다). **재사용:** `folds`, `oos_returns`, `compute_metrics`, `MIN_TRAIN_TRADES`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC`, `HOLDOUT_START`, `WF_START`은 import한다. A의 `pick_plateau`·`evaluate_folds`·`run_grid`는 A의 전역 `GRID`(K4, Q_MIN, S_MIN)와 A의 엔진에 묶여 있어 B 그리드에 쓸 수 없으므로, 같은 규칙을 `stratb/research.py`에 다시 구현한다.
+1. **A의 워크포워드 규칙(실제 값, `src/ewbot/backtest/walkforward.py`를 2026-10-07에 확인).** 구간은 `folds()`: 학습 24개월, 확인 6개월, 6개월씩 이동, 첫 확인 2019-01-01, 마지막 확인 끝 2024-01-01로 10개다. 각 조합을 BTC+ETH 포트폴리오로(두 자산이 같은 조합) [2017-01-01, 2024-01-01)에서 **한 번** 돌리고(손실 한도 끔: `breakers.enabled=False`) 구간은 그 결과를 잘라 쓴다. 최소 거래 수는 학습 창에서 `MIN_TRAIN_TRADES = 12`건이고 Calmar가 유한해야 한다. 거래 수와 Calmar는 포트폴리오의 것(두 자산의 거래 합계, 합친 계좌의 자산 곡선)이다(명세 6.3 개정). 선택 점수는 그리드 이웃(모든 축에서 인덱스 차 ≤ 1, 자신 포함) 가운데 적격 조합의 Calmar 평균(plateau)이며, 자신을 뺀 이웃의 50%(`MIN_ELIGIBLE_NEIGHBOUR_FRAC`) 이상이 적격일 때만 고를 수 있고, 동점이면 자신의 Calmar, 그다음 작은 그리드 인덱스를 고른다. 표본 외 곡선은 각 구간 확인 창의 시간별 수익률을 이어 붙인 복리다. 최종 조합은 무언가를 고른 **마지막 구간**의 조합(`chosen_final`)이고, 그것이 마지막 구간이 아니면 `chosen_final_fallback`이다(A의 CLI는 이 경우 홀드아웃을 거부한다). **재사용:** `folds`, `oos_returns`, `compute_metrics`, `MIN_TRAIN_TRADES`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC`, `HOLDOUT_START`, `WF_START`은 import한다. A의 `pick_plateau`·`evaluate_folds`·`run_grid`는 A의 전역 `GRID`(K4, Q_MIN, S_MIN)와 A의 엔진에 묶여 있어 B 그리드에 쓸 수 없으므로, 같은 규칙을 `stratb/research.py`에 다시 구현한다.
 2. **2단계 그리드에서는 plateau 규칙이 퇴화한다.** 축마다 값이 2개라 모든 조합이 서로 이웃이다. 그래서 점수가 모든 조합에서 같고(적격 조합 전체의 평균), 결과는 "32개 중 17개 이상이 적격일 때 자신의 Calmar가 가장 높은 적격 조합"이 된다. 명세가 "A와 같은 규칙"을 요구하므로 그대로 구현하고 이 동작을 테스트로 고정한다(사용자에게 보고할 위험 요소: 과최적화 방어가 약해진다).
 3. **워크포워드 종료(명세 6.3).** `proceed = (chosen_final 있음) and (fallback 아님) and (이어 붙인 표본 외 총수익 ≥ 0)`. 거짓이면 잠금을 만들지 않고 B를 끝낸다(`ewbot stratb holdout lock`이 거부한다).
 4. **기준 구간은 방향마다 따로(명세 4.1 "가장 최근에 확정된 상승 구간").** 롱은 가장 최근에 확정된 상승 구간(L → H), 숏은 가장 최근의 하락 구간(H → L)을 기준으로 하며, 같은 방향의 새 구간이 확정되거나 72시간이 지나거나 무효가 될 때까지 유효하다. 되돌림 저점이 1시간 피벗으로 확정되어도 롱의 기준 구간은 남는다(돌파 랠리가 먼저 그 저점을 확정해 롱이 사라지는 것을 막는다). 기준 구간 하나에서 신호는 하나다. 같은 봉에서 롱과 숏이 함께 확인되면 더 새로운 구간의 신호만 쓴다.
 5. **매물대(명세 4.2)** = 기준 구간의 시작 피벗(L) **이전**의 1시간 지그재그 피벗 가운데 L보다 최대 30일(`confluence_lookback_hours = 720`) 앞선 것. 명세에 기간이 없어 정했다: 전 기간을 보면 2017년부터 데이터를 가진 워크포워드와 2023-10-01부터 다시 계산하는 홀드아웃·모의매매가 서로 다른 매물대를 보게 된다(30일은 앵커와 홀드아웃 시작 사이의 3개월 안에 들어간다). 허용 폭의 ATR1h는 구간이 확정된 시점의 값이다.
-6. **다이버전스와 돌파(명세 4.3).** 15분 피벗 저점은 왼쪽 3봉보다 엄격히 낮고 오른쪽 3봉보다 같거나 낮은 봉이며(고점은 대칭), 피벗 j는 봉 j+3 마감에 알려진다. 기준 구간 극값이 나온 15분봉 이후의 피벗만 본다. 연속한 두 피벗이 가격은 더 낮고 RSI는 더 높으며 두 번째가 되돌림 구간 안이면 다이버전스 쌍이 된다. 이 쌍은 더 새로운 쌍이 생기거나 이후 봉이 두 번째 저점을 깨면 사라진다. 확인은 그 뒤 15분 종가가 두 피벗 사이 봉들의 최고가(숏은 최저가)를 처음 넘는 봉이다.
+6. **다이버전스와 돌파(명세 4.3).** 15분 피벗 저점은 왼쪽 3봉보다 엄격히 낮고 오른쪽 3봉보다 같거나 낮은 봉이며(고점은 대칭), 피벗 j는 봉 j+3 마감에 알려진다. 기준 구간 극값이 나온 15분봉 이후의 피벗만 본다. 연속한 두 피벗이 가격은 더 낮고 RSI는 더 높으며 두 번째가 되돌림 구간 안이면 다이버전스 쌍이 된다. 이 쌍은 더 새로운 쌍이 생기거나 이후 봉이 두 번째 저점을 깨면 사라진다. 확인은 그 뒤 15분 종가가 두 피벗 사이 봉들의 최고가(숏은 최저가)를 넘고 해석 7의 걸러내기를 통과하는 첫 봉이다. 넘었지만 걸러진 종가(손절이 너무 멀거나 2차 목표가 1차 목표보다 멀지 않음)는 확인이 아니며 그 쌍과 기준 구간은 살아 있어, 기준 구간이 유효한 동안(72시간 안) 이후의 종가가 다시 넘으면 확인될 수 있다(명세 4.4 "먼 손절 자리는 기다린다"; 2026-10-07 컨트롤러 결정을 Task 6b 결과를 보기 전에 기록하고 같은 날 명세에 반영).
 7. **진입가 기준(명세 4.4).** 손절·목표·걸러내기·수량은 확인 봉 종가(`entry_ref`)로 정하고(A의 `Signal.entry_ref`와 같은 방식) 실제 체결은 다음 15분봉 시가 ± 슬리피지다. 다음 시가가 이미 손절가에 닿았거나 그 봉이 누락 봉이면 진입하지 않는다. 2차 목표가 1차 목표보다 가깝거나 **같으면** 진입하지 않는다.
-8. **누락 봉(명세 6.1, 8).** 캐시에는 채우지 않는다. 엔진은 A의 `fill_gaps(df, tf=900)`로 평평한 합성 봉을 넣어 시간 격자를 잇고, p1−3봉부터 확인 봉까지 합성 봉이 하나라도 있으면 신호를 내지 않는다.
-9. **체결(명세 6.2).** A의 `PaperBroker` 규칙을 15분봉에 그대로 쓴다: 시가가 손절가를 넘으면 시가에 손절, 같은 봉에서 손절가에 닿으면 손절가에 손절(목표보다 우선), 아니면 TP1(절반, 지정가, 엄격한 돌파)과 TP2. 1계약이면 TP1에서 전량. 본절 이동은 TP1이 체결된 봉의 다음 봉부터. 손실 한도 관측은 매시 마지막 15분봉 마감(A와 같은 시각). 자산 곡선은 시간 단위(시각 = 그 시간의 시작)라서 A의 `compute_metrics`(연 8760시간)를 그대로 쓴다. Coinbase 선물의 금요일 정기 휴장은 명세에 없어 모델링하지 않는다(실거래는 Plan 5).
-10. **무작위 대조군(명세 6.5-1).** 같은 기간, 같은 진입 횟수(B의 거래 수), 같은 엔진(청산, 시간 손절, 잔량 규칙, 0.5% 수량, 3배 상한, 손실 한도, 비용). B 거래의 모양(방향, 기준가 대비 손절 거리, TP1·TP2의 R 배수)을 시드 고정 무작위 순서로 무작위 15분봉(마지막 봉·누락 봉·누락 체결 봉 제외)에 놓는다. 포지션 중에 온 진입은 B와 똑같이 건너뛰므로 실현 횟수는 같거나 적다. 1,000회(시드 0~999), B의 샤프를 대조군 샤프의 95번째 백분위수와 비교한다.
-11. **잠금과 1회 실행(명세 6.4).** `holdout-b.lock`은 2024+ 데이터를 보기 **전에** 만든다. 조합, 전체 실행 설정, 그리드, B 지문, 2024 이전 15분봉 해시(`wf_data`), 홀드아웃 시작, 앵커, 무작위 대조군 1,000회와 시드, `last_bar_ts`(잠금 시각의 마지막 완성 시간의 마지막 15분봉 = "잠금 시점의 마지막 확정 봉"), 그리고 이 필드들의 다이제스트 `sha256`을 담는다. 홀드아웃 데이터의 해시는 잠금 시점에 읽을 수 없으므로 `first_run.data`에 기록한다. 홀드아웃은 잠금이 커밋되어 있고, `first_run`이 비어 있고, B 지문과 2024 이전 데이터가 잠금과 같을 때만 1회 돈다. 시도는 실행 전에 기록되고, 끝나지 않은 시도 뒤의 재시도는 같은 홀드아웃 데이터일 때만 허용된다.
-12. **모의매매의 잠금 불일치(명세 7, 8; 8절은 2026-10-07 수정).** 잠금 파일 자체(다이제스트, 커밋된 그대로인지, 설정이 이 코드의 `config_for(params)`와 같은지, `first_run`이 합격인지)가 맞지 않으면 실행을 거부하고 알린다. 홀드아웃 구간 15분봉의 해시가 `first_run.data.sha256`과 다르면(Coinbase의 캔들 수정, Actions 캐시 삭제 뒤의 재수집) 거부하지 않고 A처럼 해시마다 한 번 경고(`DATA_HASH` 이벤트, 텔레그램)하고 계속하며, 그 때문에 바뀐 판단은 A의 대조 규칙대로 `DATA_REVISION`이 된다(거부하면 이런 일만으로 모의매매가 무기한 멈춘다). 현재 B 지문이 잠금의 `code_sha256`과 다르면 거부하지 않고 새 구간을 연다(명세 7절).
-13. **판단 기록.** A의 판단 형식과 대조 함수(`verify_decisions`, `decisions_to_record`, `classify`, `same_decision`)를 그대로 쓴다. B의 종류는 SIGNAL, ENTRY, TP1, TP2, STOP, EXIT(TIME, BREAKER), BREAKEVEN이다. A의 `known_at`은 SIGNAL을 ts + 1시간으로 셈하는데 B의 신호는 ts + 15분부터 알 수 있다. 기록 시점은 같고 APPEARED 검사만 최대 45분 늦어진다(오탐 없음).
-14. **모의 카운트(명세 7, 7.1).** 잠금의 마지막 봉 이후에 진입한 현재 구간의 청산 거래만 센다(홀드아웃 거래는 세지 않는다). 필요 30건. B 지문이 바뀌면 새 구간에서 0부터 세고, 그 구간은 실거래 전환 판정 대상이 아니다(A와 같은 규칙).
+8. **누락 봉(명세 6.1, 8).** 캐시에는 채우지 않는다. 엔진은 A의 `fill_gaps(df, tf=900)`로 평평한 합성 봉을 넣어 시간 격자를 잇고, p1−3봉부터 확인 봉까지 합성 봉이 하나라도 있으면 신호를 내지 않는다. 자산별 프레임은 같은 마지막 봉에서 끝나게 맞춘다(`build_frames`): 데이터가 일찍 끝난 자산 뒤에는 마지막 종가의 평평한 합성 봉을 붙인다. 그래야 시각 t에서 자른 실행이 두 자산을 전체 실행과 똑같이 본다(그 봉이 나중에 실제로 오면 데이터가 바뀐 것이므로 판단 대조에서 `DATA_REVISION`이다).
+9. **체결(명세 6.2).** A의 `PaperBroker` 규칙을 15분봉에 그대로 쓴다: 시가가 손절가를 넘으면 시가에 손절, 같은 봉에서 손절가에 닿으면 손절가에 손절(목표보다 우선), 아니면 TP1(절반, 지정가, 엄격한 돌파)과 TP2. 1계약이면 TP1에서 전량. 본절 이동은 TP1이 체결된 봉의 다음 봉부터. 손실 한도 관측은 매시 마지막 15분봉 마감(A와 같은 시각)에 계좌 평가액으로 한다. 자산 곡선은 시간 단위(시각 = 그 시간의 시작)라서 A의 `compute_metrics`(연 8760시간)를 그대로 쓴다. Coinbase 선물의 금요일 정기 휴장은 명세에 없어 모델링하지 않는다(실거래는 Plan 5).
+10. **무작위 대조군(명세 6.5-1, 2026-10-07 개정).** 같은 기간, 자산마다 같은 진입 횟수(그 자산의 B 거래 수 — 각 자산의 평균 빈도), 같은 포트폴리오 엔진(청산, 시간 손절, 잔량 규칙, 0.5% 수량, 3배 상한 둘, 계좌 손실 한도, 비용). 자산마다 그 자산 B 거래의 모양(방향, 기준가 대비 손절 거리, TP1·TP2의 R 배수)을 시드 고정 무작위 순서로 그 자산의 무작위 15분봉(마지막 봉·누락 봉·누락 체결 봉 제외)에 놓는다(실행 r에서 k번째 자산의 시드는 `[r, k]`). 포지션 중에 온 진입은 B와 똑같이 건너뛰므로 실현 횟수는 같거나 적다. 1,000회(시드 0~999), B 포트폴리오의 샤프를 대조군 샤프의 95번째 백분위수와 비교한다. 매수 후 보유는 BTC/ETH 50:50이다(시작할 때 반씩 사고 재조정 없음, 자산마다 A의 `buy_hold`).
+11. **잠금과 1회 실행(명세 6.4).** `holdout-b.lock`은 2024+ 데이터를 보기 **전에** 만든다. 조합, 전체 실행 설정(두 자산의 상품·계약 크기·틱, 합계 상한 포함), 그리드, B 지문, 자산마다 2024 이전 15분봉 해시(`wf_data`), 홀드아웃 시작, 앵커, 무작위 대조군 1,000회와 시드, `last_bar_ts`(잠금 시각의 마지막 완성 시간의 마지막 15분봉 = "잠금 시점의 마지막 확정 봉"), 그리고 이 필드들의 다이제스트 `sha256`을 담는다. 홀드아웃 데이터의 해시(두 자산을 함께 묶은 `data_fingerprint_b`와 자산별 해시)는 잠금 시점에 읽을 수 없으므로 `first_run.data`에 기록한다. 홀드아웃은 잠금이 커밋되어 있고, `first_run`이 비어 있고, B 지문과 두 자산의 2024 이전 데이터가 잠금과 같을 때만 1회 돈다. 시도는 실행 전에 기록되고, 끝나지 않은 시도 뒤의 재시도는 같은 홀드아웃 데이터일 때만 허용된다.
+12. **모의매매의 잠금 불일치(명세 7, 8; 8절은 2026-10-07 수정).** 잠금 파일 자체(다이제스트, 커밋된 그대로인지, 설정이 이 코드의 `config_for(params)`와 같은지, `first_run`이 합격인지)가 맞지 않으면 실행을 거부하고 알린다. 홀드아웃 구간 15분봉(두 자산)의 해시가 `first_run.data.sha256`과 다르면(Coinbase의 캔들 수정, Actions 캐시 삭제 뒤의 재수집) 거부하지 않고 A처럼 해시마다 한 번 경고(`DATA_HASH` 이벤트, 텔레그램)하고 계속하며, 그 때문에 바뀐 판단은 A의 대조 규칙대로 `DATA_REVISION`이 된다(거부하면 이런 일만으로 모의매매가 무기한 멈춘다). 현재 B 지문이 잠금의 `code_sha256`과 다르면 거부하지 않고 새 구간을 연다(명세 7절).
+13. **판단 기록.** A의 판단 형식과 대조 함수(`verify_decisions`, `decisions_to_record`, `classify`, `same_decision`)를 그대로 쓴다. B의 종류는 SIGNAL, ENTRY, TP1, TP2, STOP, EXIT(TIME, BREAKER), BREAKEVEN이다. A의 `known_at`은 SIGNAL을 ts + 1시간으로 셈하는데 B의 신호는 ts + 15분부터 알 수 있다. 기록 시점은 같고 APPEARED 검사만 최대 45분 늦어진다(오탐 없음). 판단의 `setup`은 `B-BTC`·`B-ETH`이고, 거래 키는 진입 ts(SIGNAL은 신호 ts)에 `ASSETS`에서의 자산 인덱스를 더한 정수다(BTC +0, ETH +1초; 봉 ts는 모두 900의 배수다): 두 자산이 같은 봉에 진입해도 A의 id `KIND:ts:trade_key`가 겹치지 않는다. 판단의 데이터 해시(`DATA_REVISION` 판정)는 두 자산의 그 시각까지의 봉을 함께 해시한다.
+14. **모의 카운트(명세 7, 7.1).** 잠금의 마지막 봉 이후에 진입한 현재 구간의 청산 거래만 센다(홀드아웃 거래는 세지 않는다). 필요 30건, 두 자산 합계(2026-10-07 개정). B 지문이 바뀌면 새 구간에서 0부터 세고, 그 구간은 실거래 전환 판정 대상이 아니다(A와 같은 규칙).
 15. **워크플로 휴면.** 명세 10절 순서상 `paper-b.yml`은 홀드아웃보다 먼저 `master`에 들어간다. 그동안 예비 `schedule`이 실패 알림을 보내지 않도록 작업은 저장소 변수 `PAPER_B_ENABLED`가 `true`일 때만 돈다(합격 후 사용자가 켠다. 건너뛴 작업은 실행 시간을 쓰지 않는다).
 16. **1차 트리거.** 기존 Cloudflare Worker 코드는 크론과 관계없이 `paper.yml`만 부르므로 크론 1줄만 더하면 A가 두 번 돈다. 그래서 `docs/strategy-b.md`에 `paper-b.yml`을 부르는 두 번째 Worker 코드를 싣는다(사용자 작업, `ops/`는 바꾸지 않는다).
 17. **git 동기화.** A의 `scripts/paper_sync.sh`는 `paper` 브랜치에 묶여 있고 수정할 수 없으므로 같은 규칙을 `paper-b`용 파이썬 모듈 `ewbot.paperb.sync`로 구현한다(`python -m ewbot.paperb.sync checkout | push …`).
 18. **파일 배치.** 명세 3절의 `research.py`(워크포워드와 홀드아웃)는 책임별로 `research.py`(워크포워드)와 `holdout.py`(잠금·1회 실행·합격 기준)로 나누고, 신호 생성은 `signals.py`에 둔다(`rules.py`는 순수 함수만). 모두 `stratb/` 안이라 B 지문 대상이다.
-19. **거래 빈도 조기 점검(컨트롤러 결정 2026-10-07).** Task 6 다음의 Task 6b(컨트롤러 전용 수동 단계)에서 실제 2017~2023 15분봉으로 32개 조합 모두의 월 거래 수를 센다(조합 선택 없음, 성과 지표 없음, 2024+ 데이터 없음, 홀드아웃 없음). 중앙값이 월 4건 미만이면 Task 7~14를 멈추고 사용자에게 보고한다. 홀드아웃이 아직 보이지 않았으므로 그때의 규칙 변경은 정당하지만, 사용자 재승인과 명세 개정이 먼저다.
+19. **거래 빈도 조기 점검(컨트롤러 결정 2026-10-07).** Task 6 다음의 Task 6b(컨트롤러 전용 수동 단계)에서 실제 2017~2023 15분봉으로 32개 조합 모두의 월 거래 수를 센다(조합 선택 없음, 성과 지표 없음, 2024+ 데이터 없음, 홀드아웃 없음). 중앙값이 월 4건 미만이면 Task 7~14를 멈추고 사용자에게 보고한다. 홀드아웃이 아직 보이지 않았으므로 그때의 규칙 변경은 정당하지만, 사용자 재승인과 명세 개정이 먼저다. **결과와 개정(2026-10-07):** BTC 한 자산으로는 중앙값 월 3.56건(최소 3.12, 최대 4.75)이라 멈추고 보고했고, 사용자가 ETH를 더하기로 했다(명세 1절 개정; 성과 지표는 계산하지도 보지도 않았다). 개정한 코드로 컨트롤러가 두 자산의 2017~2023 15분봉에 Task 6b를 다시 돌리고, 같은 기준을 **두 자산 합계** 거래 수에 적용한다.
+20. **포트폴리오 규칙(명세 1, 4.4, 6.2의 2026-10-07 개정을 이 계획이 정함).** 한 계좌(현금 하나, A의 `CircuitBreakers` 하나)에서 자산마다 포지션을 하나까지 둔다(동시에 최대 2개). 시간축은 두 자산 프레임의 모든 15분봉이다. **같은 봉의 순서:** 봉 안의 각 단계(시가 체결, 봉 안 체결, 본절 이동, 펀딩, 시간 손절, 진입)를 설정 순서(BTC → ETH)로 처리하고, 시가 체결은 모든 자산의 대기 청산을 먼저, 그다음 대기 진입을 처리한다. 마감된 거래는 그 순서대로 손실 한도의 연패 계산에 들어간다. **수량:** 계좌 평가액(현금 + 열린 포지션의 종가 평가 손익)으로 `size_contracts`(0.5%, 포지션 3배)를 부르고, 열린 포지션(종가)과 같은 봉에 먼저 대기한 진입(기준가)과 새 진입의 명목 합이 평가액의 3배(`max_total_leverage`)를 넘지 않게 계약 수를 내림한다. 0계약이 되면 `SIGNAL_REJECTED:leverage`로 기록하고 진입하지 않는다. 합계 상한을 두는 이유: 명세의 "레버리지 상한 3배"를 계좌 단위로 지키기 위해서다(포지션마다만 두면 합쳐 6배까지 갈 수 있다). 0.5% 위험에서는 손절 거리가 진입가의 약 0.17%보다 가까울 때만 한 포지션이 3배에 닿으므로 드물게만 작동한다. **비용:** A의 `CostParams`에서 계약 크기만 자산별로 바꾼다. ETP의 계약당 최소 수수료는 오프라인으로 확인할 수 없어 A의 값을 그대로 둔다(A의 `apply_min_fee = False`라 모델에는 들어가지 않는다). ETH 펀딩도 A의 연 10%를 쓴다. 둘 다 Plan 5 CANARY에서 확인할 항목이다. 틱(BIP $5, ETP $0.5)은 Plan 5의 주문 가격용이고 백테스트는 A처럼 가격을 틱에 맞추지 않는다.
 
 ## File Structure
 
 | 파일 | 작업 | 책임 |
 |---|---|---|
 | `src/ewbot/stratb/__init__.py` | 1 | 패키지 표시 |
-| `src/ewbot/stratb/config.py` | 1 | 그리드 32개, 고정값, 실행 설정(`BConfig`), 조합 정규화, 비용 배수 |
+| `src/ewbot/stratb/config.py` | 1 | 그리드 32개, 고정값, 두 자산(`AssetSpec`), 실행 설정(`BConfig`), 자산별 비용, 조합 정규화, 비용 배수 |
 | `src/ewbot/stratb/fingerprint.py` | 1 | B 지문 |
-| `src/ewbot/stratb/data15.py` | 2 | 15분봉 수집·캐시, 2024 가드 로더, 1시간봉 합성, 누락 보고 |
+| `src/ewbot/stratb/data15.py` | 2 | BTC·ETH 15분봉 수집(재시도, 이어 받기)·자산별 캐시, 2024 가드, 1시간봉 합성, 누락 보고 |
 | `src/ewbot/stratb/rules.py` | 3 | 순수 함수: RSI, 피벗, 되돌림 구간, 확장 목표, 매물대 겹침, 다이버전스, 돌파 수준, 손절, 1차 목표, 걸러내기 |
-| `src/ewbot/stratb/signals.py` | 4 | 15분 프레임과 1시간봉, 기준 구간(A의 ZigZag), 신호 생성 |
-| `src/ewbot/stratb/engine.py` | 5 | 15분 백테스트 루프: 체결, 수량, 손실 한도, 비용, 판단 추적 |
-| `src/ewbot/stratb/research.py` | 6 | 2024 가드, 단일 백테스트, 그리드, plateau, 구간, 워크포워드 |
-| `src/ewbot/stratb/baselines.py` | 7 | 매수 후 보유, 무작위 진입 대조군 |
-| `src/ewbot/stratb/holdout.py` | 8 | `holdout-b.lock`, 1회 홀드아웃, 합격 기준 |
+| `src/ewbot/stratb/signals.py` | 4 | 자산별 15분 프레임과 1시간봉(끝 맞추기), 기준 구간(A의 ZigZag), 신호 생성 |
+| `src/ewbot/stratb/engine.py` | 5 | 15분 포트폴리오 백테스트 루프(BTC·ETH 한 계좌): 체결, 수량, 손실 한도, 비용, 판단 추적 |
+| `src/ewbot/stratb/research.py` | 6 | 2024 가드, 포트폴리오 백테스트, 그리드, plateau, 구간, 워크포워드 |
+| `src/ewbot/stratb/baselines.py` | 7 | BTC/ETH 50:50 매수 후 보유, 자산별 무작위 진입 대조군 |
+| `src/ewbot/stratb/holdout.py` | 8 | `holdout-b.lock`(두 자산 데이터 해시), 1회 홀드아웃, 포트폴리오 합격 기준 |
 | `src/ewbot/paperb/__init__.py` | 9 | 패키지 표시 |
 | `src/ewbot/paperb/ledger.py` | 9 | A의 장부 스키마를 B 잠금에 묶기, 모의 카운트 n/30 |
-| `src/ewbot/paperb/decisions.py` | 9 | B 실행 결과 → A의 판단 형식 |
-| `src/ewbot/paperb/notify.py` | 9 | `[ewbot paper-B]` 메시지 |
+| `src/ewbot/paperb/decisions.py` | 9 | B 실행 결과 → A의 판단 형식(자산을 넣은 거래 키) |
+| `src/ewbot/paperb/notify.py` | 9 | `[ewbot paper-B]` 메시지(자산을 밝힘), 자산별 포지션 줄 |
 | `src/ewbot/paperb/runner.py` | 10 | 모의매매 1회 실행: 사전 점검, 데이터, 구간, 재계산, 대조, 장부, 알림 |
 | `src/ewbot/cli.py` (수정) | 11 | `ewbot stratb fetch | backtest | walkforward | holdout lock | holdout run | paper run | paper status` |
 | `src/ewbot/paperb/sync.py` | 12 | `paper-b` 브랜치 git 동기화 |
@@ -78,27 +79,27 @@
 
 | 작업 | 구성 | 새 테스트 |
 |---|---|---|
-| 1 | B 그리드·실행 설정, B 지문, A 보호 검사 | 16 |
-| 2 | 15분봉 수집·캐시·2024 가드 | 8 |
+| 1 | B 그리드·실행 설정(BTC·ETH), B 지문, A 보호 검사 | 17 |
+| 2 | BTC·ETH 15분봉 수집·캐시·2024 가드 | 11 |
 | 3 | 매매 규칙 순수 함수 | 8 |
-| 4 | 15분 프레임, 기준 구간, 신호(+ 합성 데이터 도우미) | 11 |
-| 5 | 15분 엔진 | 13 |
-| 6 | 백테스트 가드, 그리드, 워크포워드 | 7 |
-| 6b | 실제 2017~2023 거래 빈도 점검(컨트롤러 수동, 네트워크; 중앙값 < 월 4건이면 중단·보고) | — |
-| 7 | 매수 후 보유, 무작위 대조군 | 5 |
-| 8 | 잠금, 1회 홀드아웃, 합격 기준 | 9 |
-| 9 | 모의매매 어댑터(장부, 판단, 알림) | 6 |
+| 4 | 자산별 15분 프레임, 기준 구간, 신호(+ 합성 데이터 도우미) | 13 |
+| 5 | 15분 포트폴리오 엔진 | 18 |
+| 6 | 백테스트 가드, 그리드, 워크포워드(포트폴리오) | 7 |
+| 6b | 실제 2017~2023 거래 빈도 점검(컨트롤러 수동, 네트워크; 두 자산 합계 중앙값 < 월 4건이면 중단·보고) | — |
+| 7 | 50:50 매수 후 보유, 자산별 무작위 대조군 | 5 |
+| 8 | 잠금, 1회 홀드아웃, 포트폴리오 합격 기준 | 9 |
+| 9 | 모의매매 어댑터(장부, 판단, 알림) | 7 |
 | 10 | 모의매매 실행기 | 8 |
 | 11 | CLI `ewbot stratb …` | 11 |
 | 12 | `paper-b` 동기화, 워크플로, CI 검사, 문서 | 12 |
 | 13 | 최종 검증(전체 테스트, A 지문) | — |
 | 14 | 수동 절차: 수집, 워크포워드, 잠금, 승인, 홀드아웃, 모의매매 시작(컨트롤러와 사용자만) | — |
 
-Task 12 이후 전체: `1360 passed`(캐시가 없으면 `1359 passed, 1 skipped`) — 기준선보다 114개 많다. 각 작업의 Step 4는 그 작업의 테스트만 돌린다. 실행 시간: Task 1~12의 새 테스트는 합쳐서 약 25초, 전체는 약 2분 20초.
+Task 12 이후 전체: `1372 passed`(캐시가 없으면 `1371 passed, 1 skipped`) — 기준선보다 126개 많다. 각 작업의 Step 4는 그 작업의 테스트만 돌린다. 실행 시간: Task 1~12의 새 테스트는 합쳐서 약 25초, 전체는 약 2분 10초.
 
 ---
 
-### Task 1: B 그리드와 실행 설정, B 지문, A 보호 검사
+### Task 1: B 그리드와 실행 설정(BTC·ETH), B 지문, A 보호 검사
 
 **Files:**
 - Create: `src/ewbot/stratb/__init__.py`
@@ -111,15 +112,15 @@ Task 12 이후 전체: `1360 passed`(캐시가 없으면 `1359 passed, 1 skipped
 
 **Interfaces:**
 - Consumes: `ewbot.config`: `BreakerParams`, `CostParams`, `RiskProfile`(import만). `ewbot.paper.fingerprint`: `PROJECT_ROOT`, `fingerprint_of(files: Mapping[str, bytes]) -> str`, `current_fingerprint(repo_root=None) -> str`, `is_fingerprinted(rel: str) -> bool`, `tree_files(repo_root=None) -> dict[str, bytes]`.
-- Produces: `ewbot.stratb.config`: `M15 = 900`; `GRID_B: dict[str, tuple]`(키 순서 `zz_k`, `zone`, `tp1_r`, `ext`, `remainder`); `REMAINDER_MODES = ("breakeven", "original")`; `Combo = tuple[Any, ...]` — `(zz_k: float, (z_lo, z_hi): tuple[float, float], tp1_r: float, ext: float, remainder: str)`; `@dataclass(frozen=True) StratBParams(zz_k=2.0, zone=(0.382, 0.618), tp1_r=1.0, ext=1.272, remainder="breakeven", rsi_len=14, pivot_w=3, confluence_atr=0.25, stop_buf_atr=0.2, max_stop_atr1h=2.5, confirm_hours=72, time_stop_hours=48, atr_len=14, confluence_lookback_hours=720)`(잘못된 `remainder`/`zone`은 `ValueError`); `RISK_B = RiskProfile("stratb", 0.005, 3.0)`; `@dataclass(frozen=True) BConfig(params=StratBParams(), risk=RISK_B, breakers=BreakerParams(), costs=CostParams(), initial_equity=10_000.0, tp1_frac=0.5)`; `grid_combos() -> list[Combo]`(32개); `normalize_combo(values: Sequence) -> Combo`(JSON 리스트도 받음, 그리드 밖이면 `ValueError`); `combo_to_json(combo) -> list`(`[zz_k, [z_lo, z_hi], tp1_r, ext, remainder]`); `params_for(combo) -> StratBParams`; `combo_of(p) -> Combo`; `config_for(combo, *, breakers_enabled=True) -> BConfig`; `scale_costs(c: CostParams, mult: float) -> CostParams`(수수료율·최소 수수료·슬리피지만 배수).
+- Produces: `ewbot.stratb.config`: `M15 = 900`; `GRID_B: dict[str, tuple]`(키 순서 `zz_k`, `zone`, `tp1_r`, `ext`, `remainder`); `REMAINDER_MODES = ("breakeven", "original")`; `Combo = tuple[Any, ...]` — `(zz_k: float, (z_lo, z_hi): tuple[float, float], tp1_r: float, ext: float, remainder: str)`; `@dataclass(frozen=True) StratBParams(zz_k=2.0, zone=(0.382, 0.618), tp1_r=1.0, ext=1.272, remainder="breakeven", rsi_len=14, pivot_w=3, confluence_atr=0.25, stop_buf_atr=0.2, max_stop_atr1h=2.5, confirm_hours=72, time_stop_hours=48, atr_len=14, confluence_lookback_hours=720)`(잘못된 `remainder`/`zone`은 `ValueError`); `RISK_B = RiskProfile("stratb", 0.005, 3.0)`; `@dataclass(frozen=True) AssetSpec(asset, product, future, contract_size, tick)`; `ASSET_SPECS = (AssetSpec("BTC", "BTC-USD", "BIP-20DEC30-CDE", 0.01, 5.0), AssetSpec("ETH", "ETH-USD", "ETP-20DEC30-CDE", 0.1, 0.5))`; `ASSETS = ("BTC", "ETH")`(한 봉 안에서 자산을 처리하는 순서이기도 하다); `@dataclass(frozen=True) BConfig(params=StratBParams(), risk=RISK_B, breakers=BreakerParams(), costs=CostParams(), initial_equity=10_000.0, tp1_frac=0.5, assets=ASSET_SPECS, max_total_leverage=3.0)`; `asset_spec(cfg, asset) -> AssetSpec`(없는 자산이면 `KeyError`); `asset_costs(cfg, asset) -> CostParams`(A의 `CostParams`에 그 자산의 계약 크기); `grid_combos() -> list[Combo]`(32개); `normalize_combo(values: Sequence) -> Combo`(JSON 리스트도 받음, 그리드 밖이면 `ValueError`); `combo_to_json(combo) -> list`(`[zz_k, [z_lo, z_hi], tp1_r, ext, remainder]`); `params_for(combo) -> StratBParams`; `combo_of(p) -> Combo`; `config_for(combo, *, breakers_enabled=True) -> BConfig`; `scale_costs(c: CostParams, mult: float) -> CostParams`(수수료율·최소 수수료·슬리피지만 배수).
   `ewbot.stratb.fingerprint`: `STRATB_PREFIX = "src/ewbot/stratb/"`; `stratb_files(repo_root=None) -> dict[str, bytes]`; `stratb_fingerprint(repo_root=None) -> str`(파일이 없으면 `FileNotFoundError`).
   `tests/stratb/test_isolation.py`: 이후 모든 작업에서 A 보호를 지키는 검사(아래 설명).
 
-B의 모든 매개변수를 A의 `config.py`와 별개인 `stratb/config.py`에 둔다. 그리드 조합은 튜플로 다루며, JSON에서 온 리스트는 `normalize_combo`가 정확한 그리드 튜플로 바꾸고 그리드 밖의 값은 거부한다. B 지문은 A와 같은 형식으로 `stratb/` 아래 파일만 해시한다. `tests/stratb/test_isolation.py`는 이 계획 전체의 안전장치다: A 지문 고정값, `stratb/`·`paperb/`가 A 지문 대상 밖인지, `master`와의 merge-base 이후 B의 경로를 바꾼 브랜치가 A의 경로(지문 대상, `backtest/`, `paper/`, `live/`, `holdout.lock`, `paper.yml`, `ci.yml`, `scripts/`, `pyproject.toml`, `uv.lock`)를 하나도 바꾸지 않았는지(추적되지 않은 새 파일 포함; B를 건드리지 않는 A 유지보수 브랜치는 해당 없음; `master`가 없는 얕은 클론에서는 건너뜀), 리터럴 `include_holdout=True`를 쓰는 모듈이 `stratb/holdout.py`·`paperb/runner.py`뿐인지, B 코드가 A의 실행 산출물 이름(`paper.yml`, `holdout.lock`, `refs/heads/paper`, `origin/paper`, `BTC-USD_1h.parquet`)을 문자열로 쓰지 않는지 확인한다. 집합 검사는 부분집합(`<=`)이라 아직 없는 모듈이 있어도 통과한다.
+B의 모든 매개변수를 A의 `config.py`와 별개인 `stratb/config.py`에 둔다. BTC와 ETH는 파라미터 한 벌을 함께 쓰고(명세 1절 2026-10-07 개정), 자산마다 신호용 현물 상품과 모델링할 선물 상품(계약 크기, 틱)을 `AssetSpec`으로 둔다. 비용은 A의 `CostParams`에서 계약 크기만 자산의 값으로 바꿔 쓴다(`asset_costs`; A의 파일은 바꾸지 않는다). 틱은 Plan 5의 실거래 주문 가격에 쓰고, 백테스트는 A처럼 가격을 틱에 맞추지 않는다. 포지션마다의 3배 상한은 `RISK_B`, 모든 포지션 합계의 3배 상한은 `max_total_leverage`다(해석 20). 그리드 조합은 튜플로 다루며, JSON에서 온 리스트는 `normalize_combo`가 정확한 그리드 튜플로 바꾸고 그리드 밖의 값은 거부한다. B 지문은 A와 같은 형식으로 `stratb/` 아래 파일만 해시한다. `tests/stratb/test_isolation.py`는 이 계획 전체의 안전장치다: A 지문 고정값, `stratb/`·`paperb/`가 A 지문 대상 밖인지, `master`와의 merge-base 이후 B의 경로를 바꾼 브랜치가 A의 경로(지문 대상, `backtest/`, `paper/`, `live/`, `holdout.lock`, `paper.yml`, `ci.yml`, `scripts/`, `pyproject.toml`, `uv.lock`)를 하나도 바꾸지 않았는지(추적되지 않은 새 파일 포함; B를 건드리지 않는 A 유지보수 브랜치는 해당 없음; `master`가 없는 얕은 클론에서는 건너뜀), 리터럴 `include_holdout=True`를 쓰는 모듈이 `stratb/holdout.py`·`paperb/runner.py`뿐인지, B 코드가 A의 실행 산출물 이름(`paper.yml`, `holdout.lock`, `refs/heads/paper`, `origin/paper`, `BTC-USD_1h.parquet`)을 문자열로 쓰지 않는지 확인한다. 집합 검사는 부분집합(`<=`)이라 아직 없는 모듈이 있어도 통과한다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-테스트 패키지와 테스트 파일 4개를 만든다.
+테스트 패키지와 테스트 파일 4개를 만든다. 설정 테스트는 그리드, 고정값, 실행 설정(손실 한도·비용·초기 자금·두 자산·전체 상한)과 두 자산의 상품·계약 크기·틱, 자산별 비용을 확인한다.
 
 ```bash
 mkdir -p src/ewbot/stratb tests/stratb
@@ -136,15 +137,21 @@ mkdir -p src/ewbot/stratb tests/stratb
 ```python
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from ewbot.config import CostParams
 from ewbot.stratb.config import (
+    ASSET_SPECS,
+    ASSETS,
     GRID_B,
     M15,
     RISK_B,
     BConfig,
     StratBParams,
+    asset_costs,
+    asset_spec,
     combo_of,
     combo_to_json,
     config_for,
@@ -190,8 +197,20 @@ def test_run_config_uses_the_spec_risk_and_strategy_a_breakers_costs_and_equity(
     assert cfg.risk == RISK_B and (RISK_B.risk_pct, RISK_B.max_leverage) == (0.005, 3.0)
     assert (cfg.breakers.daily_loss, cfg.breakers.total_dd, cfg.breakers.enabled) == (0.03, 0.15, True)
     assert cfg.costs == CostParams() and cfg.initial_equity == 10_000.0 and cfg.tp1_frac == 0.5
+    assert cfg.assets == ASSET_SPECS and cfg.max_total_leverage == 3.0
     assert config_for(grid_combos()[0], breakers_enabled=False).breakers.enabled is False
     assert BConfig().params == StratBParams()
+
+
+def test_btc_and_eth_trade_their_own_contracts_with_strategy_a_costs():
+    assert ASSETS == ("BTC", "ETH")
+    btc, eth = (asset_spec(BConfig(), a) for a in ASSETS)
+    assert (btc.product, btc.future, btc.contract_size, btc.tick) == ("BTC-USD", "BIP-20DEC30-CDE", 0.01, 5.0)
+    assert (eth.product, eth.future, eth.contract_size, eth.tick) == ("ETH-USD", "ETP-20DEC30-CDE", 0.1, 0.5)
+    assert asset_costs(BConfig(), "BTC") == CostParams()
+    assert asset_costs(BConfig(), "ETH") == dataclasses.replace(CostParams(), contract_size=0.1)
+    with pytest.raises(KeyError):
+        asset_spec(BConfig(), "SOL")
 
 
 def test_scale_costs_scales_fees_and_slippage_only():
@@ -396,10 +415,12 @@ Every *.py file below this folder is hashed by ewbot.stratb.fingerprint (the B f
 **파일 `src/ewbot/stratb/config.py`** (새 파일, 전체 내용)
 
 ```python
-"""Strategy-B parameters (Plan 4 spec 4-5): the 32-combo grid, the fixed values and the run config.
+"""Strategy-B parameters (Plan 4 spec 4-5): the 32-combo grid, the fixed values, the two assets and the run
+config.
 
 Separate from ewbot.config (strategy A): A's RiskProfile / BreakerParams / CostParams types are only
-imported, never changed. Combos are tuples in GRID_B key order: (zz_k, (z_lo, z_hi), tp1_r, ext, remainder)."""
+imported, never changed. Combos are tuples in GRID_B key order: (zz_k, (z_lo, z_hi), tp1_r, ext, remainder).
+One combo serves both assets (spec 1 as revised 2026-10-07: BTC and ETH, one shared parameter set)."""
 
 from __future__ import annotations
 
@@ -456,10 +477,33 @@ RISK_B = RiskProfile("stratb", 0.005, 3.0)  # spec 4.4: 0.5% of equity per trade
 
 
 @dataclass(frozen=True, slots=True)
+class AssetSpec:
+    """One traded asset (spec 1, 6.1-6.2): signals from the Coinbase spot candles of `product`; trades are
+    modelled in the CFM futures contract `future`, `contract_size` coins per contract (whole contracts).
+    `tick` is the contract's price increment, kept for Plan 5's live orders: like A's, the backtest does not
+    round prices to ticks."""
+
+    asset: str
+    product: str
+    future: str
+    contract_size: float
+    tick: float
+
+
+ASSET_SPECS = (
+    AssetSpec("BTC", "BTC-USD", "BIP-20DEC30-CDE", 0.01, 5.0),
+    AssetSpec("ETH", "ETH-USD", "ETP-20DEC30-CDE", 0.1, 0.5),
+)
+ASSETS = tuple(s.asset for s in ASSET_SPECS)  # also the order in which a bar's steps visit the assets
+
+
+@dataclass(frozen=True, slots=True)
 class BConfig:
     """Everything a strategy-B run depends on. Breakers, costs and the initial equity are A's values
-    (spec 4.4, 6.2): daily -3%, total -15%, 5 losses -> 24h pause; fee 0.05%, slippage 0.05%, funding
-    10% APR; 10,000 USD; contracts of 0.01 BTC."""
+    (spec 4.4, 6.2): daily -3%, total -15%, 5 losses -> 24h pause, all on the one account shared by the
+    assets; fee 0.05%, slippage 0.05%, funding 10% APR, with each asset's contract size (asset_costs);
+    10,000 USD. At most one position per asset; each is sized against the account equity and capped at
+    risk.max_leverage (3x), and all of them together at max_total_leverage (3x) of the equity."""
 
     params: StratBParams = StratBParams()
     risk: RiskProfile = RISK_B
@@ -467,6 +511,20 @@ class BConfig:
     costs: CostParams = CostParams()
     initial_equity: float = 10_000.0
     tp1_frac: float = 0.5
+    assets: tuple[AssetSpec, ...] = ASSET_SPECS
+    max_total_leverage: float = 3.0
+
+
+def asset_spec(cfg: BConfig, asset: str) -> AssetSpec:
+    for s in cfg.assets:
+        if s.asset == asset:
+            return s
+    raise KeyError(f"{asset!r} is not an asset of the run config {[s.asset for s in cfg.assets]}")
+
+
+def asset_costs(cfg: BConfig, asset: str) -> CostParams:
+    """A's cost model with the asset's contract size; fee rate, minimum fee, slippage and funding are A's."""
+    return dataclasses.replace(cfg.costs, contract_size=asset_spec(cfg, asset).contract_size)
 
 
 def grid_combos() -> list[Combo]:
@@ -552,32 +610,32 @@ def stratb_fingerprint(repo_root: Path | None = None) -> str:
 uv run --group live pytest tests/stratb -q
 ```
 
-예상: `16 passed`
+예상: `17 passed`
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/ewbot/stratb/__init__.py src/ewbot/stratb/config.py src/ewbot/stratb/fingerprint.py tests/stratb/__init__.py tests/stratb/test_config.py tests/stratb/test_fingerprint_b.py tests/stratb/test_isolation.py
-git commit -m "feat(stratb): strategy-B grid, run config, B fingerprint and the strategy-A protection guard" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): strategy-B grid, run config for BTC and ETH, B fingerprint and the strategy-A protection guard" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 2: 15분봉 수집·캐시와 2024 가드
+### Task 2: BTC·ETH 15분봉 수집·캐시와 2024 가드
 
 **Files:**
 - Create: `src/ewbot/stratb/data15.py`
 - Test: `tests/stratb/test_data15.py`
 
 **Interfaces:**
-- Consumes: `ewbot.data.coinbase_history`: `API`, `COLUMNS`, `MAX_PER_REQUEST`, `_get_json(session, url, params) -> list`(429·5xx 재시도; 파일은 수정하지 않고 import만). `ewbot.data.candles`: `IntegrityReport`, `check_integrity(df, tf)`. `ewbot.backtest.walkforward`: `HOLDOUT_START = 1704067200`, `WF_START = "2017-01-01"`. `ewbot.backtest.runner.utc_ts(date) -> int`. `ewbot.paper.fingerprint.PROJECT_ROOT`. Task 1: `M15`.
-- Produces: `ewbot.stratb.data15`: `PRODUCT = "BTC-USD"`; `START_TS = 1483228800`(2017-01-01); `REPLAY_ANCHOR = 1696118400`(2023-10-01); `DEFAULT_LOCK_PATH = <저장소 루트>/holdout-b.lock`; `LOCK_KIND = "ewbot-stratb-holdout"`; `class HoldoutGuardError(RuntimeError)`; `cache_path(cache_dir, product="BTC-USD") -> Path`(`<cache_dir>/BTC-USD_15m.parquet`); `lock_exists(lock_path) -> bool`(`kind == LOCK_KIND`이고 `sha256`이 문자열인 JSON 객체일 때만 참); `fetch_15m(product, start_ts, end_ts, session=None, sleep_s=0.15) -> DataFrame`(`[start_ts, end_ts)`의 마감된 봉, 오름차순, 표준 스키마 `ts:int64, open, high, low, close, volume:float64`); `update_cache_15m(cache_dir, *, product="BTC-USD", lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> Path`; `load_15m(path, *, include_holdout=False, lock_path=DEFAULT_LOCK_PATH) -> DataFrame`; `gap_report(df15) -> IntegrityReport`; `resample_1h(df15) -> DataFrame`(완성된 UTC 시간만, `synthetic` 열 포함).
+- Consumes: `ewbot.data.coinbase_history`: `API`, `COLUMNS`, `MAX_PER_REQUEST`, `_get_json(session, url, params) -> list`(429·5xx 재시도; 파일은 수정하지 않고 import만). `ewbot.data.candles`: `IntegrityReport`, `check_integrity(df, tf)`. `ewbot.backtest.walkforward`: `HOLDOUT_START = 1704067200`, `WF_START = "2017-01-01"`. `ewbot.backtest.runner.utc_ts(date) -> int`. `ewbot.paper.fingerprint.PROJECT_ROOT`. Task 1: `ASSET_SPECS`, `M15`.
+- Produces: `ewbot.stratb.data15`: `PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}`; `START_TS = 1483228800`(2017-01-01); `REPLAY_ANCHOR = 1696118400`(2023-10-01); `DEFAULT_LOCK_PATH = <저장소 루트>/holdout-b.lock`; `LOCK_KIND = "ewbot-stratb-holdout"`; `FETCH_TRIES = 3`, `FETCH_BACKOFF_S = 1.0`; `class HoldoutGuardError(RuntimeError)`; `cache_path(cache_dir, product) -> Path`(`<cache_dir>/<product>_15m.parquet`); `cache_paths(cache_dir) -> dict[str, Path]`(자산마다, `ASSETS` 순서); `lock_exists(lock_path) -> bool`(`kind == LOCK_KIND`이고 `sha256`이 문자열인 JSON 객체일 때만 참); `fetch_15m(product, start_ts, end_ts, session=None, sleep_s=0.15, *, lock_path=DEFAULT_LOCK_PATH, on_page=None) -> DataFrame`(`[start_ts, end_ts)`의 마감된 봉, 오름차순, 표준 스키마 `ts:int64, open, high, low, close, volume:float64`; 잠금 없이 2024-01-01에 닿는 구간이면 요청 전에 `HoldoutGuardError`; `on_page`는 받은 300봉 페이지마다 불림); `update_cache_15m(cache_dir, *, product, lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> Path`(페이지마다 저장); `update_caches_15m(cache_dir, *, lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> dict[str, Path]`(두 자산, 같은 시계); `load_15m(path, *, include_holdout=False, lock_path=DEFAULT_LOCK_PATH) -> DataFrame`; `load_caches_15m(cache_dir) -> dict[str, DataFrame]`(두 자산의 2024 이전 봉; `include_holdout` 인자 없음); `gap_report(df15) -> IntegrityReport`; `resample_1h(df15) -> DataFrame`(완성된 UTC 시간만, `synthetic` 열 포함).
 
-A의 `coinbase_history.py`와 같은 공개 엔드포인트와 같은 요청 방식(최신순 최대 300행, start·end 포함)을 granularity 900으로 쓴다. 캐시는 A의 1시간봉 파일과 다른 `BTC-USD_15m.parquet`이다. 진행 중인 봉은 저장하지 않고, 누락 봉은 채우지 않는다. **가드:** 잠금 파일이 없으면 `update_cache_15m`은 2024-01-01 이후를 요청조차 하지 않고, `load_15m`은 pyarrow 필터로 읽는 순간 걸러내며, `include_holdout=True`는 `HoldoutGuardError`를 낸다. 네트워크는 `update_cache_15m`(→ `fetch_15m`)에서만 쓰고, 그것을 부르는 곳은 CLI의 `stratb fetch`·`stratb holdout run`과 모의매매 실행기뿐이다(모두 테스트에서는 가짜로 바꾼다). 모의매매는 빈 캐시를 `REPLAY_ANCHOR`부터 받는다(`start_ts`).
+A의 `coinbase_history.py`와 같은 공개 엔드포인트와 같은 요청 방식(최신순 최대 300행, start·end 포함)을 granularity 900으로 BTC-USD와 ETH-USD에 쓴다. 캐시는 자산마다 하나이고 A의 1시간봉 파일과 다르다(`BTC-USD_15m.parquet`, `ETH-USD_15m.parquet`). 진행 중인 봉은 저장하지 않고, 누락 봉은 채우지 않는다. 수집은 300봉 페이지마다 캐시 파일에 덧붙여 저장하므로(임시 파일에 쓴 뒤 바꿔 끼움) 중단돼도 다음 실행이 마지막 저장 봉부터 이어 받고, 연결 오류와 시간 초과는 페이지마다 3회까지 1초·2초 간격으로 재시도한다(429·5xx는 A의 `_get_json`이 재시도한다). **가드:** 잠금 파일이 없으면 `fetch_15m`은 2024-01-01에 닿는 구간을 요청 전에 거부하고, `update_cache_15m`은 그런 구간을 요청조차 하지 않으며, `load_15m`은 pyarrow 필터로 읽는 순간 걸러내고, `include_holdout=True`는 `HoldoutGuardError`를 낸다. 두 자산을 읽는 `load_caches_15m`에는 `include_holdout` 인자가 없다(2024 데이터를 읽는 홀드아웃과 모의매매 실행기는 자산마다 `load_15m(..., include_holdout=True)`를 직접 부른다). 네트워크는 `update_cache_15m`(→ `fetch_15m`)에서만 쓰고, 그것을 부르는 곳은 CLI의 `stratb fetch`·`stratb holdout run`과 모의매매 실행기뿐이다(모두 테스트에서는 가짜로 바꾼다). 모의매매는 빈 캐시를 `REPLAY_ANCHOR`부터 받는다(`start_ts`).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-가짜 세션(요청한 구간만 최신순으로 돌려주고 요청을 기록)으로 페이지 나누기, 2024 차단, 잠금 후 확장, 로더 가드, 1시간봉 합성, 누락 보고를 확인한다.
+가짜 세션(요청한 구간만 최신순으로 돌려주고 요청을 기록하며, 정해 둔 예외나 몇 번째 요청부터의 연결 오류를 낼 수 있다)으로 페이지 나누기, 잠금 없는 2024 구간 수집 거부, 연결 오류·시간 초과의 재시도와 대기 시간, 중단된 수집이 저장한 페이지와 이어 받기, 두 자산 캐시의 2024 차단, 잠금 후 확장, 로더 가드, 1시간봉 합성, 누락 보고를 확인한다.
 
 **파일 `tests/stratb/test_data15.py`** (새 파일, 전체 내용)
 
@@ -589,6 +647,7 @@ from datetime import UTC, datetime
 
 import pandas as pd
 import pytest
+import requests
 
 from ewbot.data import coinbase_history as ch
 from ewbot.stratb import data15 as d15
@@ -598,12 +657,14 @@ from ewbot.stratb.data15 import (
     START_TS,
     HoldoutGuardError,
     cache_path,
+    cache_paths,
     fetch_15m,
     gap_report,
     load_15m,
     lock_exists,
     resample_1h,
     update_cache_15m,
+    update_caches_15m,
 )
 
 HS = 1_704_067_200  # 2024-01-01 00:00 UTC
@@ -616,14 +677,20 @@ def _row(ts: int) -> list[float]:
 
 
 class FakeSession:
-    """Honours start/end (inclusive), at most 300 rows, newest first; records every request."""
+    """Honours start/end (inclusive), at most 300 rows, newest first; records every request. Raises the
+    queued exceptions first (one per request), and every request from fail_from on fails."""
 
-    def __init__(self, first_ts: int, last_ts: int):
+    def __init__(self, first_ts: int, last_ts: int, errors=(), fail_from: int | None = None):
         self.first, self.last = first_ts, last_ts
+        self.errors, self.fail_from = list(errors), fail_from
         self.calls: list[dict] = []
 
     def get(self, url, params=None, timeout=None):
         self.calls.append({"url": url, **params})
+        if self.errors:
+            raise self.errors.pop(0)
+        if self.fail_from is not None and len(self.calls) > self.fail_from:
+            raise requests.ConnectionError("coinbase down")
         assert params["granularity"] == 900
         s = int(datetime.strptime(params["start"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp())
         e = int(datetime.strptime(params["end"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp())
@@ -653,8 +720,9 @@ def no_sleep(monkeypatch):
 
 def test_constants():
     assert (START_TS, REPLAY_ANCHOR) == (1_483_228_800, 1_696_118_400)
-    assert cache_path("data/cache").name == "BTC-USD_15m.parquet"
-    assert d15.DEFAULT_LOCK_PATH.name == "holdout-b.lock"
+    assert {a: p.name for a, p in cache_paths("data/cache").items()} == {
+        "BTC": "BTC-USD_15m.parquet", "ETH": "ETH-USD_15m.parquet"}
+    assert d15.DEFAULT_LOCK_PATH.name == "holdout-b.lock" and d15.PRODUCTS == {"BTC": "BTC-USD", "ETH": "ETH-USD"}
 
 
 def test_fetch_pages_300_bars_at_granularity_900():
@@ -667,21 +735,59 @@ def test_fetch_pages_300_bars_at_granularity_900():
     assert df.loc[0, "open"] == _row(t0)[3] and df.loc[0, "low"] == _row(t0)[1]
 
 
-def test_without_a_lock_the_cache_stops_before_2024(tmp_path):
-    sess = FakeSession(HS - 50 * M15, HS + 500 * M15)
-    path = update_cache_15m(tmp_path, lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15,
-                            now_ts=HS + 400 * M15, session=sess, sleep_s=0)
+def test_fetch_refuses_a_2024_window_without_the_lock(tmp_path):
+    sess = FakeSession(HS - 50 * M15, HS + 50 * M15)
+    with pytest.raises(HoldoutGuardError):
+        fetch_15m("ETH-USD", HS - 10 * M15, HS + M15, session=sess, sleep_s=0, lock_path=tmp_path / "none.lock")
+    assert sess.calls == []
+    df = fetch_15m("ETH-USD", HS - 10 * M15, HS + M15, session=sess, sleep_s=0, lock_path=_lock(tmp_path / "l.lock"))
+    assert int(df["ts"].max()) == HS
+
+
+def test_connection_errors_and_timeouts_are_retried_with_backoff(monkeypatch):
+    waits = []
+    monkeypatch.setattr(d15.time, "sleep", waits.append)
+    t0 = HS - 400 * M15
+    sess = FakeSession(t0, HS, errors=[requests.ConnectionError("reset"), requests.Timeout("slow")])
+    assert len(fetch_15m("BTC-USD", t0, t0 + 10 * M15, session=sess, sleep_s=0)) == 10
+    assert waits == [1.0, 2.0] and len(sess.calls) == 3
+    sess = FakeSession(t0, HS, errors=[requests.ConnectionError("x")] * 3)
+    with pytest.raises(requests.ConnectionError):
+        fetch_15m("BTC-USD", t0, t0 + 10 * M15, session=sess, sleep_s=0)
+
+
+def test_an_interrupted_download_keeps_its_pages_and_resumes(tmp_path):
+    t0 = HS - 1000 * M15
+    none = tmp_path / "none.lock"
+    with pytest.raises(requests.ConnectionError):
+        update_cache_15m(tmp_path, product="BTC-USD", lock_path=none, start_ts=t0, now_ts=HS,
+                         session=FakeSession(t0, HS, fail_from=2), sleep_s=0)
+    assert len(pd.read_parquet(cache_path(tmp_path, "BTC-USD"))) == 600
+    sess = FakeSession(t0, HS)
+    path = update_cache_15m(tmp_path, product="BTC-USD", lock_path=none, now_ts=HS, session=sess, sleep_s=0)
     df = pd.read_parquet(path)
-    assert int(df["ts"].max()) == HS - M15 and len(df) == 50 and len(sess.calls) == 1
+    assert sess.calls[0]["start"] == datetime.fromtimestamp(t0 + 600 * M15, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert df["ts"].tolist() == [t0 + k * M15 for k in range(1000)]
+
+
+def test_without_a_lock_the_caches_stop_before_2024(tmp_path):
+    sess = FakeSession(HS - 50 * M15, HS + 500 * M15)
+    paths = update_caches_15m(tmp_path, lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15,
+                              now_ts=HS + 400 * M15, session=sess, sleep_s=0)
+    assert list(paths) == ["BTC", "ETH"] and [c["url"].split("/")[-2] for c in sess.calls] == ["BTC-USD", "ETH-USD"]
+    for p in paths.values():
+        df = pd.read_parquet(p)
+        assert int(df["ts"].max()) == HS - M15 and len(df) == 50
     assert all(c["end"] < "2024-01-01" for c in sess.calls)
 
 
 def test_with_a_lock_the_cache_extends_to_the_last_closed_bar(tmp_path):
     sess = FakeSession(HS - 50 * M15, HS + 500 * M15)
     lock = _lock(tmp_path / "holdout-b.lock")
-    update_cache_15m(tmp_path, lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15, now_ts=HS + 400 * M15,
-                     session=sess, sleep_s=0)
-    path = update_cache_15m(tmp_path, lock_path=lock, now_ts=HS + 10 * M15 + 899, session=sess, sleep_s=0)
+    update_cache_15m(tmp_path, product="BTC-USD", lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15,
+                     now_ts=HS + 400 * M15, session=sess, sleep_s=0)
+    path = update_cache_15m(tmp_path, product="BTC-USD", lock_path=lock, now_ts=HS + 10 * M15 + 899, session=sess,
+                            sleep_s=0)
     df = pd.read_parquet(path)
     assert int(df["ts"].max()) == HS + 9 * M15 and df["ts"].is_unique and len(df) == 60
     assert sess.calls[-1]["start"] == "2024-01-01T00:00:00Z"
@@ -743,23 +849,30 @@ uv run --group live pytest tests/stratb/test_data15.py -q
 **파일 `src/ewbot/stratb/data15.py`** (새 파일, 전체 내용)
 
 ```python
-"""15-minute BTC-USD candles for strategy B (Plan 4 spec 6.1): fetch, cache, guarded load, 1h bars.
+"""15-minute Coinbase spot candles for strategy B (Plan 4 spec 6.1): fetch, cache, guarded load, 1h bars.
 
+One cache file per asset of config.ASSET_SPECS: <cache_dir>/BTC-USD_15m.parquet and ETH-USD_15m.parquet.
 Same public endpoint and request pattern as ewbot.data.coinbase_history (Coinbase Exchange, no auth;
 GET .../candles returns at most 300 rows [time, low, high, open, close, volume], newest first, start and
-end inclusive bar-open times), with granularity 900. The cache is <cache_dir>/BTC-USD_15m.parquet; the
-bar in progress is never stored and missing bars are not filled in it (gap_report lists them).
+end inclusive bar-open times), with granularity 900. The bar in progress is never stored and missing bars
+are not filled in the cache (gap_report lists them). Downloads resume: every page of 300 bars is appended
+to the cache file as it arrives (written to a temp file, then renamed), so an interrupted download goes on
+from the last saved bar; a connection error or a timeout is retried FETCH_TRIES times with backoff (429 /
+5xx are retried by coinbase_history's _get_json).
 
-Holdout guard (spec 6.3): until holdout-b.lock exists, update_cache_15m never downloads a bar at or after
-HOLDOUT_START (2024-01-01) and load_15m never returns one - the parquet read itself filters them out.
-load_15m(include_holdout=True) raises HoldoutGuardError until the lock exists."""
+Holdout guard (spec 6.3): until holdout-b.lock exists, fetch_15m refuses a window that reaches
+HOLDOUT_START (2024-01-01), update_cache_15m never asks for one, and load_15m never returns a bar at or
+after it - the parquet read itself filters them out. load_15m(include_holdout=True) raises
+HoldoutGuardError until the lock exists."""
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import requests
@@ -769,22 +882,29 @@ from ewbot.backtest.walkforward import HOLDOUT_START, WF_START
 from ewbot.data.candles import IntegrityReport, check_integrity
 from ewbot.data.coinbase_history import API, COLUMNS, MAX_PER_REQUEST, _get_json
 from ewbot.paper.fingerprint import PROJECT_ROOT
-from ewbot.stratb.config import M15
+from ewbot.stratb.config import ASSET_SPECS, M15
 from ewbot.types import H1
 
-PRODUCT = "BTC-USD"
+PRODUCTS = {s.asset: s.product for s in ASSET_SPECS}  # {"BTC": "BTC-USD", "ETH": "ETH-USD"}
 START_TS = utc_ts(WF_START)  # 2017-01-01: the first bar fetched
 REPLAY_ANCHOR = utc_ts("2023-10-01")  # spec 6.4: holdout and paper runs both recompute from here
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout-b.lock"
 LOCK_KIND = "ewbot-stratb-holdout"
+FETCH_TRIES = 3  # per page, on a connection error or a timeout
+FETCH_BACKOFF_S = 1.0  # waits 1 s, then 2 s
 
 
 class HoldoutGuardError(RuntimeError):
     """Candles at/after 2024-01-01 were requested before holdout-b.lock exists."""
 
 
-def cache_path(cache_dir: Path, product: str = PRODUCT) -> Path:
+def cache_path(cache_dir: Path, product: str) -> Path:
     return Path(cache_dir) / f"{product}_15m.parquet"
+
+
+def cache_paths(cache_dir: Path) -> dict[str, Path]:
+    """{asset: its cache file}, in config.ASSETS order."""
+    return {a: cache_path(cache_dir, p) for a, p in PRODUCTS.items()}
 
 
 def lock_exists(lock_path: Path) -> bool:
@@ -813,11 +933,42 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _rows_frame(rows: list[list[float]], first: int, last_open: int) -> pd.DataFrame:
+    if not rows:
+        return _empty()
+    df = pd.DataFrame(rows, columns=["ts", "low", "high", "open", "close", "volume"])
+    df["ts"] = df["ts"].astype("int64")
+    return _standard(df[(df["ts"] >= first) & (df["ts"] <= last_open)])
+
+
+def _get_page(sess: requests.Session, url: str, params: dict[str, object]) -> list:
+    """_get_json, also retried on a connection error or a timeout (FETCH_TRIES attempts in all)."""
+    failed = 0
+    while True:
+        try:
+            return _get_json(sess, url, params)
+        except (requests.ConnectionError, requests.Timeout):
+            failed += 1
+            if failed >= FETCH_TRIES:
+                raise
+            time.sleep(FETCH_BACKOFF_S * 2 ** (failed - 1))
+
+
 def fetch_15m(
-    product: str, start_ts: int, end_ts: int, session: requests.Session | None = None, sleep_s: float = 0.15
+    product: str,
+    start_ts: int,
+    end_ts: int,
+    session: requests.Session | None = None,
+    sleep_s: float = 0.15,
+    *,
+    lock_path: Path = DEFAULT_LOCK_PATH,
+    on_page: Callable[[pd.DataFrame], None] | None = None,
 ) -> pd.DataFrame:
     """Closed 15m bars with open time in [start_ts, end_ts), ascending, standard schema (maybe empty).
-    Walks windows of 300 bars; retries 429 / 5xx like coinbase_history (its _get_json)."""
+    Walks windows of 300 bars; on_page receives each window's bars as they arrive. HoldoutGuardError,
+    before any request, when the window reaches 2024-01-01 and holdout-b.lock does not exist."""
+    if end_ts > HOLDOUT_START and not lock_exists(lock_path):
+        raise HoldoutGuardError(f"{product}: bars from 2024-01-01 on cannot be fetched before the strategy-B lock")
     first = -(-start_ts // M15) * M15
     last_open = (end_ts - 1) // M15 * M15
     if first > last_open:
@@ -828,45 +979,75 @@ def fetch_15m(
     w_start = first
     while w_start <= last_open:
         w_end = min(w_start + (MAX_PER_REQUEST - 1) * M15, last_open)
-        rows.extend(_get_json(sess, url, {"granularity": M15, "start": _iso(w_start), "end": _iso(w_end)}))
+        page = _get_page(sess, url, {"granularity": M15, "start": _iso(w_start), "end": _iso(w_end)})
+        rows.extend(page)
+        if on_page is not None:
+            on_page(_rows_frame(page, w_start, w_end))
         w_start = w_end + M15
         if w_start <= last_open and sleep_s > 0:
             time.sleep(sleep_s)
-    if not rows:
-        return _empty()
-    df = pd.DataFrame(rows, columns=["ts", "low", "high", "open", "close", "volume"])
-    df["ts"] = df["ts"].astype("int64")
-    return _standard(df[(df["ts"] >= first) & (df["ts"] <= last_open)])
+    return _rows_frame(rows, first, last_open)
+
+
+def _save(df: pd.DataFrame, path: Path) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
 
 
 def update_cache_15m(
     cache_dir: Path,
     *,
-    product: str = PRODUCT,
+    product: str,
     lock_path: Path = DEFAULT_LOCK_PATH,
     start_ts: int = START_TS,
     now_ts: int | None = None,
     session: requests.Session | None = None,
     sleep_s: float = 0.15,
 ) -> Path:
-    """Create (from start_ts) or extend the 15m cache up to the last CLOSED bar - and, while holdout-b.lock
-    does not exist, never past HOLDOUT_START. Network: only here (`stratb fetch`, `stratb holdout run`,
-    the paper-B runner, which starts an empty cache at REPLAY_ANCHOR)."""
+    """Create (from start_ts) or extend one product's 15m cache up to the last CLOSED bar - and, while
+    holdout-b.lock does not exist, never past HOLDOUT_START. Every page is saved as it arrives, so a failed
+    download keeps what it got and the next call goes on from there. Network: only here (`stratb fetch`,
+    `stratb holdout run`, the paper-B runner, which starts an empty cache at REPLAY_ANCHOR)."""
     path = cache_path(cache_dir, product)
     path.parent.mkdir(parents=True, exist_ok=True)
-    old = _standard(pd.read_parquet(path)) if path.exists() else _empty()
+    cur = _standard(pd.read_parquet(path)) if path.exists() else _empty()
     now = int(time.time()) if now_ts is None else int(now_ts)
     end = now // M15 * M15  # exclusive: the bar in progress is never stored
     if not lock_exists(lock_path):
         end = min(end, HOLDOUT_START)
-    begin = int(old["ts"].max()) + M15 if len(old) else int(start_ts)
+    begin = int(cur["ts"].max()) + M15 if len(cur) else int(start_ts)
+    if not path.exists():
+        _save(cur, path)
     if begin >= end:
-        if not path.exists():
-            old.to_parquet(path, index=False)
         return path
-    new = fetch_15m(product, begin, end, session=session, sleep_s=sleep_s)
-    _standard(pd.concat([old, new], ignore_index=True)).to_parquet(path, index=False)
+
+    def append(page: pd.DataFrame) -> None:
+        nonlocal cur
+        if len(page):
+            cur = _standard(pd.concat([cur, page], ignore_index=True))
+            _save(cur, path)
+
+    fetch_15m(product, begin, end, session=session, sleep_s=sleep_s, lock_path=lock_path, on_page=append)
     return path
+
+
+def update_caches_15m(
+    cache_dir: Path,
+    *,
+    lock_path: Path = DEFAULT_LOCK_PATH,
+    start_ts: int = START_TS,
+    now_ts: int | None = None,
+    session: requests.Session | None = None,
+    sleep_s: float = 0.15,
+) -> dict[str, Path]:
+    """update_cache_15m for every asset, with one clock: {asset: cache file}."""
+    now = int(time.time()) if now_ts is None else int(now_ts)
+    return {
+        a: update_cache_15m(cache_dir, product=p, lock_path=lock_path, start_ts=start_ts, now_ts=now,
+                            session=session, sleep_s=sleep_s)
+        for a, p in PRODUCTS.items()
+    }
 
 
 def load_15m(path: Path, *, include_holdout: bool = False, lock_path: Path = DEFAULT_LOCK_PATH) -> pd.DataFrame:
@@ -879,6 +1060,11 @@ def load_15m(path: Path, *, include_holdout: bool = False, lock_path: Path = DEF
     filters = None if include_holdout else [("ts", "<", HOLDOUT_START)]
     df = pd.read_parquet(Path(path), filters=filters)
     return _standard(df)
+
+
+def load_caches_15m(cache_dir: Path) -> dict[str, pd.DataFrame]:
+    """Every asset's bars before 2024-01-01 (research runs): {asset: load_15m(its cache)}."""
+    return {a: load_15m(p) for a, p in cache_paths(cache_dir).items()}
 
 
 def gap_report(df15: pd.DataFrame) -> IntegrityReport:
@@ -906,13 +1092,13 @@ def resample_1h(df15: pd.DataFrame) -> pd.DataFrame:
 uv run --group live pytest tests/stratb/test_data15.py -q
 ```
 
-예상: `8 passed`
+예상: `11 passed`
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/ewbot/stratb/data15.py tests/stratb/test_data15.py
-git commit -m "feat(stratb): 15m Coinbase candles with a cache that cannot reach 2024 before holdout-b.lock" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): BTC and ETH 15m Coinbase candles in caches that cannot reach 2024 before holdout-b.lock" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1186,7 +1372,7 @@ git commit -m "feat(stratb): strategy-B rules as pure functions (RSI, pivots, zo
 
 ---
 
-### Task 4: 15분 프레임, 기준 구간, 신호 생성
+### Task 4: 자산별 15분 프레임, 기준 구간, 신호 생성
 
 **Files:**
 - Create: `src/ewbot/stratb/signals.py`
@@ -1194,17 +1380,17 @@ git commit -m "feat(stratb): strategy-B rules as pure functions (RSI, pivots, zo
 - Test: `tests/stratb/test_signals.py`
 
 **Interfaces:**
-- Consumes: Task 1: `M15`, `StratBParams`. Task 3: 모든 규칙 함수. A: `ewbot.data.candles.fill_gaps(df, tf)`, `ewbot.indicators.atr_series(high, low, close, n)`, `ewbot.waves.zigzag.ZigZag(k, atr_len)`(`.update(i, bar) -> Pivot | None`, `.pivots`, `.atr`; `Pivot(i, sub_ts, price, kind, confirmed_at)`), `ewbot.types.Bar`, `H1`.
-- Produces: `ewbot.stratb.signals`: `@dataclass(frozen=True) Frame15(ts, open, high, low, close, synthetic, rsi, atr15, piv_lo, piv_hi, h_ts, h_open, h_high, h_low, h_close, h_atr, h_end, last_hour)`(numpy 배열; `len(f)` = 15분봉 수; `h_end[j]` = 1시간봉 j의 마지막 15분봉 인덱스; `last_hour[i]` = 봉 i 마감까지 완성된 마지막 1시간봉, 없으면 −1); `@dataclass(frozen=True) RefLeg(known_i, direction, start, end, start_ts, end_ts, end_i, atr1h, prior)`; `@dataclass(frozen=True) SignalB(i, ts, direction, entry_ref, stop, tp1, tp2, leg_start=0.0, leg_end=0.0, p1_ts=0, p2_ts=0, level=0.0, reason="")`(`i` = 확인 봉의 프레임 인덱스); `build_frame(df15, p=StratBParams()) -> Frame15`; `reference_legs(f, zz_k, p=StratBParams()) -> list[RefLeg]`; `generate_signals(f, p, legs=None) -> list[SignalB]`(봉 순서, 봉마다 최대 1개).
-  `tests/stratb/helpers.py`: `T0 = 1700006400`, `RANDOM_T0 = 1690848000`, `M15`, `LONG_SETUP`, `LONG_START = 1060.0`, `SIGNAL_BAR = 177`, `path(start, segments) -> list[float]`, `frame_df(closes, t0=T0, wick=0.5) -> DataFrame`, `long_setup_df(t0=T0)`, `mirror(df, ref=1200.0)`, `random_df(n, seed, t0=RANDOM_T0, start=20000.0)`.
+- Consumes: Task 1: `M15`, `StratBParams`. Task 2(테스트 도우미): `cache_paths`. Task 3: 모든 규칙 함수. A: `ewbot.data.candles.fill_gaps(df, tf)`, `ewbot.indicators.atr_series(high, low, close, n)`, `ewbot.waves.zigzag.ZigZag(k, atr_len)`(`.update(i, bar) -> Pivot | None`, `.pivots`, `.atr`; `Pivot(i, sub_ts, price, kind, confirmed_at)`), `ewbot.types.Bar`, `H1`.
+- Produces: `ewbot.stratb.signals`: `@dataclass(frozen=True) Frame15(ts, open, high, low, close, synthetic, rsi, atr15, piv_lo, piv_hi, h_ts, h_open, h_high, h_low, h_close, h_atr, h_end, last_hour)`(numpy 배열; `len(f)` = 15분봉 수; `h_end[j]` = 1시간봉 j의 마지막 15분봉 인덱스; `last_hour[i]` = 봉 i 마감까지 완성된 마지막 1시간봉, 없으면 −1); `@dataclass(frozen=True) RefLeg(known_i, direction, start, end, start_ts, end_ts, end_i, atr1h, prior)`; `@dataclass(frozen=True) SignalB(i, ts, direction, entry_ref, stop, tp1, tp2, leg_start=0.0, leg_end=0.0, p1_ts=0, p2_ts=0, level=0.0, reason="")`(`i` = 확인 봉의 프레임 인덱스); `build_frame(df15, p=StratBParams()) -> Frame15`; `build_frames(dfs: Mapping[str, DataFrame], p=StratBParams()) -> dict[str, Frame15]`(자산마다 프레임 하나, 모두 가장 늦은 마지막 봉에서 끝남; 봉이 없는 자산이 있으면 `ValueError`); `reference_legs(f, zz_k, p=StratBParams()) -> list[RefLeg]`; `generate_signals(f, p, legs=None) -> list[SignalB]`(봉 순서, 봉마다 최대 1개).
+  `tests/stratb/helpers.py`: `T0 = 1700006400`, `RANDOM_T0 = 1690848000`, `M15`, `LONG_SETUP`, `LONG_START = 1060.0`, `SIGNAL_BAR = 177`, `path(start, segments) -> list[float]`, `frame_df(closes, t0=T0, wick=0.5) -> DataFrame`, `long_setup_df(t0=T0)`, `mirror(df, ref=1200.0)`, `random_df(n, seed, t0=RANDOM_T0, start=20000.0)`, `world_dfs(t0, reps=130) -> {"BTC": DataFrame, "ETH": DataFrame}`, `save_world(cache_dir, dfs)`(자산마다 캐시 파일에 씀).
 
-명세 4.1~4.4를 15분봉 위에서 봉 마감 순서대로 적용한다(파일 머리의 docstring이 순서를 정의한다). 15분봉은 A의 `fill_gaps`로 시간 격자를 잇고(합성 봉 표시), 완성된 1시간봉(15분봉 4개)을 A의 `ZigZag`에 넣는다. 기준 구간은 방향마다 가장 최근 것이며(명세 해석 4), 매물대는 L 이전 30일의 1시간 피벗이다(해석 5). 다이버전스 쌍은 해석 6, 진입가 기준과 걸러내기는 해석 7을 따른다. 모든 계산은 인과적이다: 15분 피벗 j는 봉 j+3에서야 쓰이고, 1시간 피벗은 그 시간의 마지막 15분봉 마감에 알려진다.
+명세 4.1~4.4를 15분봉 위에서 봉 마감 순서대로 적용한다(파일 머리의 docstring이 순서를 정의한다). BTC와 ETH는 같은 규칙과 같은 파라미터로 자산마다 따로 신호를 낸다(신호는 그 자산의 봉만 본다). 15분봉은 A의 `fill_gaps`로 시간 격자를 잇고(합성 봉 표시), 완성된 1시간봉(15분봉 4개)을 A의 `ZigZag`에 넣는다. `build_frames`는 자산별 프레임이 같은 마지막 봉에서 끝나게 한다: 데이터가 일찍 끝난 자산 뒤에는 마지막 종가의 평평한 합성 봉을 붙인다(A의 `fill_gaps`가 중간의 누락 봉에 하는 것과 같다). 그래야 시각 t에서 자른 실행이 각 자산을 전체 실행과 똑같이 본다(해석 8). 기준 구간은 방향마다 가장 최근 것이며(명세 해석 4), 매물대는 L 이전 30일의 1시간 피벗이다(해석 5). 다이버전스 쌍은 해석 6, 진입가 기준과 걸러내기는 해석 7을 따른다. 모든 계산은 인과적이다: 15분 피벗 j는 봉 j+3에서야 쓰이고, 1시간 피벗은 그 시간의 마지막 15분봉 마감에 알려진다.
 
-`tests/stratb/helpers.py`의 `LONG_SETUP`은 손으로 만든 경로다: 1시간 지그재그(k = 2와 3 모두)가 상승 구간 L = 999.5 → H = 1200.5를 확정하고, 그 전의 스윙 고점 1100.5가 38.2~61.8% 구간 [1076.3, 1123.7] 안에 있다. 되돌림이 15분 저점 1109.5(RSI 13.9)와 1104.5(RSI 25.4, 구간 안)를 만들고, 봉 177의 종가 1130이 두 저점 사이의 고점 1125.5를 넘어 롱 신호 하나가 나온다. 가격이 1/64 격자라 `mirror()`(p → 2400 − p)가 정확한 숏 경로를 만든다. `random_df`는 무작위 조각선 경로로, 잘라내기 불변성 검사에 쓴다(시드 0, 3, 4는 신호를 만든다).
+`tests/stratb/helpers.py`의 `LONG_SETUP`은 손으로 만든 경로다: 1시간 지그재그(k = 2와 3 모두)가 상승 구간 L = 999.5 → H = 1200.5를 확정하고, 그 전의 스윙 고점 1100.5가 38.2~61.8% 구간 [1076.3, 1123.7] 안에 있다. 되돌림이 15분 저점 1109.5(RSI 13.9)와 1104.5(RSI 25.4, 구간 안)를 만들고, 봉 177의 종가 1130이 두 저점 사이의 고점 1125.5를 넘어 롱 신호 하나가 나온다. 가격이 1/64 격자라 `mirror()`(p → 2400 − p)가 정확한 숏 경로를 만든다. `random_df`는 무작위 조각선 경로로, 잘라내기 불변성 검사에 쓴다(시드 0, 3, 4는 신호를 만든다). `world_dfs`는 뒤의 홀드아웃·모의매매·CLI 테스트가 쓰는 두 자산 세계다: BTC는 `LONG_SETUP`을 되풀이하고 ETH는 그 거울이라, 232봉마다 같은 봉에서 BTC 롱과 ETH 숏이 하나씩 나온다(두 자산이 같은 봉에 진입하는 경우를 늘 시험한다).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-합성 데이터 도우미와 신호 테스트를 만든다. 잘라내기 테스트는 신호가 나온 봉과 그 직전 봉, 그리고 몇몇 고정 시점에서 데이터를 잘라 다시 계산하고, 그 시점까지의 신호가 전체 계산과 같은지 확인한다.
+합성 데이터 도우미와 신호 테스트를 만든다. 두 자산 프레임이 같은 봉에서 끝나는지(일찍 끝난 자산의 평평한 합성 봉), 72시간 수명의 마지막 봉에서는 확인되고 한 봉 넘으면 안 되는지도 확인한다. 잘라내기 테스트는 신호가 나온 봉과 그 직전 봉, 그리고 몇몇 고정 시점에서 데이터를 잘라 다시 계산하고, 그 시점까지의 신호가 전체 계산과 같은지 확인한다.
 
 **파일 `tests/stratb/helpers.py`** (새 파일, 전체 내용)
 
@@ -1214,12 +1400,18 @@ git commit -m "feat(stratb): strategy-B rules as pure functions (RSI, pivots, zo
 LONG_SETUP is a hand-made path whose 1h ZigZag (k = 2 or 3) confirms an up leg L = 999.5 -> H = 1200.5
 with an earlier swing high (1100.5) inside the 38.2-61.8% zone; the retracement makes two 15m lows
 1109.5 (RSI 13.9) and 1104.5 (RSI 25.4, inside the zone) and the close 1130 at bar 177 breaks the 1125.5
-swing between them: one long signal at bar 177. Prices sit on a 1/64 grid, so mirror() is exact."""
+swing between them: one long signal at bar 177. Prices sit on a 1/64 grid, so mirror() is exact.
+world_dfs() is the two-asset world of the holdout, paper and CLI tests: BTC repeats LONG_SETUP, ETH is
+its mirror, so both assets signal on the same bars (a BTC long and an ETH short every 232 bars)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+from ewbot.stratb.data15 import cache_paths
 
 T0 = 1_700_006_400  # 2023-11-15 00:00 UTC (hour aligned)
 RANDOM_T0 = 1_690_848_000  # 2023-08-01 00:00 UTC: 6,000 random bars end before 2024
@@ -1277,6 +1469,17 @@ def random_df(n: int, seed: int, t0: int = RANDOM_T0, start: float = 20_000.0) -
         {"ts": t0 + M15 * np.arange(n), "open": o, "high": np.maximum(o, c) + up, "low": np.minimum(o, c) - dn,
          "close": c, "volume": 1.0}
     ).astype({"ts": "int64"})
+
+
+def world_dfs(t0: int, reps: int = 130) -> dict[str, pd.DataFrame]:
+    btc = frame_df(path(LONG_START, LONG_SETUP * reps), t0)
+    return {"BTC": btc, "ETH": mirror(btc)}
+
+
+def save_world(cache_dir: Path, dfs: dict[str, pd.DataFrame]) -> None:
+    """Each asset's bars into its 15m cache file below cache_dir."""
+    for a, p in cache_paths(cache_dir).items():
+        dfs[a].to_parquet(p, index=False)
 ```
 
 **파일 `tests/stratb/test_signals.py`** (새 파일, 전체 내용)
@@ -1290,7 +1493,7 @@ import numpy as np
 import pytest
 
 from ewbot.stratb.config import StratBParams
-from ewbot.stratb.signals import build_frame, generate_signals, reference_legs
+from ewbot.stratb.signals import build_frame, build_frames, generate_signals, reference_legs
 from tests.stratb.helpers import SIGNAL_BAR, T0, long_setup_df, mirror, random_df
 
 M15 = 900
@@ -1314,6 +1517,18 @@ def test_frame_has_complete_hours_and_flags_gaps():
     assert f.h_ts[0] == T0 + 3600 and (f.h_ts % 3600 == 0).all()
     assert (f.ts[f.h_end] == f.h_ts + 2700).all()
     assert f.last_hour[int(f.h_end[0]) - 1] == -1 and f.last_hour[int(f.h_end[0])] == 0
+
+
+def test_the_frames_of_two_assets_end_on_the_same_bar():
+    btc, eth = long_setup_df(), mirror(long_setup_df()).iloc[:-3]  # ETH's last 3 bars are missing
+    frames = build_frames({"BTC": btc, "ETH": eth})
+    f, g = frames["BTC"], frames["ETH"]
+    assert list(frames) == ["BTC", "ETH"] and len(f) == len(g) == len(btc) and g.ts[-1] == f.ts[-1]
+    assert g.synthetic[-3:].all() and not g.synthetic[:-3].any() and (g.close[-3:] == eth["close"].iloc[-1]).all()
+    assert (g.high[-3:] == g.low[-3:]).all() and np.array_equal(g.rsi[:-3], build_frame(eth).rsi, equal_nan=True)
+    assert np.array_equal(f.close, build_frame(btc).close)
+    with pytest.raises(ValueError):
+        build_frames({"BTC": btc, "ETH": eth.iloc[:0]})
 
 
 def test_legs_alternate_and_carry_the_earlier_swings(setup):
@@ -1370,6 +1585,18 @@ def test_filters_and_expiry(setup):
     assert generate_signals(f, dataclasses.replace(p, confirm_hours=10), legs) == []  # 72 h -> 10 h: expired
 
 
+def test_the_72_hour_life_includes_its_last_bar(setup):
+    p, f, legs = setup
+    q = dataclasses.replace(p, confirm_hours=10)  # 40 bars from the bar at whose close the leg is known
+    up = next(k for k, g in enumerate(legs) if g.known_i == 135)
+
+    def leg_known_at(i):
+        return [dataclasses.replace(g, known_i=i) if k == up else g for k, g in enumerate(legs)]
+
+    assert [s.i for s in generate_signals(f, q, leg_known_at(SIGNAL_BAR - 40))] == [SIGNAL_BAR]
+    assert generate_signals(f, q, leg_known_at(SIGNAL_BAR - 41)) == []
+
+
 def test_a_gap_filled_bar_blocks_the_confirmation():
     df = long_setup_df().drop(index=[174]).reset_index(drop=True)
     p = StratBParams(zz_k=2.0)
@@ -1407,8 +1634,9 @@ uv run --group live pytest tests/stratb/test_signals.py -q
 **파일 `src/ewbot/stratb/signals.py`** (새 파일, 전체 내용)
 
 ```python
-"""Strategy-B signals over a gap-filled 15m frame (Plan 4 spec 4.1-4.4). Decisions at a bar's CLOSE
-from bars up to it only; the output for bars <= t never depends on later bars (tested by truncation).
+"""Strategy-B signals over a gap-filled 15m frame (Plan 4 spec 4.1-4.4), one frame per asset (the same
+rules and params for BTC and ETH). Decisions at a bar's CLOSE from bars up to it only; the output for bars
+<= t never depends on later bars (tested by truncation).
 
 1. Structure: complete 1h bars (4 x 15m) feed A's ATR ZigZag (waves/zigzag.py, k = zz_k, ATR 14). A
    pivot confirmed on the hour whose last 15m bar is i makes the leg (previous pivot -> new pivot) a
@@ -1423,15 +1651,18 @@ from bars up to it only; the output for bars <= t never depends on later bars (t
 4. Confirmation (spec 4.3): two consecutive 15m pivots of the trade's kind (lows for a long, w = 3) after
    the leg's extreme 15m bar make a lower low with a higher RSI(14) low, the second inside the zone; the
    latest such pair stays the setup until a newer pair replaces it or a later bar undercuts its second
-   pivot. Confirmed at the first close beyond the swing between the two pivots (highest high for a
-   long) with no gap-filled bar from p1 - w to the confirming bar.
+   pivot. Confirmed at a close beyond the swing between the two pivots (highest high for a long) with no
+   gap-filled bar from p1 - w to the confirming bar, whose levels pass the filters of item 5.
 5. Levels (spec 4.4): entry_ref = the confirming close; stop = second pivot -/+ 0.2 x ATR15; TP1 = entry +
-   tp1_r x R; TP2 = start + e (end - start). Skipped (the reference stays alive) when R > 2.5 x ATR1h or TP2
-   is not beyond TP1. A signal consumes its reference: one signal per leg."""
+   tp1_r x R; TP2 = start + e (end - start). A close beyond the level is skipped when R > 2.5 x ATR1h or TP2
+   is not beyond TP1; the pair and the reference stay alive, so a later close beyond the level within the
+   reference's life may confirm ("a far stop waits", spec 4.4). A signal consumes its reference: one
+   signal per leg."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
@@ -1535,6 +1766,25 @@ def build_frame(df15: pd.DataFrame, p: StratBParams = StratBParams()) -> Frame15
     )
 
 
+def build_frames(dfs: Mapping[str, pd.DataFrame], p: StratBParams = StratBParams()) -> dict[str, Frame15]:
+    """One frame per asset ({asset: 15m bars}, same params), all ending at the latest bar of any asset:
+    an asset whose bars end earlier gets flat synthetic bars at its last close up to there, as fill_gaps
+    makes for a missing bar, so a run cut at time t sees every asset as the full run does up to t."""
+    if not dfs or any(len(df) == 0 for df in dfs.values()):
+        raise ValueError(f"every asset needs 15m bars: {[a for a, df in dfs.items() if len(df) == 0] or 'none given'}")
+    end = max(int(df["ts"].max()) for df in dfs.values())
+    out: dict[str, Frame15] = {}
+    for a, df in dfs.items():
+        k = int(df["ts"].to_numpy().argmax())
+        if int(df["ts"].iloc[k]) < end:
+            px = float(df["close"].iloc[k])
+            pad = pd.DataFrame({"ts": [end], "open": [px], "high": [px], "low": [px], "close": [px],
+                                "volume": [0.0], "synthetic": [True]})
+            df = pd.concat([df if "synthetic" in df.columns else df.assign(synthetic=False), pad], ignore_index=True)
+        out[a] = build_frame(df, p)
+    return out
+
+
 def reference_legs(f: Frame15, zz_k: float, p: StratBParams = StratBParams()) -> list[RefLeg]:
     """Every leg the 1h ZigZag confirms, in order (spec 4.1)."""
     zz = ZigZag(zz_k, p.atr_len)
@@ -1595,7 +1845,8 @@ def _scan(f: Frame15, p: StratBParams, leg: RefLeg, last_i: int) -> SignalB | No
         if d * (f.close[i] - level) <= 0.0 or f.synthetic[max(p1 - w, 0) : i + 1].any():
             continue
         hour = int(f.last_hour[i])
-        atr15, atr1h = float(f.atr15[i]), float(f.h_atr[hour]) if hour >= 0 else float("nan")
+        atr15 = float(f.atr15[i])
+        atr1h = float(f.h_atr[hour]) if hour >= 0 else float("nan")
         if not (np.isfinite(atr15) and np.isfinite(atr1h)):
             continue
         entry = float(f.close[i])
@@ -1638,32 +1889,32 @@ def generate_signals(f: Frame15, p: StratBParams, legs: list[RefLeg] | None = No
 uv run --group live pytest tests/stratb/test_signals.py -q
 ```
 
-예상: `11 passed`
+예상: `13 passed`
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/ewbot/stratb/signals.py tests/stratb/helpers.py tests/stratb/test_signals.py
-git commit -m "feat(stratb): 1h reference legs on A's ZigZag and 15m divergence-breakout signals (truncation-invariant)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): 1h reference legs on A's ZigZag and 15m divergence-breakout signals per asset (truncation-invariant)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 5: 15분 엔진(체결, 수량, 손실 한도, 비용)
+### Task 5: 15분 포트폴리오 엔진(BTC·ETH 한 계좌: 체결, 수량, 손실 한도, 비용)
 
 **Files:**
 - Create: `src/ewbot/stratb/engine.py`
 - Test: `tests/stratb/test_engine.py`
 
 **Interfaces:**
-- Consumes: Task 1: `M15`, `BConfig`. Task 4: `Frame15`, `SignalB`(테스트는 `build_frame`, `generate_signals`, `tests.stratb.helpers.T0`, `random_df`도 쓴다). A: `ewbot.engine.loop.EquityPoint(ts, equity)`, `Trade(entry_ts, exit_ts, setup, direction, contracts, entry_price, exit_price_avg, stop0, tp1, tp2, pnl, fees, funding, r_multiple, exit_reason, snapshot)`; `ewbot.execution.costs.fee(price, contracts, c)`, `slip(price, side, c)`, `funding_per_hour(mark, contracts, direction, c)`; `ewbot.risk.sizing.size_contracts(equity, entry, stop, direction, risk, risk_mult, c) -> int`; `ewbot.risk.breakers.CircuitBreakers(p, equity0)`(`on_equity(ts, equity)`, `on_trade_closed(ts, pnl)`, `can_enter(ts)`, `halted`).
-- Produces: `ewbot.stratb.engine`: `SETUP = "B"`; `@dataclass(frozen=True) FillB(ts, kind, contracts, price, fee, trade_key)`(`kind` ∈ ENTRY, TP1, TP2, STOP, EXIT; `trade_key` = 진입 봉 ts); `@dataclass(frozen=True) StopMoveB(ts, trade_key, old, new, kind="BREAKEVEN")`; `@dataclass(frozen=True) OrderB(ts, direction, contracts, tp1_contracts)`; `@dataclass(frozen=True) BResult(trades, equity, signals, orders, fills, stops, end_fill, events)`(`signals`와 `orders`는 진입 주문을 낸 신호와 그 수량, 같은 순서; `end_fill`은 마지막 봉의 강제 청산 `FillB(kind="END")` 또는 `None`; `events`는 `(ts, "ENTRY_SKIPPED:gap" | "ENTRY_SKIPPED:open_beyond_stop" | "SIGNAL_REJECTED:size" | "SIGNAL_REJECTED:breaker" | "DAILY_HALT" | "TOTAL_HALT" | "CONSEC_PAUSE")`); `tp1_contracts(n, frac) -> int`; `run_engine(f, signals, cfg, start_ts=None) -> BResult`. 거래는 A의 `Trade`이고 `setup = "B"`, `snapshot = {"signal_ts", "entry_ref", "leg", "pivots", "level", "reason"}`, `r_multiple = pnl / (|entry_price − stop0| × contracts × 0.01)`, `exit_reason` ∈ STOP, TP1(1계약), TP2, TIME, BREAKER, END. 자산은 매시 마지막 15분봉 마감의 평가액이고 시각은 그 시간의 시작이다.
+- Consumes: Task 1: `M15`, `BConfig`, `asset_costs`. Task 4: `Frame15`, `SignalB`(테스트는 `build_frame`, `build_frames`, `generate_signals`, `tests.stratb.helpers.T0`, `RANDOM_T0`, `random_df`도 쓴다). A: `ewbot.engine.loop.EquityPoint(ts, equity)`, `Trade(entry_ts, exit_ts, setup, direction, contracts, entry_price, exit_price_avg, stop0, tp1, tp2, pnl, fees, funding, r_multiple, exit_reason, snapshot)`; `ewbot.execution.costs.fee(price, contracts, c)`, `slip(price, side, c)`, `funding_per_hour(mark, contracts, direction, c)`; `ewbot.risk.sizing.size_contracts(equity, entry, stop, direction, risk, risk_mult, c) -> int`; `ewbot.risk.breakers.CircuitBreakers(p, equity0)`(`on_equity(ts, equity)`, `on_trade_closed(ts, pnl)`, `can_enter(ts)`, `halted`).
+- Produces: `ewbot.stratb.engine`: `SETUP = "B"`; `setup_of(asset) -> str`(`"B-BTC"`, `"B-ETH"`); `asset_of(trade) -> str`(스냅숏의 자산); `@dataclass(frozen=True) FillB(ts, asset, kind, contracts, price, fee, trade_key)`(`kind` ∈ ENTRY, TP1, TP2, STOP, EXIT; `trade_key` = 진입 봉 ts, 자산마다 고유); `@dataclass(frozen=True) StopMoveB(ts, asset, trade_key, old, new, kind="BREAKEVEN")`; `@dataclass(frozen=True) OrderB(ts, asset, direction, contracts, tp1_contracts)`; `@dataclass(frozen=True) BResult(trades, equity, signals, orders, fills, stops, end_fills, events)`(`signals`와 `orders`는 진입 주문을 낸 신호와 그 주문, 같은 순서; `end_fills`는 마지막 봉에 강제 청산한 포지션의 `FillB(kind="END")`들, 자산 순서; `events`는 `(ts, 자산 — 계좌의 손실 한도 사건이면 "", "ENTRY_SKIPPED:gap" | "ENTRY_SKIPPED:open_beyond_stop" | "SIGNAL_REJECTED:size" | "SIGNAL_REJECTED:leverage" | "SIGNAL_REJECTED:breaker" | "DAILY_HALT" | "TOTAL_HALT" | "CONSEC_PAUSE")`); `tp1_contracts(n, frac) -> int`; `run_engine(frames: Mapping[str, Frame15], signals: Mapping[str, Iterable[SignalB]], cfg, start_ts=None) -> BResult`(프레임은 `cfg.assets`의 자산이고 같은 봉에서 끝나야 한다, 아니면 `ValueError`). 거래는 A의 `Trade`이고 `setup = setup_of(asset)`, `snapshot = {"asset", "signal_ts", "entry_ref", "leg", "pivots", "level", "reason"}`, `r_multiple = pnl / (|entry_price − stop0| × contracts × 그 자산의 계약 크기)`, `exit_reason` ∈ STOP, TP1(1계약), TP2, TIME, BREAKER, END. 자산 곡선(`equity`)은 매시 마지막 15분봉 마감의 계좌 평가액이고 시각은 그 시간의 시작이다.
 
-파일 머리의 docstring이 봉 안의 처리 순서(1~9)를 정의한다. 체결 규칙은 A의 `PaperBroker`와 같다(명세 해석 9). 비용·수량·손실 한도는 A의 함수를 그대로 부르므로 같은 값이 쓰인다. 엔진은 신호를 받기만 하므로(신호 생성과 분리) 무작위 대조군(Task 7)도 같은 엔진을 쓴다. 엔진이 판단 추적(주문 수량, 체결, 본절 이동, 마지막 봉 청산)을 직접 내므로 A처럼 클래스를 바꿔 끼우는 추적이 필요 없다.
+BTC와 ETH를 한 계좌(현금 하나, 손실 한도 하나)에서 자산마다 포지션 하나씩 돌리는 포트폴리오 엔진이다. 시간축은 두 자산 프레임의 모든 15분봉이고, 파일 머리의 docstring이 봉 안의 처리 순서(1~9)와 자산 순서(설정 순서 BTC → ETH, 시가의 대기 주문은 청산 먼저)를 정의한다(해석 20). 체결 규칙은 A의 `PaperBroker`와 같다(명세 해석 9). 비용·수량·손실 한도는 A의 함수를 그대로 부르므로 같은 값이 쓰이고, 비용과 수량의 계약 크기만 자산별이다. 수량은 계좌 평가액(현금 + 열린 포지션의 평가 손익)으로 정하고, 포지션마다 3배(`size_contracts`)와 모든 포지션 합계 3배(`max_total_leverage`: 열린 포지션은 종가, 대기 진입은 기준가로 셈)를 넘지 않게 줄인다. 엔진은 신호를 받기만 하므로(신호 생성과 분리) 무작위 대조군(Task 7)도 같은 엔진을 쓴다. 엔진이 판단 추적(주문 수량, 체결, 본절 이동, 마지막 봉 청산)을 직접 내므로 A처럼 클래스를 바꿔 끼우는 추적이 필요 없다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-손으로 만든 15분봉과 손으로 만든 `SignalB`로 다음 체결을 확인한다: 다음 시가 체결과 0.5% 수량(41계약), 3배 상한(150계약), 같은 봉의 손절 우선, TP1 절반·본절 이동·TP2, 본절 잔량의 손절과 원래 손절 유지, 시가 갭 손절, 48시간 시간 손절과 15분 펀딩, 1계약 TP1 전량, 마지막 봉 청산과 시간 단위 자산, 누락 봉·손절 너머 시가의 진입 취소, 전체 낙폭 한도의 청산과 진입 차단, 그리고 잘라낸 데이터의 체결·주문이 전체와 같은지.
+손으로 만든 15분봉과 손으로 만든 `SignalB`로 다음 체결을 확인한다: 다음 시가 체결과 0.5% 수량(41계약), 3배 상한(150계약), 같은 봉의 손절 우선, TP1 절반·본절 이동·TP2, 본절 잔량의 손절과 원래 손절 유지, 숏의 TP1 절반과 본절 손절, 시가 갭 손절, 48시간 시간 손절과 15분 펀딩(숏은 펀딩을 받음), 1계약 TP1 전량, 포지션이나 대기 주문이 있는 자산의 신호 버리기, 마지막 봉 청산과 시간 단위 자산, 누락 봉·손절 너머 시가의 진입 취소, 전체 낙폭 한도의 청산과 진입 차단, 두 자산의 동시 포지션(한 계좌, 자산별 계약 크기, BTC 먼저), 모든 포지션 합계 3배 상한(줄이기와 `SIGNAL_REJECTED:leverage`), 계좌 손실 한도가 두 자산을 모두 정리하는지, 그리고 포지션이 겹치는 두 자산 데이터를 잘라도 체결·주문이 전체와 같은지.
 
 **파일 `tests/stratb/test_engine.py`** (새 파일, 전체 내용)
 
@@ -1678,13 +1929,14 @@ import pytest
 from ewbot.config import BreakerParams, CostParams
 from ewbot.execution.costs import fee, funding_per_hour, slip
 from ewbot.risk.sizing import size_contracts
-from ewbot.stratb.config import RISK_B, BConfig, StratBParams
-from ewbot.stratb.engine import run_engine, tp1_contracts
-from ewbot.stratb.signals import SignalB, build_frame, generate_signals
-from tests.stratb.helpers import T0, random_df
+from ewbot.stratb.config import RISK_B, BConfig, StratBParams, asset_costs
+from ewbot.stratb.engine import asset_of, run_engine, tp1_contracts
+from ewbot.stratb.signals import SignalB, build_frame, build_frames, generate_signals
+from tests.stratb.helpers import RANDOM_T0, T0, random_df
 
 M15, H1 = 900, 3600
 C = CostParams()
+CE = asset_costs(BConfig(), "ETH")  # 0.1 ETH per contract
 
 
 def bars(rows, t0=T0):
@@ -1703,28 +1955,34 @@ def sig(i, f, stop, tp1, tp2, d=1):
                    reason="test")
 
 
+def run(f, signals, cfg=None, start_ts=None, asset="BTC"):
+    """One asset's run."""
+    return run_engine({asset: f}, {asset: signals}, BConfig() if cfg is None else cfg, start_ts)
+
+
 def test_entry_fills_at_the_next_open_with_slippage_fee_and_half_percent_sizing():
     f = bars(flat(10))
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
     n = size_contracts(10_000.0, 20_000.0, 19_900.0, 1, RISK_B, 1.0, C)
     assert n == 41 and res.orders[0].contracts == 41 and res.orders[0].tp1_contracts == 20
     entry = res.fills[0]
     px = slip(20_000.0, 1, C)
-    assert (entry.kind, entry.ts, entry.price, entry.contracts) == ("ENTRY", int(f.ts[3]), px, 41)
+    assert (entry.kind, entry.ts, entry.asset, entry.price, entry.contracts) == ("ENTRY", int(f.ts[3]), "BTC", px, 41)
     assert entry.fee == pytest.approx(fee(px, 41, C))
     assert res.signals[0].i == 2 and len(res.trades) == 1 and res.trades[0].exit_reason == "END"
+    assert res.trades[0].setup == "B-BTC" and asset_of(res.trades[0]) == "BTC"
 
 
 def test_leverage_is_capped_at_3x():
     f = bars(flat(10))
-    res = run_engine(f, [sig(2, f, 19_990.0, 20_100.0, 20_300.0)], BConfig())
+    res = run(f, [sig(2, f, 19_990.0, 20_100.0, 20_300.0)])
     assert res.orders[0].contracts == 150  # 3 x 10,000 / 20,000 = 1.5 BTC = 150 contracts of 0.01
 
 
 def test_the_stop_beats_a_target_touched_in_the_same_bar():
     rows = flat(4) + [(20_000.0, 20_500.0, 19_800.0, 20_000.0)] + flat(3)
     f = bars(rows)
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
     (t,) = res.trades
     assert [x.kind for x in res.fills] == ["ENTRY", "STOP"] and res.fills[1].price == slip(19_900.0, -1, C)
     assert t.exit_reason == "STOP" and t.pnl < 0 and t.r_multiple < -1.0
@@ -1733,12 +1991,12 @@ def test_the_stop_beats_a_target_touched_in_the_same_bar():
 def test_tp1_takes_half_moves_the_rest_to_breakeven_and_tp2_closes_it():
     rows = flat(4) + [(20_000.0, 20_150.0, 19_950.0, 20_120.0), (20_120.0, 20_350.0, 20_100.0, 20_300.0)] + flat(2, 20_300.0)
     f = bars(rows)
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
     (t,) = res.trades
     assert [(x.kind, x.contracts, x.price) for x in res.fills[1:]] == [("TP1", 20, 20_100.0), ("TP2", 21, 20_300.0)]
     (mv,) = res.stops
     entry_px = res.fills[0].price
-    assert (mv.ts, mv.old, mv.new, mv.kind) == (int(f.ts[4]), 19_900.0, entry_px, "BREAKEVEN")
+    assert (mv.ts, mv.asset, mv.old, mv.new, mv.kind) == (int(f.ts[4]), "BTC", 19_900.0, entry_px, "BREAKEVEN")
     gross = (20_100.0 - entry_px) * 20 * 0.01 + (20_300.0 - entry_px) * 21 * 0.01
     assert t.exit_reason == "TP2" and t.pnl == pytest.approx(gross - t.fees - t.funding)
     assert t.fees == pytest.approx(sum(x.fee for x in res.fills))
@@ -1748,45 +2006,70 @@ def test_the_breakeven_rest_stops_at_the_entry_and_original_keeps_the_stop():
     rows = flat(4) + [(20_000.0, 20_150.0, 19_950.0, 20_120.0), (20_120.0, 20_120.0, 19_850.0, 19_860.0)] + flat(2, 19_860.0)
     f = bars(rows)
     s = [sig(2, f, 19_900.0, 20_100.0, 20_300.0)]
-    be = run_engine(f, s, BConfig())
+    be = run(f, s)
     assert [x.kind for x in be.fills] == ["ENTRY", "TP1", "STOP"]
     assert be.fills[2].price == slip(be.fills[0].price, -1, C)
-    orig = run_engine(f, s, BConfig(params=StratBParams(remainder="original")))
+    orig = run(f, s, BConfig(params=StratBParams(remainder="original")))
     assert orig.stops == () and orig.fills[2].price == slip(19_900.0, -1, C)
+
+
+def test_a_short_takes_half_below_tp1_and_its_rest_stops_at_breakeven():
+    rows = flat(4) + [(20_000.0, 20_050.0, 19_850.0, 19_880.0), (19_880.0, 20_150.0, 19_870.0, 20_140.0)]
+    rows += flat(2, 20_140.0)
+    f = bars(rows)
+    res = run(f, [sig(2, f, 20_100.0, 19_900.0, 19_700.0, d=-1)])
+    (t,) = res.trades
+    entry_px = slip(20_000.0, -1, C)  # a short sells at the open minus slippage
+    assert [(x.kind, x.contracts) for x in res.fills] == [("ENTRY", 41), ("TP1", 20), ("STOP", 21)]
+    assert res.fills[0].price == entry_px and res.fills[1].price == 19_900.0
+    assert res.stops[0].new == entry_px and res.fills[2].price == slip(entry_px, 1, C)  # buys back above it
+    gross = (entry_px - 19_900.0) * 20 * 0.01 + (entry_px - slip(entry_px, 1, C)) * 21 * 0.01
+    assert t.direction == -1 and t.exit_reason == "STOP" and t.pnl == pytest.approx(gross - t.fees - t.funding)
 
 
 def test_a_gap_through_the_stop_fills_at_the_open():
     rows = flat(4) + [(19_800.0, 19_850.0, 19_700.0, 19_750.0)] + flat(2, 19_750.0)
     f = bars(rows)
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
     assert res.fills[1].kind == "STOP" and res.fills[1].price == slip(19_800.0, -1, C)
 
 
 def test_the_time_stop_closes_at_the_open_48_hours_after_the_entry_and_funding_is_quarter_hourly():
     f = bars(flat(250))
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
     (t,) = res.trades
     assert t.exit_reason == "TIME" and t.exit_ts == t.entry_ts + 48 * H1 and res.fills[-1].kind == "EXIT"
     assert res.fills[-1].price == slip(20_000.0, -1, C)
     held = (t.exit_ts - t.entry_ts) // M15  # bars from the entry bar to the one before the exit
     assert t.funding == pytest.approx(held * funding_per_hour(20_000.0, 41, 1, C) / 4)
+    short = run(f, [sig(2, f, 20_100.0, 19_900.0, 19_700.0, d=-1)]).trades[0]
+    assert short.exit_reason == "TIME" and short.exit_ts == short.entry_ts + 48 * H1 and short.funding < 0.0
 
 
 def test_a_single_contract_closes_at_tp1():
     f = bars(flat(4, 100.0) + [(100.0, 103.0, 99.5, 102.0)] + flat(2, 102.0))
-    res = run_engine(f, [sig(2, f, 90.0, 101.0, 105.0)], BConfig(initial_equity=30.0))
+    res = run(f, [sig(2, f, 90.0, 101.0, 105.0)], BConfig(initial_equity=30.0))
     assert res.orders[0].contracts == 1 and res.orders[0].tp1_contracts == 1
     assert res.trades[0].exit_reason == "TP1" and tp1_contracts(1, 0.5) == 1 and tp1_contracts(7, 0.5) == 3
+
+
+def test_a_signal_while_the_asset_holds_a_position_or_an_order_is_dropped():
+    f = bars(flat(12))
+    s = [sig(k, f, 19_900.0, 20_100.0, 20_300.0) for k in (2, 3, 6)]
+    res = run(f, s)
+    assert [o.ts for o in res.orders] == [int(f.ts[2])] and len(res.trades) == 1
+    assert [x.kind for x in res.fills] == ["ENTRY"] and res.events == ()
 
 
 def test_end_of_data_entries_from_start_and_hourly_equity():
     f = bars(flat(16))
     s = [sig(2, f, 19_900.0, 20_100.0, 20_300.0), sig(15, f, 19_900.0, 20_100.0, 20_300.0)]
-    res = run_engine(f, s, BConfig(), start_ts=T0 + H1)
+    res = run(f, s, start_ts=T0 + H1)
     assert res.orders == ()  # bar 2 is before start_ts, bar 15 is the last bar
     assert [p.ts for p in res.equity] == [T0 + H1, T0 + 2 * H1, T0 + 3 * H1]
-    res = run_engine(f, s[:1], BConfig())
-    assert res.end_fill is not None and res.end_fill.kind == "END" and res.trades[-1].exit_reason == "END"
+    res = run(f, s[:1])
+    (end,) = res.end_fills
+    assert end.kind == "END" and end.asset == "BTC" and res.trades[-1].exit_reason == "END"
     assert [x.kind for x in res.fills] == ["ENTRY"] and res.equity[-1].equity == pytest.approx(res.trades[-1].pnl + 10_000.0)
 
 
@@ -1794,36 +2077,77 @@ def test_entries_are_dropped_on_a_gap_bar_or_an_open_beyond_the_stop():
     df = pd.DataFrame([(T0 + k * M15, 20_000.0, 20_005.0, 19_995.0, 20_000.0, 1.0) for k in range(10) if k != 3],
                       columns=["ts", "open", "high", "low", "close", "volume"])
     f = build_frame(df)
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
-    assert res.fills == () and (int(f.ts[3]), "ENTRY_SKIPPED:gap") in res.events
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
+    assert res.fills == () and (int(f.ts[3]), "BTC", "ENTRY_SKIPPED:gap") in res.events
     f = bars(flat(3) + [(19_890.0, 19_900.0, 19_880.0, 19_890.0)] + flat(3))
-    res = run_engine(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)], BConfig())
-    assert res.fills == () and (int(f.ts[3]), "ENTRY_SKIPPED:open_beyond_stop") in res.events
+    res = run(f, [sig(2, f, 19_900.0, 20_100.0, 20_300.0)])
+    assert res.fills == () and (int(f.ts[3]), "BTC", "ENTRY_SKIPPED:open_beyond_stop") in res.events
 
 
 def test_the_total_drawdown_breaker_flattens_and_blocks_entries():
     rows = flat(4) + [(20_000.0, 20_005.0, 19_950.0, 19_960.0)] * 4 + flat(8, 19_960.0)
     f = bars(rows)
     cfg = BConfig(breakers=dataclasses.replace(BreakerParams(), total_dd=0.0001))
-    res = run_engine(f, [sig(2, f, 19_000.0, 21_000.0, 22_000.0), sig(10, f, 19_000.0, 21_000.0, 22_000.0)], cfg)
-    assert ("TOTAL_HALT" in {e for _, e in res.events}) and res.trades[0].exit_reason == "BREAKER"
-    assert (int(f.ts[10]), "SIGNAL_REJECTED:breaker") in res.events and len(res.trades) == 1
+    res = run(f, [sig(2, f, 19_000.0, 21_000.0, 22_000.0), sig(10, f, 19_000.0, 21_000.0, 22_000.0)], cfg)
+    assert ("TOTAL_HALT" in {e for _, _, e in res.events}) and res.trades[0].exit_reason == "BREAKER"
+    assert (int(f.ts[10]), "BTC", "SIGNAL_REJECTED:breaker") in res.events and len(res.trades) == 1
+
+
+def test_two_assets_hold_a_position_each_on_one_account():
+    f, g = bars(flat(12)), bars(flat(12, 1_000.0))
+    res = run_engine({"BTC": f, "ETH": g}, {"ETH": [sig(2, g, 990.0, 1_010.0, 1_030.0, d=1)],
+                                            "BTC": [sig(2, f, 19_900.0, 20_100.0, 20_300.0)]}, BConfig())
+    n_eth = size_contracts(10_000.0, 1_000.0, 990.0, 1, RISK_B, 1.0, CE)
+    assert [(o.asset, o.contracts) for o in res.orders] == [("BTC", 41), ("ETH", n_eth)] and n_eth == 45
+    assert [(x.asset, x.kind, x.ts) for x in res.fills] == [("BTC", "ENTRY", int(f.ts[3])),
+                                                             ("ETH", "ENTRY", int(f.ts[3]))]
+    assert res.fills[1].fee == pytest.approx(fee(slip(1_000.0, 1, CE), n_eth, CE))
+    assert [(t.setup, t.exit_reason) for t in res.trades] == [("B-BTC", "END"), ("B-ETH", "END")]
+    assert [x.asset for x in res.end_fills] == ["BTC", "ETH"]
+    assert res.equity[-1].equity == pytest.approx(10_000.0 + sum(t.pnl for t in res.trades))
+
+
+def test_all_positions_together_stay_within_3x_of_the_equity():
+    f, g = bars(flat(10)), bars(flat(10, 1_000.0))
+    btc = sig(2, f, 19_970.0, 20_100.0, 20_300.0)  # 1 BTC: 2x the equity
+    eth = sig(2, g, 999.0, 1_010.0, 1_030.0)  # alone: 250 contracts = 25 ETH = 2.5x
+    assert size_contracts(10_000.0, 1_000.0, 999.0, 1, RISK_B, 1.0, CE) == 250
+    res = run_engine({"BTC": f, "ETH": g}, {"BTC": [btc], "ETH": [eth]}, BConfig())
+    assert [(o.asset, o.contracts) for o in res.orders] == [("BTC", 100), ("ETH", 100)]  # ETH gets the last 1x
+    full = run_engine({"BTC": f, "ETH": g}, {"BTC": [sig(2, f, 19_990.0, 20_100.0, 20_300.0)], "ETH": [eth]}, BConfig())
+    assert [o.asset for o in full.orders] == ["BTC"]
+    assert (int(f.ts[2]), "ETH", "SIGNAL_REJECTED:leverage") in full.events
+
+
+def test_the_account_breaker_flattens_every_asset():
+    rows = flat(4) + [(20_000.0, 20_005.0, 19_950.0, 19_960.0)] * 4 + flat(8, 19_960.0)
+    f, g = bars(rows), bars(flat(16, 1_000.0))
+    cfg = BConfig(breakers=dataclasses.replace(BreakerParams(), total_dd=0.0001))
+    res = run_engine({"BTC": f, "ETH": g}, {"BTC": [sig(2, f, 19_000.0, 21_000.0, 22_000.0)],
+                                            "ETH": [sig(2, g, 900.0, 1_100.0, 1_200.0)]}, cfg)
+    assert sorted((asset_of(t), t.exit_reason) for t in res.trades) == [("BTC", "BREAKER"), ("ETH", "BREAKER")]
+    assert len({t.exit_ts for t in res.trades}) == 1
 
 
 @pytest.mark.parametrize("seed", [3, 4])
 def test_decisions_up_to_t_never_change_when_later_bars_are_cut(seed):
-    df = random_df(6000, seed)
+    """ETH follows BTC's path 20 bars earlier: positions overlap, ETH starts first and is padded at the end."""
+    dfs = {"BTC": random_df(6000, seed), "ETH": random_df(6000, seed, t0=RANDOM_T0 - 20 * M15)}
     p = StratBParams(zz_k=2.0, zone=(0.5, 0.786))
-    full_f = build_frame(df, p)
-    full = run_engine(full_f, generate_signals(full_f, p), BConfig(params=p))
-    assert full.fills
-    for t in sorted({x.ts // M15 * M15 for x in full.fills} | {int(df["ts"].iloc[2999])}):
-        k = int((t - int(df["ts"].iloc[0])) // M15)
-        f = build_frame(df.iloc[: k + 1], p)
-        cut = run_engine(f, generate_signals(f, p), BConfig(params=p))
-        assert [x for x in cut.fills] == [x for x in full.fills if x.ts <= t]
+
+    def run_all(d):
+        frames = build_frames(d, p)
+        return run_engine(frames, {a: generate_signals(f, p) for a, f in frames.items()}, BConfig(params=p))
+
+    full = run_all(dfs)
+    btc, eth = ([t for t in full.trades if asset_of(t) == a] for a in ("BTC", "ETH"))
+    assert any(b.entry_ts < e.exit_ts and e.entry_ts < b.exit_ts for b in btc for e in eth)  # overlapping positions
+    t0 = int(dfs["BTC"]["ts"].iloc[0])
+    for t in sorted({x.ts // M15 * M15 for x in full.fills} | {t0 + 2999 * M15}):
+        cut = run_all({a: df[df["ts"] <= t] for a, df in dfs.items()})
+        assert list(cut.fills) == [x for x in full.fills if x.ts <= t]
         assert list(cut.stops) == [x for x in full.stops if x.ts <= t]
-        assert [o for o in cut.orders] == [o for o in full.orders if o.ts < t]
+        assert list(cut.orders) == [o for o in full.orders if o.ts < t]
 ```
 
 - [ ] **Step 2: 테스트를 실행해 실패를 확인**
@@ -1844,57 +2168,79 @@ uv run --group live pytest tests/stratb/test_engine.py -q
 **파일 `src/ewbot/stratb/engine.py`** (새 파일, 전체 내용)
 
 ```python
-"""Strategy-B 15-minute backtest loop (Plan 4 spec 4.4, 6.2). Costs (execution/costs.py), sizing
+"""Strategy-B 15-minute portfolio backtest (Plan 4 spec 4.4, 6.2; BTC and ETH since the 2026-10-07
+revision). Costs (execution/costs.py, with each asset's contract size: config.asset_costs), sizing
 (risk/sizing.py) and the circuit breakers (risk/breakers.py) are strategy A's, imported unchanged.
 
-Per 15m bar i, in this order:
-  1. market orders queued at the previous close fill at this bar's open +/- slippage: a queued exit (TIME,
-     BREAKER) first, then a queued entry - dropped when this bar is gap-filled or opens at/beyond its stop;
+One account - one cash balance, one set of breakers - and at most one position per asset. The timeline is
+every 15m bar of the frames (build_frames makes them end on the same bar; an asset whose bars start later
+is skipped before its first bar). Per timeline bar, each step visits the assets in config order (BTC, then
+ETH):
+  1. market orders queued at the previous close fill at this bar's open +/- slippage: first every queued
+     exit (TIME, BREAKER), then every queued entry - dropped when the asset's bar is gap-filled or opens
+     at/beyond the entry's stop;
   2. intrabar, as A's PaperBroker: open at/beyond the stop -> stop at the open; stop touched -> stop at the
-     stop (it beats any target in the same bar); else TP1 (half, limit, strict cross) then TP2 (the rest);
+     stop (it beats any target in the same bar); else TP1 (half, limit, strict cross) then TP2 (the rest).
+     Every closed trade goes to the breakers, so consecutive losses count across the assets;
   3. TP1 filled and remainder == "breakeven" -> the rest's stop moves to the entry price, from the next bar;
-  4. funding for the quarter hour (A's hourly funding / 4) on the position open at the close;
-  5. time stop: open 48 h at this close -> exit queued for the next open;
-  6. at each hour's close (the bar at hh:45): breakers.on_equity(close instant, equity); TOTAL_HALT -> exit
-     queued, no more entries;
-  7. entry: not on the last bar, ts >= start_ts, flat with nothing queued, breakers.can_enter, a signal on
-     this bar -> size_contracts(equity, entry_ref, stop, 0.5% risk, 3x cap); TP1 takes half (1 contract:
-     all of it);
-  8. last bar: an open position is closed at the close (END, not a decision);
-  9. at each hour's close with hour >= start_ts: EquityPoint(hour open ts, equity at the close) - hourly
-     equity, so A's metrics (annualised with 8760 hours) apply unchanged."""
+  4. funding for the quarter hour (A's hourly funding / 4) on each position open at the close;
+  5. time stop: a position open 48 h at this close -> its exit is queued for the next open;
+  6. at each hour's close (the bar at hh:45): breakers.on_equity(close instant, account equity = cash plus
+     every open position marked at its close); TOTAL_HALT -> every open position's exit queued, no more
+     entries;
+  7. entries (not on the last bar, ts >= start_ts, breakers.can_enter): an asset with a signal on this bar
+     and neither a position nor a queued entry is sized with size_contracts(account equity, entry_ref,
+     stop, 0.5% risk, 3x cap, its contract size), then cut so that the notional of the open positions (at
+     their closes) and queued entries (at their entry_ref) stays within max_total_leverage (3x) of the
+     equity; TP1 takes half (1 contract: all of it). A signal on an asset that holds a position or has an
+     entry queued is dropped;
+  8. last bar: every open position is closed at its close (END, not a decision);
+  9. at each hour's close with hour >= start_ts: EquityPoint(hour open ts, account equity at the close) -
+     hourly equity, so A's metrics (annualised with 8760 hours) apply unchanged."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.execution.costs import fee, funding_per_hour, slip
 from ewbot.risk.breakers import CircuitBreakers
 from ewbot.risk.sizing import size_contracts
-from ewbot.stratb.config import M15, BConfig
+from ewbot.stratb.config import M15, BConfig, asset_costs
 from ewbot.stratb.signals import Frame15, SignalB
 from ewbot.types import H1
 
 SETUP = "B"
 _HOUR_LAST = H1 - M15  # ts % H1 of an hour's last 15m bar
+_EPS = 1e-9
+
+
+def setup_of(asset: str) -> str:
+    """Trade.setup of a strategy-B trade, "B-BTC" or "B-ETH" (A's message formats print it)."""
+    return f"{SETUP}-{asset}"
+
+
+def asset_of(t: Trade) -> str:
+    return str(t.snapshot["asset"])
 
 
 @dataclass(frozen=True, slots=True)
 class FillB:
     ts: int  # bar open time of the fill
-    kind: str  # "ENTRY", "TP1", "TP2", "STOP", "EXIT" ("END" only as BResult.end_fill)
+    asset: str
+    kind: str  # "ENTRY", "TP1", "TP2", "STOP", "EXIT" ("END" only in BResult.end_fills)
     contracts: int
     price: float
     fee: float
-    trade_key: int  # entry ts of the position
+    trade_key: int  # entry ts of the position (one position per asset at a time)
 
 
 @dataclass(frozen=True, slots=True)
 class StopMoveB:
     ts: int  # bar whose close moved the stop (effective from the next bar)
+    asset: str
     trade_key: int
     old: float
     new: float
@@ -1904,6 +2250,7 @@ class StopMoveB:
 @dataclass(frozen=True, slots=True)
 class OrderB:
     ts: int  # signal bar
+    asset: str
     direction: int
     contracts: int
     tp1_contracts: int
@@ -1913,16 +2260,17 @@ class OrderB:
 class BResult:
     trades: tuple[Trade, ...]
     equity: tuple[EquityPoint, ...]
-    signals: tuple[SignalB, ...]  # the signals that queued an entry, with their orders below
+    signals: tuple[SignalB, ...]  # the signals that queued an entry, with their orders below (same order)
     orders: tuple[OrderB, ...]
     fills: tuple[FillB, ...]
     stops: tuple[StopMoveB, ...]
-    end_fill: FillB | None
-    events: tuple[tuple[int, str], ...]
+    end_fills: tuple[FillB, ...]  # kind "END": the positions closed at the last bar (not decisions)
+    events: tuple[tuple[int, str, str], ...]  # (bar ts, asset or "" for the account's breakers, event)
 
 
 @dataclass
 class _Pos:
+    asset: str
     sig: SignalB
     direction: int
     total: int
@@ -1946,132 +2294,188 @@ def tp1_contracts(n: int, frac: float) -> int:
     return n if n <= 1 else min(n, max(1, math.floor(n * frac + 1e-9)))
 
 
-def run_engine(f: Frame15, signals: Iterable[SignalB], cfg: BConfig, start_ts: int | None = None) -> BResult:
-    """One run over the whole frame (cut it at the end before building it). Entries only from start_ts."""
-    c, cs = cfg.costs, cfg.costs.contract_size
-    by_i: dict[int, SignalB] = {}
-    for s in signals:
-        by_i.setdefault(s.i, s)
-    ts, op, hi, lo, cl = (a.tolist() for a in (f.ts, f.open, f.high, f.low, f.close))
-    syn = f.synthetic.tolist()
+def run_engine(
+    frames: Mapping[str, Frame15],
+    signals: Mapping[str, Iterable[SignalB]],
+    cfg: BConfig,
+    start_ts: int | None = None,
+) -> BResult:
+    """One run over the frames ({asset: Frame15} of assets of cfg, cut at the end before building them) and
+    their signals ({asset: signals}). Entries only from start_ts."""
+    allowed = [s.asset for s in cfg.assets]
+    names = [a for a in allowed if a in frames]
+    if not names or len(names) != len(frames) or not set(signals) <= set(frames):
+        raise ValueError(f"frames {sorted(frames)} and signals {sorted(signals)} must be assets of {allowed}")
+    if len({int(frames[a].ts[-1]) for a in names}) != 1:
+        raise ValueError("the frames must end on the same bar (build them with build_frames)")
+    m = len(names)
+    costs = [asset_costs(cfg, a) for a in names]
+    size = [c.contract_size for c in costs]
+    fr = [frames[a] for a in names]
+    t0 = min(int(f.ts[0]) for f in fr)
+    off = [(int(f.ts[0]) - t0) // M15 for f in fr]  # timeline index of each asset's first bar
+    n_bars = (int(fr[0].ts[-1]) - t0) // M15 + 1
+    op, hi, lo, cl = ([getattr(f, k).tolist() for f in fr] for k in ("open", "high", "low", "close"))
+    syn = [f.synthetic.tolist() for f in fr]
+    by_i: list[dict[int, SignalB]] = [{} for _ in names]
+    for j, a in enumerate(names):
+        for s in signals.get(a, ()):
+            by_i[j].setdefault(s.i, s)
     time_stop = cfg.params.time_stop_hours * H1
     breakers = CircuitBreakers(cfg.breakers, cfg.initial_equity)
     cash = float(cfg.initial_equity)
-    pos: _Pos | None = None
-    pending: tuple[SignalB, int, int] | None = None
-    exit_req: str | None = None
+    pos: list[_Pos | None] = [None] * m
+    pending: list[tuple[SignalB, int, int] | None] = [None] * m
+    exit_req: list[str | None] = [None] * m
+    mark_px = [0.0] * m
     trades: list[Trade] = []
     equity: list[EquityPoint] = []
     sigs: list[SignalB] = []
     orders: list[OrderB] = []
     fills: list[FillB] = []
     stops: list[StopMoveB] = []
-    events: list[tuple[int, str]] = []
-    end_fill: FillB | None = None
+    events: list[tuple[int, str, str]] = []
+    end_fills: list[FillB] = []
 
-    def close(t: int, kind: str, price: float, qty: int, reason: str | None) -> FillB:
-        nonlocal cash, pos
-        assert pos is not None
-        fe = fee(price, qty, c)
-        realized = pos.direction * (price - pos.entry_price) * qty * cs
+    def close(j: int, t: int, kind: str, price: float, qty: int, reason: str | None) -> FillB:
+        nonlocal cash
+        p = pos[j]
+        assert p is not None
+        fe = fee(price, qty, costs[j])
+        realized = p.direction * (price - p.entry_price) * qty * size[j]
         cash += realized - fe
-        pos.fees += fe
-        pos.gross += realized
-        pos.contracts -= qty
-        pos.exit_qty += qty
-        pos.exit_value += price * qty
-        fill = FillB(t, kind, qty, price, fe, pos.entry_ts)
-        if pos.contracts == 0:
-            trade = _trade(pos, t, reason or kind, cs)
+        p.fees += fe
+        p.gross += realized
+        p.contracts -= qty
+        p.exit_qty += qty
+        p.exit_value += price * qty
+        fill = FillB(t, p.asset, kind, qty, price, fe, p.entry_ts)
+        if p.contracts == 0:
+            trade = _trade(p, t, reason or kind, size[j])
             trades.append(trade)
             for ev in breakers.on_trade_closed(t, trade.pnl):
-                events.append((t, ev))
-            pos = None
+                events.append((t, "", ev))
+            pos[j] = None
         return fill
 
-    def mark(price: float) -> float:
-        if pos is None:
-            return cash
-        return cash + pos.direction * (price - pos.entry_price) * pos.contracts * cs
+    def account_equity() -> float:
+        eq = cash
+        for j, p in enumerate(pos):
+            if p is not None:
+                eq += p.direction * (mark_px[j] - p.entry_price) * p.contracts * size[j]
+        return eq
 
-    last = len(ts) - 1
-    for i in range(len(ts)):
-        t = ts[i]
-        if exit_req is not None and pos is not None:  # 1. queued market orders
-            fills.append(close(t, "EXIT", slip(op[i], -pos.direction, c), pos.contracts, exit_req))
-        exit_req = None
-        if pending is not None:
-            sig, n, n1 = pending
-            pending = None
+    def committed_notional() -> float:
+        out = 0.0
+        for j in range(m):
+            p, q = pos[j], pending[j]
+            if p is not None:
+                out += p.contracts * size[j] * mark_px[j]
+            if q is not None:
+                out += q[1] * size[j] * q[0].entry_ref
+        return out
+
+    for k in range(n_bars):
+        t = t0 + k * M15
+        here = [(j, k - off[j]) for j in range(m) if k >= off[j]]  # (asset, its bar index) with a bar at t
+        for j, i in here:  # 1. queued exits first ...
+            p = pos[j]
+            if exit_req[j] is not None and p is not None:
+                fills.append(close(j, t, "EXIT", slip(op[j][i], -p.direction, costs[j]), p.contracts, exit_req[j]))
+            exit_req[j] = None
+        for j, i in here:  # ... then queued entries
+            q = pending[j]
+            if q is None:
+                continue
+            sig, n, n1 = q
+            pending[j] = None
             d = sig.direction
-            if syn[i]:
-                events.append((t, "ENTRY_SKIPPED:gap"))
-            elif d * (op[i] - sig.stop) <= 0.0:
-                events.append((t, "ENTRY_SKIPPED:open_beyond_stop"))
+            if syn[j][i]:
+                events.append((t, names[j], "ENTRY_SKIPPED:gap"))
+            elif d * (op[j][i] - sig.stop) <= 0.0:
+                events.append((t, names[j], "ENTRY_SKIPPED:open_beyond_stop"))
             else:
-                px = slip(op[i], d, c)
-                fe = fee(px, n, c)
+                px = slip(op[j][i], d, costs[j])
+                fe = fee(px, n, costs[j])
                 cash -= fe
-                pos = _Pos(sig, d, n, n, t, px, sig.stop, sig.tp1, sig.tp2, n1, fe, snapshot=_snapshot(sig))
-                fills.append(FillB(t, "ENTRY", n, px, fe, t))
-        if pos is not None:  # 2. intrabar
-            d = pos.direction
+                pos[j] = _Pos(names[j], sig, d, n, n, t, px, sig.stop, sig.tp1, sig.tp2, n1, fe,
+                              snapshot=_snapshot(sig, names[j]))
+                fills.append(FillB(t, names[j], "ENTRY", n, px, fe, t))
+        for j, i in here:
+            mark_px[j] = cl[j][i]
+            p = pos[j]
+            if p is None:
+                continue
+            d = p.direction
             tp1_hit = False
-            if d * (op[i] - pos.stop) <= 0.0:
-                fills.append(close(t, "STOP", slip(op[i], -d, c), pos.contracts, None))
-            elif (lo[i] <= pos.stop) if d > 0 else (hi[i] >= pos.stop):
-                fills.append(close(t, "STOP", slip(pos.stop, -d, c), pos.contracts, None))
+            if d * (op[j][i] - p.stop) <= 0.0:  # 2. intrabar
+                fills.append(close(j, t, "STOP", slip(op[j][i], -d, costs[j]), p.contracts, None))
+            elif (lo[j][i] <= p.stop) if d > 0 else (hi[j][i] >= p.stop):
+                fills.append(close(j, t, "STOP", slip(p.stop, -d, costs[j]), p.contracts, None))
             else:
-                fav = hi[i] if d > 0 else lo[i]
-                if pos.tp1 is not None and d * (fav - pos.tp1) > 0.0:
-                    px, pos.tp1, tp1_hit = pos.tp1, None, True
-                    fills.append(close(t, "TP1", px, min(pos.tp1_n, pos.contracts), None))
-                if pos is not None and pos.tp1 is None and d * (fav - pos.tp2) > 0.0:
-                    fills.append(close(t, "TP2", pos.tp2, pos.contracts, None))
-            if pos is not None and tp1_hit and cfg.params.remainder == "breakeven" and pos.stop != pos.entry_price:
-                stops.append(StopMoveB(t, pos.entry_ts, pos.stop, pos.entry_price))  # 3.
-                pos.stop = pos.entry_price
-        if pos is not None:  # 4. funding for the quarter hour
-            cost = funding_per_hour(cl[i], pos.contracts, pos.direction, c) * (M15 / H1)
+                fav = hi[j][i] if d > 0 else lo[j][i]
+                if p.tp1 is not None and d * (fav - p.tp1) > 0.0:
+                    px, p.tp1, tp1_hit = p.tp1, None, True
+                    fills.append(close(j, t, "TP1", px, min(p.tp1_n, p.contracts), None))
+                if pos[j] is not None and p.tp1 is None and d * (fav - p.tp2) > 0.0:
+                    fills.append(close(j, t, "TP2", p.tp2, p.contracts, None))
+            if pos[j] is None:
+                continue
+            if tp1_hit and cfg.params.remainder == "breakeven" and p.stop != p.entry_price:  # 3.
+                stops.append(StopMoveB(t, p.asset, p.entry_ts, p.stop, p.entry_price))
+                p.stop = p.entry_price
+            cost = funding_per_hour(cl[j][i], p.contracts, d, costs[j]) * (M15 / H1)  # 4.
             cash -= cost
-            pos.funding += cost
-            if t + M15 - pos.entry_ts >= time_stop:  # 5.
-                exit_req = "TIME"
+            p.funding += cost
+            if t + M15 - p.entry_ts >= time_stop:  # 5.
+                exit_req[j] = "TIME"
         hour_close = t % H1 == _HOUR_LAST
         if hour_close:  # 6.
-            for ev in breakers.on_equity(t + M15, mark(cl[i])):
-                events.append((t, ev))
-            if breakers.halted and pos is not None:
-                exit_req = "BREAKER"
-        if i < last and pos is None and pending is None and (start_ts is None or t >= start_ts):  # 7.
-            sig = by_i.get(i)
-            if sig is not None:
+            for ev in breakers.on_equity(t + M15, account_equity()):
+                events.append((t, "", ev))
+            if breakers.halted:
+                for j in range(m):
+                    if pos[j] is not None:
+                        exit_req[j] = "BREAKER"
+        if k < n_bars - 1 and (start_ts is None or t >= start_ts):  # 7.
+            for j, i in here:
+                sig = by_i[j].get(i)
+                if sig is None or pos[j] is not None or pending[j] is not None:
+                    continue
                 if not breakers.can_enter(t + M15):
-                    events.append((t, "SIGNAL_REJECTED:breaker"))
-                else:
-                    n = size_contracts(cash, sig.entry_ref, sig.stop, sig.direction, cfg.risk, 1.0, c)
-                    if n == 0:
-                        events.append((t, "SIGNAL_REJECTED:size"))
-                    else:
-                        n1 = tp1_contracts(n, cfg.tp1_frac)
-                        pending = (sig, n, n1)
-                        sigs.append(sig)
-                        orders.append(OrderB(t, sig.direction, n, n1))
-        if i == last:  # 8.
-            pending = None
-            if pos is not None:
-                key = pos.entry_ts
-                f_end = close(t, "EXIT", slip(cl[i], -pos.direction, c), pos.contracts, "END")
-                end_fill = FillB(f_end.ts, "END", f_end.contracts, f_end.price, f_end.fee, key)
+                    events.append((t, names[j], "SIGNAL_REJECTED:breaker"))
+                    continue
+                eq = account_equity()
+                n = size_contracts(eq, sig.entry_ref, sig.stop, sig.direction, cfg.risk, 1.0, costs[j])
+                if n == 0:
+                    events.append((t, names[j], "SIGNAL_REJECTED:size"))
+                    continue
+                room = cfg.max_total_leverage * eq - committed_notional()
+                n = min(n, max(0, math.floor(room / (sig.entry_ref * size[j]) + _EPS)))
+                if n == 0:
+                    events.append((t, names[j], "SIGNAL_REJECTED:leverage"))
+                    continue
+                n1 = tp1_contracts(n, cfg.tp1_frac)
+                pending[j] = (sig, n, n1)
+                sigs.append(sig)
+                orders.append(OrderB(t, names[j], sig.direction, n, n1))
+        if k == n_bars - 1:  # 8.
+            for j in range(m):
+                pending[j] = None
+                p = pos[j]
+                if p is not None:
+                    key = p.entry_ts
+                    f_end = close(j, t, "EXIT", slip(mark_px[j], -p.direction, costs[j]), p.contracts, "END")
+                    end_fills.append(FillB(f_end.ts, f_end.asset, "END", f_end.contracts, f_end.price, f_end.fee, key))
         if hour_close and (start_ts is None or t - _HOUR_LAST >= start_ts):  # 9.
-            equity.append(EquityPoint(t - _HOUR_LAST, mark(cl[i])))
-    return BResult(tuple(trades), tuple(equity), tuple(sigs), tuple(orders), tuple(fills), tuple(stops), end_fill,
-                   tuple(events))
+            equity.append(EquityPoint(t - _HOUR_LAST, account_equity()))
+    return BResult(tuple(trades), tuple(equity), tuple(sigs), tuple(orders), tuple(fills), tuple(stops),
+                   tuple(end_fills), tuple(events))
 
 
-def _snapshot(sig: SignalB) -> dict:
+def _snapshot(sig: SignalB, asset: str) -> dict:
     return {
-        "signal_ts": sig.ts, "entry_ref": sig.entry_ref, "leg": [sig.leg_start, sig.leg_end],
+        "asset": asset, "signal_ts": sig.ts, "entry_ref": sig.entry_ref, "leg": [sig.leg_start, sig.leg_end],
         "pivots": [sig.p1_ts, sig.p2_ts], "level": sig.level, "reason": sig.reason,
     }
 
@@ -2080,9 +2484,9 @@ def _trade(pos: _Pos, exit_ts: int, reason: str, cs: float) -> Trade:
     pnl = pos.gross - pos.fees - pos.funding
     risk_usd = abs(pos.entry_price - pos.sig.stop) * pos.total * cs
     return Trade(
-        entry_ts=pos.entry_ts, exit_ts=exit_ts, setup=SETUP, direction=pos.direction, contracts=pos.total,
-        entry_price=pos.entry_price, exit_price_avg=pos.exit_value / pos.exit_qty, stop0=pos.sig.stop,
-        tp1=pos.sig.tp1, tp2=pos.sig.tp2, pnl=pnl, fees=pos.fees, funding=pos.funding,
+        entry_ts=pos.entry_ts, exit_ts=exit_ts, setup=setup_of(pos.asset), direction=pos.direction,
+        contracts=pos.total, entry_price=pos.entry_price, exit_price_avg=pos.exit_value / pos.exit_qty,
+        stop0=pos.sig.stop, tp1=pos.sig.tp1, tp2=pos.sig.tp2, pnl=pnl, fees=pos.fees, funding=pos.funding,
         r_multiple=pnl / risk_usd if risk_usd > 0.0 else 0.0, exit_reason=reason, snapshot=pos.snapshot,
     )
 ```
@@ -2093,13 +2497,13 @@ def _trade(pos: _Pos, exit_ts: int, reason: str, cs: float) -> Trade:
 uv run --group live pytest tests/stratb/test_engine.py -q
 ```
 
-예상: `13 passed`
+예상: `18 passed`
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/ewbot/stratb/engine.py tests/stratb/test_engine.py
-git commit -m "feat(stratb): 15m engine with A's costs, sizing and breakers (stop first, half at TP1, 48h time stop)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): 15m BTC + ETH portfolio engine on one account with A's costs, sizing and breakers" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -2111,14 +2515,14 @@ git commit -m "feat(stratb): 15m engine with A's costs, sizing and breakers (sto
 - Test: `tests/stratb/test_research.py`
 
 **Interfaces:**
-- Consumes: Task 1: `GRID_B`, `BConfig`, `Combo`, `StratBParams`, `combo_to_json`, `config_for`, `grid_combos`. Task 4: `Frame15`, `RefLeg`, `build_frame`, `generate_signals`, `reference_legs`. Task 5: `BResult`, `run_engine`. A: `ewbot.backtest.metrics.compute_metrics(equity, trades, start_ts=None, end_ts=None) -> Metrics`; `ewbot.backtest.walkforward`: `HOLDOUT_START`, `WF_START`, `MIN_TRAIN_TRADES = 12`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5`, `folds() -> list[tuple[int, int, int, int]]`, `oos_returns(res, ts0, ts1) -> list[tuple[int, float]]`(`res.equity`만 읽음); `ewbot.backtest.runner.utc_ts`; `ewbot.engine.loop.EquityPoint`.
-- Produces: `ewbot.stratb.research`: `refuse_holdout_bars(df15, end_ts, include_holdout=False) -> None`(2024 봉을 볼 실행이면 `ValueError`); `backtest_b(df15, cfg, start_ts=None, end_ts=None, *, include_holdout=False) -> BResult`(end_ts 이전 봉으로 프레임을 만들고 신호·엔진 실행); `run_grid_b(df15, start_ts, end_ts, workers=1) -> dict[Combo, BResult]`(32개, 손실 한도 끔, `grid_combos()` 순서); `pick_plateau_b(calmar, n_trades, min_trades=12) -> Combo`(고를 것이 없으면 `ValueError`); `evaluate_folds_b(results, fold_list, equity0, min_trades=12) -> dict`(키 `keys`, `folds`[각 `train`, `test`, `chosen`, `train_calmar`, `oos`], `stitched_equity`, `stitched_metrics`, `oos_trades`, `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`, `proceed`); `walk_forward_b(df15, workers=1) -> dict`(위 키 + `combo_table`).
+- Consumes: Task 1: `ASSETS`, `GRID_B`, `BConfig`, `Combo`, `StratBParams`, `combo_to_json`, `config_for`, `grid_combos`. Task 4: `Frame15`, `RefLeg`, `build_frames`, `generate_signals`, `reference_legs`. Task 5: `BResult`, `asset_of`, `run_engine`. A: `ewbot.backtest.metrics.compute_metrics(equity, trades, start_ts=None, end_ts=None) -> Metrics`; `ewbot.backtest.walkforward`: `HOLDOUT_START`, `WF_START`, `MIN_TRAIN_TRADES = 12`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5`, `folds() -> list[tuple[int, int, int, int]]`, `oos_returns(res, ts0, ts1) -> list[tuple[int, float]]`(`res.equity`만 읽음); `ewbot.backtest.runner.utc_ts`; `ewbot.engine.loop.EquityPoint`, `Trade`.
+- Produces: `ewbot.stratb.research`: `refuse_holdout_bars(df15, end_ts, include_holdout=False) -> None`(2024 봉을 볼 실행이면 `ValueError`); `backtest_b(dfs: Mapping[str, DataFrame], cfg, start_ts=None, end_ts=None, *, include_holdout=False) -> BResult`(자산마다 end_ts 이전 봉으로 프레임을 만들고 신호, 포트폴리오 엔진 실행); `trades_by_asset(trades) -> dict[str, int]`(`ASSETS` 순서); `run_grid_b(dfs, start_ts, end_ts, workers=1) -> dict[Combo, BResult]`(32개, 손실 한도 끔, `grid_combos()` 순서); `pick_plateau_b(calmar, n_trades, min_trades=12) -> Combo`(고를 것이 없으면 `ValueError`); `evaluate_folds_b(results, fold_list, equity0, min_trades=12) -> dict`(키 `keys`, `folds`[각 `train`, `test`, `chosen`, `train_calmar`, `oos`], `stitched_equity`, `stitched_metrics`, `oos_trades`, `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`, `proceed`); `walk_forward_b(dfs, workers=1) -> dict`(두 자산이 모두 있어야 한다, 아니면 `ValueError`; 위 키 + `combo_table`, 행마다 `combo`, `calmar`, `sharpe`, `n_trades`, `n_trades_by_asset`, `total_return`).
 
-명세 해석 1~3을 구현한다. A의 구간 함수와 지표는 import하고, A의 전역 그리드에 묶인 plateau 선택과 구간 평가만 B 그리드로 다시 쓴다(규칙은 문자 그대로 같다). 그리드는 프레임을 한 번만 만들고(15분 지표는 조합과 무관), 기준 구간은 `zz_k`마다 한 번만 계산한다. 다중 처리 도우미 이름은 `_pool_init`/`_pool_run`이다(A의 정적 검사가 `_init_worker`·`_map_tasks` 이름을 금지한다).
+명세 해석 1~3을 구현한다. 모든 실행은 BTC+ETH 포트폴리오 하나이고(입력은 자산별 15분봉 사전), 워크포워드는 포트폴리오 결과로 조합을 고른다(명세 6.3 개정). A의 구간 함수와 지표는 import하고, A의 전역 그리드에 묶인 plateau 선택과 구간 평가만 B 그리드로 다시 쓴다(규칙은 문자 그대로 같다). 그리드는 자산별 프레임을 한 번만 만들고(15분 지표는 조합과 무관), 기준 구간은 (자산, `zz_k`)마다 한 번만 계산한다. 다중 처리 도우미 이름은 `_pool_init`/`_pool_run`이다(A의 정적 검사가 `_init_worker`·`_map_tasks` 이름을 금지한다).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-2024 거부, 백테스트 = 엔진 실행, 2단계 그리드에서 plateau가 '자신의 Calmar 최대'로 퇴화함(동점이면 첫 조합), 17개 적격 조건, 구간 선택·이어 붙이기·`proceed`(음수 표본 외, fallback), 그리드 32회(1개와 2개 작업자가 같은 결과), 워크포워드가 2024를 자르고 A의 10개 구간을 쓰는지를 확인한다.
+2024 거부(한 자산만 2024에 닿아도), 백테스트 = 자산별 신호의 포트폴리오 엔진 실행(같은 봉의 BTC 롱과 ETH 숏), 2단계 그리드에서 plateau가 '자신의 Calmar 최대'로 퇴화함(동점이면 첫 조합), 17개 적격 조건, 구간 선택·이어 붙이기·`proceed`(음수 표본 외, fallback), 두 자산 그리드 32회(1개와 2개 작업자가 같은 결과), 워크포워드가 2024를 자르고 A의 10개 구간을 쓰며 두 자산을 요구하는지를 확인한다.
 
 **파일 `tests/stratb/test_research.py`** (새 파일, 전체 내용)
 
@@ -2133,41 +2537,53 @@ from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.stratb import research
 from ewbot.stratb.config import BConfig, StratBParams, grid_combos
 from ewbot.stratb.engine import BResult, run_engine
-from ewbot.stratb.research import backtest_b, evaluate_folds_b, pick_plateau_b, run_grid_b, walk_forward_b
-from ewbot.stratb.signals import build_frame, generate_signals
-from tests.stratb.helpers import SIGNAL_BAR, T0, long_setup_df, random_df
+from ewbot.stratb.research import (
+    backtest_b,
+    evaluate_folds_b,
+    pick_plateau_b,
+    run_grid_b,
+    trades_by_asset,
+    walk_forward_b,
+)
+from ewbot.stratb.signals import build_frames, generate_signals
+from tests.stratb.helpers import SIGNAL_BAR, long_setup_df, mirror, random_df
 
 H1 = 3600
 COMBOS = grid_combos()
 
 
 def _result(points, trades=()):
-    return BResult(tuple(trades), tuple(EquityPoint(t, e) for t, e in points), (), (), (), (), None, ())
+    return BResult(tuple(trades), tuple(EquityPoint(t, e) for t, e in points), (), (), (), (), (), ())
 
 
 def _trade(ts):
-    return Trade(ts, ts + H1, "B", 1, 1, 100.0, 101.0, 99.0, 101.0, 102.0, 1.0, 0.0, 0.0, 1.0, "TP2", {})
+    return Trade(ts, ts + H1, "B-BTC", 1, 1, 100.0, 101.0, 99.0, 101.0, 102.0, 1.0, 0.0, 0.0, 1.0, "TP2",
+                 {"asset": "BTC"})
 
 
 def test_research_runs_refuse_2024_bars():
-    df = random_df(400, 1, t0=HOLDOUT_START - 200 * 900)
+    early = random_df(400, 2, t0=HOLDOUT_START - 600 * 900)  # ETH ends before 2024, BTC does not
+    dfs = {"BTC": random_df(400, 1, t0=HOLDOUT_START - 200 * 900), "ETH": early}
     with pytest.raises(ValueError):
-        backtest_b(df, BConfig())
+        backtest_b(dfs, BConfig())
     with pytest.raises(ValueError):
-        backtest_b(df, BConfig(), end_ts=HOLDOUT_START + 900)
+        backtest_b({"ETH": early}, BConfig(), end_ts=HOLDOUT_START + 900)
     with pytest.raises(ValueError):
-        run_grid_b(df, int(df["ts"].iloc[0]), HOLDOUT_START + 900)
-    assert backtest_b(df, BConfig(), end_ts=HOLDOUT_START).equity[-1].ts < HOLDOUT_START
-    assert backtest_b(df, BConfig(), include_holdout=True).equity[-1].ts >= HOLDOUT_START
+        run_grid_b(dfs, int(early["ts"].iloc[0]), HOLDOUT_START + 900)
+    assert backtest_b(dfs, BConfig(), end_ts=HOLDOUT_START).equity[-1].ts < HOLDOUT_START
+    assert backtest_b(dfs, BConfig(), include_holdout=True).equity[-1].ts >= HOLDOUT_START
 
 
-def test_a_backtest_is_the_engine_on_the_rule_signals():
-    df = long_setup_df()
+def test_a_backtest_is_the_engine_on_each_asset_rule_signals():
+    dfs = {"BTC": long_setup_df(), "ETH": mirror(long_setup_df())}
     p = StratBParams(zz_k=2.0)
-    res = backtest_b(df, BConfig(params=p))
-    f = build_frame(df, p)
-    assert res == run_engine(f, generate_signals(f, p), BConfig(params=p))
-    assert res.signals[0].i == SIGNAL_BAR and res.trades[0].entry_ts == int(f.ts[SIGNAL_BAR + 1])
+    res = backtest_b(dfs, BConfig(params=p))
+    frames = build_frames(dfs, p)
+    assert res == run_engine(frames, {a: generate_signals(f, p) for a, f in frames.items()}, BConfig(params=p))
+    assert [(s.i, o.asset, o.direction) for s, o in zip(res.signals, res.orders)] == [(SIGNAL_BAR, "BTC", 1),
+                                                                                       (SIGNAL_BAR, "ETH", -1)]
+    assert {t.entry_ts for t in res.trades} == {int(frames["BTC"].ts[SIGNAL_BAR + 1])}
+    assert trades_by_asset(res.trades) == {"BTC": 1, "ETH": 1}
 
 
 def test_on_a_two_level_grid_the_plateau_is_the_best_own_calmar():
@@ -2213,28 +2629,32 @@ def test_folds_pick_on_training_stitch_the_test_windows_and_decide_proceed():
     assert out["chosen_final"] == COMBOS[7] and out["chosen_final_fallback"] is True and out["proceed"] is False
 
 
-def test_the_grid_runs_every_combo_once_with_the_breakers_off():
-    df = random_df(3000, 3)
-    start = int(df["ts"].iloc[400])
-    out = run_grid_b(df, start, int(df["ts"].iloc[-1]) + 900, workers=1)
+def test_the_grid_runs_every_combo_once_on_both_assets_with_the_breakers_off():
+    dfs = {"BTC": random_df(3000, 3), "ETH": random_df(3000, 4)}
+    start, end = int(dfs["BTC"]["ts"].iloc[400]), int(dfs["BTC"]["ts"].iloc[-1]) + 900
+    out = run_grid_b(dfs, start, end, workers=1)
     assert list(out) == COMBOS and all(r.equity[0].ts >= start for r in out.values())
-    assert any(r.trades for r in out.values())
-    assert run_grid_b(df, start, int(df["ts"].iloc[-1]) + 900, workers=2) == out
+    assert {a for r in out.values() for a, n in trades_by_asset(r.trades).items() if n} == {"BTC", "ETH"}
+    assert run_grid_b(dfs, start, end, workers=2) == out
 
 
 def test_walk_forward_cuts_2024_and_uses_strategy_a_folds(monkeypatch):
     seen = {}
 
-    def fake_grid(df, start, end, workers):
-        seen.update(max_ts=int(df["ts"].max()), start=start, end=end)
+    def fake_grid(dfs, start, end, workers):
+        assert sorted(dfs) == ["BTC", "ETH"]
+        seen.update(max_ts=max(int(df["ts"].max()) for df in dfs.values()), start=start, end=end)
         return {c: _result([(start, 10_000.0), (end - H1, 10_000.0)]) for c in COMBOS}
 
     monkeypatch.setattr(research, "run_grid_b", fake_grid)
     df = pd.concat([random_df(50, 1, t0=HOLDOUT_START - 50 * 900), random_df(50, 2, t0=HOLDOUT_START)])
-    out = walk_forward_b(df, workers=1)
+    out = walk_forward_b({"BTC": df, "ETH": df}, workers=1)
     assert seen == {"max_ts": HOLDOUT_START - 900, "start": 1_483_228_800, "end": HOLDOUT_START}
     assert len(out["folds"]) == 10 and out["folds"][0]["test"][0] == 1_546_300_800  # 2019-01-01
     assert out["chosen_final"] is None and out["proceed"] is False and len(out["combo_table"]) == 32
+    assert out["combo_table"][0]["n_trades_by_asset"] == {"BTC": 0, "ETH": 0}
+    with pytest.raises(ValueError, match="every asset"):
+        walk_forward_b({"BTC": df}, workers=1)
 ```
 
 - [ ] **Step 2: 테스트를 실행해 실패를 확인**
@@ -2255,7 +2675,9 @@ uv run --group live pytest tests/stratb/test_research.py -q
 **파일 `src/ewbot/stratb/research.py`** (새 파일, 전체 내용)
 
 ```python
-"""Strategy-B research runs (Plan 4 spec 6.2-6.3): one backtest, the 32-combo grid, the walk-forward.
+"""Strategy-B research runs (Plan 4 spec 6.2-6.3): one backtest, the 32-combo grid, the walk-forward. Every
+run is one portfolio over BTC and ETH ({asset: 15m bars}; one shared combo, engine.run_engine), and the
+walk-forward scores the combined portfolio (spec 6.3 as revised 2026-10-07).
 
 The walk-forward uses strategy A's rules (ewbot.backtest.walkforward, read 2026-10-07):
   - windows: A's folds() - 24-month training, 6-month test, rolling by 6 months, tests 2019-01 .. 2023-12
@@ -2293,10 +2715,19 @@ from ewbot.backtest.walkforward import (
     folds,
     oos_returns,
 )
-from ewbot.engine.loop import EquityPoint
-from ewbot.stratb.config import GRID_B, BConfig, Combo, StratBParams, combo_to_json, config_for, grid_combos
-from ewbot.stratb.engine import BResult, run_engine
-from ewbot.stratb.signals import Frame15, RefLeg, build_frame, generate_signals, reference_legs
+from ewbot.engine.loop import EquityPoint, Trade
+from ewbot.stratb.config import (
+    ASSETS,
+    GRID_B,
+    BConfig,
+    Combo,
+    StratBParams,
+    combo_to_json,
+    config_for,
+    grid_combos,
+)
+from ewbot.stratb.engine import BResult, asset_of, run_engine
+from ewbot.stratb.signals import Frame15, RefLeg, build_frames, generate_signals, reference_legs
 from ewbot.types import H1
 
 
@@ -2312,54 +2743,69 @@ def refuse_holdout_bars(df15: pd.DataFrame, end_ts: int | None, include_holdout:
         raise ValueError(f"end_ts {end_ts} reaches into the holdout (HOLDOUT_START = {HOLDOUT_START})")
 
 
+def _cut(dfs: Mapping[str, pd.DataFrame], end_ts: int | None) -> dict[str, pd.DataFrame]:
+    return {a: (df if end_ts is None else df[df["ts"] < end_ts]).reset_index(drop=True) for a, df in dfs.items()}
+
+
 def backtest_b(
-    df15: pd.DataFrame,
+    dfs: Mapping[str, pd.DataFrame],
     cfg: BConfig,
     start_ts: int | None = None,
     end_ts: int | None = None,
     *,
     include_holdout: bool = False,
 ) -> BResult:
-    """One strategy-B run over the bars before end_ts; entries from start_ts."""
-    refuse_holdout_bars(df15, end_ts, include_holdout)
-    d = df15 if end_ts is None else df15[df15["ts"] < end_ts]
-    f = build_frame(d.reset_index(drop=True), cfg.params)
-    return run_engine(f, generate_signals(f, cfg.params), cfg, start_ts)
+    """One strategy-B run over every asset's bars ({asset: 15m bars}) before end_ts; entries from start_ts."""
+    for df in dfs.values():
+        refuse_holdout_bars(df, end_ts, include_holdout)
+    frames = build_frames(_cut(dfs, end_ts), cfg.params)
+    return run_engine(frames, {a: generate_signals(f, cfg.params) for a, f in frames.items()}, cfg, start_ts)
+
+
+def trades_by_asset(trades: Sequence[Trade]) -> dict[str, int]:
+    """{asset: number of trades} in config.ASSETS order."""
+    return {a: sum(1 for t in trades if asset_of(t) == a) for a in ASSETS}
 
 
 # ----------------------------------------------------------------------------- grid
 
-_POOL: dict[str, Any] = {}  # per process: the frame, the start and the legs per zz_k
+_POOL: dict[str, Any] = {}  # per process: the frames, the start and the legs per (asset, zz_k)
 
 
-def _pool_init(frame: Frame15, start_ts: int) -> None:
+def _pool_init(frames: dict[str, Frame15], start_ts: int) -> None:
     _POOL.clear()
-    _POOL.update(frame=frame, start=start_ts, legs={})
+    _POOL.update(frames=frames, start=start_ts, legs={})
 
 
 def _pool_run(combo: Combo) -> tuple[Combo, BResult]:
     cfg = config_for(combo, breakers_enabled=False)
-    f: Frame15 = _POOL["frame"]
-    legs: dict[float, list[RefLeg]] = _POOL["legs"]
-    if cfg.params.zz_k not in legs:
-        legs[cfg.params.zz_k] = reference_legs(f, cfg.params.zz_k, cfg.params)
-    sigs = generate_signals(f, cfg.params, legs[cfg.params.zz_k])
-    return combo, run_engine(f, sigs, cfg, _POOL["start"])
+    frames: dict[str, Frame15] = _POOL["frames"]
+    legs: dict[tuple[str, float], list[RefLeg]] = _POOL["legs"]
+    sigs = {}
+    for a, f in frames.items():
+        key = (a, cfg.params.zz_k)
+        if key not in legs:
+            legs[key] = reference_legs(f, cfg.params.zz_k, cfg.params)
+        sigs[a] = generate_signals(f, cfg.params, legs[key])
+    return combo, run_engine(frames, sigs, cfg, _POOL["start"])
 
 
-def run_grid_b(df15: pd.DataFrame, start_ts: int, end_ts: int, workers: int = 1) -> dict[Combo, BResult]:
-    """Every grid combo once over the bars before end_ts (refused past HOLDOUT_START), breakers off."""
-    refuse_holdout_bars(df15, end_ts)
-    frame = build_frame(df15[df15["ts"] < end_ts].reset_index(drop=True), StratBParams())
+def run_grid_b(
+    dfs: Mapping[str, pd.DataFrame], start_ts: int, end_ts: int, workers: int = 1
+) -> dict[Combo, BResult]:
+    """Every grid combo once over every asset's bars before end_ts (refused past HOLDOUT_START), breakers off."""
+    for df in dfs.values():
+        refuse_holdout_bars(df, end_ts)
+    frames = build_frames(_cut(dfs, end_ts), StratBParams())
     combos = grid_combos()
     out: dict[Combo, BResult] = {}
     if workers <= 1:
-        _pool_init(frame, start_ts)
+        _pool_init(frames, start_ts)
         for n, c in enumerate(combos, 1):
             out[c] = _pool_run(c)[1]
             print(f"[grid-b] {n}/{len(combos)} {combo_to_json(c)}", file=sys.stderr, flush=True)
     else:
-        with mp.Pool(min(workers, len(combos)), initializer=_pool_init, initargs=(frame, start_ts)) as pool:
+        with mp.Pool(min(workers, len(combos)), initializer=_pool_init, initargs=(frames, start_ts)) as pool:
             for n, (c, res) in enumerate(pool.imap_unordered(_pool_run, combos), 1):
                 out[c] = res
                 print(f"[grid-b] {n}/{len(combos)} {combo_to_json(c)}", file=sys.stderr, flush=True)
@@ -2463,15 +2909,18 @@ def evaluate_folds_b(
     }
 
 
-def walk_forward_b(df15: pd.DataFrame, workers: int = 1) -> dict[str, Any]:
-    """The full walk-forward over [2017-01-01, 2024-01-01). Bars at/after 2024-01-01 are dropped here."""
+def walk_forward_b(dfs: Mapping[str, pd.DataFrame], workers: int = 1) -> dict[str, Any]:
+    """The full walk-forward over [2017-01-01, 2024-01-01) on the BTC + ETH portfolio (both assets
+    required). Bars at/after 2024-01-01 are dropped here."""
+    if sorted(dfs) != sorted(ASSETS):
+        raise ValueError(f"the walk-forward runs on every asset {list(ASSETS)}, got {sorted(dfs)}")
     start, end = utc_ts(WF_START), HOLDOUT_START
-    df15 = df15[df15["ts"] < end].reset_index(drop=True)
-    results = run_grid_b(df15, start, end, workers)
+    results = run_grid_b(_cut(dfs, end), start, end, workers)
     out = evaluate_folds_b(results, folds(), BConfig().initial_equity)
     full = {c: compute_metrics(r.equity, r.trades, start, end) for c, r in results.items()}
     out["combo_table"] = [
         {"combo": combo_to_json(c), "calmar": m.calmar, "sharpe": m.sharpe, "n_trades": m.n_trades,
+         "n_trades_by_asset": trades_by_asset([t for t in results[c].trades if start <= t.entry_ts < end]),
          "total_return": m.total_return}
         for c, m in full.items()
     ]
@@ -2490,111 +2939,121 @@ uv run --group live pytest tests/stratb/test_research.py -q
 
 ```bash
 git add src/ewbot/stratb/research.py tests/stratb/test_research.py
-git commit -m "feat(stratb): 2024 guard, 32-combo grid and walk-forward with strategy A's windows and plateau rule" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): 2024 guard, 32-combo grid and walk-forward of the BTC + ETH portfolio with strategy A's rules" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
 ### Task 6b: 실제 2017~2023 거래 빈도 점검 (컨트롤러 전용 수동 단계, 네트워크 — 서브에이전트 금지)
 
-**Files:** 없음. 코드를 바꾸지 않는다(캐시 `data/cache/BTC-USD_15m.parquet`만 생기며 git에서 제외된다).
+**Files:** 없음. 코드를 바꾸지 않는다(캐시 `data/cache/BTC-USD_15m.parquet`와 `data/cache/ETH-USD_15m.parquet`만 생기며 git에서 제외된다).
 
 **Interfaces:**
-- Consumes: Task 1: `combo_to_json`. Task 2: `DEFAULT_LOCK_PATH`, `gap_report`, `load_15m`, `lock_exists`, `update_cache_15m`. Task 6: `run_grid_b`. A: `ewbot.backtest.walkforward.HOLDOUT_START`, `WF_START`, `ewbot.backtest.runner.utc_ts`.
-- Produces: 32개 조합 각각의 2017~2023 거래 수, 월 거래 수, 롱/숏 수와 아래 결정 규칙의 판정. Task 7~14를 진행할지의 근거.
+- Consumes: Task 1: `ASSETS`, `combo_to_json`. Task 2: `DEFAULT_LOCK_PATH`, `gap_report`, `load_caches_15m`, `lock_exists`, `update_caches_15m`. Task 6: `run_grid_b`, `trades_by_asset`. A: `ewbot.backtest.walkforward.HOLDOUT_START`, `WF_START`, `ewbot.backtest.runner.utc_ts`.
+- Produces: 32개 조합 각각의 2017~2023 자산별·합계 거래 수, 월 거래 수, 롱/숏 수, 받지 못한 진입의 사유별 수와 아래 결정 규칙의 판정. Task 7~14를 진행할지의 근거.
 
-이유: 명세의 목표 빈도는 월 10~15건이고 홀드아웃 합격에는 약 33개월에 50건 이상이 필요한데, 합성 무작위 경로에서는 이 규칙이 월 1건 안팎만 낸다. Task 7~14에 들어가기 전에 실제 데이터의 빈도를 확인한다. 이 단계는 2024-01-01 이후 데이터를 받지도 읽지도 않고(잠금이 없으므로 수집기가 2024 이전에서 멈추고, 로더가 읽을 때 걸러내며, 스크립트가 다시 확인한다), 홀드아웃을 건드리지 않고, 조합을 고르지 않으며(32개 모두, 손실 한도 끔 — 워크포워드 그리드와 같은 실행), **수익률·낙폭·샤프 같은 성과 지표는 계산하거나 출력하지 않는다**(성과를 보고 설계를 고치지 않는다는 이 프로젝트의 연구 규칙). 2017~2023은 84개월이다.
+이유: 명세의 목표 빈도는 두 자산 합계 월 10~15건이고 홀드아웃 합격에는 약 33개월에 50건 이상이 필요한데, 합성 무작위 경로에서는 이 규칙이 월 1건 안팎만 낸다. Task 7~14에 들어가기 전에 실제 데이터의 빈도를 확인한다. 이 단계는 2024-01-01 이후 데이터를 받지도 읽지도 않고(잠금이 없으므로 수집기가 2024 이전에서 멈추고, 로더가 읽을 때 걸러내며, 스크립트가 다시 확인한다), 홀드아웃을 건드리지 않고, 조합을 고르지 않으며(32개 모두, 손실 한도 끔 — 워크포워드 그리드와 같은 포트폴리오 실행), **수익률·낙폭·샤프 같은 성과 지표는 계산하거나 출력하지 않는다**(성과를 보고 설계를 고치지 않는다는 이 프로젝트의 연구 규칙). 2017~2023은 84개월이다.
 
-- [ ] **Step 1: 실제 15분봉 수집(2017-01-01 ~ 2023-12-31)과 조합별 빈도 출력**
+**이력(2026-10-07):** 처음 점검은 BTC 한 자산으로 했고 중앙값이 월 3.56건(최소 3.12, 최대 4.75; 누락 봉 253개, `SIGNAL_REJECTED:size` 2건)이라 멈추고 보고했다. 사용자가 ETH를 더하기로 해 명세와 이 계획을 개정했으므로(해석 19, 20), 개정한 코드로 이 점검을 두 자산으로 다시 한다. BTC 캐시는 이미 2023-12-31까지 있어 ETH만 새로 받는다.
+
+- [ ] **Step 1: 실제 15분봉 수집(BTC·ETH, 2017-01-01 ~ 2023-12-31)과 조합별 빈도 출력**
 
 ```bash
 uv run python - <<'PY'
 import statistics
+from collections import Counter
 from pathlib import Path
 
 from ewbot.backtest.runner import utc_ts
 from ewbot.backtest.walkforward import HOLDOUT_START, WF_START
-from ewbot.stratb.config import combo_to_json
-from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, gap_report, load_15m, lock_exists, update_cache_15m
-from ewbot.stratb.research import run_grid_b
+from ewbot.stratb.config import ASSETS, combo_to_json
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, gap_report, load_caches_15m, lock_exists, update_caches_15m
+from ewbot.stratb.research import run_grid_b, trades_by_asset
 
 assert not lock_exists(DEFAULT_LOCK_PATH), "holdout-b.lock must not exist yet"
-path = update_cache_15m(Path("data/cache"))  # no lock: never requests a bar at/after 2024-01-01
-df = load_15m(path)  # the read filters out any 2024+ bar
-assert int(df["ts"].max()) < HOLDOUT_START
-rep = gap_report(df)
-print(f"15m bars 2017-01..2023-12: {rep.n}, missing {len(rep.missing_ts)}")
+update_caches_15m(Path("data/cache"))  # no lock: never requests a bar at/after 2024-01-01
+dfs = load_caches_15m(Path("data/cache"))  # the read filters out any 2024+ bar
+for a, df in dfs.items():
+    assert int(df["ts"].max()) < HOLDOUT_START
+    rep = gap_report(df)
+    print(f"{a} 15m bars 2017-01..2023-12: {rep.n}, missing {len(rep.missing_ts)}")
 start, months = utc_ts(WF_START), 84  # 2017-01-01 .. 2023-12-31
-res = run_grid_b(df, start, HOLDOUT_START, workers=1)  # about 15 s; a stdin script cannot spawn workers
+res = run_grid_b(dfs, start, HOLDOUT_START, workers=1)  # about a minute; a stdin script cannot spawn workers
 rates = []
 for combo, r in res.items():
-    n = len(r.trades)
+    n = trades_by_asset(r.trades)
+    total = len(r.trades)
     longs = sum(1 for t in r.trades if t.direction > 0)
-    rates.append(n / months)
-    print(f"{str(combo_to_json(combo)):48} trades {n:5d}  per month {n / months:5.2f}  long {longs:5d}  short {n - longs:5d}")
+    rates.append(total / months)
+    per = "  ".join(f"{a} {n[a]:5d} ({n[a] / months:4.2f}/mo)" for a in ASSETS)
+    print(f"{str(combo_to_json(combo)):48} {per}  combined {total:5d} ({total / months:5.2f}/mo)  "
+          f"long {longs:5d}  short {total - longs:5d}")
 med = statistics.median(rates)
 verdict = "STOP: report to the user before Task 7" if med < 4.0 else "continue with Task 7"
-print(f"median trades/month over the 32 combos: {med:.2f} (min {min(rates):.2f}, max {max(rates):.2f}) -> {verdict}")
+skipped = Counter(e for r in res.values() for _, _, e in r.events if e.startswith(("SIGNAL_REJECTED", "ENTRY_SKIPPED")))
+print(f"entries not taken over the 32 runs: {dict(sorted(skipped.items()))}")
+print(f"median combined trades/month over the 32 combos: {med:.2f} (min {min(rates):.2f}, max {max(rates):.2f}) -> {verdict}")
 PY
 ```
 
-약 820번의 공개 Coinbase API 요청(수 분)과 약 15초의 계산(작업자 1개: 표준 입력으로 받은 스크립트는 작업자 프로세스를 띄울 수 없다). 출력은 데이터 요약 1줄, 조합 32줄(`[zz_k, [z_lo, z_hi], tp1_r, ext, remainder]  trades N  per month X  long L  short S`), 판정 1줄이다: `median trades/month over the 32 combos: <중앙값> (min …, max …) -> continue with Task 7` 또는 `-> STOP: report to the user before Task 7`. 이 스크립트는 계획 작성 시 2017~2023 합성 캐시(네트워크 없음)로 실행해 출력 형식을 확인했다.
+ETH에 약 820번의 공개 Coinbase API 요청(수 분; 페이지마다 저장되므로 중단되면 다시 실행해 이어 받는다)과 약 1분의 계산(작업자 1개: 표준 입력으로 받은 스크립트는 작업자 프로세스를 띄울 수 없다). 출력은 자산마다 데이터 요약 1줄, 조합 32줄(`[zz_k, [z_lo, z_hi], tp1_r, ext, remainder]  BTC n (x/mo)  ETH m (y/mo)  combined N (X/mo)  long L  short S`), 받지 못한 진입 1줄(`entries not taken over the 32 runs: {...}`: `SIGNAL_REJECTED:size`·`:leverage`·`:breaker`, `ENTRY_SKIPPED:gap`·`:open_beyond_stop`의 수), 판정 1줄이다: `median combined trades/month over the 32 combos: <중앙값> (min …, max …) -> continue with Task 7` 또는 `-> STOP: report to the user before Task 7`. 이 스크립트는 계획 개정 시 2017~2023 두 자산 합성 캐시(네트워크 없음)로 실행해 출력 형식을 확인했다.
 
 - [ ] **Step 2: 결정 규칙에 따라 판정하고 보고**
 
-- 32개 조합의 월 거래 수 **중앙값이 4건 미만이면 멈춘다**: Task 7~14를 진행하지 않고, 조합별 표(거래 수, 월 거래 수, 롱/숏)와 누락 봉 수를 사용자에게 보고한다. 홀드아웃이 아직 보이지 않았으므로 이때의 규칙 변경은 정당하지만, 사용자의 재승인과 명세 개정(새 명세 또는 개정판, 이 계획의 개정)이 먼저이며, 이미 끝난 Task 1~6의 코드는 그 개정에 따라 고친다.
-- 중앙값이 4건 이상이면 표를 사용자에게 공유하고 Task 7로 넘어간다. 명세 목표(월 10~15건)에 못 미치면 그 사실도 함께 보고한다(규칙은 바꾸지 않는다).
-- 어느 경우에도 성과 지표는 보고하지 않는다. 이 캐시는 Task 14 Step 2에서 그대로 이어 쓴다.
+- 32개 조합의 두 자산 합계 월 거래 수 **중앙값이 4건 미만이면 멈춘다**: Task 7~14를 진행하지 않고, 조합별 표(자산별·합계 거래 수, 월 거래 수, 롱/숏), 받지 못한 진입 수, 자산별 누락 봉 수를 사용자에게 보고한다. 홀드아웃이 아직 보이지 않았으므로 이때의 규칙 변경은 정당하지만, 사용자의 재승인과 명세 개정(새 명세 또는 개정판, 이 계획의 개정)이 먼저이며, 이미 끝난 Task 1~6의 코드는 그 개정에 따라 고친다.
+- 중앙값이 4건 이상이면 표를 사용자에게 공유하고 Task 7로 넘어간다. 명세 목표(합계 월 10~15건)에 못 미치면 그 사실도 함께 보고한다(규칙은 바꾸지 않는다).
+- 어느 경우에도 성과 지표는 보고하지 않는다. 이 캐시들은 Task 14 Step 2에서 그대로 이어 쓴다.
 
 ---
 
-### Task 7: 매수 후 보유와 무작위 진입 대조군
+### Task 7: BTC/ETH 50:50 매수 후 보유와 자산별 무작위 진입 대조군
 
 **Files:**
 - Create: `src/ewbot/stratb/baselines.py`
 - Test: `tests/stratb/test_baselines.py`
 
 **Interfaces:**
-- Consumes: Task 1: `BConfig`. Task 2: `resample_1h`. Task 4: `Frame15`, `SignalB`(테스트: `build_frame`). Task 5: `run_engine`. Task 6(테스트): `backtest_b`. A: `ewbot.backtest.benchmarks.buy_hold(df1h, start_ts, end_ts, costs, equity0) -> (list[EquityPoint], list[Trade])`; `ewbot.backtest.metrics.compute_metrics`.
-- Produces: `ewbot.stratb.baselines`: `RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")`; `@dataclass(frozen=True) Shape(direction, stop_frac, tp1_r, tp2_r)`; `trade_shapes(trades) -> list[Shape]`(스냅숏의 `entry_ref` 기준); `buy_hold_b(f, start_ts, end_ts, cfg) -> (list[EquityPoint], list[Trade])`; `random_signals(f, shapes, n, start_ts, end_ts, seed) -> list[SignalB]`; `random_control(f, cfg, b_trades, start_ts, end_ts, runs=1000, seed=0, workers=1) -> dict`(`{"runs", "n_signals", "seed", "dist": {지표: {"mean", "p05", "p50", "p95"}}}`; B 거래가 없으면 `runs = 0`, `dist = {}`).
+- Consumes: Task 1: `BConfig`, `asset_costs`. Task 2: `resample_1h`. Task 4: `Frame15`, `SignalB`(테스트: `build_frame`, `build_frames`). Task 5: `asset_of`, `run_engine`. Task 6(테스트): `backtest_b`, `trades_by_asset`. A: `ewbot.backtest.benchmarks.buy_hold(df1h, start_ts, end_ts, costs, equity0) -> (list[EquityPoint], list[Trade])`; `ewbot.backtest.metrics.compute_metrics`.
+- Produces: `ewbot.stratb.baselines`: `RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")`; `@dataclass(frozen=True) Shape(direction, stop_frac, tp1_r, tp2_r)`; `trade_shapes(trades) -> list[Shape]`(스냅숏의 `entry_ref` 기준); `buy_hold_b(frames, start_ts, end_ts, cfg) -> (list[EquityPoint], list[Trade])`(자산마다 초기 자금을 똑같이 나눈 A의 `buy_hold`의 합: 50:50, 재조정 없음); `random_signals(f, shapes, n, start_ts, end_ts, seed) -> list[SignalB]`(`seed`는 정수나 정수 목록); `random_control(frames, cfg, b_trades, start_ts, end_ts, runs=1000, seed=0, workers=1) -> dict`(`{"runs", "n_signals": {자산: 그 자산의 B 거래 수}, "seed", "dist": {지표: {"mean", "p05", "p50", "p95"}}}`; 실행 r에서 k번째 자산의 진입은 시드 `[seed + r, k]`; B 거래가 없으면 `runs = 0`, `dist = {}`).
 
-명세 해석 10을 구현한다. 매수 후 보유는 A의 함수를 15분 프레임에서 만든 1시간봉에 그대로 쓴다(현물, 전 자산, 양쪽 수수료·슬리피지). 대조군은 B와 같은 엔진·설정으로 돌고 진입 시각만 무작위다. 시드가 고정되어 있어 작업자 수와 관계없이 결과가 같다.
+명세 6.5(2026-10-07 개정)와 해석 10을 구현한다. 매수 후 보유는 BTC/ETH 50:50 포트폴리오다: 초기 자금을 반씩 나눠 자산마다 A의 함수를 그 15분 프레임에서 만든 1시간봉에 그대로 쓰고(현물, 그 몫 전부, 양쪽 수수료·슬리피지), 두 곡선을 시간마다 더한다(재조정 없음). 대조군은 B와 같은 포트폴리오 엔진·설정으로 돌고 진입 시각만 무작위이며, 자산마다 그 자산의 B 거래 수와 거래 모양을 쓴다(각 자산의 평균 빈도). 시드가 고정되어 있어 작업자 수와 관계없이 결과가 같다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-A의 매수 후 보유와 같은 결과, 스냅숏 기준 거래 모양, 무작위 진입의 시드 재현·적격 봉·모양 1회씩 사용, 대조군의 분포 키와 결정성(1개와 2개 작업자), B 거래가 없을 때를 확인한다.
+50:50 매수 후 보유가 자산마다 A의 매수 후 보유(자금 절반)의 합인지, 스냅숏 기준 거래 모양, 무작위 진입의 시드 재현(정수와 목록 시드)·적격 봉·모양 1회씩 사용, 대조군의 자산별 신호 수와 분포 키와 결정성(1개와 2개 작업자), B 거래가 없을 때를 확인한다.
 
 **파일 `tests/stratb/test_baselines.py`** (새 파일, 전체 내용)
 
 ```python
 from __future__ import annotations
 
-import pandas as pd
 import pytest
 
 from ewbot.backtest.benchmarks import buy_hold
 from ewbot.engine.loop import Trade
 from ewbot.stratb.baselines import buy_hold_b, random_control, random_signals, trade_shapes
-from ewbot.stratb.config import BConfig, StratBParams
+from ewbot.stratb.config import BConfig, StratBParams, asset_costs
 from ewbot.stratb.data15 import resample_1h
-from ewbot.stratb.research import backtest_b
-from ewbot.stratb.signals import build_frame
-from tests.stratb.helpers import random_df
+from ewbot.stratb.research import backtest_b, trades_by_asset
+from ewbot.stratb.signals import build_frame, build_frames
+from tests.stratb.helpers import RANDOM_T0, random_df
 
 M15 = 900
 
 
 def _trade(d, ref, stop, tp1, tp2, ts=0):
-    return Trade(ts, ts + 900, "B", d, 3, ref, ref, stop, tp1, tp2, 0.0, 0.0, 0.0, 0.0, "TP2", {"entry_ref": ref})
+    return Trade(ts, ts + 900, "B-BTC", d, 3, ref, ref, stop, tp1, tp2, 0.0, 0.0, 0.0, 0.0, "TP2", {"entry_ref": ref})
 
 
-def test_buy_hold_is_strategy_a_buy_hold_on_the_complete_hours():
-    df = random_df(1000, 1)
-    f = build_frame(df)
-    start, end = int(df["ts"].iloc[100]) // 3600 * 3600, int(df["ts"].iloc[900]) // 3600 * 3600
-    eq, trades = buy_hold_b(f, start, end, BConfig())
-    ref_eq, ref_trades = buy_hold(resample_1h(df), start, end, BConfig().costs, 10_000.0)
-    assert eq == ref_eq and trades == ref_trades and trades[0].setup == "BH"
+def test_buy_hold_is_a_50_50_portfolio_of_strategy_a_buy_holds():
+    dfs = {"BTC": random_df(1000, 1), "ETH": random_df(1000, 2, start=2_000.0)}
+    frames = build_frames(dfs)
+    start, end = int(frames["BTC"].ts[100]) // 3600 * 3600, int(frames["BTC"].ts[900]) // 3600 * 3600
+    eq, trades = buy_hold_b(frames, start, end, BConfig())
+    parts = [buy_hold(resample_1h(dfs[a]), start, end, asset_costs(BConfig(), a), 5_000.0) for a in ("BTC", "ETH")]
+    assert [p.ts for p in eq] == [p.ts for p in parts[0][0]] == [p.ts for p in parts[1][0]]
+    assert [p.equity for p in eq] == pytest.approx([a.equity + b.equity for a, b in zip(parts[0][0], parts[1][0])])
+    assert trades == parts[0][1] + parts[1][1] and eq[0].equity == 10_000.0 and trades[0].setup == "BH"
 
 
 def test_shapes_come_from_the_signal_reference_price():
@@ -2611,6 +3070,7 @@ def test_random_entries_are_seeded_eligible_and_use_each_shape_once():
     start, end = int(f.ts[200]), int(f.ts[1999])
     a = random_signals(f, shapes, 3, start, end, seed=5)
     assert a == random_signals(f, shapes, 3, start, end, seed=5) != random_signals(f, shapes, 3, start, end, seed=6)
+    assert random_signals(f, shapes, 3, start, end, seed=[5, 1]) != a
     assert len(a) == 3 and sorted(s.direction for s in a) == [-1, 1, 1]
     for s in a:
         assert start <= s.ts < end and s.i < len(f) - 1 and not f.synthetic[s.i] and not f.synthetic[s.i + 1]
@@ -2619,26 +3079,28 @@ def test_random_entries_are_seeded_eligible_and_use_each_shape_once():
     assert len({s.i for s in many}) == len(many) and all(not f.synthetic[s.i + 1] for s in many)
 
 
-def test_the_random_control_reuses_b_exits_and_sizing_and_is_deterministic():
-    df = random_df(6000, 3)
+def test_the_random_control_imitates_each_asset_and_is_deterministic():
+    dfs = {"BTC": random_df(6000, 3), "ETH": random_df(6000, 3, t0=RANDOM_T0 - 20 * M15)}
     p = StratBParams(zz_k=3.0, zone=(0.5, 0.786))
     cfg = BConfig(params=p)
-    res = backtest_b(df, cfg)
-    assert res.trades
-    f = build_frame(df, p)
-    start, end = int(df["ts"].iloc[0]), int(df["ts"].iloc[-1]) + M15
-    one = random_control(f, cfg, res.trades, start, end, runs=6, seed=10, workers=1)
-    assert one["runs"] == 6 and one["n_signals"] == len(res.trades)
+    res = backtest_b(dfs, cfg)
+    frames = build_frames(dfs, p)
+    start, end = int(frames["BTC"].ts[0]), int(frames["BTC"].ts[-1]) + M15
+    n = trades_by_asset([t for t in res.trades if start <= t.entry_ts < end])
+    assert n["BTC"] > 0 and n["ETH"] > 0
+    one = random_control(frames, cfg, res.trades, start, end, runs=6, seed=10, workers=1)
+    assert one["runs"] == 6 and one["n_signals"] == n
     assert set(one["dist"]) == {"sharpe", "max_dd", "total_return", "calmar", "n_trades"}
     assert set(one["dist"]["sharpe"]) == {"mean", "p05", "p50", "p95"}
-    assert 0 <= one["dist"]["n_trades"]["p95"] <= len(res.trades)
-    assert random_control(f, cfg, res.trades, start, end, runs=6, seed=10, workers=2) == one
+    assert 0 <= one["dist"]["n_trades"]["p95"] <= sum(n.values())
+    assert random_control(frames, cfg, res.trades, start, end, runs=6, seed=10, workers=2) == one
 
 
 def test_no_b_trade_means_no_random_run():
-    f = build_frame(random_df(500, 1))
-    out = random_control(f, BConfig(), [], int(f.ts[0]), int(f.ts[-1]), runs=10)
-    assert out == {"runs": 0, "n_signals": 0, "seed": 0, "dist": {}}
+    frames = build_frames({"BTC": random_df(500, 1), "ETH": random_df(500, 2)})
+    f = frames["BTC"]
+    out = random_control(frames, BConfig(), [], int(f.ts[0]), int(f.ts[-1]), runs=10)
+    assert out == {"runs": 0, "n_signals": {"BTC": 0, "ETH": 0}, "seed": 0, "dist": {}}
 ```
 
 - [ ] **Step 2: 테스트를 실행해 실패를 확인**
@@ -2659,21 +3121,24 @@ uv run --group live pytest tests/stratb/test_baselines.py -q
 **파일 `src/ewbot/stratb/baselines.py`** (새 파일, 전체 내용)
 
 ```python
-"""Strategy-B baselines (Plan 4 spec 6.5 item 1): buy & hold and the random-entry control.
+"""Strategy-B baselines (Plan 4 spec 6.5 item 1, portfolio level since the 2026-10-07 revision): buy & hold
+of a 50/50 BTC/ETH portfolio and the random-entry control.
 
-Buy & hold is A's backtest.benchmarks.buy_hold on 1h bars built from the 15m frame (spot, whole equity,
-one fee and one slippage each way, hourly marks). The random control keeps everything of strategy B but
-the entry times: the same window, as many entries as B's trades in it, B's own trade shapes (direction,
-stop distance as a fraction of the reference price, TP1 and TP2 in R) assigned in a seeded random order,
-and the same engine (exits, 48 h time stop, remainder rule, 0.5% sizing, 3x cap, breakers, costs).
-Entries land on uniformly drawn 15m bars of the window (not the last bar, no gap-filled bar or fill bar);
-one that comes while a position is open is skipped, as for B."""
+Buy & hold splits the initial equity equally between the assets and runs A's backtest.benchmarks.buy_hold
+on each asset's 1h bars built from its 15m frame (spot, the part's whole equity, one fee and one slippage
+each way, hourly marks; no rebalancing); its equity is the sum of the parts. The random control keeps
+everything of strategy B but the entry times, per asset: the same window, as many entries on each asset
+as B's trades on it (each asset's own frequency), that asset's own trade shapes (direction, stop distance
+as a fraction of the reference price, TP1 and TP2 in R) in a seeded random order, on uniformly drawn 15m
+bars of the asset (not the last bar, no gap-filled bar or fill bar), and the same portfolio engine (exits,
+48 h time stop, remainder rule, 0.5% sizing, 3x caps, account breakers, costs). An entry that comes while
+its asset holds a position is skipped, as for B."""
 
 from __future__ import annotations
 
 import multiprocessing as mp
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -2681,9 +3146,9 @@ import pandas as pd
 from ewbot.backtest.benchmarks import buy_hold
 from ewbot.backtest.metrics import compute_metrics
 from ewbot.engine.loop import EquityPoint, Trade
-from ewbot.stratb.config import BConfig
+from ewbot.stratb.config import BConfig, asset_costs
 from ewbot.stratb.data15 import resample_1h
-from ewbot.stratb.engine import run_engine
+from ewbot.stratb.engine import asset_of, run_engine
 from ewbot.stratb.signals import Frame15, SignalB
 
 RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")
@@ -2708,14 +3173,38 @@ def trade_shapes(trades: Sequence[Trade]) -> list[Shape]:
     return out
 
 
-def buy_hold_b(f: Frame15, start_ts: int, end_ts: int, cfg: BConfig) -> tuple[list[EquityPoint], list[Trade]]:
-    df = pd.DataFrame({"ts": f.ts, "open": f.open, "high": f.high, "low": f.low, "close": f.close, "volume": 0.0,
-                       "synthetic": f.synthetic})
-    return buy_hold(resample_1h(df), start_ts, end_ts, cfg.costs, cfg.initial_equity)
+def _assets(frames: Mapping[str, Frame15], cfg: BConfig) -> list[str]:
+    return [s.asset for s in cfg.assets if s.asset in frames]
+
+
+def buy_hold_b(
+    frames: Mapping[str, Frame15], start_ts: int, end_ts: int, cfg: BConfig
+) -> tuple[list[EquityPoint], list[Trade]]:
+    """Equal-weight buy & hold of the frames' assets: (summed hourly equity, every part's trade)."""
+    names = _assets(frames, cfg)
+    share = cfg.initial_equity / len(names)
+    parts: list[list[EquityPoint]] = []
+    trades: list[Trade] = []
+    for a in names:
+        f = frames[a]
+        df = pd.DataFrame({"ts": f.ts, "open": f.open, "high": f.high, "low": f.low, "close": f.close,
+                           "volume": 0.0, "synthetic": f.synthetic})
+        eq, tr = buy_hold(resample_1h(df), start_ts, end_ts, asset_costs(cfg, a), share)
+        parts.append(eq)
+        trades.extend(tr)
+    out: list[EquityPoint] = []
+    cur, nxt = [share] * len(parts), [0] * len(parts)
+    for t in sorted({p.ts for eq in parts for p in eq}):
+        for k, eq in enumerate(parts):  # each part at its latest point at or before t
+            while nxt[k] < len(eq) and eq[nxt[k]].ts <= t:
+                cur[k] = eq[nxt[k]].equity
+                nxt[k] += 1
+        out.append(EquityPoint(t, float(sum(cur))))
+    return out, trades
 
 
 def random_signals(
-    f: Frame15, shapes: Sequence[Shape], n: int, start_ts: int, end_ts: int, seed: int
+    f: Frame15, shapes: Sequence[Shape], n: int, start_ts: int, end_ts: int, seed: int | Sequence[int]
 ) -> list[SignalB]:
     """n entries (at most one per bar) on eligible bars of [start_ts, end_ts), shapes in a seeded order."""
     if n <= 0 or not shapes:
@@ -2744,15 +3233,17 @@ def random_signals(
 _POOL: dict[str, Any] = {}
 
 
-def _pool_init(f: Frame15, cfg: BConfig, shapes: list[Shape], n: int, start_ts: int, end_ts: int) -> None:
+def _pool_init(frames: dict[str, Frame15], cfg: BConfig, shapes: dict[str, list[Shape]], n: dict[str, int],
+               start_ts: int, end_ts: int) -> None:
     _POOL.clear()
-    _POOL.update(f=f, cfg=cfg, shapes=shapes, n=n, start=start_ts, end=end_ts)
+    _POOL.update(frames=frames, cfg=cfg, shapes=shapes, n=n, start=start_ts, end=end_ts)
 
 
 def _pool_run(seed: int) -> dict[str, float]:
     s = _POOL
-    sigs = random_signals(s["f"], s["shapes"], s["n"], s["start"], s["end"], seed)
-    res = run_engine(s["f"], sigs, s["cfg"], s["start"])
+    sigs = {a: random_signals(f, s["shapes"][a], s["n"][a], s["start"], s["end"], [seed, k])
+            for k, (a, f) in enumerate(s["frames"].items())}
+    res = run_engine(s["frames"], sigs, s["cfg"], s["start"])
     m = compute_metrics(res.equity, res.trades, s["start"], s["end"])
     return {k: float(getattr(m, k)) for k in RANDOM_METRICS}
 
@@ -2764,7 +3255,7 @@ def _dist(values: Sequence[float]) -> dict[str, float]:
 
 
 def random_control(
-    f: Frame15,
+    frames: Mapping[str, Frame15],
     cfg: BConfig,
     b_trades: Sequence[Trade],
     start_ts: int,
@@ -2773,16 +3264,19 @@ def random_control(
     seed: int = 0,
     workers: int = 1,
 ) -> dict[str, Any]:
-    """`runs` random-entry runs (seeds seed .. seed + runs - 1) over [start_ts, end_ts). dist[metric] =
-    {mean, p05, p50, p95}; no runs when B made no trade in the window (nothing to imitate)."""
+    """`runs` random-entry runs over [start_ts, end_ts): run r draws the entries of the run's k-th asset
+    (config order) with the seed [seed + r, k]. n_signals = {asset: B's trades on it in the window};
+    dist[metric] = {mean, p05, p50, p95}; no runs when B made no trade in the window (nothing to imitate)."""
+    names = _assets(frames, cfg)
     mine = [t for t in b_trades if start_ts <= t.entry_ts < end_ts]
-    shapes = trade_shapes(mine)
-    n = len(mine)
+    per = {a: [t for t in mine if asset_of(t) == a] for a in names}
+    shapes = {a: trade_shapes(per[a]) for a in names}
+    n = {a: len(per[a]) for a in names}
     out: dict[str, Any] = {"runs": 0, "n_signals": n, "seed": seed, "dist": {}}
-    if runs <= 0 or n == 0 or not shapes:
+    if runs <= 0 or not any(shapes.values()):
         return out
     seeds = list(range(seed, seed + runs))
-    args = (f, cfg, shapes, n, start_ts, end_ts)
+    args = ({a: frames[a] for a in names}, cfg, shapes, n, start_ts, end_ts)
     if workers <= 1:
         _pool_init(*args)
         rows = [_pool_run(s) for s in seeds]
@@ -2806,27 +3300,27 @@ uv run --group live pytest tests/stratb/test_baselines.py -q
 
 ```bash
 git add src/ewbot/stratb/baselines.py tests/stratb/test_baselines.py
-git commit -m "feat(stratb): buy & hold and the random-entry control (same exits, sizing and costs, random entry times)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): 50/50 BTC/ETH buy & hold and the per-asset random-entry control (same exits, sizing and costs)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 8: holdout-b.lock, 1회 홀드아웃, 합격 기준
+### Task 8: holdout-b.lock, 1회 홀드아웃, 포트폴리오 합격 기준
 
 **Files:**
 - Create: `src/ewbot/stratb/holdout.py`
 - Test: `tests/stratb/test_holdout.py`
 
 **Interfaces:**
-- Consumes: Task 1: `GRID_B`, `M15`, `combo_to_json`, `config_for`, `normalize_combo`, `scale_costs`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `LOCK_KIND`, `REPLAY_ANCHOR`, `cache_path`, `load_15m`, `HoldoutGuardError`(테스트). Task 4: `build_frame`, `generate_signals`. Task 5: `run_engine`. Task 6: `backtest_b`. Task 7: `buy_hold_b`, `random_control`. A: `ewbot.backtest.holdout.data_fingerprint(df, start_ts, last_ts) -> str`, `git_state() -> dict`; `ewbot.backtest.metrics.Metrics`, `compute_metrics`; `ewbot.backtest.report.to_jsonable`; 테스트: `tests.paper.helpers.git(repo, *args)`.
-- Produces: `ewbot.stratb.holdout`: `LOCK_VERSION = 1`, `RANDOM_RUNS = 1000`, `MAX_DD = 0.15`, `MIN_TRADES = 50`, `COST_MULT = 1.5`, `BOUND`(다이제스트 대상 필드); `class HoldoutBError(RuntimeError)`; `lock_digest_b(lock) -> str`; `read_lock(path) -> dict`(종류·다이제스트 확인); `committed_lock(path) -> dict`(git HEAD의 내용; 커밋 안 됐으면 `HoldoutBError`); `wf_data_record(df_wf) -> dict`; `create_lock(params, df_wf, *, params_source, now_ts, lock_path=DEFAULT_LOCK_PATH, random_runs=1000, random_seed=0) -> dict`; `evaluate_criteria_b(b, bh, rnd, cost) -> dict`(`c1_sharpe_beats_bh_and_random_p95`, `c2_max_dd_le_15pct`, `c3_trades_ge_50`, `c4_cost_x1_5_net_profit`, `passed` 등); `run_holdout_b(*, confirm, cache_dir, lock_path=DEFAULT_LOCK_PATH, workers=1, fingerprint=stratb_fingerprint) -> dict`(`{"lock_path", "result": BResult, "first_run"}`).
-  잠금 파일 필드: `kind`, `version`, `keys`, `params`, `config`, `grid`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `random_runs`, `random_seed`, `code_sha256`, `wf_data`{`first_ts`, `last_ts`, `n_bars`, `sha256`}, `sha256`, `params_source`, `locked_at`, `git_head`, `git_dirty`, `attempts`[{`started`, `data_sha256`, `git_head`, `git_dirty`, `completed`?}], `first_run`{`started`, `completed`, `start_ts`, `end_ts`, `last_bar_ts`, `data`{`start_ts`, `last_bar_ts`, `n_bars`, `sha256`}, `metrics`{`B`, `BH`, `B_cost_x1_5`}, `random`, `criteria`}.
+- Consumes: Task 1: `ASSETS`, `GRID_B`, `M15`, `combo_to_json`, `config_for`, `normalize_combo`, `scale_costs`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `LOCK_KIND`, `REPLAY_ANCHOR`, `cache_paths`, `load_15m`, `load_caches_15m`·`HoldoutGuardError`(테스트). Task 4: `build_frames`, `generate_signals`; 테스트 도우미 `save_world`, `world_dfs`. Task 5: `run_engine`. Task 6: `backtest_b`, `trades_by_asset`. Task 7: `buy_hold_b`, `random_control`. A: `ewbot.backtest.holdout.data_fingerprint(df, start_ts, last_ts) -> str`, `git_state() -> dict`; `ewbot.backtest.metrics.Metrics`, `compute_metrics`; `ewbot.backtest.report.to_jsonable`; 테스트: `tests.paper.helpers.git(repo, *args)`.
+- Produces: `ewbot.stratb.holdout`: `LOCK_VERSION = 1`, `RANDOM_RUNS = 1000`, `MAX_DD = 0.15`, `MIN_TRADES = 50`, `COST_MULT = 1.5`, `BOUND`(다이제스트 대상 필드); `class HoldoutBError(RuntimeError)`; `lock_digest_b(lock) -> str`; `read_lock(path) -> dict`(종류·다이제스트 확인); `committed_lock(path) -> dict`(git HEAD의 내용; 커밋 안 됐으면 `HoldoutBError`); `wf_data_record(dfs_wf) -> dict`(`{자산: {first_ts, last_ts, n_bars, sha256}}`, 두 자산이 모두 있어야 한다); `data_fingerprint_b(dfs, start_ts, last_ts) -> str`(자산마다 A의 `data_fingerprint`를 `"<자산>:<해시>"` 줄로 `ASSETS` 순서로 이어 sha256); `create_lock(params, dfs_wf, *, params_source, now_ts, lock_path=DEFAULT_LOCK_PATH, random_runs=1000, random_seed=0) -> dict`; `evaluate_criteria_b(b, bh, rnd, cost) -> dict`(`c1_sharpe_beats_bh_and_random_p95`, `c2_max_dd_le_15pct`, `c3_trades_ge_50`, `c4_cost_x1_5_net_profit`, `passed` 등); `run_holdout_b(*, confirm, cache_dir, lock_path=DEFAULT_LOCK_PATH, workers=1, fingerprint=stratb_fingerprint) -> dict`(`{"lock_path", "result": BResult, "first_run"}`).
+  잠금 파일 필드: `kind`, `version`, `keys`, `params`, `config`, `grid`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `random_runs`, `random_seed`, `code_sha256`, `wf_data`{`BTC`, `ETH`: 각각 {`first_ts`, `last_ts`, `n_bars`, `sha256`}}, `sha256`, `params_source`, `locked_at`, `git_head`, `git_dirty`, `attempts`[{`started`, `data_sha256`, `git_head`, `git_dirty`, `completed`?}], `first_run`{`started`, `completed`, `start_ts`, `end_ts`, `last_bar_ts`, `data`{`start_ts`, `last_bar_ts`, `n_bars`{자산}, `sha256`(두 자산, `data_fingerprint_b`), `assets`{자산: 해시}}, `metrics`{`B`, `BH`, `B_cost_x1_5`}, `n_trades_by_asset`, `random`, `criteria`}. `config`에는 두 자산의 상품·계약 크기·틱과 `max_total_leverage`도 들어간다.
 
-명세 6.4~6.5와 해석 11을 구현한다. 잠금은 2024+ 데이터 없이 만들어지고(2024 이전 데이터 해시만 묶음), 커밋된 뒤에야 홀드아웃이 돈다. 홀드아웃은 `REPLAY_ANCHOR`부터 잠금의 마지막 봉까지를 손실 한도를 켠 채 다시 계산하고 2024-01-01부터 거래한다. 이어서 매수 후 보유, 무작위 대조군(잠금의 횟수·시드), 비용 1.5배 재실행을 같은 프레임에서 돌린다. 합격 기준 4개를 모두 `first_run.criteria`에 기록한다. 테스트의 합성 세계(`LONG_SETUP` 130번 반복, 2023-10-01부터)는 232봉마다 롱 하나가 나와 홀드아웃 구간에 62건, 네 기준 모두 합격이다(무작위 대조군은 테스트 속도를 위해 4회).
+명세 6.4~6.5(2026-10-07 개정)와 해석 11을 구현한다. 잠금은 2024+ 데이터 없이 만들어지고(두 자산 각각의 2024 이전 데이터 해시만 묶음), 커밋된 뒤에야 홀드아웃이 돈다. 홀드아웃은 두 자산을 `REPLAY_ANCHOR`부터 잠금의 마지막 봉까지 손실 한도를 켠 채 다시 계산하고 2024-01-01부터 거래한다. 이어서 50:50 매수 후 보유, 자산별 무작위 대조군(잠금의 횟수·시드), 비용 1.5배 재실행을 같은 프레임에서 돌린다. 포트폴리오 합격 기준 4개(거래 수는 두 자산 합계)를 모두 `first_run.criteria`에 기록한다. 테스트의 두 자산 합성 세계(`world_dfs`, 2023-10-01부터)는 232봉마다 같은 봉에서 BTC 롱과 ETH 숏이 나와 홀드아웃 구간에 124건(자산마다 62건), 네 기준 모두 합격이다(무작위 대조군은 테스트 속도를 위해 4회).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-잠금 전 2024 읽기 거부, 잠금 내용과 1회 작성, 그리드 밖·2024 데이터·이른 시각 거부, 필드 수정 감지, `--confirm`과 커밋 요구, B 코드 변경·2024 이전 데이터 변경 거부, 1회 실행과 기록(62건, 합격), 재실행 거부, 끝나지 않은 시도의 데이터 일치, 기준 하나하나의 실패를 확인한다.
+잠금 전 두 자산의 2024 읽기 거부, 잠금 내용(자산별 데이터 해시, 두 자산 설정)과 1회 작성, 그리드 밖·2024 데이터·한 자산뿐인 데이터·이른 시각 거부, 필드 수정 감지, `--confirm`과 커밋 요구, B 코드 변경·한 자산의 2024 이전 데이터 변경 거부, 1회 실행과 기록(124건 = 자산마다 62건, 합격), 재실행 거부, 끝나지 않은 시도의 데이터 일치, 기준 하나하나의 실패를 확인한다.
 
 **파일 `tests/stratb/test_holdout.py`** (새 파일, 전체 내용)
 
@@ -2839,18 +3333,19 @@ import pandas as pd
 import pytest
 
 from ewbot.backtest.metrics import Metrics
-from ewbot.stratb.data15 import REPLAY_ANCHOR, HoldoutGuardError, cache_path, load_15m
+from ewbot.stratb.data15 import REPLAY_ANCHOR, HoldoutGuardError, cache_paths, load_15m, load_caches_15m
 from ewbot.stratb.fingerprint import stratb_fingerprint
 from ewbot.stratb.holdout import (
     HoldoutBError,
     create_lock,
+    data_fingerprint_b,
     evaluate_criteria_b,
     lock_digest_b,
     read_lock,
     run_holdout_b,
 )
 from tests.paper.helpers import git
-from tests.stratb.helpers import LONG_SETUP, LONG_START, frame_df, path
+from tests.stratb.helpers import save_world, world_dfs
 
 HS = 1_704_067_200
 NOW = HS + 150 * 86_400 + 1_234
@@ -2864,17 +3359,15 @@ def world(tmp_path):
     git(repo, "init", "-q")
     cache = tmp_path / "cache"
     cache.mkdir()
-    df = frame_df(path(LONG_START, LONG_SETUP * 130), REPLAY_ANCHOR)  # one long setup per 232 bars, to 2024-08
-    df.to_parquet(cache_path(cache), index=False)
+    save_world(cache, world_dfs(REPLAY_ANCHOR))  # a BTC long and an ETH short per 232 bars, to 2024-08
     return repo, cache, repo / "holdout-b.lock"
 
 
 def _lock(world, **kw):
     _, cache, lock_path = world
-    wf = load_15m(cache_path(cache), lock_path=lock_path)
     args = dict(params_source="test", now_ts=NOW, lock_path=lock_path, random_runs=4)
     args.update(kw)
-    return create_lock(COMBO, wf, **args)
+    return create_lock(COMBO, load_caches_15m(cache), **args)
 
 
 def _commit(world):
@@ -2885,10 +3378,12 @@ def _commit(world):
 
 def test_2024_bars_are_unreadable_until_the_lock_exists(world):
     _, cache, lock_path = world
-    with pytest.raises(HoldoutGuardError):
-        load_15m(cache_path(cache), include_holdout=True, lock_path=lock_path)
+    for p in cache_paths(cache).values():
+        with pytest.raises(HoldoutGuardError):
+            load_15m(p, include_holdout=True, lock_path=lock_path)
     _lock(world)
-    assert int(load_15m(cache_path(cache), include_holdout=True, lock_path=lock_path)["ts"].max()) > HS
+    for p in cache_paths(cache).values():
+        assert int(load_15m(p, include_holdout=True, lock_path=lock_path)["ts"].max()) > HS
 
 
 def test_the_lock_binds_params_code_data_and_window_and_is_written_once(world):
@@ -2897,19 +3392,24 @@ def test_the_lock_binds_params_code_data_and_window_and_is_written_once(world):
     assert lock["params"] == COMBO and lock["sha256"] == lock_digest_b(lock)
     assert lock["last_bar_ts"] == NOW // 3600 * 3600 - 900 and (lock["holdout_start"], lock["replay_anchor"]) == (HS, REPLAY_ANCHOR)
     assert lock["code_sha256"] == stratb_fingerprint() and lock["random_runs"] == 4 and lock["first_run"] is None
-    assert lock["wf_data"]["last_ts"] == HS - 900 and lock["config"]["risk"]["risk_pct"] == 0.005
+    assert [(a, w["last_ts"]) for a, w in lock["wf_data"].items()] == [("BTC", HS - 900), ("ETH", HS - 900)]
+    assert lock["wf_data"]["BTC"]["sha256"] != lock["wf_data"]["ETH"]["sha256"]
+    assert lock["config"]["risk"]["risk_pct"] == 0.005 and lock["config"]["max_total_leverage"] == 3.0
+    assert [a["future"] for a in lock["config"]["assets"]] == ["BIP-20DEC30-CDE", "ETP-20DEC30-CDE"]
     with pytest.raises(HoldoutBError, match="written once"):
         _lock(world)
 
 
-def test_the_lock_refuses_off_grid_params_2024_walk_forward_data_and_an_early_clock(world):
+def test_the_lock_refuses_off_grid_params_2024_or_one_asset_data_and_an_early_clock(world):
     _, cache, lock_path = world
-    wf = load_15m(cache_path(cache), lock_path=lock_path)
+    wf = load_caches_15m(cache)
     with pytest.raises(HoldoutBError):
         create_lock([2.5, [0.382, 0.618], 1.0, 1.272, "breakeven"], wf, params_source="t", now_ts=NOW, lock_path=lock_path)
-    full = pd.read_parquet(cache_path(cache))
+    full = {a: pd.read_parquet(p) for a, p in cache_paths(cache).items()}
     with pytest.raises(HoldoutBError, match="before 2024"):
         create_lock(COMBO, full, params_source="t", now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="every asset"):
+        create_lock(COMBO, {"BTC": wf["BTC"]}, params_source="t", now_ts=NOW, lock_path=lock_path)
     with pytest.raises(HoldoutBError, match="after 2024"):
         create_lock(COMBO, wf, params_source="t", now_ts=HS + 600, lock_path=lock_path)
     assert not lock_path.exists()
@@ -2939,10 +3439,11 @@ def test_a_b_code_change_or_other_walk_forward_bars_are_refused(world):
     _commit(world)
     with pytest.raises(HoldoutBError, match="code changed"):
         run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path, fingerprint=lambda: "0" * 64)
-    df = pd.read_parquet(cache_path(cache))
+    eth = cache_paths(cache)["ETH"]
+    df = pd.read_parquet(eth)
     df.loc[5, "close"] += 1.0
-    df.to_parquet(cache_path(cache), index=False)
-    with pytest.raises(HoldoutBError, match="before 2024-01-01 differ"):
+    df.to_parquet(eth, index=False)
+    with pytest.raises(HoldoutBError, match=r"\['ETH'\] 15m bars before 2024-01-01 differ"):
         run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
 
 
@@ -2955,8 +3456,11 @@ def test_the_holdout_runs_once_and_records_the_criteria(world):
     fr = lock["first_run"]
     assert fr == out["first_run"] and fr["end_ts"] == lock["last_bar_ts"] + 900
     assert fr["data"]["start_ts"] == REPLAY_ANCHOR and len(lock["attempts"]) == 1 and lock["attempts"][0]["completed"]
+    win = {a: df[df["ts"] <= lock["last_bar_ts"]] for a, df in world_dfs(REPLAY_ANCHOR).items()}
+    assert fr["data"]["sha256"] == data_fingerprint_b(win, REPLAY_ANCHOR, lock["last_bar_ts"])
     crit = fr["criteria"]
-    assert fr["metrics"]["B"]["n_trades"] == crit["n_trades"] == 62 and fr["random"]["runs"] == 4
+    assert fr["metrics"]["B"]["n_trades"] == crit["n_trades"] == 124 and fr["random"]["runs"] == 4
+    assert fr["n_trades_by_asset"] == fr["random"]["n_signals"] == {"BTC": 62, "ETH": 62}
     assert crit["passed"] is True  # the synthetic setups win every time: all four criteria hold
     assert all(HS <= t.entry_ts <= lock["last_bar_ts"] + 900 for t in out["result"].trades)
     with pytest.raises(HoldoutBError, match="already run once"):
@@ -3014,20 +3518,23 @@ uv run --group live pytest tests/stratb/test_holdout.py -q
 """Strategy-B holdout lock and its one-shot run (Plan 4 spec 6.4-6.5).
 
 create_lock() writes <project root>/holdout-b.lock BEFORE any 2024+ candle can be read (data15 refuses
-them until a lock exists): the walk-forward's final combo, the full run config, the grid, the B
-fingerprint, the sha256 of the pre-2024 15m bars the walk-forward used, the holdout start, the replay
-anchor (2023-10-01), the 1,000-run random control and its seed, and last_bar_ts - the last 15m bar of
-the last complete hour at lock time, where the holdout ends (spec 6.4). The user commits it.
+them until a lock exists): the walk-forward's final combo, the full run config (assets included), the
+grid, the B fingerprint, the sha256 of each asset's pre-2024 15m bars the walk-forward used (wf_data:
+BTC and ETH), the holdout start, the replay anchor (2023-10-01), the 1,000-run random control and its
+seed, and last_bar_ts - the last 15m bar of the last complete hour at lock time, where the holdout ends
+(spec 6.4). The user commits it.
 
 run_holdout_b() runs the holdout ONCE after the user's approval (confirm=True) and records the result in
 first_run. It refuses (HoldoutBError) unless: the lock's sha256 is the digest of its own bound fields and
 equals the committed version's (git HEAD); first_run is empty there and in the file (one completed run,
 ever: no rerun, no other combo); the running B fingerprint equals code_sha256 (no B code change after the
-lock); the pre-2024 bars hash to wf_data.sha256; the data reaches last_bar_ts; an unfinished earlier
-attempt saw the same holdout bars. Each attempt is recorded in the lock before it runs.
+lock); every asset's pre-2024 bars hash to its wf_data sha256; every asset's data reaches last_bar_ts;
+an unfinished earlier attempt saw the same holdout bars. Each attempt is recorded in the lock before it
+runs.
 
-Criteria (spec 6.5, all four): Sharpe above buy & hold and above the 95th percentile of the random
-control; max drawdown <= 15%; >= 50 trades; total return > 0 with fees and slippage x 1.5."""
+Criteria (spec 6.5 as revised 2026-10-07, on the BTC + ETH portfolio, all four): Sharpe above the 50/50
+buy & hold and above the 95th percentile of the random control (each asset's own entry frequency); max
+drawdown <= 15%; >= 50 trades of both assets together; total return > 0 with fees and slippage x 1.5."""
 
 from __future__ import annotations
 
@@ -3038,7 +3545,7 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
 
@@ -3047,12 +3554,12 @@ from ewbot.backtest.metrics import Metrics, compute_metrics
 from ewbot.backtest.report import to_jsonable
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.stratb.baselines import buy_hold_b, random_control
-from ewbot.stratb.config import GRID_B, M15, combo_to_json, config_for, normalize_combo, scale_costs
-from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_path, load_15m
+from ewbot.stratb.config import ASSETS, GRID_B, M15, combo_to_json, config_for, normalize_combo, scale_costs
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m
 from ewbot.stratb.engine import run_engine
 from ewbot.stratb.fingerprint import stratb_fingerprint
-from ewbot.stratb.research import backtest_b
-from ewbot.stratb.signals import build_frame, generate_signals
+from ewbot.stratb.research import backtest_b, trades_by_asset
+from ewbot.stratb.signals import build_frames, generate_signals
 from ewbot.types import H1
 
 LOCK_VERSION = 1
@@ -3112,16 +3619,30 @@ def committed_lock(path: Path) -> dict[str, Any]:
         raise HoldoutBError(f"the committed {p.name} is not JSON") from exc
 
 
-def wf_data_record(df_wf: pd.DataFrame) -> dict[str, Any]:
-    if df_wf.empty:
-        raise HoldoutBError("no 15m bars before 2024-01-01")
-    return {"first_ts": int(df_wf["ts"].iloc[0]), "last_ts": int(df_wf["ts"].iloc[-1]), "n_bars": int(len(df_wf)),
-            "sha256": data_fingerprint(df_wf, 0, HOLDOUT_START - 1)}
+def wf_data_record(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
+    """{asset: {first_ts, last_ts, n_bars, sha256}} of every asset's walk-forward bars (all before 2024)."""
+    if sorted(dfs_wf) != sorted(ASSETS):
+        raise HoldoutBError(f"the lock needs the walk-forward bars of every asset {list(ASSETS)}, got {sorted(dfs_wf)}")
+    out: dict[str, Any] = {}
+    for a in ASSETS:
+        df = dfs_wf[a]
+        if df.empty:
+            raise HoldoutBError(f"no {a} 15m bars before 2024-01-01")
+        out[a] = {"first_ts": int(df["ts"].iloc[0]), "last_ts": int(df["ts"].iloc[-1]), "n_bars": int(len(df)),
+                  "sha256": data_fingerprint(df, 0, HOLDOUT_START - 1)}
+    return out
+
+
+def data_fingerprint_b(dfs: Mapping[str, pd.DataFrame], start_ts: int, last_ts: int) -> str:
+    """One sha256 over every asset's bars with start_ts <= ts <= last_ts: of the lines "<asset>:<A's
+    data_fingerprint>" in config.ASSETS order (an asset without bars there hashes as an empty window)."""
+    lines = "".join(f"{a}:{data_fingerprint(dfs[a], start_ts, last_ts)}\n" for a in ASSETS if a in dfs)
+    return hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
 
 def create_lock(
     params: Sequence[Any],
-    df_wf: pd.DataFrame,
+    dfs_wf: Mapping[str, pd.DataFrame],
     *,
     params_source: str,
     now_ts: int,
@@ -3129,7 +3650,7 @@ def create_lock(
     random_runs: int = RANDOM_RUNS,
     random_seed: int = 0,
 ) -> dict[str, Any]:
-    """Write the lock (once). df_wf: the walk-forward's 15m bars, all before 2024-01-01."""
+    """Write the lock (once). dfs_wf: every asset's walk-forward 15m bars, all before 2024-01-01."""
     path = Path(lock_path)
     if path.exists():
         raise HoldoutBError(f"{path} exists: the strategy-B lock is written once")
@@ -3137,7 +3658,7 @@ def create_lock(
         combo = normalize_combo(params)
     except ValueError as exc:
         raise HoldoutBError(str(exc)) from exc
-    if len(df_wf) and int(df_wf["ts"].max()) >= HOLDOUT_START:
+    if any(len(df) and int(df["ts"].max()) >= HOLDOUT_START for df in dfs_wf.values()):
         raise HoldoutBError("the walk-forward data must end before 2024-01-01")
     last_bar = int(now_ts) // H1 * H1 - M15
     if last_bar < HOLDOUT_START:
@@ -3157,7 +3678,7 @@ def create_lock(
         "random_runs": int(random_runs),
         "random_seed": int(random_seed),
         "code_sha256": stratb_fingerprint(),
-        "wf_data": wf_data_record(df_wf),
+        "wf_data": wf_data_record(dfs_wf),
     }
     lock.update(sha256=lock_digest_b(lock), params_source=params_source, locked_at=_now(), **git_state(),
                 attempts=[], first_run=None)
@@ -3201,15 +3722,19 @@ def run_holdout_b(
         raise HoldoutBError("the strategy-B holdout has already run once: no rerun, no other combo (spec 6.4)")
     if fingerprint() != lock["code_sha256"]:
         raise HoldoutBError("the strategy-B code changed after the lock (B fingerprint differs): refusing")
-    df = load_15m(cache_path(cache_dir), include_holdout=True, lock_path=path)
-    if wf_data_record(df[df["ts"] < HOLDOUT_START])["sha256"] != lock["wf_data"]["sha256"]:
-        raise HoldoutBError("the 15m bars before 2024-01-01 differ from the ones the walk-forward used")
+    dfs = {a: load_15m(p, include_holdout=True, lock_path=path) for a, p in cache_paths(cache_dir).items()}
+    wf = wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a, df in dfs.items()})
+    changed = [a for a in ASSETS if wf[a]["sha256"] != lock["wf_data"][a]["sha256"]]
+    if changed:
+        raise HoldoutBError(f"the {changed} 15m bars before 2024-01-01 differ from the ones the walk-forward used")
     last = int(lock["last_bar_ts"])
-    if df.empty or int(df["ts"].iloc[-1]) < last:
-        raise HoldoutBError(f"the cache ends before the lock's last bar {last}: run `ewbot stratb fetch` first")
-    win = df[(df["ts"] >= REPLAY_ANCHOR) & (df["ts"] <= last)].reset_index(drop=True)
-    data = {"start_ts": REPLAY_ANCHOR, "last_bar_ts": last, "n_bars": int(len(win)),
-            "sha256": data_fingerprint(win, REPLAY_ANCHOR, last)}
+    short = [a for a, df in dfs.items() if df.empty or int(df["ts"].iloc[-1]) < last]
+    if short:
+        raise HoldoutBError(f"the {short} cache ends before the lock's last bar {last}: run `ewbot stratb fetch` first")
+    win = {a: df[(df["ts"] >= REPLAY_ANCHOR) & (df["ts"] <= last)].reset_index(drop=True) for a, df in dfs.items()}
+    data = {"start_ts": REPLAY_ANCHOR, "last_bar_ts": last, "n_bars": {a: int(len(df)) for a, df in win.items()},
+            "sha256": data_fingerprint_b(win, REPLAY_ANCHOR, last),
+            "assets": {a: data_fingerprint(df, REPLAY_ANCHOR, last) for a, df in win.items()}}
     for a in lock["attempts"]:
         if a["data_sha256"] != data["sha256"]:
             raise HoldoutBError("an earlier unfinished attempt saw other holdout bars: refusing (inspect by hand)")
@@ -3220,14 +3745,15 @@ def run_holdout_b(
     cfg = config_for(normalize_combo(lock["params"]))
     end = last + M15
     res = backtest_b(win, cfg, HOLDOUT_START, end, include_holdout=True)
-    f = build_frame(win, cfg.params)
+    frames = build_frames(win, cfg.params)
     b = compute_metrics(res.equity, res.trades, HOLDOUT_START, end)
-    bh_eq, bh_trades = buy_hold_b(f, HOLDOUT_START, end, cfg)
+    bh_eq, bh_trades = buy_hold_b(frames, HOLDOUT_START, end, cfg)
     bh = compute_metrics(bh_eq, bh_trades, HOLDOUT_START, end)
-    rnd = random_control(f, cfg, res.trades, HOLDOUT_START, end, runs=int(lock["random_runs"]),
+    rnd = random_control(frames, cfg, res.trades, HOLDOUT_START, end, runs=int(lock["random_runs"]),
                          seed=int(lock["random_seed"]), workers=workers)
     dear = dataclasses.replace(cfg, costs=scale_costs(cfg.costs, COST_MULT))
-    res_dear = run_engine(f, generate_signals(f, cfg.params), dear, HOLDOUT_START)
+    signals = {a: generate_signals(f, cfg.params) for a, f in frames.items()}
+    res_dear = run_engine(frames, signals, dear, HOLDOUT_START)
     cost = compute_metrics(res_dear.equity, res_dear.trades, HOLDOUT_START, end)
     criteria = evaluate_criteria_b(b, bh, rnd, cost)
     attempt["completed"] = _now()
@@ -3235,6 +3761,7 @@ def run_holdout_b(
         "started": attempt["started"], "completed": attempt["completed"], "start_ts": HOLDOUT_START, "end_ts": end,
         "last_bar_ts": last, "data": data,
         "metrics": {"B": dataclasses.asdict(b), "BH": dataclasses.asdict(bh), "B_cost_x1_5": dataclasses.asdict(cost)},
+        "n_trades_by_asset": trades_by_asset([t for t in res.trades if HOLDOUT_START <= t.entry_ts < end]),
         "random": rnd, "criteria": criteria,
     })
     _write(path, lock)
@@ -3253,7 +3780,7 @@ uv run --group live pytest tests/stratb/test_holdout.py -q
 
 ```bash
 git add src/ewbot/stratb/holdout.py tests/stratb/test_holdout.py
-git commit -m "feat(stratb): holdout-b.lock written before any 2024 bar, one-shot holdout and the spec 6.5 criteria" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): holdout-b.lock pinning both assets' pre-2024 bars, one-shot holdout and the portfolio criteria" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -3269,16 +3796,16 @@ git commit -m "feat(stratb): holdout-b.lock written before any 2024 bar, one-sho
 - Test: `tests/paperb/test_adapters.py`
 
 **Interfaces:**
-- Consumes: Task 5: `BResult`, `run_engine`(테스트), `SignalB`·`build_frame`(테스트). A(import만): `ewbot.paper.ledger.Ledger`, `current_epoch`, `ensure_epoch`, `replace_epoch_trades`, `save_ledger`, `load_ledger`; `ewbot.paper.decisions.decision_id(kind, ts, trade_key)`, `verify_decisions`(테스트); `ewbot.paper.notify`: `HEAD = "[ewbot paper]"`, `make_event(kind, ts, trade_key, text)`, `close_text(t, count, counted)`, `stop_move_text(dec, t)`, `failure_text`, `position_line(pos)`.
-- Produces: `ewbot.paperb.ledger`: `PAPER_B_REQUIRED = 30`; `holdout_summary_b(lock) -> dict`(`lock_sha256`, `params`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `data_sha256`, `n_trades: {"B": n}`, `passed`); `new_ledger_b(lock) -> Ledger`(구간 1 = 잠금의 B 지문, 시작 = 잠금의 마지막 봉); `paper_count_b(ledger) -> dict`(`epoch_id`, `eligible`, `paper`, `required`).
-  `ewbot.paperb.decisions`: `split_result_b(res) -> (list[Trade], Trade | None)`; `build_decisions_b(res) -> list[dict]`(A의 판단 형식: `id`, `kind`, `ts`, `price`, `contracts`, `reason`, `trade_key`, `levels`, `setup`, `direction`); `open_position_b(open_trade, res, epoch_start) -> dict`(A의 `position_line`이 읽는 키).
-  `ewbot.paperb.notify`: `HEAD_B = "[ewbot paper-B]"`; `b_head(text) -> str`(A 메시지의 접두어 교체, A 메시지가 아니면 `ValueError`); `entry_text_b(t) -> str`; `close_text_b(t, n_at, required, counted) -> str`; `holdout_trades_text_b(expected, got) -> str`; `daily_text_b(ny_date, lines) -> str`; `decision_events_b(fresh, trades, open_key, epoch_start, count, cur_closed) -> list[dict]`.
+- Consumes: Task 1: `ASSETS`. Task 5: `BResult`, `asset_of`, `setup_of`, `run_engine`(테스트), `SignalB`·`build_frame`(테스트). A(import만): `ewbot.paper.ledger.Ledger`, `current_epoch`, `ensure_epoch`, `replace_epoch_trades`, `save_ledger`, `load_ledger`; `ewbot.paper.decisions.decision_id(kind, ts, trade_key)`, `verify_decisions`(테스트); `ewbot.paper.notify`: `HEAD = "[ewbot paper]"`, `make_event(kind, ts, trade_key, text)`, `close_text(t, count, counted)`, `stop_move_text(dec, t)`, `failure_text`, `position_line(pos)`.
+- Produces: `ewbot.paperb.ledger`: `PAPER_B_REQUIRED = 30`(두 자산 합계); `holdout_summary_b(lock) -> dict`(`lock_sha256`, `params`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `data_sha256`(두 자산), `n_trades: {"B": n}`(합계), `passed`); `new_ledger_b(lock) -> Ledger`(구간 1 = 잠금의 B 지문, 시작 = 잠금의 마지막 봉; `open_position`에는 `{자산: 포지션}` 또는 `None`); `paper_count_b(ledger) -> dict`(`epoch_id`, `eligible`, `paper`, `required`).
+  `ewbot.paperb.decisions`: `trade_key_b(asset, ts) -> int`(ts + `ASSETS`에서의 자산 인덱스); `key_of(trade) -> int`; `split_result_b(res) -> (list[Trade], list[Trade])`(닫힌 거래, 마지막 봉에 열려 있던 포지션들); `build_decisions_b(res) -> list[dict]`(A의 판단 형식: `id`, `kind`, `ts`, `price`, `contracts`, `reason`, `trade_key`, `levels`, `setup`, `direction`; (ts, 종류, 거래 키) 순서); `open_positions_b(still, res, epoch_start) -> dict[str, dict] | None`(자산마다 A의 `position_line`이 읽는 키 + `asset`).
+  `ewbot.paperb.notify`: `HEAD_B = "[ewbot paper-B]"`; `b_head(text) -> str`(A 메시지의 접두어 교체, A 메시지가 아니면 `ValueError`); `entry_text_b(t) -> str`; `close_text_b(t, n_at, required, counted) -> str`; `holdout_trades_text_b(expected, got) -> str`; `daily_text_b(ny_date, lines) -> str`; `position_lines_b(open_position) -> list[str]`(포지션마다 A의 한 줄, 없으면 `포지션: 없음`); `decision_events_b(fresh, trades, open_keys, epoch_start, count, cur_closed) -> list[dict]`(`trades`는 B 거래 키로 찾음).
 
-A의 `paper/` 부품을 수정하지 않고 재사용하기 위한 얇은 어댑터다. 장부는 A의 `Ledger` 스키마(버전 1)와 원자적 입출력을 그대로 쓰고, 묶이는 대상만 `holdout-b.lock`으로 바꾼다. 판단은 A의 형식으로 만들어 A의 대조 함수를 그대로 쓴다(해석 13). 메시지는 A의 형식을 쓰되 접두어를 `[ewbot paper-B]`로 바꾸고, 파동 카운트를 설명하는 A의 진입 메시지만 B용으로 새로 쓴다.
+A의 `paper/` 부품을 수정하지 않고 재사용하기 위한 얇은 어댑터다. 장부는 A의 `Ledger` 스키마(버전 1)와 원자적 입출력을 그대로 쓰고, 묶이는 대상만 `holdout-b.lock`으로 바꾼다. B는 자산마다 포지션을 하나씩 가질 수 있으므로 `open_position`에는 `{자산: 포지션}`을 담는다(B의 장부는 B만 읽는다). 판단은 A의 형식으로 만들어 A의 대조 함수를 그대로 쓴다(해석 13): 두 자산이 같은 봉에 진입할 수 있으므로 거래 키는 진입 ts에 자산 인덱스(BTC +0, ETH +1초)를 더한 정수다. 거래의 `setup`이 `B-BTC`·`B-ETH`라서 A의 청산·손절 이동·포지션 문구가 자산을 밝힌다. 메시지는 A의 형식을 쓰되 접두어를 `[ewbot paper-B]`로 바꾸고, 파동 카운트를 설명하는 A의 진입 메시지만 B용으로 새로 쓴다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-장부가 A 스키마로 저장·적재되는지, 카운트가 30건 기준이고 지문 변경 시 0이 되는지, 판단 종류·수량·본절 기록과 A의 대조 결과(그대로면 불일치 없음, 가격을 바꾸면 CHANGED·UNEXPLAINED), 마지막 봉 포지션 분리, 접두어, 알림 이벤트를 확인한다.
+장부가 A 스키마로 저장·적재되는지, 카운트가 30건 기준이고 지문 변경 시 0이 되는지, 판단 종류·수량·본절 기록과 A의 대조 결과(그대로면 불일치 없음, 가격을 바꾸면 CHANGED·UNEXPLAINED), 마지막 봉 포지션 분리, 같은 봉에 진입한 두 자산의 서로 다른 판단 id·포지션 줄·알림, 접두어, 알림 이벤트를 확인한다.
 
 ```bash
 mkdir -p src/ewbot/paperb tests/paperb
@@ -3301,10 +3828,17 @@ import pytest
 from ewbot.paper import notify as a_notify
 from ewbot.paper.decisions import verify_decisions
 from ewbot.paper.ledger import Ledger, ensure_epoch, load_ledger, replace_epoch_trades, save_ledger
-from ewbot.paper.notify import position_line
-from ewbot.paperb.decisions import build_decisions_b, open_position_b, split_result_b
+from ewbot.paperb.decisions import build_decisions_b, key_of, open_positions_b, split_result_b, trade_key_b
 from ewbot.paperb.ledger import PAPER_B_REQUIRED, holdout_summary_b, new_ledger_b, paper_count_b
-from ewbot.paperb.notify import HEAD_B, b_head, close_text_b, daily_text_b, decision_events_b, entry_text_b
+from ewbot.paperb.notify import (
+    HEAD_B,
+    b_head,
+    close_text_b,
+    daily_text_b,
+    decision_events_b,
+    entry_text_b,
+    position_lines_b,
+)
 from ewbot.stratb.config import BConfig
 from ewbot.stratb.engine import run_engine
 from ewbot.stratb.signals import SignalB, build_frame
@@ -3323,11 +3857,14 @@ def _frame(rows):
                                     columns=["ts", "open", "high", "low", "close", "volume"]))
 
 
-def _run(rows, end_open=False):
+def _sig(f, d=1, scale=1.0):
+    return SignalB(i=2, ts=int(f.ts[2]), direction=d, entry_ref=20_000.0 * scale, stop=(20_000.0 - d * 100.0) * scale,
+                   tp1=(20_000.0 + d * 100.0) * scale, tp2=(20_000.0 + d * 300.0) * scale, reason="long div 1/2 break 3.00")
+
+
+def _run(rows):
     f = _frame(rows)
-    s = SignalB(i=2, ts=int(f.ts[2]), direction=1, entry_ref=20_000.0, stop=19_900.0, tp1=20_100.0, tp2=20_300.0,
-                reason="long div 1/2 break 3.00")
-    return f, run_engine(f, [s], BConfig())
+    return f, run_engine({"BTC": f}, {"BTC": [_sig(f)]}, BConfig())
 
 
 FLAT = [(20_000.0, 20_005.0, 19_995.0, 20_000.0)]
@@ -3360,7 +3897,7 @@ def test_decisions_are_strategy_a_records_and_replay_cleanly():
     assert [d["kind"] for d in dec] == ["SIGNAL", "ENTRY", "TP1", "BREAKEVEN", "STOP"]
     sig, entry, tp1, be, stop = dec
     assert (sig["ts"], sig["contracts"], sig["levels"], sig["trade_key"]) == (int(f.ts[2]), 41, [19_900.0, 20_100.0, 20_300.0], int(f.ts[2]))
-    assert entry["id"] == f"ENTRY:{int(f.ts[3])}:{int(f.ts[3])}" and entry["reason"] == "B"
+    assert entry["id"] == f"ENTRY:{int(f.ts[3])}:{int(f.ts[3])}" and entry["reason"] == entry["setup"] == "B-BTC"
     assert (be["contracts"], be["levels"], be["price"]) == (21, [19_900.0], entry["price"])
     assert stop["reason"] == "STOP" and tp1["contracts"] == 20
     epoch = {"id": 1, "started_ts": 0, "through_ts": int(f.ts[-1])}
@@ -3372,20 +3909,41 @@ def test_decisions_are_strategy_a_records_and_replay_cleanly():
     assert (disc["type"], disc["cause"]) == ("CHANGED", "UNEXPLAINED")
 
 
-def test_a_position_open_at_the_last_bar_is_split_off_and_described():
+def test_positions_open_at_the_last_bar_are_split_off_and_described():
     f, res = _run(FLAT * 8)
-    closed, open_trade = split_result_b(res)
-    assert closed == [] and open_trade.exit_reason == "END"
-    pos = open_position_b(open_trade, res, epoch_start=int(f.ts[0]))
-    assert (pos["remaining"], pos["stop"], pos["counted"], pos["tp1_done"]) == (41, 19_900.0, True, False)
-    assert position_line(pos).startswith("포지션: B 롱 41/41계약")
+    closed, still = split_result_b(res)
+    assert closed == [] and [t.exit_reason for t in still] == ["END"]
+    pos = open_positions_b(still, res, epoch_start=int(f.ts[0]))
+    assert list(pos) == ["BTC"] and open_positions_b([], res, 0) is None
+    assert (pos["BTC"]["remaining"], pos["BTC"]["stop"], pos["BTC"]["counted"], pos["BTC"]["tp1_done"]) == (41, 19_900.0, True, False)
+    assert position_lines_b(pos)[0].startswith("포지션: B-BTC 롱 41/41계약") and position_lines_b(None) == ["포지션: 없음"]
     assert "ENTRY" in [d["kind"] for d in build_decisions_b(res)] and "EXIT" not in [d["kind"] for d in build_decisions_b(res)]
+
+
+def test_two_assets_entering_on_the_same_bar_have_distinct_decisions_and_messages():
+    f, g = _frame(FLAT * 8), _frame([tuple(x / 10 for x in FLAT[0])] * 8)
+    res = run_engine({"BTC": f, "ETH": g}, {"BTC": [_sig(f)], "ETH": [_sig(g, d=-1, scale=0.1)]}, BConfig())
+    t3 = int(f.ts[3])
+    dec = build_decisions_b(res)
+    assert [(d["id"], d["setup"], d["direction"]) for d in dec] == [
+        (f"SIGNAL:{t3 - M15}:{t3 - M15}", "B-BTC", 1), (f"SIGNAL:{t3 - M15}:{t3 - M15 + 1}", "B-ETH", -1),
+        (f"ENTRY:{t3}:{t3}", "B-BTC", 1), (f"ENTRY:{t3}:{t3 + 1}", "B-ETH", -1)]
+    assert (trade_key_b("BTC", t3), trade_key_b("ETH", t3)) == (t3, t3 + 1)
+    epoch = {"id": 1, "started_ts": 0, "through_ts": int(f.ts[-1])}
+    assert verify_decisions([{**d, "epoch_id": 1} for d in dec], dec, epoch, lambda d: False, lambda d: False) == []
+    closed, still = split_result_b(res)
+    pos = open_positions_b(still, res, epoch_start=0)
+    assert closed == [] and list(pos) == ["BTC", "ETH"]
+    assert [x.split(" · ")[0] for x in position_lines_b(pos)] == ["포지션: B-BTC 롱 41/41계약", "포지션: B-ETH 숏 41/41계약"]
+    events = decision_events_b(dec, {key_of(t): t for t in res.trades}, {key_of(t) for t in still}, 0, {"required": 30}, [])
+    assert [e["id"] for e in events] == [f"ENTRY:{t3}:{t3}", f"ENTRY:{t3}:{t3 + 1}"]
+    assert "B-BTC 롱" in events[0]["text"] and "B-ETH 숏" in events[1]["text"]
 
 
 def test_messages_carry_the_paper_b_prefix():
     _, res = _run(TP1_THEN_BE)
     t = res.trades[0]
-    assert entry_text_b(t).startswith(f"{HEAD_B} 신규 진입") and "근거: long div 1/2 break 3.00" in entry_text_b(t)
+    assert entry_text_b(t).startswith(f"{HEAD_B} 신규 진입\nB-BTC 롱 · ") and "근거: long div 1/2 break 3.00" in entry_text_b(t)
     assert close_text_b(t, 3, 30, True).startswith(f"{HEAD_B} 청산 · STOP") and "3/30" in close_text_b(t, 3, 30, True)
     assert b_head(a_notify.failure_text("data", "x", None)) == f"{HEAD_B} 실패 · 단계 data\nx"
     assert daily_text_b("2024-06-01", ["a", "b"]) == f"{HEAD_B} 일일 요약 2024-06-01 (뉴욕)\na\nb"
@@ -3396,8 +3954,8 @@ def test_messages_carry_the_paper_b_prefix():
 def test_decision_events_announce_entries_breakeven_moves_and_closes():
     f, res = _run(TP1_THEN_BE)
     dec = build_decisions_b(res)
-    trades = {t.entry_ts: t for t in res.trades}
-    events = decision_events_b(dec, trades, None, epoch_start=0, count={"required": 30}, cur_closed=list(res.trades))
+    trades = {key_of(t): t for t in res.trades}
+    events = decision_events_b(dec, trades, set(), epoch_start=0, count={"required": 30}, cur_closed=list(res.trades))
     assert [e["kind"] for e in events] == ["ENTRY", "BREAKEVEN", "CLOSE"]
     assert all(e["text"].startswith(HEAD_B) for e in events) and "1/30" in events[-1]["text"]
 ```
@@ -3420,7 +3978,8 @@ uv run --group live pytest tests/paperb/test_adapters.py -q
 **파일 `src/ewbot/paperb/__init__.py`** (새 파일, 전체 내용)
 
 ```python
-"""Paper trading of strategy B (Plan 4 spec 7): an hourly deterministic recompute on the `paper-b` branch.
+"""Paper trading of strategy B (Plan 4 spec 7): an hourly deterministic recompute of BTC and ETH on the
+`paper-b` branch.
 
 Outside the B fingerprint (stratb/ only) and outside strategy A's paper runtime (paper/ is imported, never
 changed)."""
@@ -3433,8 +3992,9 @@ changed)."""
 
 Epoch 1 starts at the lock's last bar with the lock's B fingerprint; another B fingerprint opens a new
 epoch (A's ensure_epoch) and the count starts again (spec 7). Paper trades are the current epoch's closed
-trades that entered after its start (A's paper_trades); 30 are needed (spec 7.1). Holdout trades never
-count."""
+trades of both assets that entered after its start (A's paper_trades); 30 are needed, BTC and ETH
+together (spec 7.1). Holdout trades never count. open_position holds {asset: position} (or None): B may
+hold one position per asset."""
 
 from __future__ import annotations
 
@@ -3484,12 +4044,16 @@ A's replay check - verify_decisions, decisions_to_record, classify (DATA_REVISIO
 ENVIRONMENT_CHANGE, UNEXPLAINED), same_decision - runs unchanged on them.
 
   SIGNAL     ts = confirming 15m bar, price = entry_ref, contracts = queued size, levels = [stop, tp1, tp2]
-  ENTRY      ts = fill bar (the next 15m open), reason = setup "B"
+  ENTRY      ts = fill bar (the next 15m open), reason = setup ("B-BTC" or "B-ETH")
   TP1 / TP2 / STOP / EXIT   fills (EXIT reason: TIME or BREAKER)
   BREAKEVEN  the rest's stop moved to the entry price after TP1: price = new stop, levels = [old stop]
-The END close of a position still open at the last bar is not a decision. A run whose last bar is T
-knows every fill and stop move with ts <= T and every signal with ts <= T - 15m (no entry is evaluated on
-the last bar); A's known_at() dates a SIGNAL at ts + 1h, which only ever delays its APPEARED check."""
+setup and direction name the asset and the side. A's decision id is KIND:ts:trade_key with an integer
+trade key, the position's entry ts; BTC and ETH may enter on the same 15m bar, so a B trade key is the
+entry ts (the signal ts for SIGNAL) plus the asset's index in config.ASSETS - BTC + 0, ETH + 1 second
+(every bar ts is a multiple of 900). The END close of a position still open at the last bar is not a
+decision. A run whose last bar is T knows every fill and stop move with ts <= T and every signal with ts
+<= T - 15m (no entry is evaluated on the last bar); A's known_at() dates a SIGNAL at ts + 1h, which only
+ever delays its APPEARED check."""
 
 from __future__ import annotations
 
@@ -3497,20 +4061,29 @@ from typing import Any, Sequence
 
 from ewbot.engine.loop import Trade
 from ewbot.paper.decisions import decision_id
-from ewbot.stratb.engine import BResult
+from ewbot.stratb.config import ASSETS
+from ewbot.stratb.engine import BResult, asset_of, setup_of
 
 _ORDER = {k: i for i, k in enumerate(("EXIT", "ENTRY", "STOP", "TP1", "TP2", "BREAKEVEN", "TRAIL", "SIGNAL"))}
 
 
-def split_result_b(res: BResult) -> tuple[list[Trade], Trade | None]:
-    """(closed trades, the position the engine force-closed at the last bar)."""
-    trades = list(res.trades)
-    if res.end_fill is None:
-        return trades, None
-    last = trades[-1]
-    if last.exit_reason != "END" or last.entry_ts != res.end_fill.trade_key:
-        raise ValueError("the END-closed trade is not the last trade of the run")
-    return trades[:-1], last
+def trade_key_b(asset: str, ts: int) -> int:
+    """The integer key of A's decision format: ts + the asset's index in config.ASSETS."""
+    return int(ts) + ASSETS.index(asset)
+
+
+def key_of(t: Trade) -> int:
+    return trade_key_b(asset_of(t), t.entry_ts)
+
+
+def split_result_b(res: BResult) -> tuple[list[Trade], list[Trade]]:
+    """(closed trades, the positions the engine force-closed at the last bar), each in run order."""
+    ends = {(f.asset, f.trade_key) for f in res.end_fills}
+    closed = [t for t in res.trades if (asset_of(t), t.entry_ts) not in ends]
+    still = [t for t in res.trades if (asset_of(t), t.entry_ts) in ends]
+    if len(still) != len(ends) or any(t.exit_reason != "END" for t in still):
+        raise ValueError("the END fills do not match the END-closed trades of the run")
+    return closed, still
 
 
 def _decision(kind: str, ts: int, price: float, contracts: int, reason: str, key: int,
@@ -3521,47 +4094,55 @@ def _decision(kind: str, ts: int, price: float, contracts: int, reason: str, key
 
 
 def build_decisions_b(res: BResult) -> list[dict[str, Any]]:
-    """Every decision of one run, ordered by (ts, kind) as A's build_decisions."""
-    by_entry = {t.entry_ts: t for t in res.trades}
+    """Every decision of one run, ordered by (ts, kind) as A's build_decisions, then by trade key."""
+    by_entry = {(asset_of(t), t.entry_ts): t for t in res.trades}
     out = [
-        _decision("SIGNAL", s.ts, s.entry_ref, o.contracts, s.reason, s.ts, [s.stop, s.tp1, s.tp2], "B", s.direction)
+        _decision("SIGNAL", s.ts, s.entry_ref, o.contracts, s.reason, trade_key_b(o.asset, s.ts),
+                  [s.stop, s.tp1, s.tp2], setup_of(o.asset), s.direction)
         for s, o in zip(res.signals, res.orders, strict=True)
     ]
-    tp1_done: list[tuple[int, int, int]] = []
+    tp1_done: list[tuple[int, str, int, int]] = []
     for f in res.fills:
-        t = by_entry[f.trade_key]
+        t = by_entry[(f.asset, f.trade_key)]
         reason = t.setup if f.kind == "ENTRY" else (t.exit_reason if f.kind == "EXIT" else f.kind)
-        out.append(_decision(f.kind, f.ts, f.price, f.contracts, reason, f.trade_key, [], t.setup, t.direction))
+        out.append(_decision(f.kind, f.ts, f.price, f.contracts, reason, trade_key_b(f.asset, f.trade_key), [],
+                             t.setup, t.direction))
         if f.kind == "TP1":
-            tp1_done.append((f.ts, f.trade_key, f.contracts))
+            tp1_done.append((f.ts, f.asset, f.trade_key, f.contracts))
     for s in res.stops:
-        t = by_entry[s.trade_key]
-        left = t.contracts - sum(n for ts, key, n in tp1_done if key == s.trade_key and ts <= s.ts)
-        out.append(_decision(s.kind, s.ts, s.new, left, s.kind, s.trade_key, [s.old], t.setup, t.direction))
-    out.sort(key=lambda d: (d["ts"], _ORDER[d["kind"]]))
+        t = by_entry[(s.asset, s.trade_key)]
+        left = t.contracts - sum(n for ts, a, key, n in tp1_done if (a, key) == (s.asset, s.trade_key) and ts <= s.ts)
+        out.append(_decision(s.kind, s.ts, s.new, left, s.kind, trade_key_b(s.asset, s.trade_key), [s.old], t.setup,
+                             t.direction))
+    out.sort(key=lambda d: (d["ts"], _ORDER[d["kind"]], d["trade_key"]))
     return out
 
 
-def open_position_b(open_trade: Trade, res: BResult, epoch_start: int) -> dict[str, Any]:
-    """The position held after the last bar, in the shape A's notify.position_line reads."""
-    key = open_trade.entry_ts
-    tp1 = sum(f.contracts for f in res.fills if f.trade_key == key and f.kind == "TP1")
-    moves = [s for s in res.stops if s.trade_key == key]
-    return {
-        "entry_ts": key, "setup": open_trade.setup, "direction": open_trade.direction,
-        "contracts": open_trade.contracts, "remaining": open_trade.contracts - tp1,
-        "entry_price": open_trade.entry_price, "stop0": open_trade.stop0,
-        "stop": moves[-1].new if moves else open_trade.stop0, "tp1": open_trade.tp1, "tp2": open_trade.tp2,
-        "tp1_done": tp1 > 0, "mark_ts": None if res.end_fill is None else res.end_fill.ts,
-        "pnl_if_closed": open_trade.pnl, "r_if_closed": open_trade.r_multiple, "counted": key > int(epoch_start),
-    }
+def open_positions_b(still: Sequence[Trade], res: BResult, epoch_start: int) -> dict[str, dict[str, Any]] | None:
+    """{asset: the position held after the last bar, in the shape A's notify.position_line reads}, None if
+    flat (stored as the ledger's open_position)."""
+    out: dict[str, dict[str, Any]] = {}
+    for t in still:
+        a, key = asset_of(t), t.entry_ts
+        tp1 = sum(f.contracts for f in res.fills if (f.asset, f.trade_key) == (a, key) and f.kind == "TP1")
+        moves = [s for s in res.stops if (s.asset, s.trade_key) == (a, key)]
+        end = next(f for f in res.end_fills if (f.asset, f.trade_key) == (a, key))
+        out[a] = {
+            "asset": a, "entry_ts": key, "setup": t.setup, "direction": t.direction,
+            "contracts": t.contracts, "remaining": t.contracts - tp1, "entry_price": t.entry_price,
+            "stop0": t.stop0, "stop": moves[-1].new if moves else t.stop0, "tp1": t.tp1, "tp2": t.tp2,
+            "tp1_done": tp1 > 0, "mark_ts": end.ts, "pnl_if_closed": t.pnl, "r_if_closed": t.r_multiple,
+            "counted": key > int(epoch_start),
+        }
+    return out or None
 ```
 
 **파일 `src/ewbot/paperb/notify.py`** (새 파일, 전체 내용)
 
 ```python
 """Paper-B Telegram messages (spec 7): strategy A's formats and delivery (ewbot.paper.notify), with the
-prefix `[ewbot paper-B]`. Only the entry message is B's own (A's describes wave counts)."""
+prefix `[ewbot paper-B]`. Only the entry message is B's own (A's describes wave counts). Every trade and
+position line names its asset through the trade's setup ("B-BTC", "B-ETH")."""
 
 from __future__ import annotations
 
@@ -3570,7 +4151,8 @@ from typing import Any, Mapping, Sequence
 
 from ewbot.engine.loop import Trade
 from ewbot.paper import notify as a_notify
-from ewbot.paper.notify import make_event
+from ewbot.paper.notify import make_event, position_line
+from ewbot.paperb.decisions import key_of
 
 HEAD_B = "[ewbot paper-B]"
 
@@ -3590,7 +4172,7 @@ def entry_text_b(t: Trade) -> str:
     snap = t.snapshot or {}
     return "\n".join([
         f"{HEAD_B} 신규 진입",
-        f"B {'롱' if t.direction > 0 else '숏'} · {_utc(t.entry_ts)}",
+        f"{t.setup} {'롱' if t.direction > 0 else '숏'} · {_utc(t.entry_ts)}",
         f"진입 {t.entry_price:,.2f} · 손절 {t.stop0:,.2f} · {t.contracts}계약",
         f"TP1 {t.tp1:,.2f} (절반) · TP2 {float(t.tp2 or 0.0):,.2f}",
         f"근거: {snap.get('reason', '-')}",
@@ -3613,15 +4195,23 @@ def daily_text_b(ny_date: str, lines: Sequence[str]) -> str:
     return "\n".join([f"{HEAD_B} 일일 요약 {ny_date} (뉴욕)", *lines])
 
 
+def position_lines_b(open_position: Mapping[str, Mapping[str, Any]] | None) -> list[str]:
+    """One A position line per open position (the ledger's open_position: {asset: position} or None)."""
+    if not open_position:
+        return [position_line(None)]
+    return [position_line(p) for p in open_position.values()]
+
+
 def decision_events_b(
     fresh: Sequence[dict[str, Any]],
     trades: Mapping[int, Trade],
-    open_key: int | None,
+    open_keys: set[int],
     epoch_start: int,
     count: Mapping[str, Any],
     cur_closed: Sequence[Trade],
 ) -> list[dict[str, Any]]:
-    """ENTRY, BREAKEVEN and CLOSE events for the decisions first recorded in this run (A's rules)."""
+    """ENTRY, BREAKEVEN and CLOSE events for the decisions first recorded in this run (A's rules). `trades`
+    maps the B trade key (decisions.key_of) to every trade of the run; open_keys are the open positions'."""
     out: list[dict[str, Any]] = []
     for d in fresh:
         t = trades.get(d["trade_key"])
@@ -3631,7 +4221,7 @@ def decision_events_b(
             out.append(make_event("ENTRY", d["ts"], d["trade_key"], entry_text_b(t)))
         elif d["kind"] == "BREAKEVEN":
             out.append(make_event("BREAKEVEN", d["ts"], d["trade_key"], b_head(a_notify.stop_move_text(d, t))))
-        elif d["kind"] in ("STOP", "TP1", "TP2", "EXIT") and t.entry_ts != open_key and t.exit_ts == d["ts"]:
+        elif d["kind"] in ("STOP", "TP1", "TP2", "EXIT") and key_of(t) not in open_keys and t.exit_ts == d["ts"]:
             counted = t.entry_ts > int(epoch_start)
             n_at = sum(1 for x in cur_closed if x.exit_ts <= t.exit_ts)
             out.append(make_event("CLOSE", d["ts"], d["trade_key"], close_text_b(t, n_at, count["required"], counted)))
@@ -3644,7 +4234,7 @@ def decision_events_b(
 uv run --group live pytest tests/paperb/test_adapters.py -q
 ```
 
-예상: `6 passed`
+예상: `7 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -3664,22 +4254,23 @@ git commit -m "feat(paperb): ledger, decision and message adapters over strategy
 - Test: `tests/paperb/test_runner.py`
 
 **Interfaces:**
-- Consumes: Task 1: `config_for`, `normalize_combo`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `REPLAY_ANCHOR`, `load_15m`, `update_cache_15m`, `cache_path`(테스트). Task 6: `backtest_b`. Task 8: `HoldoutBError`, `committed_lock`, `read_lock`, `lock_digest_b`(테스트), `create_lock`·`run_holdout_b`(테스트 도우미). Task 9: 모든 어댑터. A(import만): `ewbot.backtest.holdout.data_fingerprint`; `ewbot.backtest.report.to_jsonable`; `ewbot.paper.decisions`: `decisions_to_record`, `known_at`, `paper_trades`, `verify_decisions`; `ewbot.paper.environment`: `environment_digest`, `runtime_environment`; `ewbot.paper.ledger`: `RUNS_LOG`, `Ledger`, `LedgerError`, `append_log_line`, `ensure_epoch`, `load_ledger`, `replace_epoch_trades`, `save_ledger`; `ewbot.paper.notify`: `NY`, `Sender`, `daily_summary_due`, `deliver`, `discrepancy_text`, `epoch_text`, `make_event`, `position_line`, `queue_events`. 테스트: `tests.paper.helpers.Clock`, `FakeSender`, `git`.
-- Produces: `ewbot.paperb.runner`: `FETCH_ATTEMPTS = 3`, `DAILY_HOUR_NY = 9`; `class PaperBRunError(RuntimeError)`(`.stage`, `.message`); `default_fetch_b(cache_dir, lock_path) -> Path`; `@dataclass PaperBEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch_b, sender=None, clock=<벽시계>, fingerprint=stratb_fingerprint, sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)`; `@dataclass(frozen=True) RunOutcomeB(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, count)`; `precheck_lock_b(lock_path) -> dict`; `status_lines_b(ledger, count) -> list[str]`; `run_paper_b(env) -> RunOutcomeB`. 실행 기록(`ledger.runs[]`)의 키: `id`, `ts`, `status`, `last_bar_ts`, `data_sha256`, `holdout_data_ok`, `holdout_trades_recomputed`, `epoch_id`, `paper_trades`, `new_decisions`, `new_discrepancies`, `env`, `env_sha256`, `warnings`, `notify`. 장부 디렉터리에는 `ledger.json`과 `runs.log`만 쓴다.
-  `tests/paperb/helpers.py`: `HS`, `LOCK_NOW`, `LAST_BAR`, `COMBO`, `M15`, `world_df()`, `build_passed_lock(tmp) -> str`, `commit_lock_b(repo, text) -> Path`, `FakeFetchB(source, clock, fail=0)`, `make_env(tmp_path, lock_text, now, source=None, **kw) -> (PaperBEnv, Clock, FakeSender)`. `tests/paperb/conftest.py`: 세션 픽스처 `lock_text`(합성 홀드아웃을 실제로 한 번 돌린 잠금 파일 내용).
+- Consumes: Task 1: `ASSETS`, `config_for`, `normalize_combo`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `REPLAY_ANCHOR`, `load_15m`, `update_caches_15m`, `cache_paths`·`load_caches_15m`(테스트). Task 4(테스트): `save_world`, `world_dfs`. Task 6: `backtest_b`. Task 8: `HoldoutBError`, `committed_lock`, `data_fingerprint_b`, `read_lock`, `lock_digest_b`(테스트), `create_lock`·`run_holdout_b`(테스트 도우미). Task 9: 모든 어댑터. A(import만): `ewbot.backtest.report.to_jsonable`; `ewbot.paper.decisions`: `decisions_to_record`, `known_at`, `paper_trades`, `verify_decisions`; `ewbot.paper.environment`: `environment_digest`, `runtime_environment`; `ewbot.paper.ledger`: `RUNS_LOG`, `Ledger`, `LedgerError`, `append_log_line`, `ensure_epoch`, `load_ledger`, `replace_epoch_trades`, `save_ledger`; `ewbot.paper.notify`: `NY`, `Sender`, `daily_summary_due`, `data_hash_text`, `deliver`, `discrepancy_text`, `epoch_text`, `make_event`, `queue_events`. 테스트: `tests.paper.helpers.Clock`, `FakeSender`, `git`.
+- Produces: `ewbot.paperb.runner`: `FETCH_ATTEMPTS = 3`, `DAILY_HOUR_NY = 9`; `class PaperBRunError(RuntimeError)`(`.stage`, `.message`); `default_fetch_b(cache_dir, lock_path) -> dict[str, Path]`(두 자산 캐시를 늘림); `@dataclass PaperBEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch_b, sender=None, clock=<벽시계>, fingerprint=stratb_fingerprint, sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)`; `@dataclass(frozen=True) RunOutcomeB(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, count)`; `precheck_lock_b(lock_path) -> dict`; `status_lines_b(ledger, count) -> list[str]`; `run_paper_b(env) -> RunOutcomeB`. 실행 기록(`ledger.runs[]`)의 키: `id`, `ts`, `status`, `last_bar_ts`, `data_sha256`, `holdout_data_ok`, `holdout_trades_recomputed`, `epoch_id`, `paper_trades`, `new_decisions`, `new_discrepancies`, `env`, `env_sha256`, `warnings`, `notify`. 장부 디렉터리에는 `ledger.json`과 `runs.log`만 쓴다.
+  `tests/paperb/helpers.py`: `HS`, `LOCK_NOW`, `LAST_BAR`, `COMBO`, `M15`, `world() -> {자산: DataFrame}`, `build_passed_lock(tmp) -> str`, `commit_lock_b(repo, text) -> Path`, `FakeFetchB(source, clock, fail=0)`(두 자산 캐시를 씀), `make_env(tmp_path, lock_text, now, source=None, **kw) -> (PaperBEnv, Clock, FakeSender)`. `tests/paperb/conftest.py`: 세션 픽스처 `lock_text`(합성 홀드아웃을 실제로 한 번 돌린 잠금 파일 내용).
 
-명세 7·8과 해석 12~14를 구현한다. 단계: 사전 점검(잠금) → 장부(이 잠금에서 시작된 장부인지) → 데이터(3회 재시도, `REPLAY_ANCHOR` 이후, 잠금의 마지막 봉 이상; 홀드아웃 구간 해시가 다르면 거부하지 않고 해시마다 한 번 경고 — 명세 8절 2026-10-07 수정) → 지문·구간 → 재계산(`backtest_b(..., HOLDOUT_START, None, include_holdout=True)`, 홀드아웃 거래 수 재현 확인) → A의 대조(데이터가 바뀌어 달라진 판단은 `DATA_REVISION`) → 이벤트(진입, 본절, 청산, 불일치, 구간, 데이터 해시 경고, 뉴욕 9시 일일 요약 n/30) → 쓰기 → 알림. 각 단계의 실패는 `PaperBRunError(stage)`이며, 쓰기 단계 전에는 아무것도 쓰지 않는다. 일일 요약의 실거래 전환 조건 4줄(명세 7.1)은 `status_lines_b`가 만든다. 시간마다 전체를 다시 계산하는 데 수 초가 걸린다(3년치 15분봉 약 10만 개).
+명세 7·8(2026-10-07 개정)과 해석 12~14를 구현한다. BTC와 ETH는 이 실행기 하나, 장부 하나에서 함께 돈다. 단계: 사전 점검(잠금) → 장부(이 잠금에서 시작된 장부인지) → 데이터(두 자산 캐시 갱신 3회 재시도, `REPLAY_ANCHOR` 이후, 자산마다 잠금의 마지막 봉 이상; 두 자산의 홀드아웃 구간 해시 `data_fingerprint_b`가 다르면 거부하지 않고 해시마다 한 번 경고 — 명세 8절 2026-10-07 수정) → 지문·구간 → 재계산(`backtest_b(..., HOLDOUT_START, None, include_holdout=True)`, 홀드아웃 거래 수(합계) 재현 확인) → A의 대조(데이터가 바뀌어 달라진 판단은 `DATA_REVISION`; 판단의 데이터 해시도 두 자산을 함께 본다) → 이벤트(진입, 본절, 청산 — 자산을 밝힘, 불일치, 구간, 데이터 해시 경고, 뉴욕 9시 일일 요약 n/30과 자산별 포지션) → 쓰기 → 알림. 각 단계의 실패는 `PaperBRunError(stage)`이며, 쓰기 단계 전에는 아무것도 쓰지 않는다. 일일 요약의 실거래 전환 조건 4줄(명세 7.1)은 `status_lines_b`가 만든다. 시간마다 전체를 다시 계산하는 데 수 초가 걸린다(두 자산 3년치 15분봉 약 20만 개).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-테스트 도우미(합성 세계, 실제로 한 번 돈 합성 홀드아웃의 잠금, 시계 기준으로 마감된 봉만 쓰는 가짜 수집기)와 실행기 테스트를 만든다.
+테스트 도우미(두 자산 합성 세계, 실제로 한 번 돈 합성 홀드아웃의 잠금, 시계 기준으로 마감된 봉만 두 자산 캐시에 쓰는 가짜 수집기)와 실행기 테스트를 만든다.
 
 **파일 `tests/paperb/helpers.py`** (새 파일, 전체 내용)
 
 ```python
-"""Shared helpers for tests/paperb: one synthetic world (a long setup every 232 15m bars from 2023-10-01
-to 2024-08), a strategy-B lock whose holdout really ran on it, a fake 15m fetcher. A's fake sender, clock
-and git helper (tests.paper.helpers) are reused. No network, no real cache, no real lock."""
+"""Shared helpers for tests/paperb: one synthetic two-asset world (from 2023-10-01 to 2024-08, a BTC long
+and an ETH short on the same 15m bar every 232 bars: tests.stratb.helpers.world_dfs), a strategy-B lock
+whose holdout really ran on it, a fake 15m fetcher of both assets. A's fake sender, clock and git helper
+(tests.paper.helpers) are reused. No network, no real cache, no real lock."""
 
 from __future__ import annotations
 
@@ -3691,10 +4282,10 @@ from typing import Any, Callable
 import pandas as pd
 
 from ewbot.paperb.runner import PaperBEnv
-from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_path, load_15m
+from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths, load_caches_15m
 from ewbot.stratb.holdout import create_lock, run_holdout_b
 from tests.paper.helpers import Clock, FakeSender, git
-from tests.stratb.helpers import LONG_SETUP, LONG_START, frame_df, path
+from tests.stratb.helpers import save_world, world_dfs
 
 HS = 1_704_067_200
 LOCK_NOW = HS + 150 * 86_400 + 1_234  # the lock's clock: last bar 2024-05-30 00:45 UTC
@@ -3703,8 +4294,8 @@ COMBO = [2.0, [0.382, 0.618], 1.0, 1.272, "breakeven"]
 M15 = 900
 
 
-def world_df() -> pd.DataFrame:
-    return frame_df(path(LONG_START, LONG_SETUP * 130), REPLAY_ANCHOR)
+def world() -> dict[str, pd.DataFrame]:
+    return world_dfs(REPLAY_ANCHOR)
 
 
 def build_passed_lock(tmp: Path) -> str:
@@ -3713,10 +4304,9 @@ def build_passed_lock(tmp: Path) -> str:
     repo.mkdir()
     cache.mkdir()
     git(repo, "init", "-q")
-    world_df().to_parquet(cache_path(cache), index=False)
+    save_world(cache, world())
     lp = repo / "holdout-b.lock"
-    create_lock(COMBO, load_15m(cache_path(cache), lock_path=lp), params_source="test", now_ts=LOCK_NOW, lock_path=lp,
-                random_runs=2)
+    create_lock(COMBO, load_caches_15m(cache), params_source="test", now_ts=LOCK_NOW, lock_path=lp, random_runs=2)
     git(repo, "add", lp.name)
     git(repo, "commit", "-q", "-m", "lock")
     run_holdout_b(confirm=True, cache_dir=cache, lock_path=lp)
@@ -3739,21 +4329,24 @@ def commit_lock_b(repo: Path, text: str) -> Path:
 
 
 class FakeFetchB:
-    """Stands in for update_cache_15m: writes the bars of `source` closed by clock() into the 15m cache."""
+    """Stands in for update_caches_15m: writes each asset's bars of `source` closed by clock() into its cache."""
 
-    def __init__(self, source: pd.DataFrame | Callable[[], pd.DataFrame], clock: Callable[[], int], fail: int = 0):
+    def __init__(self, source: dict[str, pd.DataFrame] | Callable[[], dict[str, pd.DataFrame]],
+                 clock: Callable[[], int], fail: int = 0):
         self.source, self.clock, self.fail, self.calls = source, clock, fail, 0
 
-    def __call__(self, cache_dir: Path, lock_path: Path) -> Path:
+    def __call__(self, cache_dir: Path, lock_path: Path) -> dict[str, Path]:
         self.calls += 1
         if self.fail > 0:
             self.fail -= 1
             raise ConnectionError("coinbase down")
-        df = self.source() if callable(self.source) else self.source
-        p = cache_path(cache_dir)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        df[df["ts"] < int(self.clock()) // M15 * M15].reset_index(drop=True).to_parquet(p, index=False)
-        return p
+        dfs = self.source() if callable(self.source) else self.source
+        paths = cache_paths(cache_dir)
+        for a, p in paths.items():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            df = dfs[a]
+            df[df["ts"] < int(self.clock()) // M15 * M15].reset_index(drop=True).to_parquet(p, index=False)
+        return paths
 
 
 def make_env(tmp_path: Path, lock_text: str, now: int, source: Any = None, **kw: Any) -> tuple[PaperBEnv, Clock, FakeSender]:
@@ -3761,7 +4354,7 @@ def make_env(tmp_path: Path, lock_text: str, now: int, source: Any = None, **kw:
     sender = FakeSender()
     env = PaperBEnv(
         ledger_dir=tmp_path / "ledger", lock_path=commit_lock_b(tmp_path / "repo", lock_text),
-        cache_dir=tmp_path / "cache", fetch=FakeFetchB(world_df() if source is None else source, clock),
+        cache_dir=tmp_path / "cache", fetch=FakeFetchB(world() if source is None else source, clock),
         sender=sender, clock=clock, sleep=lambda s: None, environment=lambda: {"python": "3.12.13"},
     )
     for k, v in kw.items():
@@ -3802,7 +4395,7 @@ from ewbot.paperb.notify import HEAD_B
 from ewbot.paperb.runner import PaperBRunError, precheck_lock_b, run_paper_b
 from ewbot.stratb.holdout import lock_digest_b
 from tests.paper.helpers import git
-from tests.paperb.helpers import LAST_BAR, FakeFetchB, commit_lock_b, make_env, world_df
+from tests.paperb.helpers import LAST_BAR, FakeFetchB, commit_lock_b, make_env, world
 
 H1 = 3600
 
@@ -3843,7 +4436,7 @@ def test_the_first_run_reproduces_the_holdout_and_writes_only_the_b_ledger(tmp_p
     out = run_paper_b(env)
     led = load_ledger(env.ledger_dir)
     assert (out.epoch_id, out.last_bar_ts, out.notes) == (1, LAST_BAR + H1, [])
-    assert led.runs[0]["holdout_trades_recomputed"] == led.holdout["n_trades"]["B"] == 62
+    assert led.runs[0]["holdout_trades_recomputed"] == led.holdout["n_trades"]["B"] == 124
     assert led.runs[0]["warnings"] == [] and all(known_at(d) > LAST_BAR for d in led.decisions)
     assert sorted(p.name for p in env.ledger_dir.iterdir()) == ["ledger.json", "runs.log"]
     assert "paper=0/30" in (env.ledger_dir / "runs.log").read_text()
@@ -3856,9 +4449,11 @@ def test_hourly_runs_count_paper_trades_and_notify_with_the_b_prefix(tmp_path, l
         out = run_paper_b(env)
         assert out.new_discrepancies == 0
     led = load_ledger(env.ledger_dir)
-    assert out.count["paper"] >= 2 and all(t["entry_ts"] > LAST_BAR for t in led.trades)
-    assert any(x.startswith(f"{HEAD_B} 신규 진입") for x in sender.texts)
-    assert any(x.startswith(f"{HEAD_B} 청산") for x in sender.texts)
+    assert out.count["paper"] >= 4 and all(t["entry_ts"] > LAST_BAR for t in led.trades)
+    assert {t["setup"] for t in led.trades} == {"B-BTC", "B-ETH"}
+    for asset in ("B-BTC 롱", "B-ETH 숏"):
+        assert any(x.startswith(f"{HEAD_B} 신규 진입") and asset in x for x in sender.texts)
+        assert any(x.startswith(f"{HEAD_B} 청산") and asset in x for x in sender.texts)
     assert all(x.startswith(HEAD_B) for x in sender.texts) and led.discrepancies == []
     fresh, _, _ = make_env(tmp_path / "fresh", lock_text, clock.now)
     run_paper_b(fresh)
@@ -3896,9 +4491,10 @@ def test_revised_holdout_bars_warn_once_and_changed_decisions_are_data_revisions
     raw = json.loads((env.ledger_dir / "ledger.json").read_text())
     raw["decisions"][0]["price"] += 1.0  # a recorded decision that will not reappear unchanged
     (env.ledger_dir / "ledger.json").write_text(json.dumps(raw))
-    df = world_df()
-    df.loc[(df["ts"] - LAST_BAR).abs().idxmin() - 500, "close"] += 0.5  # a bar inside the holdout window
-    env.fetch = FakeFetchB(df, clock)
+    dfs = world()
+    eth = dfs["ETH"]
+    eth.loc[(eth["ts"] - LAST_BAR).abs().idxmin() - 500, "close"] += 0.5  # an ETH bar inside the holdout window
+    env.fetch = FakeFetchB(dfs, clock)
     for _ in range(2):
         clock.now += H1
         out = run_paper_b(env)
@@ -3913,9 +4509,9 @@ def test_revised_holdout_bars_warn_once_and_changed_decisions_are_data_revisions
 
 def test_candle_updates_are_retried_three_times(tmp_path, lock_text):
     env, clock, _ = make_env(tmp_path, lock_text, LAST_BAR + 900 + 60)
-    env.fetch = FakeFetchB(world_df(), clock, fail=2)
+    env.fetch = FakeFetchB(world(), clock, fail=2)
     run_paper_b(env)
-    env.fetch = FakeFetchB(world_df(), clock, fail=3)
+    env.fetch = FakeFetchB(world(), clock, fail=3)
     with pytest.raises(PaperBRunError) as exc:
         run_paper_b(env)
     assert exc.value.stage == "data" and env.fetch.calls == 3
@@ -3953,14 +4549,16 @@ uv run --group live pytest tests/paperb/test_runner.py -q
 
 ```python
 """One `ewbot stratb paper run` (Plan 4 spec 7, 8): precheck -> data -> fingerprint/epoch -> full recompute
-from REPLAY_ANCHOR -> replay check -> ledger and runs.log -> Telegram.
+from REPLAY_ANCHOR -> replay check -> ledger and runs.log -> Telegram. BTC and ETH run together in this one
+runtime and ledger (spec 7 as revised 2026-10-07): one portfolio recompute, one count of 30 trades of both
+assets, messages that name the asset.
 
 Inputs are frozen by holdout-b.lock: the params and the whole run config come from it (the precheck refuses
 a lock whose sha256 is not the digest of its fields, that is not committed unchanged, whose holdout has
 not run or failed - strategy B ended -, or whose config is not config_for(params) of this code). The
 recompute starts at REPLAY_ANCHOR (2023-10-01) and trades from HOLDOUT_START, exactly like the holdout
 run, so it reproduces the holdout and continues it; trades entering after the lock's last bar are paper
-trades. When the holdout window's bars no longer hash to first_run.data.sha256 (a Coinbase candle
+trades. When the holdout window's bars (both assets) no longer hash to first_run.data.sha256 (a Coinbase candle
 revision, a re-download after a cache eviction) the run is NOT refused (spec 8 as amended 2026-10-07):
 like A it warns once per distinct hash (DATA_HASH event) and goes on, and a recorded decision that changes
 because of it is classified DATA_REVISION by A's replay check. A different B fingerprint opens a new epoch
@@ -3983,7 +4581,6 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.holdout import data_fingerprint
 from ewbot.backtest.report import to_jsonable
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.paper.decisions import decisions_to_record, known_at, paper_trades, verify_decisions
@@ -4007,16 +4604,15 @@ from ewbot.paper.notify import (
     discrepancy_text,
     epoch_text,
     make_event,
-    position_line,
     queue_events,
 )
-from ewbot.paperb.decisions import build_decisions_b, open_position_b, split_result_b
+from ewbot.paperb.decisions import build_decisions_b, key_of, open_positions_b, split_result_b
 from ewbot.paperb.ledger import holdout_summary_b, new_ledger_b, paper_count_b
-from ewbot.paperb.notify import b_head, daily_text_b, decision_events_b, holdout_trades_text_b
-from ewbot.stratb.config import config_for, normalize_combo
-from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, REPLAY_ANCHOR, load_15m, update_cache_15m
+from ewbot.paperb.notify import b_head, daily_text_b, decision_events_b, holdout_trades_text_b, position_lines_b
+from ewbot.stratb.config import ASSETS, config_for, normalize_combo
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, REPLAY_ANCHOR, load_15m, update_caches_15m
 from ewbot.stratb.fingerprint import stratb_fingerprint
-from ewbot.stratb.holdout import HoldoutBError, committed_lock, read_lock
+from ewbot.stratb.holdout import HoldoutBError, committed_lock, data_fingerprint_b, read_lock
 from ewbot.stratb.research import backtest_b
 from ewbot.types import H1
 
@@ -4031,9 +4627,9 @@ class PaperBRunError(RuntimeError):
         self.message = message
 
 
-def default_fetch_b(cache_dir: Path, lock_path: Path) -> Path:
-    """Extend the 15m cache (an empty one starts at REPLAY_ANCHOR: the recompute needs nothing older)."""
-    return update_cache_15m(Path(cache_dir), lock_path=Path(lock_path), start_ts=REPLAY_ANCHOR)
+def default_fetch_b(cache_dir: Path, lock_path: Path) -> dict[str, Path]:
+    """Extend both 15m caches (an empty one starts at REPLAY_ANCHOR: the recompute needs nothing older)."""
+    return update_caches_15m(Path(cache_dir), lock_path=Path(lock_path), start_ts=REPLAY_ANCHOR)
 
 
 def _wall_clock() -> int:
@@ -4047,7 +4643,7 @@ class PaperBEnv:
     ledger_dir: Path
     lock_path: Path = DEFAULT_LOCK_PATH
     cache_dir: Path = Path("data/cache")
-    fetch: Callable[[Path, Path], Path] = default_fetch_b
+    fetch: Callable[[Path, Path], dict[str, Path]] = default_fetch_b
     sender: Sender | None = None
     clock: Callable[[], int] = _wall_clock
     fingerprint: Callable[[], str] = stratb_fingerprint
@@ -4121,25 +4717,29 @@ def _open_ledger(ledger_dir: Path, lock: dict[str, Any]) -> Ledger:
     return ledger
 
 
-def _load_data(env: PaperBEnv) -> pd.DataFrame:
-    path: Path | None = None
+def _load_data(env: PaperBEnv) -> dict[str, pd.DataFrame]:
+    paths: dict[str, Path] | None = None
     last: Exception | None = None
     for attempt in range(FETCH_ATTEMPTS):
         try:
-            path = Path(env.fetch(Path(env.cache_dir), Path(env.lock_path)))
+            paths = {a: Path(p) for a, p in env.fetch(Path(env.cache_dir), Path(env.lock_path)).items()}
             break
         except Exception as exc:  # noqa: BLE001 - network / API errors are retried
             last = exc
             if attempt < FETCH_ATTEMPTS - 1:
                 env.sleep(env.fetch_backoff_s * 2**attempt)
-    if path is None:
+    if paths is None:
         raise PaperBRunError("data", f"candle update failed {FETCH_ATTEMPTS} times: {type(last).__name__}: {last}")
     with _stage("data"):
-        df = load_15m(path, include_holdout=True, lock_path=env.lock_path)
-        df = df[df["ts"] >= REPLAY_ANCHOR].reset_index(drop=True)
-        if df.empty:
-            raise PaperBRunError("data", f"{path} has no bars from the replay anchor on")
-        return df
+        if sorted(paths) != sorted(ASSETS):
+            raise PaperBRunError("data", f"the candle update returned {sorted(paths)}, not every asset {list(ASSETS)}")
+        dfs: dict[str, pd.DataFrame] = {}
+        for a in ASSETS:
+            df = load_15m(paths[a], include_holdout=True, lock_path=env.lock_path)
+            dfs[a] = df[df["ts"] >= REPLAY_ANCHOR].reset_index(drop=True)
+            if dfs[a].empty:
+                raise PaperBRunError("data", f"{paths[a]} has no bars from the replay anchor on")
+        return dfs
 
 
 def _recording_floor(ledger: Ledger) -> int:
@@ -4182,12 +4782,14 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
     with _stage("ledger"):
         ledger = _open_ledger(ledger_dir, lock)
         hs = ledger.holdout
-    df = _load_data(env)
+    dfs = _load_data(env)
     with _stage("data"):
-        last_bar = int(df["ts"].iloc[-1])
-        if last_bar < hs["last_bar_ts"]:
-            raise PaperBRunError("data", f"data ends at {last_bar}, before the lock's last bar {hs['last_bar_ts']}")
-        holdout_sha = data_fingerprint(df, REPLAY_ANCHOR, hs["last_bar_ts"])
+        ends = {a: int(df["ts"].iloc[-1]) for a, df in dfs.items()}
+        early = {a: e for a, e in ends.items() if e < hs["last_bar_ts"]}
+        if early:
+            raise PaperBRunError("data", f"data ends at {early}, before the lock's last bar {hs['last_bar_ts']}")
+        last_bar = max(ends.values())  # the recompute pads an asset that ends earlier (signals.build_frames)
+        holdout_sha = data_fingerprint_b(dfs, REPLAY_ANCHOR, hs["last_bar_ts"])
         holdout_ok = holdout_sha == hs["data_sha256"]
     with _stage("fingerprint"):
         epoch, created = ensure_epoch(ledger, env.fingerprint(), last_bar)
@@ -4195,20 +4797,20 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         if created:
             epoch["through_ts"] = floor
     with _stage("recompute"):
-        res = backtest_b(df, cfg, HOLDOUT_START, None, include_holdout=True)
-        closed, open_trade = split_result_b(res)
-        all_trades = closed + ([open_trade] if open_trade is not None else [])
-        by_entry = {t.entry_ts: t for t in all_trades}
+        res = backtest_b(dfs, cfg, HOLDOUT_START, None, include_holdout=True)
+        closed, still = split_result_b(res)
+        all_trades = closed + still
+        by_key = {key_of(t): t for t in all_trades}
         holdout_n = sum(1 for t in all_trades if HOLDOUT_START <= t.entry_ts <= hs["last_bar_ts"])
         cur_closed = paper_trades(closed, int(epoch["started_ts"]))
         replace_epoch_trades(ledger, epoch["id"], cur_closed)
         start = int(epoch["started_ts"])
-        ledger.open_position = None if open_trade is None else open_position_b(open_trade, res, start)
+        ledger.open_position = open_positions_b(still, res, start)
         memo: dict[int, str] = {}
 
         def prefix(ts: int) -> str:
             if ts not in memo:
-                memo[ts] = data_fingerprint(df, 0, int(ts))
+                memo[ts] = data_fingerprint_b(dfs, 0, int(ts))
             return memo[ts]
 
         ok_runs = sorted((r for r in ledger.runs if r.get("status") == "ok"), key=lambda r: r["last_bar_ts"])
@@ -4252,8 +4854,8 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
             events.append(make_event("HOLDOUT_TRADES", hs["last_bar_ts"], holdout_n, holdout_trades_text_b(lock_n, holdout_n)))
         if created:
             events.append(make_event("EPOCH", epoch["started_ts"], epoch["id"], b_head(epoch_text(epoch))))
-        events += decision_events_b(fresh, by_entry, None if open_trade is None else open_trade.entry_ts,
-                                    int(epoch["started_ts"]), count, cur_closed)
+        events += decision_events_b(fresh, by_key, {key_of(t) for t in still}, int(epoch["started_ts"]), count,
+                                    cur_closed)
         if new_disc:
             text = b_head(discrepancy_text(new_disc))
             events.append(make_event("DISCREPANCY", last_bar, len(ledger.discrepancies), text))
@@ -4271,7 +4873,7 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
             eq = {p.ts: p.equity for p in res.equity}
             base = eq.get(hs["last_bar_ts"] // H1 * H1, cfg.initial_equity)
             last_eq = res.equity[-1].equity if res.equity else cfg.initial_equity
-            lines = [position_line(ledger.open_position),
+            lines = [*position_lines_b(ledger.open_position),
                      f"자산 {last_eq:,.2f} USD (잠금 이후 {last_eq / base - 1:+.2%})",
                      f"모의 {count['paper']}/{count['required']} · 구간 {epoch['id']}",
                      *status_lines_b(ledger, count)]
@@ -4312,7 +4914,7 @@ uv run --group live pytest tests/paperb/test_runner.py -q
 
 ```bash
 git add src/ewbot/paperb/runner.py tests/paperb/helpers.py tests/paperb/conftest.py tests/paperb/test_runner.py
-git commit -m "feat(paperb): hourly deterministic paper-B run from REPLAY_ANCHOR with A's replay check and ledger" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(paperb): hourly deterministic paper-B run of BTC and ETH from REPLAY_ANCHOR with A's replay check and ledger" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -4325,10 +4927,10 @@ git commit -m "feat(paperb): hourly deterministic paper-B run from REPLAY_ANCHOR
 - Test: `tests/paperb/test_cli_paper_b.py`
 
 **Interfaces:**
-- Consumes: Task 1: `combo_to_json`, `config_for`, `normalize_combo`. Task 2: `DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`), `cache_path`(`b_cache_path`), `gap_report`, `load_15m`, `lock_exists`, `update_cache_15m`. Task 6: `backtest_b`, `walk_forward_b`. Task 8: `HoldoutBError`, `create_lock`, `run_holdout_b`. Task 9: `paper_count_b`, `b_head`. Task 10: `PaperBEnv`, `PaperBRunError`, `run_paper_b`, `status_lines_b`. cli.py에 이미 있는 것: `_refuse`, `_requested_window`, `_print_comparison`, `to_jsonable`, `compute_metrics`, `deliver`, `failure_text`, `make_event`, `position_line`, `sender_from_env`, `load_ledger`, `LedgerError`, `current_epoch`, `RUN_URL_ENV`, `FAILURE_MARKER_ENV`, `WF_END`.
-- Produces: `ewbot stratb fetch [--cache-dir]`; `ewbot stratb backtest --params zz_k,z_lo,z_hi,tp1_r,ext,remainder [--start] [--end] [--cache-dir] [--out reports/stratb-backtest.json]`; `ewbot stratb walkforward [--workers] [--cache-dir] [--out reports/stratb-walkforward.json]`; `ewbot stratb holdout lock --params-from <walkforward json> [--cache-dir]`; `ewbot stratb holdout run --confirm [--workers] [--cache-dir]`; `ewbot stratb paper run --ledger-dir <dir> [--cache-dir]`; `ewbot stratb paper status --ledger-dir <dir>`. cli.py의 새 이름: `STRATB_LOCK`, `_b_params(text) -> Combo`(그리드 밖이면 종료 코드 2), `_b_df`, `_b_write_json`, `_b_fetch`, `_b_backtest`, `_b_walkforward`, `_b_holdout_lock`, `_b_holdout_run`, `_b_paper_env(args) -> PaperBEnv`(테스트가 바꿔 끼움), `_b_alert_failure`, `_b_paper_run`, `_b_paper_status`, `cmd_stratb`. 잠금 경로는 CLI 옵션이 아니다(항상 `<저장소 루트>/holdout-b.lock`).
+- Consumes: Task 1: `combo_to_json`, `config_for`, `normalize_combo`. Task 2: `DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`), `cache_paths`(`b_cache_paths`), `gap_report`, `load_caches_15m`, `lock_exists`, `update_caches_15m`. Task 4(테스트): `save_world`, `world_dfs`. Task 6: `backtest_b`, `trades_by_asset`, `walk_forward_b`. Task 8: `HoldoutBError`, `create_lock`, `run_holdout_b`. Task 9: `paper_count_b`, `b_head`, `position_lines_b`. Task 10: `PaperBEnv`, `PaperBRunError`, `run_paper_b`, `status_lines_b`. cli.py에 이미 있는 것: `_refuse`, `_requested_window`, `_print_comparison`, `to_jsonable`, `compute_metrics`, `deliver`, `failure_text`, `make_event`, `position_line`, `sender_from_env`, `load_ledger`, `LedgerError`, `current_epoch`, `RUN_URL_ENV`, `FAILURE_MARKER_ENV`, `WF_END`.
+- Produces: `ewbot stratb fetch [--cache-dir]`; `ewbot stratb backtest --params zz_k,z_lo,z_hi,tp1_r,ext,remainder [--start] [--end] [--cache-dir] [--out reports/stratb-backtest.json]`; `ewbot stratb walkforward [--workers] [--cache-dir] [--out reports/stratb-walkforward.json]`; `ewbot stratb holdout lock --params-from <walkforward json> [--cache-dir]`; `ewbot stratb holdout run --confirm [--workers] [--cache-dir]`; `ewbot stratb paper run --ledger-dir <dir> [--cache-dir]`; `ewbot stratb paper status --ledger-dir <dir>`. cli.py의 새 이름: `STRATB_LOCK`, `_b_params(text) -> Combo`(그리드 밖이면 종료 코드 2), `_b_dfs`(두 자산 캐시, 2024 이전), `_b_write_json`, `_b_fetch`, `_b_backtest`, `_b_walkforward`, `_b_holdout_lock`, `_b_holdout_run`, `_b_paper_env(args) -> PaperBEnv`(테스트가 바꿔 끼움), `_b_alert_failure`, `_b_paper_run`, `_b_paper_status`, `cmd_stratb`. 잠금 경로는 CLI 옵션이 아니다(항상 `<저장소 루트>/holdout-b.lock`).
 
-명세 3절의 CLI를 `cli.py`에 추가한다(`cli.py`는 A의 지문 대상이 아니다). 연구 명령은 `load_15m`의 가드 때문에 2024 이후 봉을 읽지 못하고, `--start`/`--end`가 홀드아웃에 닿으면 A와 같은 `_requested_window`가 종료 코드 2로 거부한다. `holdout lock`은 워크포워드 JSON의 `proceed`가 참이고 fallback이 아닐 때만 잠금을 쓰고 커밋 명령을 출력한다. `holdout run`은 `--confirm` 없이는 2를 돌려주고, 잠금이 있으면 캐시를 지금까지 늘린 뒤(네트워크) 1회 실행한다. `paper run`의 실패 알림은 A와 같은 방식(실행 로그 링크, 실패 표시 파일)이며 접두어만 `[ewbot paper-B]`다. `paper status`는 마지막 실행의 홀드아웃 데이터 상태(`ok` 또는 `MISMATCH (warned, not refused)`)와 홀드아웃 거래 재현 수를 보여 준다. 수정은 여섯 군데이며 각 '찾을 부분'은 `cli.py`에서 한 번만 나온다.
+명세 3절의 CLI를 `cli.py`에 추가한다(`cli.py`는 A의 지문 대상이 아니다). 모든 명령이 BTC와 ETH를 함께 다룬다: `fetch`는 두 캐시를 늘리고 자산마다 봉 수와 누락을 보이며, `backtest`는 두 자산 포트폴리오를 돌려 자산별 거래 수도 JSON에 쓴다. 연구 명령은 `load_15m`의 가드 때문에 2024 이후 봉을 읽지 못하고, `--start`/`--end`가 홀드아웃에 닿으면 A와 같은 `_requested_window`가 종료 코드 2로 거부한다. `holdout lock`은 워크포워드 JSON의 `proceed`가 참이고 fallback이 아닐 때만 잠금을 쓰고 커밋 명령을 출력한다. `holdout run`은 `--confirm` 없이는 2를 돌려주고, 잠금이 있으면 두 캐시를 지금까지 늘린 뒤(네트워크) 1회 실행한다. `paper run`의 실패 알림은 A와 같은 방식(실행 로그 링크, 실패 표시 파일)이며 접두어만 `[ewbot paper-B]`다. `paper status`는 자산별 포지션, 마지막 실행의 홀드아웃 데이터 상태(`ok` 또는 `MISMATCH (warned, not refused)`)와 홀드아웃 거래 재현 수를 보여 준다. 수정은 여섯 군데이며 각 '찾을 부분'은 `cli.py`에서 한 번만 나온다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -4345,9 +4947,9 @@ import pytest
 
 from ewbot import cli
 from ewbot.cli import build_parser, main
-from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_path
+from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths
 from ewbot.stratb.holdout import read_lock
-from tests.stratb.helpers import LONG_SETUP, LONG_START, frame_df, path
+from tests.stratb.helpers import save_world, world_dfs
 
 HS = 1_704_067_200
 COMBO = [2.0, [0.382, 0.618], 1.0, 1.272, "breakeven"]
@@ -4357,7 +4959,7 @@ COMBO = [2.0, [0.382, 0.618], 1.0, 1.272, "breakeven"]
 def cache(tmp_path):
     c = tmp_path / "cache"
     c.mkdir()
-    frame_df(path(LONG_START, LONG_SETUP * 130), REPLAY_ANCHOR).to_parquet(cache_path(c), index=False)
+    save_world(c, world_dfs(REPLAY_ANCHOR))
     return c
 
 
@@ -4382,12 +4984,13 @@ def test_params_must_be_a_grid_combo():
         cli._b_params("2.5,0.382,0.618,1,1.272,breakeven")
 
 
-def test_fetch_reports_the_guarded_cache(tmp_path, cache, monkeypatch, capsys):
+def test_fetch_reports_both_guarded_caches(tmp_path, cache, monkeypatch, capsys):
     monkeypatch.setattr(cli, "STRATB_LOCK", tmp_path / "none.lock")
-    monkeypatch.setattr(cli, "update_cache_15m", lambda c, lock_path: cache_path(c))
+    monkeypatch.setattr(cli, "update_caches_15m", lambda c, lock_path: cache_paths(c))
     assert main(["stratb", "fetch", "--cache-dir", str(cache)]) == 0
     out = capsys.readouterr().out
-    assert "bars before 2024-01-01: 8832" in out and "stops at 2024-01-01 (no lock)" in out
+    assert "BTC bars before 2024-01-01: 8832" in out and "ETH bars before 2024-01-01: 8832" in out
+    assert "stops at 2024-01-01 (no lock)" in out
 
 
 def test_backtest_writes_json_and_never_reaches_into_2024(tmp_path, cache, capsys):
@@ -4396,7 +4999,7 @@ def test_backtest_writes_json_and_never_reaches_into_2024(tmp_path, cache, capsy
                  "--out", str(out)]) == 0
     res = json.loads(out.read_text())
     assert res["params"] == COMBO and res["window"][1] == HS and res["metrics"]["n_trades"] == len(res["trades"]) > 0
-    assert all(t["entry_ts"] < HS for t in res["trades"])
+    assert all(t["entry_ts"] < HS for t in res["trades"]) and res["n_trades_by_asset"]["ETH"] == len(res["trades"]) // 2
     with pytest.raises(SystemExit) as exc:
         main(["stratb", "backtest", "--params", "2,0.382,0.618,1,1.272,breakeven", "--cache-dir", str(cache),
               "--end", "2024-02-01"])
@@ -4404,8 +5007,8 @@ def test_backtest_writes_json_and_never_reaches_into_2024(tmp_path, cache, capsy
 
 
 def test_walkforward_writes_json_and_says_whether_to_proceed(tmp_path, cache, monkeypatch, capsys):
-    def fake(df, workers):
-        assert int(df["ts"].max()) < HS
+    def fake(dfs, workers):
+        assert sorted(dfs) == ["BTC", "ETH"] and all(int(df["ts"].max()) < HS for df in dfs.values())
         return {"folds": [], "stitched_metrics": {k: 0.0 for k in ("total_return", "cagr", "max_dd", "sharpe", "sortino",
                 "calmar", "win_rate", "avg_r")} | {"n_trades": 0, "exposure": 0.0}, "oos_trades": [],
                 "chosen_final": None, "chosen_final_fallback": False, "proceed": False}
@@ -4487,7 +5090,7 @@ def test_paper_b_run_then_status(senders, tmp_path, capsys):
     assert main(["stratb", "paper", "status", "--ledger-dir", str(ledger_dir)]) == 0
     out = capsys.readouterr().out
     assert "실거래 전환 조건 (Plan 4 명세 7.1)" in out and "1. 홀드아웃 합격: 충족" in out
-    assert "holdout data ok, holdout trades recomputed 62 (lock: 62)" in out and "discrepancies 0" in out
+    assert "holdout data ok, holdout trades recomputed 124 (lock: 124)" in out and "discrepancies 0" in out
 
 
 def test_a_failed_run_alerts_with_the_paper_b_prefix(senders, tmp_path, monkeypatch, capsys):
@@ -4552,8 +5155,8 @@ inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy 
 ```python
 inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options.
 `stratb fetch | backtest | walkforward | holdout lock | holdout run | paper run | paper status` (Plan 4) is
-strategy B (ewbot.stratb, ewbot.paperb) with its own 15m cache, lock (holdout-b.lock) and ledger (paper-b
-branch); its research commands never read a bar from 2024-01-01 on (data15 filters them out)."""
+strategy B (ewbot.stratb, ewbot.paperb) on BTC and ETH with its own 15m caches, lock (holdout-b.lock) and
+ledger (paper-b branch); its research commands never read a bar from 2024-01-01 on (data15 filters them out)."""
 ```
 
 **수정 `src/ewbot/cli.py`** (3/6) — 다음 부분을 찾아:
@@ -4566,14 +5169,14 @@ from ewbot.types import H1
 
 ```python
 from ewbot.paperb.ledger import paper_count_b
-from ewbot.paperb.notify import b_head
+from ewbot.paperb.notify import b_head, position_lines_b
 from ewbot.paperb.runner import PaperBEnv, PaperBRunError, run_paper_b, status_lines_b
 from ewbot.stratb.config import combo_to_json, config_for, normalize_combo
 from ewbot.stratb.data15 import DEFAULT_LOCK_PATH as STRATB_LOCK
-from ewbot.stratb.data15 import cache_path as b_cache_path
-from ewbot.stratb.data15 import gap_report, load_15m, lock_exists, update_cache_15m
+from ewbot.stratb.data15 import cache_paths as b_cache_paths
+from ewbot.stratb.data15 import gap_report, load_caches_15m, lock_exists, update_caches_15m
 from ewbot.stratb.holdout import HoldoutBError, create_lock, run_holdout_b
-from ewbot.stratb.research import backtest_b, walk_forward_b
+from ewbot.stratb.research import backtest_b, trades_by_asset, walk_forward_b
 from ewbot.types import H1
 ```
 
@@ -4593,8 +5196,8 @@ from ewbot.types import H1
     b_sub = p_b.add_subparsers(dest="b_cmd", required=True)
     b_cache = argparse.ArgumentParser(add_help=False)
     b_cache.add_argument("--cache-dir", type=Path, default=Path("data/cache"))
-    b_sub.add_parser("fetch", parents=[b_cache], help="update the 15m cache (stops before 2024 until holdout-b.lock exists)")
-    p_bb = b_sub.add_parser("backtest", parents=[b_cache], help="one strategy-B backtest before 2024")
+    b_sub.add_parser("fetch", parents=[b_cache], help="update the BTC and ETH 15m caches (before 2024 until the lock)")
+    p_bb = b_sub.add_parser("backtest", parents=[b_cache], help="one strategy-B backtest (BTC + ETH) before 2024")
     p_bb.add_argument("--params", required=True, help="zz_k,z_lo,z_hi,tp1_r,ext,remainder e.g. 2.0,0.382,0.618,1.0,1.272,breakeven")
     p_bb.add_argument("--start", default=None, help="UTC date YYYY-MM-DD (default: first bar)")
     p_bb.add_argument("--end", default=None, help=f"UTC date YYYY-MM-DD, exclusive, at most {WF_END}")
@@ -4645,15 +5248,16 @@ def _b_params(text: str) -> tuple:
         _refuse(f"--params {text}: {exc}")
 
 
-def _b_df(args: argparse.Namespace) -> pd.DataFrame:
-    """The 15m bars before 2024-01-01 (data15 filters the rest out while reading)."""
-    path = b_cache_path(args.cache_dir)
-    if not path.exists():
-        raise SystemExit(f"15m cache not found: {path} - run `ewbot stratb fetch` first")
-    df = load_15m(path)
-    rep = gap_report(df)
-    print(f"[data] {rep.n} 15m bars before {WF_END}, {len(rep.missing_ts)} missing", file=sys.stderr)
-    return df
+def _b_dfs(args: argparse.Namespace) -> dict[str, pd.DataFrame]:
+    """Every asset's 15m bars before 2024-01-01 (data15 filters the rest out while reading)."""
+    for path in b_cache_paths(args.cache_dir).values():
+        if not path.exists():
+            raise SystemExit(f"15m cache not found: {path} - run `ewbot stratb fetch` first")
+    dfs = load_caches_15m(args.cache_dir)
+    for a, df in dfs.items():
+        rep = gap_report(df)
+        print(f"[data] {a}: {rep.n} 15m bars before {WF_END}, {len(rep.missing_ts)} missing", file=sys.stderr)
+    return dfs
 
 
 def _b_write_json(path: Path, obj: Any) -> None:
@@ -4662,32 +5266,36 @@ def _b_write_json(path: Path, obj: Any) -> None:
 
 
 def _b_fetch(args: argparse.Namespace) -> int:
-    path = update_cache_15m(args.cache_dir, lock_path=STRATB_LOCK)
-    rep = gap_report(load_15m(path))
+    paths = update_caches_15m(args.cache_dir, lock_path=STRATB_LOCK)
+    for a, df in load_caches_15m(args.cache_dir).items():
+        rep = gap_report(df)
+        print(f"{a} cache: {paths[a]}\n{a} bars before {WF_END}: {rep.n}  missing: {len(rep.missing_ts)}  duplicate: "
+              f"{len(rep.duplicate_ts)}")
     unlocked = "2024+ included (holdout-b.lock exists)" if lock_exists(STRATB_LOCK) else f"stops at {WF_END} (no lock)"
-    print(f"cache: {path}\nbars before {WF_END}: {rep.n}  missing: {len(rep.missing_ts)}  duplicate: "
-          f"{len(rep.duplicate_ts)}\nfetch window: {unlocked}")
+    print(f"fetch window: {unlocked}")
     return 0
 
 
 def _b_backtest(args: argparse.Namespace) -> int:
     combo = _b_params(args.params)
     start, end = _requested_window(args)
-    df = _b_df(args)
-    start = start if start is not None else int(df["ts"].iloc[0])
-    end = end if end is not None else int(df["ts"].iloc[-1]) + 900
-    res = backtest_b(df, config_for(combo), start, end)
+    dfs = _b_dfs(args)
+    start = start if start is not None else min(int(df["ts"].iloc[0]) for df in dfs.values())
+    end = end if end is not None else max(int(df["ts"].iloc[-1]) for df in dfs.values()) + 900
+    res = backtest_b(dfs, config_for(combo), start, end)
     m = compute_metrics(res.equity, res.trades, start, end)
     _print_comparison({"B": dataclasses.asdict(m)})
+    by_asset = trades_by_asset([t for t in res.trades if start <= t.entry_ts < end])
+    print(f"trades by asset: {by_asset}")
     _b_write_json(args.out, {"params": combo_to_json(combo), "window": [start, end], "metrics": m,
-                             "trades": list(res.trades), "events": list(res.events)})
+                             "n_trades_by_asset": by_asset, "trades": list(res.trades), "events": list(res.events)})
     print(f"json: {args.out}")
     return 0
 
 
 def _b_walkforward(args: argparse.Namespace) -> int:
     t0 = time.perf_counter()
-    wf = walk_forward_b(_b_df(args), args.workers)
+    wf = walk_forward_b(_b_dfs(args), args.workers)
     _b_write_json(args.out, {k: v for k, v in wf.items() if k != "oos_trades"})
     _print_comparison({"WF-OOS": wf["stitched_metrics"]})
     chosen = None if wf["chosen_final"] is None else combo_to_json(wf["chosen_final"])
@@ -4705,7 +5313,7 @@ def _b_holdout_lock(args: argparse.Namespace) -> int:
         _refuse(f"{args.params_from}: proceed is false (spec 6.3: negative out-of-sample, fallback or no pick); "
                 "strategy B ends without a holdout")
     try:
-        lock = create_lock(wf["chosen_final"], _b_df(args), params_source=f"walkforward:{args.params_from}#chosen_final",
+        lock = create_lock(wf["chosen_final"], _b_dfs(args), params_source=f"walkforward:{args.params_from}#chosen_final",
                            now_ts=int(time.time()), lock_path=STRATB_LOCK)
     except HoldoutBError as exc:
         _refuse(str(exc))
@@ -4723,13 +5331,14 @@ def _b_holdout_run(args: argparse.Namespace) -> int:
         return 2
     if not lock_exists(STRATB_LOCK):
         _refuse(f"{STRATB_LOCK} does not exist: `ewbot stratb holdout lock` first")
-    update_cache_15m(args.cache_dir, lock_path=STRATB_LOCK)
+    update_caches_15m(args.cache_dir, lock_path=STRATB_LOCK)
     try:
         out = run_holdout_b(confirm=True, cache_dir=args.cache_dir, lock_path=STRATB_LOCK, workers=args.workers)
     except HoldoutBError as exc:
         _refuse(str(exc))
     fr = out["first_run"]
     _print_comparison({k: fr["metrics"][k] for k in ("B", "BH", "B_cost_x1_5")})
+    print(f"trades by asset: {fr['n_trades_by_asset']}")
     print(json.dumps(fr["criteria"], indent=1))
     print(f"holdout {'PASSED' if fr['criteria']['passed'] else 'FAILED - strategy B ends (spec 6.5)'}; result in "
           f"{STRATB_LOCK} first_run. Commit it:\n  git add \"{STRATB_LOCK}\"\n"
@@ -4784,9 +5393,8 @@ def _b_paper_status(args: argparse.Namespace) -> int:
     if led is None:
         print(f"no ledger.json in {args.ledger_dir}", file=sys.stderr)
         return 1
-    for line in status_lines_b(led, paper_count_b(led)):
+    for line in status_lines_b(led, paper_count_b(led)) + position_lines_b(led.open_position):
         print(line)
-    print(position_line(led.open_position))
     cur = current_epoch(led)
     print(f"epoch {cur['id']} of {len(led.epochs)}: B fingerprint {cur['fingerprint'][:12]} "
           f"(lock {led.baseline['fingerprint'][:12]})")
@@ -4856,9 +5464,9 @@ git commit -m "feat(cli): ewbot stratb fetch | backtest | walkforward | holdout 
 
 **Interfaces:**
 - Consumes: Task 10·11: `ewbot stratb paper run --ledger-dir`. A의 `paper.yml`(구조만 따름), A의 `tests/paper/test_static.py`의 `SRC`, `WORKFLOWS`, `yaml`.
-- Produces: `ewbot.paperb.sync`: `BRANCH = "paper-b"`, `LEDGER_FILES = ("ledger.json", "runs.log")`, `ATTEMPTS = 3`, `class SyncError(RuntimeError)`, `origin_branch(cwd) -> str`, `checkout(repo, paper_dir) -> None`, `commit_ledger(paper_dir) -> bool`, `push(paper_dir, recompute, *, attempts=3, backoff=5.0, sleep=time.sleep) -> str`, `main(argv=None) -> int`(`python -m ewbot.paperb.sync checkout | push RECOMPUTE...`, 환경 변수 `PAPER_B_DIR`, `PAPER_B_PUSH_BACKOFF`). `.github/workflows/paper-b.yml`: `workflow_dispatch` + `schedule: "47 */3 * * *"`, 동시성 그룹 `paper-b`, `if: vars.PAPER_B_ENABLED == 'true'`, 캐시 키 `btc-usd-15m-`, 텔레그램 시크릿은 실행·푸시·대체 알림 단계에만. `docs/strategy-b.md`: 운영 안내.
+- Produces: `ewbot.paperb.sync`: `BRANCH = "paper-b"`, `LEDGER_FILES = ("ledger.json", "runs.log")`, `ATTEMPTS = 3`, `class SyncError(RuntimeError)`, `origin_branch(cwd) -> str`, `checkout(repo, paper_dir) -> None`, `commit_ledger(paper_dir) -> bool`, `push(paper_dir, recompute, *, attempts=3, backoff=5.0, sleep=time.sleep) -> str`, `main(argv=None) -> int`(`python -m ewbot.paperb.sync checkout | push RECOMPUTE...`, 환경 변수 `PAPER_B_DIR`, `PAPER_B_PUSH_BACKOFF`). `.github/workflows/paper-b.yml`: `workflow_dispatch` + `schedule: "47 */3 * * *"`, 동시성 그룹 `paper-b`, `if: vars.PAPER_B_ENABLED == 'true'`, 두 자산 캐시의 키 `stratb-15m-`, 텔레그램 시크릿은 실행·푸시·대체 알림 단계에만. `docs/strategy-b.md`: 운영 안내.
 
-A의 `paper.yml` 구조를 따르는 별도 워크플로를 만든다(해석 15~17). 이 작업에서 `tests/paper/test_static.py`를 고쳐야 한다: 이 파일의 `test_the_repository_has_exactly_the_paper_and_ci_workflows`는 워크플로가 정확히 `ci.yml`과 `paper.yml`뿐이라고 단언하므로 `paper-b.yml`을 더하면 `ci.yml`이 실패한다. 이 한 테스트를 세 파일로 바꾸고, `ci.yml`이 실행하는 파일이 이것뿐이므로 B 보호 검사 두 개(B 파일이 A 지문 밖, `paper-b.yml`이 A의 것을 건드리지 않음)를 여기에 더한다. A의 다른 테스트와 `ci.yml` 자체는 바꾸지 않는다. 동기화 모듈은 A의 `scripts/paper_sync.sh`와 같은 규칙(고아 브랜치, 얕은 가져오기, 3회 푸시, 원격이 움직였을 때만 재계산)을 `paper-b`에 적용한다. 문서는 연구·잠금·승인·홀드아웃 순서, 휴면 해제(`PAPER_B_ENABLED`), 두 번째 Cloudflare Worker 코드, Actions 사용량 확인, 실패 대응을 담는다.
+A의 `paper.yml` 구조를 따르는 별도 워크플로를 만든다(해석 15~17). 이 작업에서 `tests/paper/test_static.py`를 고쳐야 한다: 이 파일의 `test_the_repository_has_exactly_the_paper_and_ci_workflows`는 워크플로가 정확히 `ci.yml`과 `paper.yml`뿐이라고 단언하므로 `paper-b.yml`을 더하면 `ci.yml`이 실패한다. 이 한 테스트를 세 파일로 바꾸고, `ci.yml`이 실행하는 파일이 이것뿐이므로 B 보호 검사 두 개(B 파일이 A 지문 밖, `paper-b.yml`이 A의 것을 건드리지 않음)를 여기에 더한다. A의 다른 테스트와 `ci.yml` 자체는 바꾸지 않는다. 동기화 모듈은 A의 `scripts/paper_sync.sh`와 같은 규칙(고아 브랜치, 얕은 가져오기, 3회 푸시, 원격이 움직였을 때만 재계산)을 `paper-b`에 적용한다. 문서는 두 자산의 상품·계약 크기·틱과 같은 봉 처리 순서, Plan 5에서 확인할 것(ETP 최소 수수료, ETH 펀딩), 연구·잠금·승인·홀드아웃 순서와 포트폴리오 합격 기준, 휴면 해제(`PAPER_B_ENABLED`), 두 번째 Cloudflare Worker 코드, Actions 사용량 확인, 실패 대응을 담는다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -5058,7 +5666,7 @@ def test_steps_run_the_b_runtime_and_its_sync():
     assert _step(steps, "push")["run"] == f"uv run python -m ewbot.paperb.sync push {RUN}"
     assert "uv run python -m ewbot.paperb.sync checkout" in _step(steps, "checkout-paper-b")["run"]
     cache = next(s for s in steps if s.get("uses") == "actions/cache@v6")["with"]
-    assert cache["path"] == "data/cache" and cache["restore-keys"].strip() == "btc-usd-15m-"
+    assert cache["path"] == "data/cache" and cache["restore-keys"].strip() == "stratb-15m-"
     budget = sum(s.get("timeout-minutes", 0) for s in steps)
     assert wf["jobs"]["paper-b"]["timeout-minutes"] >= budget + 10
 
@@ -5264,7 +5872,7 @@ if __name__ == "__main__":
 **파일 `.github/workflows/paper-b.yml`** (새 파일, 전체 내용)
 
 ```yaml
-# ewbot paper trading of strategy B (Plan 4 spec 7): one deterministic recompute per run.
+# ewbot paper trading of strategy B (Plan 4 spec 7): one deterministic recompute of BTC and ETH per run.
 # Code comes from master; ledger.json / runs.log live on the orphan `paper-b` branch, which only this
 # workflow writes (docs/strategy-b.md: never push to it by hand). Strategy A's workflow (paper.yml), its
 # `paper` branch, its sync script and its candle cache key are never touched.
@@ -5322,13 +5930,13 @@ jobs:
           git config --global user.email "ewbot-paper-b@users.noreply.github.com"
           PAPER_B_DIR="$RUNNER_TEMP/paper-b" uv run python -m ewbot.paperb.sync checkout
 
-      - name: Restore the 15m candle cache
+      - name: Restore the BTC and ETH 15m candle caches
         uses: actions/cache@v6
         with:
           path: data/cache
-          key: btc-usd-15m-${{ github.run_id }}-${{ github.run_attempt }}
+          key: stratb-15m-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            btc-usd-15m-
+            stratb-15m-
 
       - name: Paper-B run
         id: paper-b
@@ -5379,20 +5987,29 @@ jobs:
 
 Spec: `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`. Plan: `docs/superpowers/plans/2026-10-07-ewbot-plan4-strategy-b.md`.
 
-Strategy B takes the swing structure from 1h bars (built from 15m bars, A's ATR ZigZag), waits for a retracement into a Fibonacci zone that overlaps an earlier swing, and enters on the next 15m open after a 15m RSI divergence and a breakout close. Half is taken at TP1, the rest runs to the leg's extension with a breakeven or original stop, everything is closed after 48 hours. Risk 0.5% per trade, leverage cap 3x, A's breakers (-3% day, -15% total) and A's costs.
+Strategy B takes the swing structure from 1h bars (built from 15m bars, A's ATR ZigZag), waits for a retracement into a Fibonacci zone that overlaps an earlier swing, and enters on the next 15m open after a 15m RSI divergence and a breakout close. Half is taken at TP1, the rest runs to the leg's extension with a breakeven or original stop, everything is closed after 48 hours. It trades BTC and ETH with one shared parameter set (spec revised 2026-10-07, before any holdout run): at most one position per asset, 0.5% of the shared account equity per trade, leverage cap 3x per position and 3x for all positions together, A's breakers (-3% day, -15% total) on the account, and A's costs with each asset's contract size.
+
+## Assets and contracts
+
+| Asset | Signals (Coinbase spot, 15m) | Modelled contract (Plan 5 trades it) | Contract size | Tick |
+|---|---|---|---|---|
+| BTC | `BTC-USD` | `BIP-20DEC30-CDE` | 0.01 BTC | $5 |
+| ETH | `ETH-USD` | `ETP-20DEC30-CDE` | 0.1 ETH | $0.5 (intraday margin about 10%) |
+
+When both assets act on the same 15m bar, every step of the bar goes BTC first, then ETH, and queued exits fill before queued entries. The backtest, like A's, does not round prices to ticks (Plan 5's live orders will). To confirm before live trading (Plan 5): the ETP minimum fee per contract (A's value is kept; A's cost model does not apply a minimum fee) and ETH funding (A's 10% a year is assumed for both assets).
 
 ## Isolation from strategy A
 
 - B's code lives in `src/ewbot/stratb/` (the B fingerprint hashes every `*.py` there) and `src/ewbot/paperb/` (the paper-B runtime). A's fingerprinted folders, `paper/`, `backtest/`, `live/`, `holdout.lock`, `paper.yml`, `ci.yml`, `scripts/` and `uv.lock` are never changed; B only imports from them.
-- B has its own cache file (`data/cache/BTC-USD_15m.parquet`), lock (`holdout-b.lock`), ledger branch (`paper-b`), workflow (`.github/workflows/paper-b.yml`) and Actions cache key (`btc-usd-15m-`).
+- B has its own cache files (`data/cache/BTC-USD_15m.parquet`, `data/cache/ETH-USD_15m.parquet`), lock (`holdout-b.lock`), ledger branch (`paper-b`), workflow (`.github/workflows/paper-b.yml`) and Actions cache key (`stratb-15m-`).
 - `tests/stratb/test_isolation.py` checks A's fingerprint, that B is outside A's fingerprinted folders and that no A path changed since `master`; `tests/paper/test_static.py` (run by `ci.yml`) carries the CI part.
 
 ## Commands
 
 ```bash
-uv run ewbot stratb fetch                                   # 15m cache; stops at 2024-01-01 until holdout-b.lock exists
-uv run ewbot stratb backtest --params 2.0,0.382,0.618,1.0,1.272,breakeven   # one run, 2017..2023 only
-uv run ewbot stratb walkforward                             # 32 combos, A's windows and rules -> reports/stratb-walkforward.json
+uv run ewbot stratb fetch                                   # BTC and ETH 15m caches; stop at 2024-01-01 until holdout-b.lock exists
+uv run ewbot stratb backtest --params 2.0,0.382,0.618,1.0,1.272,breakeven   # one BTC + ETH run, 2017..2023 only
+uv run ewbot stratb walkforward                             # 32 combos on the BTC + ETH portfolio, A's windows and rules -> reports/stratb-walkforward.json
 uv run ewbot stratb holdout lock --params-from reports/stratb-walkforward.json   # writes holdout-b.lock
 uv run ewbot stratb holdout run --confirm                   # ONCE, after your approval
 uv run ewbot stratb paper status --ledger-dir <paper-b worktree>   # read-only
@@ -5402,15 +6019,15 @@ uv run ewbot stratb paper status --ledger-dir <paper-b worktree>   # read-only
 
 ## Research and holdout (in this order)
 
-1. `uv run ewbot stratb fetch` (about 820 requests to the public Coinbase API, a few minutes). Check the printed missing-bar count.
-2. `uv run ewbot stratb walkforward`. It prints the stitched out-of-sample metrics, `chosen_final` and `proceed`. If `proceed` is false (negative out-of-sample return, or the last fold had no selectable combo), strategy B ends here (spec 6.3).
-3. `uv run ewbot stratb holdout lock --params-from reports/stratb-walkforward.json`, then commit `holdout-b.lock` right away. The lock fixes the combo, the run config, the B fingerprint, the hash of the pre-2024 bars and the holdout's last bar (the last 15m bar of the last complete hour at lock time).
-4. Ask the user for approval. Only then: `uv run ewbot stratb holdout run --confirm`, and commit `holdout-b.lock` again (it now holds `first_run`). The holdout runs once: a second run, a changed B file or other pre-2024 bars are refused.
+1. `uv run ewbot stratb fetch` (about 820 requests per asset to the public Coinbase API, a few minutes each; an interrupted download resumes from the last saved page). Check the printed missing-bar counts.
+2. `uv run ewbot stratb walkforward`. It scores the 32 combos on the BTC + ETH portfolio and prints the stitched out-of-sample metrics, `chosen_final` and `proceed`. If `proceed` is false (negative out-of-sample return, or the last fold had no selectable combo), strategy B ends here (spec 6.3).
+3. `uv run ewbot stratb holdout lock --params-from reports/stratb-walkforward.json`, then commit `holdout-b.lock` right away. The lock fixes the combo, the run config (assets included), the B fingerprint, the hash of each asset's pre-2024 bars and the holdout's last bar (the last 15m bar of the last complete hour at lock time).
+4. Ask the user for approval. Only then: `uv run ewbot stratb holdout run --confirm`, and commit `holdout-b.lock` again (it now holds `first_run`). The holdout runs once: a second run, a changed B file or other pre-2024 bars of either asset are refused. The criteria are the portfolio's: Sharpe above the 50/50 BTC/ETH buy & hold and above the random control's 95th percentile (random entries per asset at each asset's own frequency), max drawdown at most 15%, at least 50 trades of both assets together, and a net profit with costs x 1.5.
 5. If `first_run.criteria.passed` is false, strategy B ends (spec 6.5): no paper trading, no retuning on the same data.
 
 ## Paper trading (only after a passed holdout)
 
-What runs: `.github/workflows/paper-b.yml` recomputes everything from 2023-10-01 (the replay anchor) with the params in the committed `holdout-b.lock`, records the decisions in `ledger.json` and `runs.log` on the orphan branch `paper-b` (only the workflow writes it: never push to it by hand), and sends Telegram messages prefixed `[ewbot paper-B]` with the same bot and secrets as strategy A. Paper trades are the trades that enter after the lock's last bar; 30 are needed (spec 7.1), with no unexplained discrepancy. A change of any file in `src/ewbot/stratb/` opens a new epoch and restarts the count.
+What runs: `.github/workflows/paper-b.yml` recomputes both assets from 2023-10-01 (the replay anchor) with the params in the committed `holdout-b.lock`, records the decisions in `ledger.json` and `runs.log` on the orphan branch `paper-b` (only the workflow writes it: never push to it by hand), and sends Telegram messages prefixed `[ewbot paper-B]` with the same bot and secrets as strategy A; each trade message names its asset (`B-BTC`, `B-ETH`). Paper trades are the trades of either asset that enter after the lock's last bar; 30 are needed in all (spec 7.1), with no unexplained discrepancy. A change of any file in `src/ewbot/stratb/` opens a new epoch and restarts the count.
 
 One-time setup (you):
 
@@ -5454,13 +6071,13 @@ One-time setup (you):
 ## Failures
 
 - A failed run sends `[ewbot paper-B] 실패 · 단계 <stage>` with the log link (the workflow's fallback alert covers checkout, setup and push failures). Nothing is committed after a failed run; the next run recomputes everything.
-- Stage `precheck`: `holdout-b.lock` is missing, not committed, edited, not run, failed, or its config is not the code's. Stage `data`: the candle update failed three times.
-- `[ewbot paper-B] 경고: 홀드아웃 구간 데이터 해시 불일치`: the 15m bars of the holdout window no longer hash to the holdout run's (a Coinbase candle revision, or a full re-download after the Actions cache was evicted). The run is not refused (spec 8 as amended 2026-10-07): it warns once per distinct hash, and any recorded decision that changes because of it is classified `DATA_REVISION`. `ewbot stratb paper status` shows `holdout data MISMATCH` until the data is back.
+- Stage `precheck`: `holdout-b.lock` is missing, not committed, edited, not run, failed, or its config is not the code's. Stage `data`: the candle update failed three times, or an asset's data ends before the lock's last bar.
+- `[ewbot paper-B] 경고: 홀드아웃 구간 데이터 해시 불일치`: the 15m bars of the holdout window (either asset) no longer hash to the holdout run's (a Coinbase candle revision, or a full re-download after the Actions cache was evicted). The run is not refused (spec 8 as amended 2026-10-07): it warns once per distinct hash, and any recorded decision that changes because of it is classified `DATA_REVISION`. `ewbot stratb paper status` shows `holdout data MISMATCH` until the data is back.
 - Discrepancies (`[ewbot paper-B] 경고: 결정 불일치`) are classified like A's: `DATA_REVISION`, `FINGERPRINT_CHANGE`, `ENVIRONMENT_CHANGE`, `UNEXPLAINED`. Any `UNEXPLAINED` one blocks the go-live condition.
 
 ## Go-live (Plan 5, never automatic)
 
-Holdout passed, at least 30 paper trades after the lock's last bar, zero unexplained discrepancies in the paper period, and your explicit approval. Live trading of B needs its own Coinbase account or portfolio (A and B cannot share one BIP position) and is Plan 5.
+Holdout passed, at least 30 paper trades of BTC and ETH together after the lock's last bar, zero unexplained discrepancies in the paper period, and your explicit approval. Live trading of B (BIP and ETP contracts) needs its own Coinbase account or portfolio (A and B cannot share one BIP position) and is Plan 5.
 ````
 
 **수정 `README.md`** (1/5) — 다음 부분을 찾아:
@@ -5473,7 +6090,7 @@ Holdout passed, at least 30 paper trades after the lock's last bar, zero unexpla
 
 ```markdown
 | **Live trading** (Plan 3) | Turns the same decisions into Coinbase CFM futures orders (`BIP-20DEC30-CDE`, nano BTC perp, 0.01 BTC per contract) with exchange-side stops | A US-East VPS, in Docker | **SHADOW** since 2026-10-05 (no real orders) |
-| **Strategy B** (Plan 4) | A separate 15m strategy (1h swing structure, Fibonacci zone with an earlier swing, 15m RSI divergence and breakout). Its own walk-forward, one-shot holdout (`holdout-b.lock`) and paper trading (`paper-b` branch). Never touches A. | Your laptop, then GitHub Actions (`paper-b.yml`) | Research ([`docs/strategy-b.md`](docs/strategy-b.md)) |
+| **Strategy B** (Plan 4) | A separate 15m strategy on BTC and ETH (1h swing structure, Fibonacci zone with an earlier swing, 15m RSI divergence and breakout). Its own walk-forward, one-shot holdout (`holdout-b.lock`) and paper trading (`paper-b` branch). Never touches A. | Your laptop, then GitHub Actions (`paper-b.yml`) | Research ([`docs/strategy-b.md`](docs/strategy-b.md)) |
 ```
 
 **수정 `README.md`** (2/5) — 다음 부분을 찾아:
@@ -5525,7 +6142,7 @@ src/ewbot/live/       live runtime (Plan 3): exchange adapter, reconcile, execut
 
 ```markdown
 src/ewbot/live/       live runtime (Plan 3): exchange adapter, reconcile, executor, watchdog, Telegram, stages
-src/ewbot/stratb/     strategy B (Plan 4): 15m data, rules, engine, walk-forward, holdout (B fingerprint)
+src/ewbot/stratb/     strategy B (Plan 4): BTC and ETH 15m data, rules, portfolio engine, walk-forward, holdout (B fingerprint)
 src/ewbot/paperb/     strategy B paper trading (Plan 4): runner, ledger adapters, paper-b git sync
 ```
 
@@ -5560,9 +6177,9 @@ git commit -m "feat(paperb): paper-b workflow and git sync, CI guard for strateg
 uv run --group live pytest -q
 ```
 
-예상: `1360 passed` 또는 `1359 passed, 1 skipped`
+예상: `1372 passed` 또는 `1371 passed, 1 skipped`
 
-`data/cache/BTC-USD_1h.parquet`가 없으면 `tests/backtest/test_e2e_real.py` 1개가 건너뛰어진다. 기준선보다 정확히 114개가 많아야 한다.
+`data/cache/BTC-USD_1h.parquet`가 없으면 `tests/backtest/test_e2e_real.py` 1개가 건너뛰어진다. 기준선보다 정확히 126개가 많아야 한다.
 
 - [ ] **Step 2: A 지문이 그대로인지 확인**
 
@@ -5656,7 +6273,7 @@ git status --porcelain
 ```bash
 git push -u origin feat/plan4-strategy-b
 gh pr create --base master --title "Plan 4: strategy B research and paper-B runtime" --body-file - <<'BODY'
-Strategy B (Plan 4): 15m data, rules, engine, walk-forward, one-shot holdout lock, paper-B runtime and workflow (dormant until PAPER_B_ENABLED). Strategy A's fingerprint e0435223… is unchanged; no strategy-A file, workflow, lock or ledger is modified.
+Strategy B (Plan 4) on BTC and ETH: 15m data, rules, portfolio engine, walk-forward, one-shot holdout lock, paper-B runtime and workflow (dormant until PAPER_B_ENABLED). Strategy A's fingerprint e0435223… is unchanged; no strategy-A file, workflow, lock or ledger is modified.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 BODY
@@ -5671,7 +6288,7 @@ git switch master && git pull --ff-only && git switch -c chore/stratb-holdout
 uv run ewbot stratb fetch
 ```
 
-Task 6b에서 이미 받았다면 새로 받을 것이 없다(아니면 약 820번의 공개 API 요청, 수 분). 출력의 `bars before 2024-01-01`(약 245,000)과 `missing`(누락 봉 수)을 기록한다. 중단되면 다시 실행한다(이어서 받는다). 잠금 전이므로 2024 이후 봉은 받지 않는다(`fetch window: stops at 2024-01-01 (no lock)`).
+Task 6b에서 이미 받았다면 새로 받을 것이 없다(아니면 자산마다 약 820번의 공개 API 요청, 수 분). 출력의 자산별 `bars before 2024-01-01`(약 245,000)과 `missing`(누락 봉 수)을 기록한다. 중단되면 다시 실행한다(페이지마다 저장되어 이어서 받는다). 잠금 전이므로 2024 이후 봉은 받지 않는다(`fetch window: stops at 2024-01-01 (no lock)`).
 
 - [ ] **Step 3: 워크포워드 실행과 보고(2024 데이터 없음)**
 
@@ -5679,7 +6296,7 @@ Task 6b에서 이미 받았다면 새로 받을 것이 없다(아니면 약 820�
 uv run ewbot stratb walkforward
 ```
 
-몇 분 안에 끝난다(조합 32개). 사용자에게 보고한다: 구간별 선택 조합, 이어 붙인 표본 외 성과(`WF-OOS` 줄), 조합표(`reports/stratb-walkforward.json`의 `combo_table`: 조합별 Calmar·샤프·거래 수), `chosen_final`, `chosen_final_fallback`, `proceed`. 2단계 그리드에서는 선택이 '자신의 Calmar 최대'와 같다는 점(명세 해석 2)도 함께 보고한다. 월 거래 수가 명세 목표(월 10~15건)에서 크게 벗어나면 그것도 보고한다(규칙은 바꾸지 않는다). **`proceed`가 거짓이면 B를 여기서 끝낸다**(명세 6.3): 잠금을 만들지 않는다.
+몇 분 안에 끝난다(조합 32개, BTC+ETH 포트폴리오). 사용자에게 보고한다: 구간별 선택 조합, 이어 붙인 표본 외 성과(`WF-OOS` 줄), 조합표(`reports/stratb-walkforward.json`의 `combo_table`: 조합별 Calmar·샤프·거래 수·자산별 거래 수), `chosen_final`, `chosen_final_fallback`, `proceed`. 2단계 그리드에서는 선택이 '자신의 Calmar 최대'와 같다는 점(명세 해석 2)도 함께 보고한다. 월 거래 수가 명세 목표(두 자산 합계 월 10~15건)에서 크게 벗어나면 그것도 보고한다(규칙은 바꾸지 않는다). **`proceed`가 거짓이면 B를 여기서 끝낸다**(명세 6.3): 잠금을 만들지 않는다.
 
 - [ ] **Step 4: 잠금 작성과 즉시 커밋**
 
@@ -5694,7 +6311,7 @@ git commit -m "chore(stratb): lock the strategy-B holdout" -m "Co-Authored-By: C
 
 - [ ] **Step 5: 사용자 승인(필수)**
 
-사용자에게 잠금 내용(조합, `last_bar_ts`, 무작위 대조군 1,000회)과 합격 기준 4개(명세 6.5)를 보여 주고, 홀드아웃을 **1회** 실행해도 되는지 명시적 승인을 받는다. 승인이 없으면 멈춘다.
+사용자에게 잠금 내용(조합, `last_bar_ts`, 자산별 데이터 해시, 무작위 대조군 1,000회)과 포트폴리오 합격 기준 4개(명세 6.5)를 보여 주고, 홀드아웃을 **1회** 실행해도 되는지 명시적 승인을 받는다. 승인이 없으면 멈춘다.
 
 - [ ] **Step 6: 홀드아웃 1회 실행과 커밋(네트워크)**
 
@@ -5704,7 +6321,7 @@ git add holdout-b.lock
 git commit -m "chore(stratb): record the strategy-B holdout run" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-캐시를 지금까지 늘린 뒤 2023-10-01부터 잠금의 마지막 봉까지 다시 계산하고, 매수 후 보유·무작위 대조군 1,000회·비용 1.5배를 돈다(작업자 수에 따라 1~5분). 출력의 기준 4개와 `PASSED`/`FAILED`를 그대로 사용자에게 보고한다. 다시 실행하거나, 기준을 낮추거나, 다른 조합을 시험하지 않는다(명세 6.5). 같은 명령을 다시 실행하면 거부된다.
+두 캐시를 지금까지 늘린 뒤 2023-10-01부터 잠금의 마지막 봉까지 두 자산을 다시 계산하고, 50:50 매수 후 보유·자산별 무작위 대조군 1,000회·비용 1.5배를 돈다(작업자 수에 따라 2~10분). 출력의 기준 4개, 자산별 거래 수와 `PASSED`/`FAILED`를 그대로 사용자에게 보고한다. 다시 실행하거나, 기준을 낮추거나, 다른 조합을 시험하지 않는다(명세 6.5). 같은 명령을 다시 실행하면 거부된다.
 
 - [ ] **Step 7: 결과 병합(사용자)**
 
@@ -5717,7 +6334,7 @@ gh pr create --base master --title "chore(stratb): strategy-B holdout lock and i
 
 - [ ] **Step 8: 모의매매 시작(합격한 경우에만, 사용자)**
 
-`docs/strategy-b.md`의 "Paper trading" 절차를 따른다: `gh variable set PAPER_B_ENABLED --body true`, 두 번째 Cloudflare Worker(크론 `47 * * * *`), 첫 실행 `gh workflow run paper-b.yml --ref master`와 `gh run watch`. 첫 실행 뒤 텔레그램에 `[ewbot paper-B]` 메시지가 오는지(뉴욕 9시 이후 첫 실행이면 일일 요약), `paper-b` 브랜치의 `runs.log`에 `holdout trades recomputed`가 잠금의 거래 수와 같은지(`ewbot stratb paper status`) 확인한다:
+`docs/strategy-b.md`의 "Paper trading" 절차를 따른다: `gh variable set PAPER_B_ENABLED --body true`, 두 번째 Cloudflare Worker(크론 `47 * * * *`), 첫 실행 `gh workflow run paper-b.yml --ref master`와 `gh run watch`. 첫 실행 뒤 텔레그램에 `[ewbot paper-B]` 메시지가 오는지(뉴욕 9시 이후 첫 실행이면 일일 요약; 진입·청산 메시지는 `B-BTC`·`B-ETH`로 자산을 밝힌다), `paper-b` 브랜치의 `runs.log`에 `holdout trades recomputed`가 잠금의 거래 수와 같은지(`ewbot stratb paper status`) 확인한다:
 
 ```bash
 git fetch origin paper-b
@@ -5739,30 +6356,33 @@ git worktree remove "$TMPDIR/paper-b"
 | 명세 | 요구 | 작업 |
 |---|---|---|
 | 1 목표·결정 사항 | 별도 전략 B, 1h 방향·15m 진입, 확인 후 다음 봉 시가 진입, TP1 절반·잔량 규칙 그리드, 0.5%·3배·−3%/−15% | 1, 4, 5 |
-| 1 거래 빈도(주 2~3회) | 실제 2017~2023 빈도 조기 점검, 중앙값 < 월 4건이면 중단·보고(컨트롤러 결정) | 6b(해석 19) |
+| 1 자산(2026-10-07 개정) | BTC와 ETH, 파라미터 한 벌, 자산별 현물 신호·선물 상품(BIP 0.01 BTC·틱 $5, ETP 0.1 ETH·틱 $0.5), 자산마다 포지션 하나, 계좌 단위 손실 한도, 합계 3배 | 1, 2, 4, 5(해석 20) |
+| 1 거래 빈도(주 2~3회) | 실제 2017~2023 빈도 조기 점검, 중앙값 < 월 4건이면 중단·보고(컨트롤러 결정); 개정 뒤 두 자산 합계로 다시 | 6b(해석 19) |
 | 1 비목표 | A 변경 없음, 실거래 없음(Plan 5) | Global Constraints, 1(`test_isolation`), 12(`test_static`), 13 |
 | 2 격리 | `stratb/`·`paperb/`만, import만, `uv.lock` 불변, CI A 지문 통과, B 검사 추가 | 1, 12, 13 |
 | 3 구조 | `data15`, `rules`, `engine`, `config`, `research`, `baselines`, `fingerprint`, `paperb/runner`, `paper-b.yml`, `holdout-b.lock`, `paper-b` 브랜치, CLI 6개 | 1~12(해석 18) |
 | 4.1 큰 구조 | 15m→1h, A의 ZigZag(`zz_k`), 가장 최근 확정 상승 구간 | 4(해석 4) |
 | 4.2 후보 구간 | 되돌림 구간, 매물대 ±0.25×ATR1h, L 아래 종가 무효 | 3, 4(해석 5) |
 | 4.3 확인·진입 | RSI(14) 다이버전스(좌우 3봉), 두 번째 저점 구간 안, 종가 돌파, 다음 봉 시가, 72시간 | 3, 4, 5(해석 6) |
-| 4.4 손절·청산·수량 | 손절 −0.2×ATR15, 2.5×ATR1h 걸러내기, 1포지션, TP1 `tp1_r`R 절반, TP2 확장, TP2가 가까우면 제외, 잔량 규칙, 48시간, 0.5%·3배, A의 손실 한도 | 3, 4, 5(해석 7, 9) |
+| 4.4 손절·청산·수량 | 손절 −0.2×ATR15, 2.5×ATR1h 걸러내기(걸러진 종가 뒤 72시간 안 재확인 가능), 자산마다 1포지션, TP1 `tp1_r`R 절반, TP2 확장, TP2가 가까우면 제외, 잔량 규칙, 48시간, 계좌 평가액의 0.5%·포지션 3배·합계 3배, A의 손실 한도(계좌 단위) | 3, 4, 5(해석 6, 7, 9, 20) |
 | 4.5 제외 항목 | 주관 확률·추세선·거시·분할 진입·지정가 선주문 없음 | 구현하지 않음 |
-| 5 그리드 | 32개, 고정값 | 1 |
-| 6.1 데이터 | 2017-01부터 15m, 1h 합성, 누락 봉 기록·미보충, 확정 봉만 | 2, 4(해석 8) |
-| 6.2 체결 | 15m 체결, A의 비용, 손절 우선, A의 초기 자금, 0.01 BTC 정수 내림 | 5 |
-| 6.3 워크포워드 | A의 구간 길이·최소 거래·선택 점수·최종 조합(실제 값 확인), 음수면 종료, 2024 가드와 테스트 | 2, 6(해석 1~3), 11 |
-| 6.4 잠금·홀드아웃 1회 | 조합·B 지문·데이터 해시·그리드·시작일, 승인 후 1회, `first_run`, `REPLAY_ANCHOR` 2023-10-01 | 2, 8(해석 11), 11, 14 |
-| 6.5 합격 기준 | 샤프 > BH·무작위 p95(1,000회), MDD ≤ 15%, 거래 ≥ 50, 비용 1.5배 순이익 > 0 | 7, 8(해석 10) |
+| 5 그리드 | 32개, 고정값, 두 자산 포트폴리오로 평가 | 1, 6 |
+| 6.1 데이터 | BTC-USD·ETH-USD 2017-01부터 15m(자산별 캐시, 같은 2024 가드, 이어 받기), 1h 합성, 누락 봉 기록·미보충, 확정 봉만 | 2, 4(해석 8) |
+| 6.2 체결 | 15m 체결, A의 비용(자산별 계약 크기; ETP 최소 수수료·ETH 펀딩은 Plan 5 확인), 손절 우선, A의 초기 자금 하나, 자산별 정수 계약 내림, 같은 봉의 결정적 처리 순서 | 1, 5(해석 20) |
+| 6.3 워크포워드 | A의 구간 길이·최소 거래·선택 점수·최종 조합(실제 값 확인), 포트폴리오로 평가, 음수면 종료, 2024 가드와 테스트 | 2, 6(해석 1~3), 11 |
+| 6.4 잠금·홀드아웃 1회 | 조합·B 지문·데이터 해시(두 자산 각각)·그리드·시작일, 승인 후 1회, `first_run`, `REPLAY_ANCHOR` 2023-10-01 | 2, 8(해석 11), 11, 14 |
+| 6.5 합격 기준(포트폴리오) | 샤프 > BTC/ETH 50:50 BH·자산별 빈도의 무작위 p95(1,000회), MDD ≤ 15%, 두 자산 합계 거래 ≥ 50, 비용 1.5배 순이익 > 0 | 7, 8(해석 10) |
 | 6.6 해석의 한계 | 합격 = 버릴 이유 없음, 확인은 모의매매 | 14(보고), 문서 |
-| 7 모의매매 | 앵커부터 결정적 재계산, A의 불일치 분류, `paper-b.yml`(매시 47분, 예비 schedule), 사용량, orphan `paper-b`, A 장부 스키마, 잠금 이후 진입만 카운트, B 지문 구간, `[ewbot paper-B]` 진입·청산·일일 요약(n/30, 불일치, 손익), 실패 알림 | 9, 10, 11, 12(해석 12~17), 14 |
-| 7.1 실거래 전환 조건 | 합격, 모의 30건, 원인 불명 0건, 사용자 승인 | 10(`status_lines_b`), 문서 |
-| 8 오류 처리(2026-10-07 수정 포함) | 수집 재시도 후 알림·중단, 누락 봉 판단 없음, 잠금 불일치 시 거부·알림, 홀드아웃 구간 데이터 해시 불일치는 거부 없이 한 번 경고·`DATA_REVISION` 분류, A와 충돌 없음(테스트) | 2, 4, 10, 11, 1, 12 |
-| 9 테스트 | 규칙 단위, 미래 정보 차단(잘라내기), 체결, 홀드아웃 보호, A 보호(CI), 모의매매(A 도우미 재사용) | 3, 4, 5, 8, 1·12·13, 9·10·11·12 |
-| 10 진행 절차 | 승인 → 계획 → 작업별 구현·검토(Task 6 뒤 빈도 점검) → PR(A의 CI 통과) → 수집·워크포워드·보고 → 잠금 → 승인 → 홀드아웃 1회 → 합격 시 크론·모의매매 | 1~13, 6b, 14 |
+| 7 모의매매 | 두 자산을 한 실행·장부로, 앵커부터 결정적 재계산, A의 불일치 분류(자산을 넣은 거래 키), `paper-b.yml`(매시 47분, 예비 schedule), 사용량, orphan `paper-b`, A 장부 스키마, 잠금 이후 진입만 카운트(합계), B 지문 구간, `[ewbot paper-B]` 진입·청산(자산 표시)·일일 요약(n/30, 불일치, 손익, 자산별 포지션), 실패 알림 | 9, 10, 11, 12(해석 12~17), 14 |
+| 7.1 실거래 전환 조건 | 합격, 모의 30건(두 자산 합계), 원인 불명 0건, 사용자 승인 | 10(`status_lines_b`), 문서 |
+| 8 오류 처리(2026-10-07 수정 포함) | 수집 재시도(연결 오류·시간 초과 포함) 후 알림·중단, 한 자산이라도 실패하면 실행하지 않음, 누락 봉 판단 없음, 잠금 불일치 시 거부·알림, 홀드아웃 구간 데이터 해시 불일치는 거부 없이 한 번 경고·`DATA_REVISION` 분류, A와 충돌 없음(테스트) | 2, 4, 10, 11, 1, 12 |
+| 9 테스트 | 규칙 단위, 미래 정보 차단(두 자산 잘라내기), 체결(롱·숏, 시간 손절, 자산별 계약, 두 상한, 같은 봉 순서, 계좌 손실 한도), 홀드아웃 보호, A 보호(CI), 모의매매(A 도우미 재사용) | 3, 4, 5, 8, 1·12·13, 9·10·11·12 |
+| 10 진행 절차 | 승인 → 계획 → 작업별 구현·검토(Task 6 뒤 빈도 점검, 개정 뒤 두 자산으로 다시) → PR(A의 CI 통과) → 수집·워크포워드·보고 → 잠금 → 승인 → 홀드아웃 1회 → 합격 시 크론·모의매매 | 1~13, 6b, 14 |
 
 **2. 자리 표시자 검사:** "TBD", "TODO", "나중에", "적절히 처리", "Task N과 같이" 같은 표현이 없다. 모든 코드 단계에 전체 코드가 있고, 모든 명령에 예상 출력이 있다.
 
-**3. 타입 일관성:** `Combo`(튜플)와 JSON 조합(리스트)은 `normalize_combo`/`combo_to_json`으로만 오간다. `SignalB.i`는 프레임 인덱스, 비교는 `ts`로 한다. `BResult`의 `signals`와 `orders`는 같은 순서다(`build_decisions_b`가 `zip(strict=True)`). `run_holdout_b`, `create_lock`, `run_paper_b`, `precheck_lock_b`, `PaperBEnv`의 이름과 인자는 Task 8·10·11·12에서 같다. 잠금 경로는 어디서나 `stratb.data15.DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`)다.
+**3. 타입 일관성:** `Combo`(튜플)와 JSON 조합(리스트)은 `normalize_combo`/`combo_to_json`으로만 오간다. 여러 자산의 데이터는 어디서나 `ASSETS` 순서의 사전 `{자산: …}`이다(15분봉, 프레임, 신호, 캐시 경로, 잠금의 `wf_data`). `SignalB.i`는 그 자산 프레임의 인덱스, 비교는 `ts`로 한다. `BResult`의 `signals`와 `orders`는 같은 순서이고 자산은 `OrderB.asset`에 있다(`build_decisions_b`가 `zip(strict=True)`). 엔진 안의 거래 키는 (자산, 진입 ts)이고, A의 판단 형식에 넣을 때만 정수 `trade_key_b`(ts + 자산 인덱스)로 바꾼다. `run_holdout_b`, `create_lock`, `run_paper_b`, `precheck_lock_b`, `PaperBEnv`의 이름과 인자는 Task 8·10·11·12에서 같다. 잠금 경로는 어디서나 `stratb.data15.DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`)다.
 
 **4. 검증:** 이 계획은 작성 시점(2026-10-07)에 새 클론(`feat/plan4-strategy-b`, Python 3.12.13)에 문서 그대로 적용해 확인했다: 모든 파일과 수정을 적힌 대로 쓰고 모든 명령을 실행했으며, 39개의 `예상` 항목이 모두 맞았다(각 Step 2는 적힌 대로 실패, 각 Step 4는 적힌 수로 통과, Task 13의 전체 테스트 `1359 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함). 적용 결과의 42개 파일은 개발 사본과 바이트 단위로 같았다. Task 6b와 Task 14는 네트워크와 사용자 승인이 필요한 수동 단계라 재생에서 제외했다(6b의 스크립트는 합성 캐시로 따로 실행해 확인).
+
+**5. 2026-10-07 개정(BTC+ETH)의 재검증:** 개정한 이 계획 전체를 같은 날 새 클론의 계획 커밋 `4969109`(Task 1 코드 이전)에서 문서 그대로 다시 적용했다: 모든 Step 2가 적힌 대로 실패하고 모든 Step 4가 적힌 수로 통과했으며(`예상` 항목 39개 모두 일치), Task 13의 전체 테스트는 `1371 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함. 적용 결과에서 Task 1~6의 파일은 저장소에 커밋된 개정 코드와, Task 7~12의 파일은 개발 사본과 바이트 단위로 같았다. Task 6b의 두 자산 스크립트는 2017~2023 두 자산 합성 캐시로 따로 실행해 출력 형식을 확인했다(실제 데이터와 네트워크는 쓰지 않았다).
