@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pandas as pd
@@ -24,6 +25,7 @@ from ewbot.stratb.holdout import (
     read_lock,
     run_holdout_b,
 )
+from ewbot.stratb.research import wf_provenance
 from tests.paper.helpers import git
 from tests.stratb.helpers import save_world, world_dfs
 
@@ -43,11 +45,22 @@ def world(tmp_path):
     return repo, cache, repo / "holdout-b.lock"
 
 
+def _report(world, dfs=None, **edit):
+    """A walk-forward report as `ewbot stratb walkforward` writes it: it proceeds with COMBO and was made on
+    the cache's bars (or dfs) and this code."""
+    repo, cache, _ = world
+    rep = {"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True,
+           **wf_provenance(load_caches_15m(cache) if dfs is None else dfs), **edit}
+    path = repo.parent / "wf.json"  # outside the repo, like the gitignored reports/
+    path.write_text(json.dumps(rep), encoding="utf-8")
+    return path
+
+
 def _lock(world, **kw):
     _, cache, lock_path = world
-    args = dict(params_source="test", now_ts=NOW, lock_path=lock_path, random_runs=4)
+    args = dict(now_ts=NOW, lock_path=lock_path, random_runs=4)
     args.update(kw)
-    return create_lock(COMBO, load_caches_15m(cache), **args)
+    return create_lock(_report(world), load_caches_15m(cache), **args)
 
 
 def _commit(world):
@@ -97,16 +110,36 @@ def test_the_lock_binds_params_code_data_and_window_and_is_written_once(world):
 def test_the_lock_refuses_off_grid_params_2024_or_one_asset_data_and_an_early_clock(world):
     _, cache, lock_path = world
     wf = load_caches_15m(cache)
-    with pytest.raises(HoldoutBError):
-        create_lock([2.5, [0.382, 0.618], 1.0, 1.272, "breakeven"], wf, params_source="t", now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="not a combo"):
+        create_lock(_report(world, chosen_final=[2.5, [0.382, 0.618], 1.0, 1.272, "breakeven"]), wf, now_ts=NOW,
+                    lock_path=lock_path)
     full = {a: pd.read_parquet(p) for a, p in cache_paths(cache).items()}
     with pytest.raises(HoldoutBError, match="before 2024"):
-        create_lock(COMBO, full, params_source="t", now_ts=NOW, lock_path=lock_path)
+        create_lock(_report(world), full, now_ts=NOW, lock_path=lock_path)
     with pytest.raises(HoldoutBError, match="every asset"):
-        create_lock(COMBO, {"BTC": wf["BTC"]}, params_source="t", now_ts=NOW, lock_path=lock_path)
+        create_lock(_report(world), {"BTC": wf["BTC"]}, now_ts=NOW, lock_path=lock_path)
     with pytest.raises(HoldoutBError, match="after 2024"):
-        create_lock(COMBO, wf, params_source="t", now_ts=HS + 600, lock_path=lock_path)
+        create_lock(_report(world), wf, now_ts=HS + 600, lock_path=lock_path)
     assert not lock_path.exists()
+
+
+def test_the_lock_comes_from_a_proceeding_walk_forward_report_of_these_bars_and_this_code(world):
+    repo, cache, lock_path = world
+    wf = load_caches_15m(cache)
+    for edit, match in (({"proceed": False}, "proceed is false"), ({"chosen_final_fallback": True}, "proceed is false"),
+                        ({"chosen_final": None}, "proceed is false"), ({"code_sha256": "0" * 64}, r"\['code_sha256'\]"),
+                        ({"deps_sha256": "0" * 64}, r"\['deps_sha256'\]")):
+        with pytest.raises(HoldoutBError, match=match):
+            create_lock(_report(world, **edit), wf, now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match=r"\['wf_data'\]"):  # the walk-forward saw other bars
+        create_lock(_report(world, {a: df.iloc[1:] for a, df in wf.items()}), wf, now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="unreadable"):
+        create_lock(repo.parent / "missing.json", wf, now_ts=NOW, lock_path=lock_path)
+    assert not lock_path.exists()
+    report = _report(world)
+    lock = create_lock(report, wf, now_ts=NOW, lock_path=lock_path, random_runs=4)
+    assert lock["wf_report_sha256"] == hashlib.sha256(report.read_bytes()).hexdigest() and "wf_report_sha256" in LOCK_BOUND
+    assert lock["params_source"] == f"walkforward:{report}#chosen_final" and read_lock(lock_path) == lock
 
 
 def test_an_edited_bound_field_breaks_the_lock(world):
@@ -182,7 +215,7 @@ def test_a_dirty_tracked_tree_is_refused_at_lock_and_run_but_not_the_lock_itself
     with pytest.raises(HoldoutBError, match="other holdout bars"):  # past the clean-tree check
         run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
     with pytest.raises(HoldoutBError, match="not a git working tree"):
-        create_lock(COMBO, load_caches_15m(cache), params_source="t", now_ts=NOW, lock_path=tmp_path / "holdout-b.lock")
+        create_lock(_report(world), load_caches_15m(cache), now_ts=NOW, lock_path=tmp_path / "holdout-b.lock")
 
 
 def test_the_holdout_runs_once_and_records_the_criteria(world):

@@ -8,6 +8,7 @@ from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.stratb import research
 from ewbot.stratb.config import BConfig, StratBParams, grid_combos
 from ewbot.stratb.engine import BResult, run_engine
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.research import (
     backtest_b,
     evaluate_folds_b,
@@ -15,6 +16,7 @@ from ewbot.stratb.research import (
     run_grid_b,
     trades_by_asset,
     walk_forward_b,
+    wf_data_record,
 )
 from ewbot.stratb.signals import build_frames, generate_signals
 from tests.stratb.helpers import SIGNAL_BAR, long_setup_df, mirror, random_df
@@ -124,5 +126,10 @@ def test_walk_forward_cuts_2024_and_uses_strategy_a_folds(monkeypatch):
     assert len(out["folds"]) == 10 and out["folds"][0]["test"][0] == 1_546_300_800  # 2019-01-01
     assert out["chosen_final"] is None and out["proceed"] is False and len(out["combo_table"]) == 32
     assert out["combo_table"][0]["n_trades_by_asset"] == {"BTC": 0, "ETH": 0}
+    assert out["wf_data"] == wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a in ("BTC", "ETH")})
+    assert out["wf_data"]["ETH"]["n_bars"] == 50 and out["wf_data"]["ETH"]["last_ts"] == HOLDOUT_START - 900
+    assert (out["code_sha256"], out["deps_sha256"]) == (stratb_fingerprint(), deps_fingerprint())
     with pytest.raises(ValueError, match="every asset"):
         walk_forward_b({"BTC": df}, workers=1)
+    with pytest.raises(ValueError, match="no ETH 15m bars"):
+        wf_data_record({"BTC": df, "ETH": df.iloc[:0]})

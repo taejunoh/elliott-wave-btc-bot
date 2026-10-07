@@ -6,8 +6,9 @@ import pytest
 
 from ewbot import cli
 from ewbot.cli import build_parser, main
-from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths
+from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths, load_caches_15m
 from ewbot.stratb.holdout import read_lock
+from ewbot.stratb.research import wf_provenance
 from tests.paper.helpers import git
 from tests.stratb.helpers import save_world, world_dfs
 
@@ -90,10 +91,11 @@ def test_holdout_lock_needs_a_walk_forward_that_proceeds(tmp_path, cache, monkey
     with pytest.raises(SystemExit) as exc:
         main(["stratb", "holdout", "lock", "--params-from", str(wf), "--cache-dir", str(cache)])
     assert exc.value.code == 2 and not lock_path.exists()
-    wf.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True}))
+    wf.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True,
+                              **wf_provenance(load_caches_15m(cache))}))
     assert main(["stratb", "holdout", "lock", "--params-from", str(wf), "--cache-dir", str(cache)]) == 0
     lock = read_lock(lock_path)
-    assert lock["params"] == COMBO and lock["random_runs"] == 1000 and lock["params_source"].startswith("walkforward:")
+    assert lock["params"] == COMBO and lock["random_runs"] == 1000 and lock["params_source"] == f"walkforward:{wf}#chosen_final"
     assert "Commit it NOW" in capsys.readouterr().out
 
 

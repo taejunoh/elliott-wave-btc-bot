@@ -973,13 +973,10 @@ def _b_walkforward(args: argparse.Namespace) -> int:
 
 
 def _b_holdout_lock(args: argparse.Namespace) -> int:
-    wf = json.loads(Path(args.params_from).read_text(encoding="utf-8"))
-    if not wf.get("proceed") or not wf.get("chosen_final") or wf.get("chosen_final_fallback"):
-        _refuse(f"{args.params_from}: proceed is false (spec 6.3: negative out-of-sample, fallback or no pick); "
-                "strategy B ends without a holdout")
+    """The lock from the walk-forward report; stratb.holdout.create_lock refuses one that does not proceed or
+    was made on other bars or code, and a dirty tracked tree."""
     try:
-        lock = create_lock(wf["chosen_final"], _b_dfs(args), params_source=f"walkforward:{args.params_from}#chosen_final",
-                           now_ts=int(time.time()), lock_path=STRATB_LOCK)
+        lock = create_lock(Path(args.params_from), _b_dfs(args), now_ts=int(time.time()), lock_path=STRATB_LOCK)
     except HoldoutBError as exc:
         _refuse(str(exc))
     print(f"holdout-b.lock written: {STRATB_LOCK} (sha256 {lock['sha256'][:12]}, params {lock['params']}, "

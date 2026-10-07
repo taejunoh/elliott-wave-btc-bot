@@ -15,6 +15,7 @@ import pandas as pd
 from ewbot.paperb.runner import PaperBEnv
 from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths, load_caches_15m
 from ewbot.stratb.holdout import create_lock, run_holdout_b
+from ewbot.stratb.research import wf_provenance
 from tests.paper.helpers import Clock, FakeSender, git
 from tests.stratb.helpers import save_world, world_dfs
 
@@ -37,7 +38,10 @@ def build_passed_lock(tmp: Path) -> str:
     git(repo, "init", "-q")
     save_world(cache, world())
     lp = repo / "holdout-b.lock"
-    create_lock(COMBO, load_caches_15m(cache), params_source="test", now_ts=LOCK_NOW, lock_path=lp, random_runs=2)
+    report = tmp / "wf.json"  # a walk-forward report that proceeds with COMBO, made on these bars and this code
+    report.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True,
+                                  **wf_provenance(load_caches_15m(cache))}), encoding="utf-8")
+    create_lock(report, load_caches_15m(cache), now_ts=LOCK_NOW, lock_path=lp, random_runs=2)
     git(repo, "add", lp.name)
     git(repo, "commit", "-q", "-m", "lock")
     run_holdout_b(confirm=True, cache_dir=cache, lock_path=lp)

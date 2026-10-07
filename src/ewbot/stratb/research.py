@@ -15,7 +15,10 @@ The walk-forward uses strategy A's rules (ewbot.backtest.walkforward, read 2026-
 A's pick_plateau reads A's own GRID, so the identical rule is implemented here over GRID_B. With two
 values per axis every combo neighbours every other: the score is the same for all, the pick is the
 highest own Calmar, and it needs >= 17 of the 32 combos eligible. Spec 6.3: a negative stitched
-out-of-sample return ends strategy B (proceed = False); so does a fallback pick (A's CLI refuses it too)."""
+out-of-sample return ends strategy B (proceed = False); so does a fallback pick (A's CLI refuses it too).
+The walk-forward output also records what it ran on (wf_provenance: every asset's bars before 2024 - wf_data -,
+the B fingerprint and the strategy-A modules B imports); holdout.create_lock checks them against the bars
+and the code at lock time."""
 
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from ewbot.backtest.holdout import data_fingerprint
 from ewbot.backtest.metrics import compute_metrics
 from ewbot.backtest.runner import utc_ts
 from ewbot.backtest.walkforward import (
@@ -50,6 +54,7 @@ from ewbot.stratb.config import (
     grid_combos,
 )
 from ewbot.stratb.engine import BResult, asset_of, run_engine
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.signals import Frame15, RefLeg, build_frames, generate_signals, reference_legs
 from ewbot.types import H1
 
@@ -88,6 +93,26 @@ def backtest_b(
 def trades_by_asset(trades: Sequence[Trade]) -> dict[str, int]:
     """{asset: number of trades} in config.ASSETS order."""
     return {a: sum(1 for t in trades if asset_of(t) == a) for a in ASSETS}
+
+
+def wf_data_record(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
+    """{asset: {first_ts, last_ts, n_bars, sha256}} of every asset's walk-forward bars (A's data_fingerprint of
+    the bars before 2024). ValueError unless every asset of config.ASSETS has bars."""
+    if sorted(dfs_wf) != sorted(ASSETS):
+        raise ValueError(f"the walk-forward bars of every asset {list(ASSETS)} are needed, got {sorted(dfs_wf)}")
+    out: dict[str, Any] = {}
+    for a in ASSETS:
+        df = dfs_wf[a]
+        if df.empty:
+            raise ValueError(f"no {a} 15m bars before 2024-01-01")
+        out[a] = {"first_ts": int(df["ts"].iloc[0]), "last_ts": int(df["ts"].iloc[-1]), "n_bars": int(len(df)),
+                  "sha256": data_fingerprint(df, 0, HOLDOUT_START - 1)}
+    return out
+
+
+def wf_provenance(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
+    """What a walk-forward runs on: wf_data (every asset's bars), code_sha256 (B fingerprint), deps_sha256."""
+    return {"wf_data": wf_data_record(dfs_wf), "code_sha256": stratb_fingerprint(), "deps_sha256": deps_fingerprint()}
 
 
 # ----------------------------------------------------------------------------- grid
@@ -234,10 +259,11 @@ def evaluate_folds_b(
 
 def walk_forward_b(dfs: Mapping[str, pd.DataFrame], workers: int = 1) -> dict[str, Any]:
     """The full walk-forward over [2017-01-01, 2024-01-01) on the BTC + ETH portfolio (both assets
-    required). Bars at/after 2024-01-01 are dropped here."""
+    required). Bars at/after 2024-01-01 are dropped here. The output carries wf_provenance of the bars."""
     if sorted(dfs) != sorted(ASSETS):
         raise ValueError(f"the walk-forward runs on every asset {list(ASSETS)}, got {sorted(dfs)}")
     start, end = utc_ts(WF_START), HOLDOUT_START
+    provenance = wf_provenance(_cut(dfs, end))
     results = run_grid_b(_cut(dfs, end), start, end, workers)
     out = evaluate_folds_b(results, folds(), BConfig().initial_equity)
     full = {c: compute_metrics(r.equity, r.trades, start, end) for c, r in results.items()}
@@ -247,4 +273,5 @@ def walk_forward_b(dfs: Mapping[str, pd.DataFrame], workers: int = 1) -> dict[st
          "total_return": m.total_return}
         for c, m in full.items()
     ]
+    out.update(provenance)
     return out

@@ -1,8 +1,11 @@
 """Strategy-B holdout lock and its one-shot run (Plan 4 spec 6.4-6.5).
 
 create_lock() writes <project root>/holdout-b.lock BEFORE any 2024+ candle can be read (data15 refuses
-them until a lock exists): the walk-forward's final combo, the full run config (assets included), the
-grid, the B fingerprint, deps_sha256 (fingerprint.deps_fingerprint: the strategy-A modules B imports -
+them until a lock exists), from the walk-forward report (`ewbot stratb walkforward` JSON): only one that
+proceeds (spec 6.3) and was made on the same bars, B code and strategy-A modules (its wf_data, code_sha256
+and deps_sha256 equal research.wf_provenance of the bars and the code now). The lock holds the report's
+final combo and sha256 (wf_report_sha256), the full run config (assets included), the grid, the B
+fingerprint, deps_sha256 (fingerprint.deps_fingerprint: the strategy-A modules B imports -
 config defaults, costs, sizing, breakers, metrics, buy & hold, walk-forward windows, data hashing, ...),
 the sha256 of each asset's pre-2024 15m bars the walk-forward used (wf_data: BTC and ETH), the holdout
 start, the replay anchor (2023-10-01), the 1,000-run random control and its seed, and last_bar_ts - the
@@ -32,7 +35,7 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 
@@ -45,7 +48,7 @@ from ewbot.stratb.config import ASSETS, GRID_B, M15, combo_to_json, config_for, 
 from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m, lock_digest_b
 from ewbot.stratb.engine import run_engine
 from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
-from ewbot.stratb.research import backtest_b, trades_by_asset
+from ewbot.stratb.research import backtest_b, trades_by_asset, wf_data_record, wf_provenance
 from ewbot.stratb.signals import build_frames, generate_signals
 from ewbot.types import H1
 
@@ -130,20 +133,6 @@ def lock_mismatch_b(lock: Mapping[str, Any]) -> list[str]:
     return [k for k, v in want.items() if lock.get(k) != v]
 
 
-def wf_data_record(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
-    """{asset: {first_ts, last_ts, n_bars, sha256}} of every asset's walk-forward bars (all before 2024)."""
-    if sorted(dfs_wf) != sorted(ASSETS):
-        raise HoldoutBError(f"the lock needs the walk-forward bars of every asset {list(ASSETS)}, got {sorted(dfs_wf)}")
-    out: dict[str, Any] = {}
-    for a in ASSETS:
-        df = dfs_wf[a]
-        if df.empty:
-            raise HoldoutBError(f"no {a} 15m bars before 2024-01-01")
-        out[a] = {"first_ts": int(df["ts"].iloc[0]), "last_ts": int(df["ts"].iloc[-1]), "n_bars": int(len(df)),
-                  "sha256": data_fingerprint(df, 0, HOLDOUT_START - 1)}
-    return out
-
-
 def data_fingerprint_b(dfs: Mapping[str, pd.DataFrame], start_ts: int, last_ts: int) -> str:
     """One sha256 over every asset's bars with start_ts <= ts <= last_ts: of the lines "<asset>:<A's
     data_fingerprint>" in config.ASSETS order (an asset without bars there hashes as an empty window)."""
@@ -151,26 +140,46 @@ def data_fingerprint_b(dfs: Mapping[str, pd.DataFrame], start_ts: int, last_ts: 
     return hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
 
+_PROVENANCE = {"wf_data": "15m bars", "code_sha256": "B code", "deps_sha256": "strategy-A modules B imports"}
+
+
 def create_lock(
-    params: Sequence[Any],
+    report_path: Path,
     dfs_wf: Mapping[str, pd.DataFrame],
     *,
-    params_source: str,
     now_ts: int,
     lock_path: Path = DEFAULT_LOCK_PATH,
     random_runs: int = RANDOM_RUNS,
     random_seed: int = 0,
 ) -> dict[str, Any]:
-    """Write the lock (once). dfs_wf: every asset's walk-forward 15m bars, all before 2024-01-01."""
+    """Write the lock (once) from the walk-forward report at report_path. dfs_wf: every asset's walk-forward
+    15m bars, all before 2024-01-01 (the report must have been made on them)."""
     path = Path(lock_path)
     if path.exists():
         raise HoldoutBError(f"{path} exists: the strategy-B lock is written once")
     try:
-        combo = normalize_combo(params)
-    except ValueError as exc:
+        raw = Path(report_path).read_bytes()
+        report = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise HoldoutBError(f"{report_path}: unreadable walk-forward report: {exc}") from exc
+    if (not isinstance(report, dict) or not report.get("proceed") or not report.get("chosen_final")
+            or report.get("chosen_final_fallback")):
+        raise HoldoutBError(f"{report_path}: proceed is false (spec 6.3: negative out-of-sample, fallback or no "
+                            "pick); strategy B ends without a holdout")
+    try:
+        combo = normalize_combo(report["chosen_final"])
+    except (TypeError, ValueError) as exc:
         raise HoldoutBError(str(exc)) from exc
     if any(len(df) and int(df["ts"].max()) >= HOLDOUT_START for df in dfs_wf.values()):
         raise HoldoutBError("the walk-forward data must end before 2024-01-01")
+    try:
+        made_on = wf_provenance(dfs_wf)
+    except ValueError as exc:
+        raise HoldoutBError(str(exc)) from exc
+    stale = [k for k in _PROVENANCE if report.get(k) != made_on[k]]
+    if stale:
+        raise HoldoutBError(f"{report_path} was made on other {stale} ({', '.join(_PROVENANCE[k] for k in stale)}) "
+                            "than now: re-run `ewbot stratb walkforward`")
     last_bar = int(now_ts) // H1 * H1 - M15
     if last_bar < HOLDOUT_START:
         raise HoldoutBError("the lock must be written after 2024-01-01")
@@ -189,12 +198,13 @@ def create_lock(
         "last_bar_ts": last_bar,
         "random_runs": int(random_runs),
         "random_seed": int(random_seed),
-        "code_sha256": stratb_fingerprint(),
-        "deps_sha256": deps_fingerprint(),
-        "wf_data": wf_data_record(dfs_wf),
+        "code_sha256": made_on["code_sha256"],
+        "deps_sha256": made_on["deps_sha256"],
+        "wf_data": made_on["wf_data"],
+        "wf_report_sha256": hashlib.sha256(raw).hexdigest(),
     }
-    lock.update(sha256=lock_digest_b(lock), params_source=params_source, locked_at=_now(), **git_state(),
-                attempts=[], first_run=None)
+    lock.update(sha256=lock_digest_b(lock), params_source=f"walkforward:{report_path}#chosen_final", locked_at=_now(),
+                **git_state(), attempts=[], first_run=None)
     _write(path, lock)
     return lock
 
@@ -245,7 +255,10 @@ def run_holdout_b(
                             "refusing")
     _refuse_dirty(path)
     dfs = {a: load_15m(p, include_holdout=True, lock_path=path) for a, p in cache_paths(cache_dir).items()}
-    wf = wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a, df in dfs.items()})
+    try:
+        wf = wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a, df in dfs.items()})
+    except ValueError as exc:
+        raise HoldoutBError(str(exc)) from exc
     changed = [a for a in ASSETS if wf[a]["sha256"] != lock["wf_data"][a]["sha256"]]
     if changed:
         raise HoldoutBError(f"the {changed} 15m bars before 2024-01-01 differ from the ones the walk-forward used")
