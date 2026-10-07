@@ -1,5 +1,6 @@
-"""Strategy-B signals over a gap-filled 15m frame (Plan 4 spec 4.1-4.4). Decisions at a bar's CLOSE
-from bars up to it only; the output for bars <= t never depends on later bars (tested by truncation).
+"""Strategy-B signals over a gap-filled 15m frame (Plan 4 spec 4.1-4.4), one frame per asset (the same
+rules and params for BTC and ETH). Decisions at a bar's CLOSE from bars up to it only; the output for bars
+<= t never depends on later bars (tested by truncation).
 
 1. Structure: complete 1h bars (4 x 15m) feed A's ATR ZigZag (waves/zigzag.py, k = zz_k, ATR 14). A
    pivot confirmed on the hour whose last 15m bar is i makes the leg (previous pivot -> new pivot) a
@@ -14,15 +15,18 @@ from bars up to it only; the output for bars <= t never depends on later bars (t
 4. Confirmation (spec 4.3): two consecutive 15m pivots of the trade's kind (lows for a long, w = 3) after
    the leg's extreme 15m bar make a lower low with a higher RSI(14) low, the second inside the zone; the
    latest such pair stays the setup until a newer pair replaces it or a later bar undercuts its second
-   pivot. Confirmed at the first close beyond the swing between the two pivots (highest high for a
-   long) with no gap-filled bar from p1 - w to the confirming bar.
+   pivot. Confirmed at a close beyond the swing between the two pivots (highest high for a long) with no
+   gap-filled bar from p1 - w to the confirming bar, whose levels pass the filters of item 5.
 5. Levels (spec 4.4): entry_ref = the confirming close; stop = second pivot -/+ 0.2 x ATR15; TP1 = entry +
-   tp1_r x R; TP2 = start + e (end - start). Skipped (the reference stays alive) when R > 2.5 x ATR1h or TP2
-   is not beyond TP1. A signal consumes its reference: one signal per leg."""
+   tp1_r x R; TP2 = start + e (end - start). A close beyond the level is skipped when R > 2.5 x ATR1h or TP2
+   is not beyond TP1; the pair and the reference stay alive, so a later close beyond the level within the
+   reference's life may confirm ("a far stop waits", spec 4.4). A signal consumes its reference: one
+   signal per leg."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
@@ -126,6 +130,25 @@ def build_frame(df15: pd.DataFrame, p: StratBParams = StratBParams()) -> Frame15
     )
 
 
+def build_frames(dfs: Mapping[str, pd.DataFrame], p: StratBParams = StratBParams()) -> dict[str, Frame15]:
+    """One frame per asset ({asset: 15m bars}, same params), all ending at the latest bar of any asset:
+    an asset whose bars end earlier gets flat synthetic bars at its last close up to there, as fill_gaps
+    makes for a missing bar, so a run cut at time t sees every asset as the full run does up to t."""
+    if not dfs or any(len(df) == 0 for df in dfs.values()):
+        raise ValueError(f"every asset needs 15m bars: {[a for a, df in dfs.items() if len(df) == 0] or 'none given'}")
+    end = max(int(df["ts"].max()) for df in dfs.values())
+    out: dict[str, Frame15] = {}
+    for a, df in dfs.items():
+        k = int(df["ts"].to_numpy().argmax())
+        if int(df["ts"].iloc[k]) < end:
+            px = float(df["close"].iloc[k])
+            pad = pd.DataFrame({"ts": [end], "open": [px], "high": [px], "low": [px], "close": [px],
+                                "volume": [0.0], "synthetic": [True]})
+            df = pd.concat([df if "synthetic" in df.columns else df.assign(synthetic=False), pad], ignore_index=True)
+        out[a] = build_frame(df, p)
+    return out
+
+
 def reference_legs(f: Frame15, zz_k: float, p: StratBParams = StratBParams()) -> list[RefLeg]:
     """Every leg the 1h ZigZag confirms, in order (spec 4.1)."""
     zz = ZigZag(zz_k, p.atr_len)
@@ -186,7 +209,8 @@ def _scan(f: Frame15, p: StratBParams, leg: RefLeg, last_i: int) -> SignalB | No
         if d * (f.close[i] - level) <= 0.0 or f.synthetic[max(p1 - w, 0) : i + 1].any():
             continue
         hour = int(f.last_hour[i])
-        atr15, atr1h = float(f.atr15[i]), float(f.h_atr[hour]) if hour >= 0 else float("nan")
+        atr15 = float(f.atr15[i])
+        atr1h = float(f.h_atr[hour]) if hour >= 0 else float("nan")
         if not (np.isfinite(atr15) and np.isfinite(atr1h)):
             continue
         entry = float(f.close[i])

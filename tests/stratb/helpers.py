@@ -3,12 +3,18 @@
 LONG_SETUP is a hand-made path whose 1h ZigZag (k = 2 or 3) confirms an up leg L = 999.5 -> H = 1200.5
 with an earlier swing high (1100.5) inside the 38.2-61.8% zone; the retracement makes two 15m lows
 1109.5 (RSI 13.9) and 1104.5 (RSI 25.4, inside the zone) and the close 1130 at bar 177 breaks the 1125.5
-swing between them: one long signal at bar 177. Prices sit on a 1/64 grid, so mirror() is exact."""
+swing between them: one long signal at bar 177. Prices sit on a 1/64 grid, so mirror() is exact.
+world_dfs() is the two-asset world of the holdout, paper and CLI tests: BTC repeats LONG_SETUP, ETH is
+its mirror, so both assets signal on the same bars (a BTC long and an ETH short every 232 bars)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+from ewbot.stratb.data15 import cache_paths
 
 T0 = 1_700_006_400  # 2023-11-15 00:00 UTC (hour aligned)
 RANDOM_T0 = 1_690_848_000  # 2023-08-01 00:00 UTC: 6,000 random bars end before 2024
@@ -66,3 +72,14 @@ def random_df(n: int, seed: int, t0: int = RANDOM_T0, start: float = 20_000.0) -
         {"ts": t0 + M15 * np.arange(n), "open": o, "high": np.maximum(o, c) + up, "low": np.minimum(o, c) - dn,
          "close": c, "volume": 1.0}
     ).astype({"ts": "int64"})
+
+
+def world_dfs(t0: int, reps: int = 130) -> dict[str, pd.DataFrame]:
+    btc = frame_df(path(LONG_START, LONG_SETUP * reps), t0)
+    return {"BTC": btc, "ETH": mirror(btc)}
+
+
+def save_world(cache_dir: Path, dfs: dict[str, pd.DataFrame]) -> None:
+    """Each asset's bars into its 15m cache file below cache_dir."""
+    for a, p in cache_paths(cache_dir).items():
+        dfs[a].to_parquet(p, index=False)

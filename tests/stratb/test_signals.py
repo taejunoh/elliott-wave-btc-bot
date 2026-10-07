@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from ewbot.stratb.config import StratBParams
-from ewbot.stratb.signals import build_frame, generate_signals, reference_legs
+from ewbot.stratb.signals import build_frame, build_frames, generate_signals, reference_legs
 from tests.stratb.helpers import SIGNAL_BAR, T0, long_setup_df, mirror, random_df
 
 M15 = 900
@@ -30,6 +30,18 @@ def test_frame_has_complete_hours_and_flags_gaps():
     assert f.h_ts[0] == T0 + 3600 and (f.h_ts % 3600 == 0).all()
     assert (f.ts[f.h_end] == f.h_ts + 2700).all()
     assert f.last_hour[int(f.h_end[0]) - 1] == -1 and f.last_hour[int(f.h_end[0])] == 0
+
+
+def test_the_frames_of_two_assets_end_on_the_same_bar():
+    btc, eth = long_setup_df(), mirror(long_setup_df()).iloc[:-3]  # ETH's last 3 bars are missing
+    frames = build_frames({"BTC": btc, "ETH": eth})
+    f, g = frames["BTC"], frames["ETH"]
+    assert list(frames) == ["BTC", "ETH"] and len(f) == len(g) == len(btc) and g.ts[-1] == f.ts[-1]
+    assert g.synthetic[-3:].all() and not g.synthetic[:-3].any() and (g.close[-3:] == eth["close"].iloc[-1]).all()
+    assert (g.high[-3:] == g.low[-3:]).all() and np.array_equal(g.rsi[:-3], build_frame(eth).rsi, equal_nan=True)
+    assert np.array_equal(f.close, build_frame(btc).close)
+    with pytest.raises(ValueError):
+        build_frames({"BTC": btc, "ETH": eth.iloc[:0]})
 
 
 def test_legs_alternate_and_carry_the_earlier_swings(setup):
@@ -84,6 +96,18 @@ def test_filters_and_expiry(setup):
     assert generate_signals(f, dataclasses.replace(p, max_stop_atr1h=0.5), legs) == []  # stop too far
     assert generate_signals(f, dataclasses.replace(p, tp1_r=5.0), legs) == []  # TP2 not beyond TP1
     assert generate_signals(f, dataclasses.replace(p, confirm_hours=10), legs) == []  # 72 h -> 10 h: expired
+
+
+def test_the_72_hour_life_includes_its_last_bar(setup):
+    p, f, legs = setup
+    q = dataclasses.replace(p, confirm_hours=10)  # 40 bars from the bar at whose close the leg is known
+    up = next(k for k, g in enumerate(legs) if g.known_i == 135)
+
+    def leg_known_at(i):
+        return [dataclasses.replace(g, known_i=i) if k == up else g for k, g in enumerate(legs)]
+
+    assert [s.i for s in generate_signals(f, q, leg_known_at(SIGNAL_BAR - 40))] == [SIGNAL_BAR]
+    assert generate_signals(f, q, leg_known_at(SIGNAL_BAR - 41)) == []
 
 
 def test_a_gap_filled_bar_blocks_the_confirmation():
