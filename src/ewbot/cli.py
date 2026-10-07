@@ -992,7 +992,8 @@ def _b_holdout_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     if not lock_exists(STRATB_LOCK):
-        _refuse(f"{STRATB_LOCK} does not exist: `ewbot stratb holdout lock` first")
+        _refuse(f"{STRATB_LOCK} is missing or not a valid strategy-B lock (its sha256 must be the digest of its "
+                "fields): `ewbot stratb holdout lock` first")
     update_caches_15m(args.cache_dir, lock_path=STRATB_LOCK)
     try:
         out = run_holdout_b(confirm=True, cache_dir=args.cache_dir, lock_path=STRATB_LOCK, workers=args.workers)

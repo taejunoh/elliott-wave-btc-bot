@@ -105,4 +105,8 @@ def test_holdout_run_needs_confirm_and_a_lock(tmp_path, monkeypatch, capsys):
     assert "--confirm" in capsys.readouterr().err
     with pytest.raises(SystemExit) as exc:
         main(["stratb", "holdout", "run", "--confirm"])
-    assert exc.value.code == 2
+    assert exc.value.code == 2 and "missing or not a valid strategy-B lock" in capsys.readouterr().err
+    (tmp_path / "holdout-b.lock").write_text(json.dumps({"kind": "ewbot-stratb-holdout", "sha256": "ab" * 32}))
+    with pytest.raises(SystemExit) as exc:  # a hand-made file with the lock's shape is not a lock
+        main(["stratb", "holdout", "run", "--confirm"])
+    assert exc.value.code == 2 and "missing or not a valid strategy-B lock" in capsys.readouterr().err
