@@ -8,41 +8,53 @@ from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.stratb import research
 from ewbot.stratb.config import BConfig, StratBParams, grid_combos
 from ewbot.stratb.engine import BResult, run_engine
-from ewbot.stratb.research import backtest_b, evaluate_folds_b, pick_plateau_b, run_grid_b, walk_forward_b
-from ewbot.stratb.signals import build_frame, generate_signals
-from tests.stratb.helpers import SIGNAL_BAR, T0, long_setup_df, random_df
+from ewbot.stratb.research import (
+    backtest_b,
+    evaluate_folds_b,
+    pick_plateau_b,
+    run_grid_b,
+    trades_by_asset,
+    walk_forward_b,
+)
+from ewbot.stratb.signals import build_frames, generate_signals
+from tests.stratb.helpers import SIGNAL_BAR, long_setup_df, mirror, random_df
 
 H1 = 3600
 COMBOS = grid_combos()
 
 
 def _result(points, trades=()):
-    return BResult(tuple(trades), tuple(EquityPoint(t, e) for t, e in points), (), (), (), (), None, ())
+    return BResult(tuple(trades), tuple(EquityPoint(t, e) for t, e in points), (), (), (), (), (), ())
 
 
 def _trade(ts):
-    return Trade(ts, ts + H1, "B", 1, 1, 100.0, 101.0, 99.0, 101.0, 102.0, 1.0, 0.0, 0.0, 1.0, "TP2", {})
+    return Trade(ts, ts + H1, "B-BTC", 1, 1, 100.0, 101.0, 99.0, 101.0, 102.0, 1.0, 0.0, 0.0, 1.0, "TP2",
+                 {"asset": "BTC"})
 
 
 def test_research_runs_refuse_2024_bars():
-    df = random_df(400, 1, t0=HOLDOUT_START - 200 * 900)
+    early = random_df(400, 2, t0=HOLDOUT_START - 600 * 900)  # ETH ends before 2024, BTC does not
+    dfs = {"BTC": random_df(400, 1, t0=HOLDOUT_START - 200 * 900), "ETH": early}
     with pytest.raises(ValueError):
-        backtest_b(df, BConfig())
+        backtest_b(dfs, BConfig())
     with pytest.raises(ValueError):
-        backtest_b(df, BConfig(), end_ts=HOLDOUT_START + 900)
+        backtest_b({"ETH": early}, BConfig(), end_ts=HOLDOUT_START + 900)
     with pytest.raises(ValueError):
-        run_grid_b(df, int(df["ts"].iloc[0]), HOLDOUT_START + 900)
-    assert backtest_b(df, BConfig(), end_ts=HOLDOUT_START).equity[-1].ts < HOLDOUT_START
-    assert backtest_b(df, BConfig(), include_holdout=True).equity[-1].ts >= HOLDOUT_START
+        run_grid_b(dfs, int(early["ts"].iloc[0]), HOLDOUT_START + 900)
+    assert backtest_b(dfs, BConfig(), end_ts=HOLDOUT_START).equity[-1].ts < HOLDOUT_START
+    assert backtest_b(dfs, BConfig(), include_holdout=True).equity[-1].ts >= HOLDOUT_START
 
 
-def test_a_backtest_is_the_engine_on_the_rule_signals():
-    df = long_setup_df()
+def test_a_backtest_is_the_engine_on_each_asset_rule_signals():
+    dfs = {"BTC": long_setup_df(), "ETH": mirror(long_setup_df())}
     p = StratBParams(zz_k=2.0)
-    res = backtest_b(df, BConfig(params=p))
-    f = build_frame(df, p)
-    assert res == run_engine(f, generate_signals(f, p), BConfig(params=p))
-    assert res.signals[0].i == SIGNAL_BAR and res.trades[0].entry_ts == int(f.ts[SIGNAL_BAR + 1])
+    res = backtest_b(dfs, BConfig(params=p))
+    frames = build_frames(dfs, p)
+    assert res == run_engine(frames, {a: generate_signals(f, p) for a, f in frames.items()}, BConfig(params=p))
+    assert [(s.i, o.asset, o.direction) for s, o in zip(res.signals, res.orders)] == [(SIGNAL_BAR, "BTC", 1),
+                                                                                       (SIGNAL_BAR, "ETH", -1)]
+    assert {t.entry_ts for t in res.trades} == {int(frames["BTC"].ts[SIGNAL_BAR + 1])}
+    assert trades_by_asset(res.trades) == {"BTC": 1, "ETH": 1}
 
 
 def test_on_a_two_level_grid_the_plateau_is_the_best_own_calmar():
@@ -88,25 +100,29 @@ def test_folds_pick_on_training_stitch_the_test_windows_and_decide_proceed():
     assert out["chosen_final"] == COMBOS[7] and out["chosen_final_fallback"] is True and out["proceed"] is False
 
 
-def test_the_grid_runs_every_combo_once_with_the_breakers_off():
-    df = random_df(3000, 3)
-    start = int(df["ts"].iloc[400])
-    out = run_grid_b(df, start, int(df["ts"].iloc[-1]) + 900, workers=1)
+def test_the_grid_runs_every_combo_once_on_both_assets_with_the_breakers_off():
+    dfs = {"BTC": random_df(3000, 3), "ETH": random_df(3000, 4)}
+    start, end = int(dfs["BTC"]["ts"].iloc[400]), int(dfs["BTC"]["ts"].iloc[-1]) + 900
+    out = run_grid_b(dfs, start, end, workers=1)
     assert list(out) == COMBOS and all(r.equity[0].ts >= start for r in out.values())
-    assert any(r.trades for r in out.values())
-    assert run_grid_b(df, start, int(df["ts"].iloc[-1]) + 900, workers=2) == out
+    assert {a for r in out.values() for a, n in trades_by_asset(r.trades).items() if n} == {"BTC", "ETH"}
+    assert run_grid_b(dfs, start, end, workers=2) == out
 
 
 def test_walk_forward_cuts_2024_and_uses_strategy_a_folds(monkeypatch):
     seen = {}
 
-    def fake_grid(df, start, end, workers):
-        seen.update(max_ts=int(df["ts"].max()), start=start, end=end)
+    def fake_grid(dfs, start, end, workers):
+        assert sorted(dfs) == ["BTC", "ETH"]
+        seen.update(max_ts=max(int(df["ts"].max()) for df in dfs.values()), start=start, end=end)
         return {c: _result([(start, 10_000.0), (end - H1, 10_000.0)]) for c in COMBOS}
 
     monkeypatch.setattr(research, "run_grid_b", fake_grid)
     df = pd.concat([random_df(50, 1, t0=HOLDOUT_START - 50 * 900), random_df(50, 2, t0=HOLDOUT_START)])
-    out = walk_forward_b(df, workers=1)
+    out = walk_forward_b({"BTC": df, "ETH": df}, workers=1)
     assert seen == {"max_ts": HOLDOUT_START - 900, "start": 1_483_228_800, "end": HOLDOUT_START}
     assert len(out["folds"]) == 10 and out["folds"][0]["test"][0] == 1_546_300_800  # 2019-01-01
     assert out["chosen_final"] is None and out["proceed"] is False and len(out["combo_table"]) == 32
+    assert out["combo_table"][0]["n_trades_by_asset"] == {"BTC": 0, "ETH": 0}
+    with pytest.raises(ValueError, match="every asset"):
+        walk_forward_b({"BTC": df}, workers=1)
