@@ -5,7 +5,9 @@ import dataclasses
 import pandas as pd
 import pytest
 
+from ewbot.backtest.metrics import compute_metrics
 from ewbot.config import BreakerParams, CostParams
+from ewbot.engine.loop import EquityPoint
 from ewbot.execution.costs import fee, funding_per_hour, slip
 from ewbot.risk.sizing import size_contracts
 from ewbot.stratb.config import RISK_B, BConfig, StratBParams, asset_costs
@@ -145,11 +147,21 @@ def test_end_of_data_entries_from_start_and_hourly_equity():
     s = [sig(2, f, 19_900.0, 20_100.0, 20_300.0), sig(15, f, 19_900.0, 20_100.0, 20_300.0)]
     res = run(f, s, start_ts=T0 + H1)
     assert res.orders == ()  # bar 2 is before start_ts, bar 15 is the last bar
-    assert [p.ts for p in res.equity] == [T0 + H1, T0 + 2 * H1, T0 + 3 * H1]
+    assert [p.ts for p in res.equity] == [T0, T0 + H1, T0 + 2 * H1, T0 + 3 * H1]  # T0: the account at start_ts
     res = run(f, s[:1])
     (end,) = res.end_fills
     assert end.kind == "END" and end.asset == "BTC" and res.trades[-1].exit_reason == "END"
     assert [x.kind for x in res.fills] == ["ENTRY"] and res.equity[-1].equity == pytest.approx(res.trades[-1].pnl + 10_000.0)
+
+
+def test_a_start_time_measures_the_first_hour_from_the_starting_equity():
+    f = bars(flat(16))
+    res = run(f, [sig(4, f, 19_900.0, 20_100.0, 20_300.0)], start_ts=T0 + H1)  # fills at T0 + H1 + 15 min
+    assert res.equity[0] == EquityPoint(T0, 10_000.0) and res.equity[1].ts == T0 + H1
+    assert res.equity[1].equity < 10_000.0  # the entry's fee and slippage fall in the first hour
+    m = compute_metrics(res.equity, res.trades, T0 + H1, T0 + 4 * H1)
+    assert m.total_return == pytest.approx(res.equity[-1].equity / 10_000.0 - 1.0) and m.n_trades == 1
+    assert run(f, [], start_ts=T0).equity[0].ts == T0  # no bar before the start: no earlier point
 
 
 def test_entries_are_dropped_on_a_gap_bar_or_an_open_beyond_the_stop():

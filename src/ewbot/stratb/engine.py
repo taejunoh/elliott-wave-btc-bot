@@ -25,8 +25,12 @@ ETH):
      equity; TP1 takes half (1 contract: all of it). A signal on an asset that holds a position or has an
      entry queued is dropped;
   8. last bar: every open position is closed at its close (END, not a decision);
-  9. at each hour's close with hour >= start_ts: EquityPoint(hour open ts, account equity at the close) -
-     hourly equity, so A's metrics (annualised with 8760 hours) apply unchanged."""
+  9. at each hour's close from start_ts's hour boundary on (every close at or after floor(start_ts, 1 h)):
+     EquityPoint(hour open ts, account equity at the close) - hourly equity, so A's metrics (annualised with
+     8760 hours) apply unchanged. With a start time the first point is the hour before it, the account just
+     before the first entry can fill, so compute_metrics(start_ts=...) measures the first hour (an entry's
+     costs at hh:15 included) from the starting value; with none, or no bar before it, the curve starts at the
+     first hour."""
 
 from __future__ import annotations
 
@@ -297,7 +301,7 @@ def run_engine(
                     key = p.entry_ts
                     f_end = close(j, t, "EXIT", slip(mark_px[j], -p.direction, costs[j]), p.contracts, "END")
                     end_fills.append(FillB(f_end.ts, f_end.asset, "END", f_end.contracts, f_end.price, f_end.fee, key))
-        if hour_close and (start_ts is None or t - _HOUR_LAST >= start_ts):  # 9.
+        if hour_close and (start_ts is None or t + M15 >= start_ts // H1 * H1):  # 9.
             equity.append(EquityPoint(t - _HOUR_LAST, account_equity()))
     return BResult(tuple(trades), tuple(equity), tuple(sigs), tuple(orders), tuple(fills), tuple(stops),
                    tuple(end_fills), tuple(events))

@@ -104,7 +104,7 @@ def test_the_grid_runs_every_combo_once_on_both_assets_with_the_breakers_off():
     dfs = {"BTC": random_df(3000, 3), "ETH": random_df(3000, 4)}
     start, end = int(dfs["BTC"]["ts"].iloc[400]), int(dfs["BTC"]["ts"].iloc[-1]) + 900
     out = run_grid_b(dfs, start, end, workers=1)
-    assert list(out) == COMBOS and all(r.equity[0].ts >= start for r in out.values())
+    assert list(out) == COMBOS and all(r.equity[0] == EquityPoint(start - H1, 10_000.0) for r in out.values())
     assert {a for r in out.values() for a, n in trades_by_asset(r.trades).items() if n} == {"BTC", "ETH"}
     assert run_grid_b(dfs, start, end, workers=2) == out
 

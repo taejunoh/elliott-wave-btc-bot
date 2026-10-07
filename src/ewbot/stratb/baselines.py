@@ -3,7 +3,9 @@ of a 50/50 BTC/ETH portfolio and the random-entry control.
 
 Buy & hold splits the initial equity equally between the assets and runs A's backtest.benchmarks.buy_hold
 on each asset's 1h bars built from its 15m frame (spot, the part's whole equity, one fee and one slippage
-each way, hourly marks; no rebalancing); its equity is the sum of the parts. The random control keeps
+each way, hourly marks; no rebalancing); its equity is the sum of the parts, after the same starting point
+as the engine's curve (the initial equity at the hour before start_ts, when the frames have that hour), so
+strategy B and buy & hold are measured over the same hours. The random control keeps
 everything of strategy B but the entry times, per asset: the same window, as many entries on each asset
 as B's trades on it (each asset's own frequency), that asset's own trade shapes (direction, stop distance
 as a fraction of the reference price, TP1 and TP2 in R) in a seeded random order, on uniformly drawn 15m
@@ -23,10 +25,11 @@ import pandas as pd
 from ewbot.backtest.benchmarks import buy_hold
 from ewbot.backtest.metrics import compute_metrics
 from ewbot.engine.loop import EquityPoint, Trade
-from ewbot.stratb.config import BConfig, asset_costs
+from ewbot.stratb.config import M15, BConfig, asset_costs
 from ewbot.stratb.data15 import resample_1h
 from ewbot.stratb.engine import asset_of, run_engine
 from ewbot.stratb.signals import Frame15, SignalB
+from ewbot.types import H1
 
 RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")
 
@@ -70,6 +73,9 @@ def buy_hold_b(
         parts.append(eq)
         trades.extend(tr)
     out: list[EquityPoint] = []
+    base = start_ts // H1 * H1 - H1  # run_engine's first point with a start time: the account before the window
+    if any(parts) and min(int(frames[a].ts[0]) for a in names) <= base + H1 - M15:
+        out.append(EquityPoint(base, float(cfg.initial_equity)))
     cur, nxt = [share] * len(parts), [0] * len(parts)
     for t in sorted({p.ts for eq in parts for p in eq}):
         for k, eq in enumerate(parts):  # each part at its latest point at or before t

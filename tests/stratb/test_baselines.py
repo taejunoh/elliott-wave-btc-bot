@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ewbot.backtest.benchmarks import buy_hold
-from ewbot.engine.loop import Trade
+from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.stratb.baselines import buy_hold_b, random_control, random_signals, trade_shapes
 from ewbot.stratb.config import BConfig, StratBParams, asset_costs
 from ewbot.stratb.data15 import resample_1h
@@ -24,9 +24,21 @@ def test_buy_hold_is_a_50_50_portfolio_of_strategy_a_buy_holds():
     start, end = int(frames["BTC"].ts[100]) // 3600 * 3600, int(frames["BTC"].ts[900]) // 3600 * 3600
     eq, trades = buy_hold_b(frames, start, end, BConfig())
     parts = [buy_hold(resample_1h(dfs[a]), start, end, asset_costs(BConfig(), a), 5_000.0) for a in ("BTC", "ETH")]
-    assert [p.ts for p in eq] == [p.ts for p in parts[0][0]] == [p.ts for p in parts[1][0]]
-    assert [p.equity for p in eq] == pytest.approx([a.equity + b.equity for a, b in zip(parts[0][0], parts[1][0])])
-    assert trades == parts[0][1] + parts[1][1] and eq[0].equity == 10_000.0 and trades[0].setup == "BH"
+    assert eq[0] == EquityPoint(start - 3600, 10_000.0)  # the account before the window, as the engine's
+    assert [p.ts for p in eq[1:]] == [p.ts for p in parts[0][0]] == [p.ts for p in parts[1][0]]
+    assert [p.equity for p in eq[1:]] == pytest.approx([a.equity + b.equity for a, b in zip(parts[0][0], parts[1][0])])
+    assert trades == parts[0][1] + parts[1][1] and eq[1].equity == 10_000.0 and trades[0].setup == "BH"
+
+
+def test_strategy_b_and_buy_and_hold_are_measured_on_the_same_hours():
+    dfs = {"BTC": random_df(3000, 3), "ETH": random_df(3000, 4, start=2_000.0)}
+    cfg = BConfig()
+    frames = build_frames(dfs, cfg.params)
+    start, end = RANDOM_T0 + 100 * 3600, RANDOM_T0 + 600 * 3600
+    res = backtest_b(dfs, cfg, start, end)
+    bh, _ = buy_hold_b(frames, start, end, cfg)
+    assert [p.ts for p in res.equity] == [p.ts for p in bh] == list(range(start - 3600, end, 3600))
+    assert res.equity[0] == bh[0] == EquityPoint(start - 3600, 10_000.0)
 
 
 def test_shapes_come_from_the_signal_reference_price():
