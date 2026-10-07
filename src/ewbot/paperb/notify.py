@@ -69,7 +69,9 @@ def decision_events_b(
     cur_closed: Sequence[Trade],
 ) -> list[dict[str, Any]]:
     """ENTRY, BREAKEVEN and CLOSE events for the decisions first recorded in this run (A's rules). `trades`
-    maps the B trade key (decisions.key_of) to every trade of the run; open_keys are the open positions'."""
+    maps the B trade key (decisions.key_of) to every trade of the run; open_keys are the open positions'.
+    A close's n/30 counts the epoch's closed trades up to it in (exit ts, trade key) order, so two trades
+    closing on the same bar get consecutive numbers."""
     out: list[dict[str, Any]] = []
     for d in fresh:
         t = trades.get(d["trade_key"])
@@ -81,6 +83,6 @@ def decision_events_b(
             out.append(make_event("BREAKEVEN", d["ts"], d["trade_key"], b_head(a_notify.stop_move_text(d, t))))
         elif d["kind"] in ("STOP", "TP1", "TP2", "EXIT") and key_of(t) not in open_keys and t.exit_ts == d["ts"]:
             counted = t.entry_ts > int(epoch_start)
-            n_at = sum(1 for x in cur_closed if x.exit_ts <= t.exit_ts)
+            n_at = sum(1 for x in cur_closed if (x.exit_ts, key_of(x)) <= (t.exit_ts, key_of(t)))
             out.append(make_event("CLOSE", d["ts"], d["trade_key"], close_text_b(t, n_at, count["required"], counted)))
     return out

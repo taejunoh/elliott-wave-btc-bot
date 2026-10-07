@@ -118,6 +118,20 @@ def test_two_assets_entering_on_the_same_bar_have_distinct_decisions_and_message
     assert "B-BTC 롱" in events[0]["text"] and "B-ETH 숏" in events[1]["text"]
 
 
+def test_two_trades_closing_on_the_same_bar_count_one_after_the_other():
+    eth_flat = tuple(x / 10 for x in FLAT[0])
+    f = _frame(FLAT * 5 + [(20_000.0, 20_005.0, 19_850.0, 19_860.0)] + FLAT * 2)  # BTC long: stop at bar 5
+    g = _frame([eth_flat] * 5 + [(2_000.0, 2_015.0, 1_999.5, 2_012.0)] + [eth_flat] * 2)  # ETH short: stop at bar 5
+    res = run_engine({"BTC": f, "ETH": g}, {"BTC": [_sig(f)], "ETH": [_sig(g, d=-1, scale=0.1)]}, BConfig())
+    assert [(t.setup, t.exit_reason, t.exit_ts) for t in res.trades] == [("B-BTC", "STOP", int(f.ts[5])),
+                                                                          ("B-ETH", "STOP", int(f.ts[5]))]
+    dec = build_decisions_b(res)
+    events = decision_events_b(dec, {key_of(t): t for t in res.trades}, set(), 0, {"required": 30}, list(res.trades))
+    closes = [e["text"] for e in events if e["kind"] == "CLOSE"]
+    assert len(closes) == 2 and "B-BTC" in closes[0] and "1/30" in closes[0]
+    assert "B-ETH" in closes[1] and "2/30" in closes[1]
+
+
 def test_messages_carry_the_paper_b_prefix():
     _, res = _run(TP1_THEN_BE)
     t = res.trades[0]
