@@ -2,18 +2,22 @@
 
 create_lock() writes <project root>/holdout-b.lock BEFORE any 2024+ candle can be read (data15 refuses
 them until a lock exists): the walk-forward's final combo, the full run config (assets included), the
-grid, the B fingerprint, the sha256 of each asset's pre-2024 15m bars the walk-forward used (wf_data:
-BTC and ETH), the holdout start, the replay anchor (2023-10-01), the 1,000-run random control and its
-seed, and last_bar_ts - the last 15m bar of the last complete hour at lock time, where the holdout ends
-(spec 6.4). The user commits it.
+grid, the B fingerprint, deps_sha256 (fingerprint.deps_fingerprint: the strategy-A modules B imports -
+config defaults, costs, sizing, breakers, metrics, buy & hold, walk-forward windows, data hashing, ...),
+the sha256 of each asset's pre-2024 15m bars the walk-forward used (wf_data: BTC and ETH), the holdout
+start, the replay anchor (2023-10-01), the 1,000-run random control and its seed, and last_bar_ts - the
+last 15m bar of the last complete hour at lock time, where the holdout ends (spec 6.4). It refuses when a
+tracked file of the lock's git working tree has uncommitted changes. The user commits it.
 
 run_holdout_b() runs the holdout ONCE after the user's approval (confirm=True) and records the result in
 first_run. It refuses (HoldoutBError) unless: the lock's sha256 is the digest of its own bound fields and
 equals the committed version's (git HEAD); first_run is empty there and in the file (one completed run,
 ever: no rerun, no other combo); the running B fingerprint equals code_sha256 (no B code change after the
-lock); every asset's pre-2024 bars hash to its wf_data sha256; every asset's data reaches last_bar_ts;
-an unfinished earlier attempt saw the same holdout bars. Each attempt is recorded in the lock before it
-runs.
+lock); the lock's keys, grid, config, holdout_start and replay_anchor are what this code writes for its
+params (lock_mismatch_b); the strategy-A modules B imports hash to deps_sha256; no tracked file but the
+lock itself has uncommitted changes; every asset's pre-2024 bars hash to its wf_data sha256; every
+asset's data reaches last_bar_ts; an unfinished earlier attempt saw the same holdout bars. Each attempt
+is recorded in the lock before it runs.
 
 Criteria (spec 6.5 as revised 2026-10-07, on the BTC + ETH portfolio, all four): Sharpe above the 50/50
 buy & hold and above the 95th percentile of the random control (each asset's own entry frequency); max
@@ -40,7 +44,7 @@ from ewbot.stratb.baselines import buy_hold_b, random_control
 from ewbot.stratb.config import ASSETS, GRID_B, M15, combo_to_json, config_for, normalize_combo, scale_costs
 from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m, lock_digest_b
 from ewbot.stratb.engine import run_engine
-from ewbot.stratb.fingerprint import stratb_fingerprint
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.research import backtest_b, trades_by_asset
 from ewbot.stratb.signals import build_frames, generate_signals
 from ewbot.types import H1
@@ -94,6 +98,38 @@ def committed_lock(path: Path) -> dict[str, Any]:
         raise HoldoutBError(f"the committed {p.name} is not JSON") from exc
 
 
+def _dirty(path: Path) -> list[str]:
+    """Tracked files of the lock's git working tree with uncommitted changes, the lock itself excepted."""
+    p = Path(path)
+    cmd = ["git", "-C", str(p.parent), "status", "--porcelain", "--untracked-files=no", "--", ":/", f":!{p.name}"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HoldoutBError(f"git is not available to check the working tree: {exc}") from exc
+    if r.returncode != 0:
+        raise HoldoutBError(f"{p.parent} is not a git working tree (the lock is committed there): {r.stderr.strip()}")
+    return [line[3:] for line in r.stdout.splitlines() if line.strip()]
+
+
+def _refuse_dirty(path: Path) -> None:
+    dirty = _dirty(path)
+    if dirty:
+        raise HoldoutBError(f"uncommitted changes to tracked files {dirty[:5]}{' ...' if len(dirty) > 5 else ''}: "
+                            "the lock is written and the holdout runs on a clean tree (commit or discard them)")
+
+
+def lock_mismatch_b(lock: Mapping[str, Any]) -> list[str]:
+    """The lock fields that are not what this code writes for the lock's params: keys, grid, config
+    (config_for(params)), holdout_start, replay_anchor; ["params"] when the params are not a grid combo."""
+    try:
+        combo = normalize_combo(lock.get("params") or [])
+    except (TypeError, ValueError):
+        return ["params"]
+    want = {"keys": list(GRID_B), "grid": to_jsonable(GRID_B), "config": to_jsonable(dataclasses.asdict(config_for(combo))),
+            "holdout_start": HOLDOUT_START, "replay_anchor": REPLAY_ANCHOR}
+    return [k for k, v in want.items() if lock.get(k) != v]
+
+
 def wf_data_record(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
     """{asset: {first_ts, last_ts, n_bars, sha256}} of every asset's walk-forward bars (all before 2024)."""
     if sorted(dfs_wf) != sorted(ASSETS):
@@ -140,6 +176,7 @@ def create_lock(
         raise HoldoutBError("the lock must be written after 2024-01-01")
     if int(random_runs) < 1:
         raise HoldoutBError("random_runs must be >= 1 (criterion 1 compares with the random control)")
+    _refuse_dirty(path)
     lock: dict[str, Any] = {
         "kind": LOCK_KIND,
         "version": LOCK_VERSION,
@@ -153,6 +190,7 @@ def create_lock(
         "random_runs": int(random_runs),
         "random_seed": int(random_seed),
         "code_sha256": stratb_fingerprint(),
+        "deps_sha256": deps_fingerprint(),
         "wf_data": wf_data_record(dfs_wf),
     }
     lock.update(sha256=lock_digest_b(lock), params_source=params_source, locked_at=_now(), **git_state(),
@@ -184,6 +222,7 @@ def run_holdout_b(
     lock_path: Path = DEFAULT_LOCK_PATH,
     workers: int = 1,
     fingerprint: Callable[[], str] = stratb_fingerprint,
+    deps: Callable[[], str] = deps_fingerprint,
 ) -> dict[str, Any]:
     """The one-shot holdout over [2024-01-01, last_bar_ts], recomputed from REPLAY_ANCHOR (2023-10-01)."""
     if not confirm:
@@ -197,6 +236,14 @@ def run_holdout_b(
         raise HoldoutBError("the strategy-B holdout has already run once: no rerun, no other combo (spec 6.4)")
     if fingerprint() != lock["code_sha256"]:
         raise HoldoutBError("the strategy-B code changed after the lock (B fingerprint differs): refusing")
+    stale = lock_mismatch_b(lock)
+    if stale:
+        raise HoldoutBError(f"the lock's {stale} are not this code's (keys, grid, config_for(params), holdout start, "
+                            "replay anchor): refusing")
+    if deps() != lock.get("deps_sha256"):
+        raise HoldoutBError("the strategy-A modules strategy B imports changed after the lock (deps_sha256 differs): "
+                            "refusing")
+    _refuse_dirty(path)
     dfs = {a: load_15m(p, include_holdout=True, lock_path=path) for a, p in cache_paths(cache_dir).items()}
     wf = wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a, df in dfs.items()})
     changed = [a for a in ASSETS if wf[a]["sha256"] != lock["wf_data"][a]["sha256"]]

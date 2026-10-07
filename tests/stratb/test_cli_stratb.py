@@ -8,6 +8,7 @@ from ewbot import cli
 from ewbot.cli import build_parser, main
 from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths
 from ewbot.stratb.holdout import read_lock
+from tests.paper.helpers import git
 from tests.stratb.helpers import save_world, world_dfs
 
 HS = 1_704_067_200
@@ -80,7 +81,9 @@ def test_walkforward_writes_json_and_says_whether_to_proceed(tmp_path, cache, mo
 
 
 def test_holdout_lock_needs_a_walk_forward_that_proceeds(tmp_path, cache, monkeypatch, capsys):
-    lock_path = tmp_path / "holdout-b.lock"
+    (tmp_path / "repo").mkdir()
+    git(tmp_path / "repo", "init", "-q")
+    lock_path = tmp_path / "repo" / "holdout-b.lock"
     monkeypatch.setattr(cli, "STRATB_LOCK", lock_path)
     wf = tmp_path / "wf.json"
     wf.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": False}))

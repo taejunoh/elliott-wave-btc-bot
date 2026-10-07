@@ -6,8 +6,16 @@ import pandas as pd
 import pytest
 
 from ewbot.backtest.metrics import Metrics
-from ewbot.stratb.data15 import REPLAY_ANCHOR, HoldoutGuardError, cache_paths, load_15m, load_caches_15m, lock_digest_b
-from ewbot.stratb.fingerprint import stratb_fingerprint
+from ewbot.stratb.data15 import (
+    LOCK_BOUND,
+    REPLAY_ANCHOR,
+    HoldoutGuardError,
+    cache_paths,
+    load_15m,
+    load_caches_15m,
+    lock_digest_b,
+)
+from ewbot.stratb.fingerprint import deps_files, deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.holdout import (
     HoldoutBError,
     create_lock,
@@ -48,6 +56,15 @@ def _commit(world):
     git(repo, "commit", "-q", "-m", "lock")
 
 
+def _recommit(world, edit):
+    """Edit the committed lock (its sha256 recomputed, so only the code checks can catch it) and commit it."""
+    lock = json.loads(world[2].read_text())
+    edit(lock)
+    lock["sha256"] = lock_digest_b(lock)
+    world[2].write_text(json.dumps(lock))
+    _commit(world)
+
+
 def test_2024_bars_are_unreadable_until_the_lock_exists(world):
     _, cache, lock_path = world
     for p in cache_paths(cache).values():
@@ -64,6 +81,11 @@ def test_the_lock_binds_params_code_data_and_window_and_is_written_once(world):
     assert lock["params"] == COMBO and lock["sha256"] == lock_digest_b(lock)
     assert lock["last_bar_ts"] == NOW // 3600 * 3600 - 900 and (lock["holdout_start"], lock["replay_anchor"]) == (HS, REPLAY_ANCHOR)
     assert lock["code_sha256"] == stratb_fingerprint() and lock["random_runs"] == 4 and lock["first_run"] is None
+    assert lock["deps_sha256"] == deps_fingerprint() and {"code_sha256", "deps_sha256", "wf_data"} <= set(LOCK_BOUND)
+    a_side = {f"src/ewbot/{m}" for m in ("config.py", "indicators.py", "backtest/metrics.py", "backtest/benchmarks.py",
+              "backtest/holdout.py", "backtest/walkforward.py", "execution/costs.py", "risk/sizing.py",
+              "risk/breakers.py", "waves/zigzag.py", "data/coinbase_history.py")}
+    assert a_side <= set(deps_files())
     assert [(a, w["last_ts"]) for a, w in lock["wf_data"].items()] == [("BTC", HS - 900), ("ETH", HS - 900)]
     assert lock["wf_data"]["BTC"]["sha256"] != lock["wf_data"]["ETH"]["sha256"]
     assert lock["config"]["risk"]["risk_pct"] == 0.005 and lock["config"]["max_total_leverage"] == 3.0
@@ -117,6 +139,50 @@ def test_a_b_code_change_or_other_walk_forward_bars_are_refused(world):
     df.to_parquet(eth, index=False)
     with pytest.raises(HoldoutBError, match=r"\['ETH'\] 15m bars before 2024-01-01 differ"):
         run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+
+
+def test_the_holdout_refuses_a_lock_that_is_not_this_codes_and_changed_strategy_a_modules(world):
+    _, cache, lock_path = world
+    _lock(world)
+    _commit(world)
+    with pytest.raises(HoldoutBError, match="strategy-A modules"):
+        run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path, deps=lambda: "0" * 64)
+    edits = {"config": lambda x: x["config"].update(initial_equity=20_000.0),
+             "grid": lambda x: x["grid"]["zz_k"].append(4.0), "keys": lambda x: x["keys"].reverse(),
+             "holdout_start": lambda x: x.update(holdout_start=HS + 3600),
+             "replay_anchor": lambda x: x.update(replay_anchor=REPLAY_ANCHOR - 86_400)}
+    for field, edit in edits.items():
+        original = lock_path.read_text()
+        _recommit(world, edit)
+        with pytest.raises(HoldoutBError, match=rf"\['{field}'\] are not this code's"):
+            run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+        _recommit(world, lambda x: x.clear() or x.update(json.loads(original)))
+    assert read_lock(lock_path)["attempts"] == []
+
+
+def test_a_dirty_tracked_tree_is_refused_at_lock_and_run_but_not_the_lock_itself(world, tmp_path):
+    repo, cache, lock_path = world
+    (repo / "notes.txt").write_text("a\n")
+    git(repo, "add", "notes.txt")
+    git(repo, "commit", "-q", "-m", "notes")
+    (repo / "notes.txt").write_text("b\n")
+    with pytest.raises(HoldoutBError, match="uncommitted changes"):
+        _lock(world)
+    assert not lock_path.exists()
+    git(repo, "checkout", "-q", "notes.txt")
+    _lock(world)
+    _commit(world)
+    (repo / "notes.txt").write_text("b\n")
+    with pytest.raises(HoldoutBError, match="uncommitted changes"):
+        run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+    git(repo, "checkout", "-q", "notes.txt")
+    lock = json.loads(lock_path.read_text())
+    lock["attempts"].append({"started": "x", "data_sha256": "f" * 64})  # an uncommitted change of the lock itself
+    lock_path.write_text(json.dumps(lock))
+    with pytest.raises(HoldoutBError, match="other holdout bars"):  # past the clean-tree check
+        run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="not a git working tree"):
+        create_lock(COMBO, load_caches_15m(cache), params_source="t", now_ts=NOW, lock_path=tmp_path / "holdout-b.lock")
 
 
 def test_the_holdout_runs_once_and_records_the_criteria(world):

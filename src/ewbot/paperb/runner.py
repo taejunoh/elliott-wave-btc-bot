@@ -7,7 +7,9 @@ padded bar of the late asset), and the run records a warning.
 
 Inputs are frozen by holdout-b.lock: the params and the whole run config come from it (the precheck refuses
 a lock whose sha256 is not the digest of its fields, that is not committed unchanged, whose holdout has
-not run or failed - strategy B ended -, or whose config is not config_for(params) of this code). The
+not run or failed - strategy B ended -, whose keys, grid, config, holdout start or replay anchor are not
+this code's (holdout.lock_mismatch_b), or whose deps_sha256 is not the hash of the strategy-A modules B
+imports now - a changed A module is refused like a lock problem, not a new epoch). The
 recompute starts at REPLAY_ANCHOR (2023-10-01) and trades from HOLDOUT_START, exactly like the holdout
 run, so it reproduces the holdout and continues it; trades entering after the lock's last bar are paper
 trades. When the holdout window's bars (both assets) no longer hash to first_run.data.sha256 (a Coinbase candle
@@ -22,7 +24,6 @@ alert. Nothing is written before the write stage."""
 
 from __future__ import annotations
 
-import dataclasses
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -33,7 +34,6 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.report import to_jsonable
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.paper.decisions import decisions_to_record, known_at, paper_trades, verify_decisions
 from ewbot.paper.environment import environment_digest, runtime_environment
@@ -63,8 +63,8 @@ from ewbot.paperb.ledger import holdout_summary_b, new_ledger_b, paper_count_b
 from ewbot.paperb.notify import b_head, daily_text_b, decision_events_b, holdout_trades_text_b, position_lines_b
 from ewbot.stratb.config import ASSETS, config_for, normalize_combo
 from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, REPLAY_ANCHOR, load_15m, update_caches_15m
-from ewbot.stratb.fingerprint import stratb_fingerprint
-from ewbot.stratb.holdout import HoldoutBError, committed_lock, data_fingerprint_b, read_lock
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
+from ewbot.stratb.holdout import HoldoutBError, committed_lock, data_fingerprint_b, lock_mismatch_b, read_lock
 from ewbot.stratb.research import backtest_b
 from ewbot.types import H1
 
@@ -99,6 +99,7 @@ class PaperBEnv:
     sender: Sender | None = None
     clock: Callable[[], int] = _wall_clock
     fingerprint: Callable[[], str] = stratb_fingerprint
+    deps: Callable[[], str] = deps_fingerprint
     sleep: Callable[[float], None] = time.sleep
     fetch_backoff_s: float = 10.0
     environment: Callable[[], dict[str, Any]] = runtime_environment
@@ -130,8 +131,9 @@ def _stage(name: str, *, detail: bool = True) -> Iterator[None]:
         raise PaperBRunError(name, f"{type(exc).__name__} (details withheld: may contain the token)") from None
 
 
-def precheck_lock_b(lock_path: Path) -> dict[str, Any]:
-    """The committed, passed strategy-B lock whose config is this code's config for its params."""
+def precheck_lock_b(lock_path: Path, deps: Callable[[], str] = deps_fingerprint) -> dict[str, Any]:
+    """The committed, passed strategy-B lock of this code: its config is this code's config for its params, and
+    the strategy-A modules B imports still hash to its deps_sha256."""
     try:
         lock = read_lock(lock_path)
         if committed_lock(lock_path) != lock:
@@ -143,14 +145,13 @@ def precheck_lock_b(lock_path: Path) -> dict[str, Any]:
         raise PaperBRunError("precheck", "the strategy-B holdout has not run: paper trading starts after it passes")
     if not fr["criteria"].get("passed"):
         raise PaperBRunError("precheck", "the strategy-B holdout failed (spec 6.5): strategy B ended, no paper trading")
-    try:
-        combo = normalize_combo(lock["params"])
-    except ValueError as exc:
-        raise PaperBRunError("precheck", str(exc)) from exc
-    if int(lock["holdout_start"]) != HOLDOUT_START or int(lock["replay_anchor"]) != REPLAY_ANCHOR:
-        raise PaperBRunError("precheck", "the lock's holdout start or replay anchor is not this code's")
-    if lock["config"] != to_jsonable(dataclasses.asdict(config_for(combo))):
-        raise PaperBRunError("precheck", "the lock's run config is not this code's config for its params")
+    stale = lock_mismatch_b(lock)
+    if stale:
+        raise PaperBRunError("precheck", f"the lock's {stale} are not this code's (keys, grid, config_for(params), "
+                                         "holdout start, replay anchor)")
+    if deps() != lock.get("deps_sha256"):
+        raise PaperBRunError("precheck", "the strategy-A modules strategy B imports changed since the lock "
+                                         "(deps_sha256 differs): refusing")
     return lock
 
 
@@ -226,7 +227,7 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
     with _stage("precheck"):
         now = int(env.clock())
         run_id = _run_id(now)
-        lock = precheck_lock_b(Path(env.lock_path))
+        lock = precheck_lock_b(Path(env.lock_path), env.deps)
         cfg = config_for(normalize_combo(lock["params"]))
         ledger_dir = Path(env.ledger_dir)
         run_env = dict(env.environment())

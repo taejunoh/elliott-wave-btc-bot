@@ -43,7 +43,7 @@ REPLAY_ANCHOR = utc_ts("2023-10-01")  # spec 6.4: holdout and paper runs both re
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout-b.lock"
 LOCK_KIND = "ewbot-stratb-holdout"
 LOCK_BOUND = ("kind", "version", "keys", "params", "config", "grid", "holdout_start", "replay_anchor", "last_bar_ts",
-              "random_runs", "random_seed", "code_sha256", "wf_data")  # the lock fields its sha256 binds
+              "random_runs", "random_seed", "code_sha256", "deps_sha256", "wf_data")  # the fields its sha256 binds
 FETCH_TRIES = 3  # per page, on a connection error or a timeout
 FETCH_BACKOFF_S = 1.0  # waits 1 s, then 2 s
 

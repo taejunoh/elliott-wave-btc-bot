@@ -11,6 +11,7 @@ from ewbot.paper.notify import NY
 from ewbot.paperb.notify import HEAD_B
 from ewbot.paperb.runner import PaperBRunError, precheck_lock_b, run_paper_b
 from ewbot.stratb.data15 import lock_digest_b
+from ewbot.stratb.fingerprint import deps_files, deps_fingerprint
 from tests.paper.helpers import git
 from tests.paperb.helpers import LAST_BAR, FakeFetchB, commit_lock_b, make_env, world
 
@@ -44,8 +45,16 @@ def test_the_precheck_needs_the_committed_passed_lock_of_this_code(tmp_path, loc
     other = json.loads(lock_text)
     other["config"]["initial_equity"] = 20_000.0
     other["sha256"] = lock_digest_b(other)
-    with pytest.raises(PaperBRunError, match="not this code's config"):
+    with pytest.raises(PaperBRunError, match=r"\['config'\] are not this code's"):
         precheck_lock_b(commit_lock_b(tmp_path / "e", json.dumps(other)))
+    assert lock["deps_sha256"] == deps_fingerprint()
+    assert {f"src/ewbot/paper/{m}.py" for m in ("ledger", "decisions", "notify", "environment")} <= set(deps_files())
+    with pytest.raises(PaperBRunError, match="strategy-A modules"):
+        precheck_lock_b(commit_lock_b(tmp_path / "g", lock_text), deps=lambda: "0" * 64)
+    env, _, _ = make_env(tmp_path / "f", lock_text, LAST_BAR + 900 + 60, deps=lambda: "0" * 64)
+    with pytest.raises(PaperBRunError, match="strategy-A modules") as exc:
+        run_paper_b(env)
+    assert exc.value.stage == "precheck" and not env.ledger_dir.exists()
 
 
 def test_the_first_run_reproduces_the_holdout_and_writes_only_the_b_ledger(tmp_path, lock_text):
