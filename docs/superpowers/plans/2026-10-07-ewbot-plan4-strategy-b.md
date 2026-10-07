@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12 (uv), 기존 의존성만(numpy, pandas 3, pyarrow, requests, PyYAML); pytest; GitHub Actions(`actions/checkout@v7`, `astral-sh/setup-uv` v10.2.0 커밋 `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Coinbase Exchange 공개 캔들 API(granularity 900, `BTC-USD`·`ETH-USD`); Telegram Bot API(A와 같은 봇·시크릿).
 
-**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`(사용자 승인 2026-10-07; 8절의 데이터 해시 항목은 같은 날 컨트롤러 결정으로 수정; 같은 날 홀드아웃 실행 전에 사용자 승인으로 BTC+ETH로 개정 — 명세 1절 "개정 (2026-10-07)"). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`, Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`.
+**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`(사용자 승인 2026-10-07; 8절의 데이터 해시 항목은 같은 날 컨트롤러 결정으로 수정; 같은 날 홀드아웃 실행 전에 사용자 승인으로 BTC+ETH로 개정 — 명세 1절 "개정 (2026-10-07)"; 같은 날 잠금 전에 최종 검토 수정(컨트롤러 결정) — 명세 6.4, 6.5, 7, 8절의 "최종 검토" 항목: 잠금이 B가 import하는 A 모듈의 해시와 워크포워드 보고서의 출처를 묶고 깨끗한 작업 트리를 요구함, 시작 시점의 자금부터 측정, 모의매매는 두 자산이 모두 가진 마지막 봉에서 끝남). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`, Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
 ## Global Constraints
 
@@ -18,6 +18,7 @@
 - 만들 수 있는 것: `src/ewbot/stratb/**`, `src/ewbot/paperb/**`, `tests/stratb/**`, `tests/paperb/**`, `.github/workflows/paper-b.yml`, `docs/strategy-b.md`. 수정할 수 있는 것: `src/ewbot/cli.py`(`stratb` 하위 명령), `README.md`, `tests/paper/test_static.py`(Task 12에서 워크플로 목록 테스트 1개를 고치고 B 보호 테스트 2개를 추가: `ci.yml`은 `tests/paper/test_fingerprint.py`와 이 파일만 실행하므로 B의 CI 검사는 여기에 둔다).
 - A 지문은 `e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1`로 유지된다(`tests/paper/test_fingerprint.py`, `tests/stratb/test_isolation.py`, Task 13).
 - B 지문 = `src/ewbot/stratb/` 아래 모든 `*.py`의 sha256(A와 같은 형식: `ewbot.paper.fingerprint.fingerprint_of`). `paperb/`와 `cli.py`는 포함하지 않는다. 바뀌면 B의 모의매매 구간(epoch)만 새로 열린다.
+- B가 `stratb/`·`paperb/`에서 직접 또는 다른 모듈을 거쳐 import하는 A 모듈의 해시(`deps_sha256`, Task 1의 `deps_fingerprint`; 지금 42개 파일)는 잠금이 묶는다: 잠금 뒤에 그 A 모듈이 바뀌면(A의 유지보수 변경과, `paperb/`가 다른 A 모듈을 새로 import하는 것 포함) 홀드아웃과 모의매매가 거부된다.
 - **2024-01-01 00:00 UTC(`HOLDOUT_START = 1704067200`) 이후 데이터는 `holdout-b.lock`이 생기기 전에 읽을 수 없다**(두 자산 모두): `stratb.data15.load_15m`은 parquet을 읽을 때 걸러내고, `fetch_15m`은 그런 구간을 요청 전에 거부하고, `update_cache_15m`은 내려받지 않으며, `include_holdout=True`는 잠금 파일이 있어야 한다. 리터럴 `include_holdout=True`는 `stratb/holdout.py`와 `paperb/runner.py`에서만 쓴다. B 코드는 A의 `allow_holdout` 키워드와 `_init_worker`·`_map_tasks`·`check_before_holdout` 이름을 쓰지 않는다(A의 `tests/paper/test_static.py`가 `src/ewbot` 전체를 검사한다).
 - 결정성: 판단은 마감된 15분봉으로만 하고, 데이터의 마지막 봉에서는 진입을 평가하지 않는다. 시각 t에서 자른 데이터의 판단은 전체 데이터의 t까지 판단과 같아야 한다.
 - 고정값(명세 5절): RSI 14, 피벗 좌우 3봉, 매물대 허용 ±0.25×ATR1h, 손절 여유 0.2×ATR15m, 최대 손절 2.5×ATR1h, 확인 기한 72시간, 시간 손절 48시간, ATR 14. 그리드 32개: `zz_k` (2.0, 3.0) × 되돌림 구간 ((0.382, 0.618), (0.5, 0.786)) × `tp1_r` (1.0, 1.5) × `e` (1.272, 1.618) × `remainder` (breakeven, original).
@@ -35,13 +36,13 @@
 5. **매물대(명세 4.2)** = 기준 구간의 시작 피벗(L) **이전**의 1시간 지그재그 피벗 가운데 L보다 최대 30일(`confluence_lookback_hours = 720`) 앞선 것. 명세에 기간이 없어 정했다: 전 기간을 보면 2017년부터 데이터를 가진 워크포워드와 2023-10-01부터 다시 계산하는 홀드아웃·모의매매가 서로 다른 매물대를 보게 된다(30일은 앵커와 홀드아웃 시작 사이의 3개월 안에 들어간다). 허용 폭의 ATR1h는 구간이 확정된 시점의 값이다.
 6. **다이버전스와 돌파(명세 4.3).** 15분 피벗 저점은 왼쪽 3봉보다 엄격히 낮고 오른쪽 3봉보다 같거나 낮은 봉이며(고점은 대칭), 피벗 j는 봉 j+3 마감에 알려진다. 기준 구간 극값이 나온 15분봉 이후의 피벗만 본다. 연속한 두 피벗이 가격은 더 낮고 RSI는 더 높으며 두 번째가 되돌림 구간 안이면 다이버전스 쌍이 된다. 이 쌍은 더 새로운 쌍이 생기거나 이후 봉이 두 번째 저점을 깨면 사라진다. 확인은 그 뒤 15분 종가가 두 피벗 사이 봉들의 최고가(숏은 최저가)를 넘고 해석 7의 걸러내기를 통과하는 첫 봉이다. 넘었지만 걸러진 종가(손절이 너무 멀거나 2차 목표가 1차 목표보다 멀지 않음)는 확인이 아니며 그 쌍과 기준 구간은 살아 있어, 기준 구간이 유효한 동안(72시간 안) 이후의 종가가 다시 넘으면 확인될 수 있다(명세 4.4 "먼 손절 자리는 기다린다"; 2026-10-07 컨트롤러 결정을 Task 6b 결과를 보기 전에 기록하고 같은 날 명세에 반영).
 7. **진입가 기준(명세 4.4).** 손절·목표·걸러내기·수량은 확인 봉 종가(`entry_ref`)로 정하고(A의 `Signal.entry_ref`와 같은 방식) 실제 체결은 다음 15분봉 시가 ± 슬리피지다. 다음 시가가 이미 손절가에 닿았거나 그 봉이 누락 봉이면 진입하지 않는다. 2차 목표가 1차 목표보다 가깝거나 **같으면** 진입하지 않는다.
-8. **누락 봉(명세 6.1, 8).** 캐시에는 채우지 않는다. 엔진은 A의 `fill_gaps(df, tf=900)`로 평평한 합성 봉을 넣어 시간 격자를 잇고, p1−3봉부터 확인 봉까지 합성 봉이 하나라도 있으면 신호를 내지 않는다. 자산별 프레임은 같은 마지막 봉에서 끝나게 맞춘다(`build_frames`): 데이터가 일찍 끝난 자산 뒤에는 마지막 종가의 평평한 합성 봉을 붙인다. 그래야 시각 t에서 자른 실행이 두 자산을 전체 실행과 똑같이 본다(그 봉이 나중에 실제로 오면 데이터가 바뀐 것이므로 판단 대조에서 `DATA_REVISION`이다).
-9. **체결(명세 6.2).** A의 `PaperBroker` 규칙을 15분봉에 그대로 쓴다: 시가가 손절가를 넘으면 시가에 손절, 같은 봉에서 손절가에 닿으면 손절가에 손절(목표보다 우선), 아니면 TP1(절반, 지정가, 엄격한 돌파)과 TP2. 1계약이면 TP1에서 전량. 본절 이동은 TP1이 체결된 봉의 다음 봉부터. 손실 한도 관측은 매시 마지막 15분봉 마감(A와 같은 시각)에 계좌 평가액으로 한다. 자산 곡선은 시간 단위(시각 = 그 시간의 시작)라서 A의 `compute_metrics`(연 8760시간)를 그대로 쓴다. Coinbase 선물의 금요일 정기 휴장은 명세에 없어 모델링하지 않는다(실거래는 Plan 5).
+8. **누락 봉(명세 6.1, 8).** 캐시에는 채우지 않는다. 엔진은 A의 `fill_gaps(df, tf=900)`로 평평한 합성 봉을 넣어 시간 격자를 잇고, p1−3봉부터 확인 봉까지 합성 봉이 하나라도 있으면 신호를 내지 않는다. 자산별 프레임은 같은 마지막 봉에서 끝나게 맞춘다(`build_frames`): 데이터가 일찍 끝난 자산 뒤에는 마지막 종가의 평평한 합성 봉을 붙인다. 그래야 시각 t에서 자른 실행이 두 자산을 전체 실행과 똑같이 본다(그 봉이 나중에 실제로 오면 데이터가 바뀐 것이므로 판단 대조에서 `DATA_REVISION`이다). 모의매매는 매 실행을 두 자산이 모두 가진 마지막 봉에서 끝내므로(Task 10, 2026-10-07 최종 검토) 최신 봉이 늦은 자산을 평평한 봉으로 채워 판단하는 일이 없다.
+9. **체결(명세 6.2).** A의 `PaperBroker` 규칙을 15분봉에 그대로 쓴다: 시가가 손절가를 넘으면 시가에 손절, 같은 봉에서 손절가에 닿으면 손절가에 손절(목표보다 우선), 아니면 TP1(절반, 지정가, 엄격한 돌파)과 TP2. 1계약이면 TP1에서 전량. 본절 이동은 TP1이 체결된 봉의 다음 봉부터. 손실 한도 관측은 매시 마지막 15분봉 마감(A와 같은 시각)에 계좌 평가액으로 한다. 자산 곡선은 시간 단위(시각 = 그 시간의 시작)라서 A의 `compute_metrics`(연 8760시간)를 그대로 쓴다. 시작 시각(`start_ts`)이 있는 실행의 곡선은 시작 직전 시간의 점(시작 시점의 계좌, 어떤 진입도 체결되기 전)에서 시작하므로 첫 시간의 수익(00:15 진입의 비용 포함)도 지표에 들어가고, 매수 후 보유도 같은 첫 점을 가져 B와 같은 시간들로 측정된다(2026-10-07 최종 검토). Coinbase 선물의 금요일 정기 휴장은 명세에 없어 모델링하지 않는다(실거래는 Plan 5).
 10. **무작위 대조군(명세 6.5-1, 2026-10-07 개정).** 같은 기간, 자산마다 같은 진입 횟수(그 자산의 B 거래 수 — 각 자산의 평균 빈도), 같은 포트폴리오 엔진(청산, 시간 손절, 잔량 규칙, 0.5% 수량, 3배 상한 둘, 계좌 손실 한도, 비용). 자산마다 그 자산 B 거래의 모양(방향, 기준가 대비 손절 거리, TP1·TP2의 R 배수)을 시드 고정 무작위 순서로 그 자산의 무작위 15분봉(마지막 봉·누락 봉·누락 체결 봉 제외)에 놓는다(실행 r에서 k번째 자산의 시드는 `[r, k]`). 포지션 중에 온 진입은 B와 똑같이 건너뛰므로 실현 횟수는 같거나 적다. 1,000회(시드 0~999), B 포트폴리오의 샤프를 대조군 샤프의 95번째 백분위수와 비교한다. 매수 후 보유는 BTC/ETH 50:50이다(시작할 때 반씩 사고 재조정 없음, 자산마다 A의 `buy_hold`).
-11. **잠금과 1회 실행(명세 6.4).** `holdout-b.lock`은 2024+ 데이터를 보기 **전에** 만든다. 조합, 전체 실행 설정(두 자산의 상품·계약 크기·틱, 합계 상한 포함), 그리드, B 지문, 자산마다 2024 이전 15분봉 해시(`wf_data`), 홀드아웃 시작, 앵커, 무작위 대조군 1,000회와 시드, `last_bar_ts`(잠금 시각의 마지막 완성 시간의 마지막 15분봉 = "잠금 시점의 마지막 확정 봉"), 그리고 이 필드들의 다이제스트 `sha256`을 담는다. 홀드아웃 데이터의 해시(두 자산을 함께 묶은 `data_fingerprint_b`와 자산별 해시)는 잠금 시점에 읽을 수 없으므로 `first_run.data`에 기록한다. 홀드아웃은 잠금이 커밋되어 있고, `first_run`이 비어 있고, B 지문과 두 자산의 2024 이전 데이터가 잠금과 같을 때만 1회 돈다. 시도는 실행 전에 기록되고, 끝나지 않은 시도 뒤의 재시도는 같은 홀드아웃 데이터일 때만 허용된다.
-12. **모의매매의 잠금 불일치(명세 7, 8; 8절은 2026-10-07 수정).** 잠금 파일 자체(다이제스트, 커밋된 그대로인지, 설정이 이 코드의 `config_for(params)`와 같은지, `first_run`이 합격인지)가 맞지 않으면 실행을 거부하고 알린다. 홀드아웃 구간 15분봉(두 자산)의 해시가 `first_run.data.sha256`과 다르면(Coinbase의 캔들 수정, Actions 캐시 삭제 뒤의 재수집) 거부하지 않고 A처럼 해시마다 한 번 경고(`DATA_HASH` 이벤트, 텔레그램)하고 계속하며, 그 때문에 바뀐 판단은 A의 대조 규칙대로 `DATA_REVISION`이 된다(거부하면 이런 일만으로 모의매매가 무기한 멈춘다). 현재 B 지문이 잠금의 `code_sha256`과 다르면 거부하지 않고 새 구간을 연다(명세 7절).
+11. **잠금과 1회 실행(명세 6.4).** `holdout-b.lock`은 2024+ 데이터를 보기 **전에** 워크포워드 보고서(`ewbot stratb walkforward`의 JSON)에서만 만든다: 보고서가 `proceed`이고 fallback이 아니며, 보고서가 기록한 봉 해시·B 지문·`deps_sha256`이 잠금 시점의 것과 같아야 한다. 조합, 전체 실행 설정(두 자산의 상품·계약 크기·틱, 합계 상한 포함), 그리드, B 지문, B가 import하는 A 모듈의 해시(`deps_sha256`), 자산마다 2024 이전 15분봉 해시(`wf_data`), 워크포워드 보고서 파일의 sha256(`wf_report_sha256`), 홀드아웃 시작, 앵커, 무작위 대조군 1,000회와 시드, `last_bar_ts`(잠금 시각의 마지막 완성 시간의 마지막 15분봉 = "잠금 시점의 마지막 확정 봉"), 그리고 이 필드들의 다이제스트 `sha256`을 담는다. 홀드아웃 데이터의 해시(두 자산을 함께 묶은 `data_fingerprint_b`와 자산별 해시)는 잠금 시점에 읽을 수 없으므로 `first_run.data`에 기록한다. 홀드아웃은 잠금이 커밋되어 있고, `first_run`이 비어 있고, B 지문·`deps_sha256`과 두 자산의 2024 이전 데이터가 잠금과 같고, 잠금의 키·그리드·설정·홀드아웃 시작·앵커가 이 코드가 쓸 값과 같을 때만 1회 돈다. 잠금 작성과 홀드아웃 실행은 추적 파일에 커밋 안 된 변경이 있으면 거부된다(잠금 파일 자체는 예외: 시도가 실행 전에 기록된다). 시도는 실행 전에 기록되고, 끝나지 않은 시도 뒤의 재시도는 같은 홀드아웃 데이터일 때만 허용된다. (2026-10-07 최종 검토: 잠금 뒤 A 쪽 코드나 설정이 바뀌거나 작업 트리가 더러운 채로 다르게 계산된 홀드아웃이 거부 없이 기록되는 것과, 잠금이 출처를 확인할 수 없는 조합을 묶는 것을 막는다.)
+12. **모의매매의 잠금 불일치(명세 7, 8; 8절은 2026-10-07 수정).** 잠금 파일 자체(다이제스트, 커밋된 그대로인지, 키·그리드·설정·홀드아웃 시작·앵커가 이 코드의 것과 같은지 — 설정은 `config_for(params)` —, `first_run`이 합격인지)나 B가 import하는 A 모듈의 해시(`deps_sha256`)가 맞지 않으면 실행을 거부하고 알린다(A 모듈의 변경은 B 지문의 변경과 달리 새 구간이 아니라 거부다: 홀드아웃을 검증한 계산이 아니게 된다; 2026-10-07 최종 검토). 홀드아웃 구간 15분봉(두 자산)의 해시가 `first_run.data.sha256`과 다르면(Coinbase의 캔들 수정, Actions 캐시 삭제 뒤의 재수집) 거부하지 않고 A처럼 해시마다 한 번 경고(`DATA_HASH` 이벤트, 텔레그램)하고 계속하며, 그 때문에 바뀐 판단은 A의 대조 규칙대로 `DATA_REVISION`이 된다(거부하면 이런 일만으로 모의매매가 무기한 멈춘다). 현재 B 지문이 잠금의 `code_sha256`과 다르면 거부하지 않고 새 구간을 연다(명세 7절).
 13. **판단 기록.** A의 판단 형식과 대조 함수(`verify_decisions`, `decisions_to_record`, `classify`, `same_decision`)를 그대로 쓴다. B의 종류는 SIGNAL, ENTRY, TP1, TP2, STOP, EXIT(TIME, BREAKER), BREAKEVEN이다. A의 `known_at`은 SIGNAL을 ts + 1시간으로 셈하는데 B의 신호는 ts + 15분부터 알 수 있다. 기록 시점은 같고 APPEARED 검사만 최대 45분 늦어진다(오탐 없음). 판단의 `setup`은 `B-BTC`·`B-ETH`이고, 거래 키는 진입 ts(SIGNAL은 신호 ts)에 `ASSETS`에서의 자산 인덱스를 더한 정수다(BTC +0, ETH +1초; 봉 ts는 모두 900의 배수다): 두 자산이 같은 봉에 진입해도 A의 id `KIND:ts:trade_key`가 겹치지 않는다. 판단의 데이터 해시(`DATA_REVISION` 판정)는 두 자산의 그 시각까지의 봉을 함께 해시한다.
-14. **모의 카운트(명세 7, 7.1).** 잠금의 마지막 봉 이후에 진입한 현재 구간의 청산 거래만 센다(홀드아웃 거래는 세지 않는다). 필요 30건, 두 자산 합계(2026-10-07 개정). B 지문이 바뀌면 새 구간에서 0부터 세고, 그 구간은 실거래 전환 판정 대상이 아니다(A와 같은 규칙).
+14. **모의 카운트(명세 7, 7.1).** 잠금의 마지막 봉 이후에 진입한 현재 구간의 청산 거래만 센다(홀드아웃 거래는 세지 않는다). 필요 30건, 두 자산 합계(2026-10-07 개정). 청산 알림의 n/30은 (청산 시각, 거래 키) 순서로 매기므로 같은 봉에 청산된 두 거래도 차례로 번호를 받는다. B 지문이 바뀌면 새 구간에서 0부터 세고, 그 구간은 실거래 전환 판정 대상이 아니다(A와 같은 규칙).
 15. **워크플로 휴면.** 명세 10절 순서상 `paper-b.yml`은 홀드아웃보다 먼저 `master`에 들어간다. 그동안 예비 `schedule`이 실패 알림을 보내지 않도록 작업은 저장소 변수 `PAPER_B_ENABLED`가 `true`일 때만 돈다(합격 후 사용자가 켠다. 건너뛴 작업은 실행 시간을 쓰지 않는다).
 16. **1차 트리거.** 기존 Cloudflare Worker 코드는 크론과 관계없이 `paper.yml`만 부르므로 크론 1줄만 더하면 A가 두 번 돈다. 그래서 `docs/strategy-b.md`에 `paper-b.yml`을 부르는 두 번째 Worker 코드를 싣는다(사용자 작업, `ops/`는 바꾸지 않는다).
 17. **git 동기화.** A의 `scripts/paper_sync.sh`는 `paper` 브랜치에 묶여 있고 수정할 수 없으므로 같은 규칙을 `paper-b`용 파이썬 모듈 `ewbot.paperb.sync`로 구현한다(`python -m ewbot.paperb.sync checkout | push …`).
@@ -55,14 +56,14 @@
 |---|---|---|
 | `src/ewbot/stratb/__init__.py` | 1 | 패키지 표시 |
 | `src/ewbot/stratb/config.py` | 1 | 그리드 32개, 고정값, 두 자산(`AssetSpec`), 실행 설정(`BConfig`), 자산별 비용, 조합 정규화, 비용 배수 |
-| `src/ewbot/stratb/fingerprint.py` | 1 | B 지문 |
-| `src/ewbot/stratb/data15.py` | 2 | BTC·ETH 15분봉 수집(재시도, 이어 받기)·자산별 캐시, 2024 가드, 1시간봉 합성, 누락 보고 |
+| `src/ewbot/stratb/fingerprint.py` | 1 | B 지문, B가 import하는 A 모듈의 해시(deps) |
+| `src/ewbot/stratb/data15.py` | 2 | BTC·ETH 15분봉 수집(재시도, 이어 받기)·자산별 캐시, 2024 가드(잠금 다이제스트 확인), 1시간봉 합성, 누락 보고 |
 | `src/ewbot/stratb/rules.py` | 3 | 순수 함수: RSI, 피벗, 되돌림 구간, 확장 목표, 매물대 겹침, 다이버전스, 돌파 수준, 손절, 1차 목표, 걸러내기 |
 | `src/ewbot/stratb/signals.py` | 4 | 자산별 15분 프레임과 1시간봉(끝 맞추기), 기준 구간(A의 ZigZag), 신호 생성 |
 | `src/ewbot/stratb/engine.py` | 5 | 15분 포트폴리오 백테스트 루프(BTC·ETH 한 계좌): 체결, 수량, 손실 한도, 비용, 판단 추적 |
-| `src/ewbot/stratb/research.py` | 6 | 2024 가드, 포트폴리오 백테스트, 그리드, plateau, 구간, 워크포워드 |
+| `src/ewbot/stratb/research.py` | 6 | 2024 가드, 포트폴리오 백테스트, 그리드, plateau, 구간, 워크포워드(쓴 봉과 코드 기록) |
 | `src/ewbot/stratb/baselines.py` | 7 | BTC/ETH 50:50 매수 후 보유, 자산별 무작위 진입 대조군 |
-| `src/ewbot/stratb/holdout.py` | 8 | `holdout-b.lock`(두 자산 데이터 해시), 1회 홀드아웃, 포트폴리오 합격 기준 |
+| `src/ewbot/stratb/holdout.py` | 8 | `holdout-b.lock`(워크포워드 보고서에서; 두 자산 데이터 해시, A 모듈 해시), 1회 홀드아웃(이 코드의 잠금, 깨끗한 작업 트리), 포트폴리오 합격 기준 |
 | `src/ewbot/paperb/__init__.py` | 9 | 패키지 표시 |
 | `src/ewbot/paperb/ledger.py` | 9 | A의 장부 스키마를 B 잠금에 묶기, 모의 카운트 n/30 |
 | `src/ewbot/paperb/decisions.py` | 9 | B 실행 결과 → A의 판단 형식(자산을 넣은 거래 키) |
@@ -79,23 +80,23 @@
 
 | 작업 | 구성 | 새 테스트 |
 |---|---|---|
-| 1 | B 그리드·실행 설정(BTC·ETH), B 지문, A 보호 검사 | 17 |
+| 1 | B 그리드·실행 설정(BTC·ETH), B 지문과 deps 지문, A 보호 검사 | 19 |
 | 2 | BTC·ETH 15분봉 수집·캐시·2024 가드 | 11 |
 | 3 | 매매 규칙 순수 함수 | 8 |
 | 4 | 자산별 15분 프레임, 기준 구간, 신호(+ 합성 데이터 도우미) | 13 |
-| 5 | 15분 포트폴리오 엔진 | 18 |
+| 5 | 15분 포트폴리오 엔진 | 19 |
 | 6 | 백테스트 가드, 그리드, 워크포워드(포트폴리오) | 7 |
 | 6b | 실제 2017~2023 거래 빈도 점검(컨트롤러 수동, 네트워크; 두 자산 합계 중앙값 < 월 4건이면 중단·보고) | — |
-| 7 | 50:50 매수 후 보유, 자산별 무작위 대조군 | 5 |
-| 8 | 잠금, 1회 홀드아웃, 포트폴리오 합격 기준 | 9 |
-| 9 | 모의매매 어댑터(장부, 판단, 알림) | 7 |
-| 10 | 모의매매 실행기 | 8 |
+| 7 | 50:50 매수 후 보유, 자산별 무작위 대조군 | 6 |
+| 8 | 잠금, 1회 홀드아웃, 포트폴리오 합격 기준 | 12 |
+| 9 | 모의매매 어댑터(장부, 판단, 알림) | 8 |
+| 10 | 모의매매 실행기 | 9 |
 | 11 | CLI `ewbot stratb …` | 11 |
 | 12 | `paper-b` 동기화, 워크플로, CI 검사, 문서 | 12 |
 | 13 | 최종 검증(전체 테스트, A 지문) | — |
 | 14 | 수동 절차: 수집, 워크포워드, 잠금, 승인, 홀드아웃, 모의매매 시작(컨트롤러와 사용자만) | — |
 
-Task 12 이후 전체: `1372 passed`(캐시가 없으면 `1371 passed, 1 skipped`) — 기준선보다 126개 많다. 각 작업의 Step 4는 그 작업의 테스트만 돌린다. 실행 시간: Task 1~12의 새 테스트는 합쳐서 약 25초, 전체는 약 2분 10초.
+Task 12 이후 전체: `1381 passed`(캐시가 없으면 `1380 passed, 1 skipped`) — 기준선보다 135개 많다. 각 작업의 Step 4는 그 작업의 테스트만 돌린다. 실행 시간: Task 1~12의 새 테스트는 합쳐서 약 25초, 전체는 약 2분 15초.
 
 ---
 
@@ -111,16 +112,16 @@ Task 12 이후 전체: `1372 passed`(캐시가 없으면 `1371 passed, 1 skipped
 - Test: `tests/stratb/test_isolation.py`
 
 **Interfaces:**
-- Consumes: `ewbot.config`: `BreakerParams`, `CostParams`, `RiskProfile`(import만). `ewbot.paper.fingerprint`: `PROJECT_ROOT`, `fingerprint_of(files: Mapping[str, bytes]) -> str`, `current_fingerprint(repo_root=None) -> str`, `is_fingerprinted(rel: str) -> bool`, `tree_files(repo_root=None) -> dict[str, bytes]`.
+- Consumes: `ewbot.config`: `BreakerParams`, `CostParams`, `RiskProfile`(import만). `ewbot.paper.fingerprint`: `PROJECT_ROOT`, `PKG_PREFIX`(`src/ewbot/`), `fingerprint_of(files: Mapping[str, bytes]) -> str`, `current_fingerprint(repo_root=None) -> str`, `is_fingerprinted(rel: str) -> bool`, `tree_files(repo_root=None) -> dict[str, bytes]`.
 - Produces: `ewbot.stratb.config`: `M15 = 900`; `GRID_B: dict[str, tuple]`(키 순서 `zz_k`, `zone`, `tp1_r`, `ext`, `remainder`); `REMAINDER_MODES = ("breakeven", "original")`; `Combo = tuple[Any, ...]` — `(zz_k: float, (z_lo, z_hi): tuple[float, float], tp1_r: float, ext: float, remainder: str)`; `@dataclass(frozen=True) StratBParams(zz_k=2.0, zone=(0.382, 0.618), tp1_r=1.0, ext=1.272, remainder="breakeven", rsi_len=14, pivot_w=3, confluence_atr=0.25, stop_buf_atr=0.2, max_stop_atr1h=2.5, confirm_hours=72, time_stop_hours=48, atr_len=14, confluence_lookback_hours=720)`(잘못된 `remainder`/`zone`은 `ValueError`); `RISK_B = RiskProfile("stratb", 0.005, 3.0)`; `@dataclass(frozen=True) AssetSpec(asset, product, future, contract_size, tick)`; `ASSET_SPECS = (AssetSpec("BTC", "BTC-USD", "BIP-20DEC30-CDE", 0.01, 5.0), AssetSpec("ETH", "ETH-USD", "ETP-20DEC30-CDE", 0.1, 0.5))`; `ASSETS = ("BTC", "ETH")`(한 봉 안에서 자산을 처리하는 순서이기도 하다); `@dataclass(frozen=True) BConfig(params=StratBParams(), risk=RISK_B, breakers=BreakerParams(), costs=CostParams(), initial_equity=10_000.0, tp1_frac=0.5, assets=ASSET_SPECS, max_total_leverage=3.0)`; `asset_spec(cfg, asset) -> AssetSpec`(없는 자산이면 `KeyError`); `asset_costs(cfg, asset) -> CostParams`(A의 `CostParams`에 그 자산의 계약 크기); `grid_combos() -> list[Combo]`(32개); `normalize_combo(values: Sequence) -> Combo`(JSON 리스트도 받음, 그리드 밖이면 `ValueError`); `combo_to_json(combo) -> list`(`[zz_k, [z_lo, z_hi], tp1_r, ext, remainder]`); `params_for(combo) -> StratBParams`; `combo_of(p) -> Combo`; `config_for(combo, *, breakers_enabled=True) -> BConfig`; `scale_costs(c: CostParams, mult: float) -> CostParams`(수수료율·최소 수수료·슬리피지만 배수).
-  `ewbot.stratb.fingerprint`: `STRATB_PREFIX = "src/ewbot/stratb/"`; `stratb_files(repo_root=None) -> dict[str, bytes]`; `stratb_fingerprint(repo_root=None) -> str`(파일이 없으면 `FileNotFoundError`).
+  `ewbot.stratb.fingerprint`: `STRATB_PREFIX = "src/ewbot/stratb/"`; `B_PACKAGES = ("stratb", "paperb")`; `stratb_files(repo_root=None) -> dict[str, bytes]`; `stratb_fingerprint(repo_root=None) -> str`(파일이 없으면 `FileNotFoundError`); `deps_files(repo_root=None) -> dict[str, bytes]`(`stratb/`·`paperb/`의 모듈이 직접 또는 다른 모듈을 거쳐 import하는, 두 폴더 밖의 모든 모듈과 그 패키지의 `__init__.py`; ast로 정적으로 찾음); `deps_fingerprint(repo_root=None) -> str`(같은 형식, 없으면 `FileNotFoundError`).
   `tests/stratb/test_isolation.py`: 이후 모든 작업에서 A 보호를 지키는 검사(아래 설명).
 
-B의 모든 매개변수를 A의 `config.py`와 별개인 `stratb/config.py`에 둔다. BTC와 ETH는 파라미터 한 벌을 함께 쓰고(명세 1절 2026-10-07 개정), 자산마다 신호용 현물 상품과 모델링할 선물 상품(계약 크기, 틱)을 `AssetSpec`으로 둔다. 비용은 A의 `CostParams`에서 계약 크기만 자산의 값으로 바꿔 쓴다(`asset_costs`; A의 파일은 바꾸지 않는다). 틱은 Plan 5의 실거래 주문 가격에 쓰고, 백테스트는 A처럼 가격을 틱에 맞추지 않는다. 포지션마다의 3배 상한은 `RISK_B`, 모든 포지션 합계의 3배 상한은 `max_total_leverage`다(해석 20). 그리드 조합은 튜플로 다루며, JSON에서 온 리스트는 `normalize_combo`가 정확한 그리드 튜플로 바꾸고 그리드 밖의 값은 거부한다. B 지문은 A와 같은 형식으로 `stratb/` 아래 파일만 해시한다. `tests/stratb/test_isolation.py`는 이 계획 전체의 안전장치다: A 지문 고정값, `stratb/`·`paperb/`가 A 지문 대상 밖인지, `master`와의 merge-base 이후 B의 경로를 바꾼 브랜치가 A의 경로(지문 대상, `backtest/`, `paper/`, `live/`, `holdout.lock`, `paper.yml`, `ci.yml`, `scripts/`, `pyproject.toml`, `uv.lock`)를 하나도 바꾸지 않았는지(추적되지 않은 새 파일 포함; B를 건드리지 않는 A 유지보수 브랜치는 해당 없음; `master`가 없는 얕은 클론에서는 건너뜀), 리터럴 `include_holdout=True`를 쓰는 모듈이 `stratb/holdout.py`·`paperb/runner.py`뿐인지, B 코드가 A의 실행 산출물 이름(`paper.yml`, `holdout.lock`, `refs/heads/paper`, `origin/paper`, `BTC-USD_1h.parquet`)을 문자열로 쓰지 않는지 확인한다. 집합 검사는 부분집합(`<=`)이라 아직 없는 모듈이 있어도 통과한다.
+B의 모든 매개변수를 A의 `config.py`와 별개인 `stratb/config.py`에 둔다. BTC와 ETH는 파라미터 한 벌을 함께 쓰고(명세 1절 2026-10-07 개정), 자산마다 신호용 현물 상품과 모델링할 선물 상품(계약 크기, 틱)을 `AssetSpec`으로 둔다. 비용은 A의 `CostParams`에서 계약 크기만 자산의 값으로 바꿔 쓴다(`asset_costs`; A의 파일은 바꾸지 않는다). 틱은 Plan 5의 실거래 주문 가격에 쓰고, 백테스트는 A처럼 가격을 틱에 맞추지 않는다. 포지션마다의 3배 상한은 `RISK_B`, 모든 포지션 합계의 3배 상한은 `max_total_leverage`다(해석 20). 그리드 조합은 튜플로 다루며, JSON에서 온 리스트는 `normalize_combo`가 정확한 그리드 튜플로 바꾸고 그리드 밖의 값은 거부한다. B 지문은 A와 같은 형식으로 `stratb/` 아래 파일만 해시한다. 같은 모듈의 `deps_fingerprint`는 B의 결과를 정하는 A 쪽 코드, 곧 `stratb/`·`paperb/`가 직접 또는 다른 모듈을 거쳐 import하는 A 모듈(설정 기본값, 비용, 사이징, 손실 한도, 지그재그, 지표, 성과 지표, 매수 후 보유, 워크포워드 구간, 데이터 해시, 모의매매가 쓰는 `paper/` 모듈 등; 함수 안과 `TYPE_CHECKING` 블록의 import, 상대 import, 패키지 `__init__.py` 포함)를 해시한다(해석 11). 잠금이 이 값(`deps_sha256`)을 묶는다(Task 8). `tests/stratb/test_isolation.py`는 이 계획 전체의 안전장치다: A 지문 고정값, `stratb/`·`paperb/`가 A 지문 대상 밖인지, `master`와의 merge-base 이후 B의 경로를 바꾼 브랜치가 A의 경로(지문 대상, `backtest/`, `paper/`, `live/`, `holdout.lock`, `paper.yml`, `ci.yml`, `scripts/`, `pyproject.toml`, `uv.lock`)를 하나도 바꾸지 않았는지(추적되지 않은 새 파일 포함; B를 건드리지 않는 A 유지보수 브랜치는 해당 없음; `master`가 없는 얕은 클론에서는 건너뜀), 리터럴 `include_holdout=True`를 쓰는 모듈이 `stratb/holdout.py`·`paperb/runner.py`뿐인지, B 코드가 A의 실행 산출물 이름(`paper.yml`, `holdout.lock`, `refs/heads/paper`, `origin/paper`, `BTC-USD_1h.parquet`)을 문자열로 쓰지 않는지 확인한다. 집합 검사는 부분집합(`<=`)이라 아직 없는 모듈이 있어도 통과한다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-테스트 패키지와 테스트 파일 4개를 만든다. 설정 테스트는 그리드, 고정값, 실행 설정(손실 한도·비용·초기 자금·두 자산·전체 상한)과 두 자산의 상품·계약 크기·틱, 자산별 비용을 확인한다.
+테스트 패키지와 테스트 파일 4개를 만든다. 설정 테스트는 그리드, 고정값, 실행 설정(손실 한도·비용·초기 자금·두 자산·전체 상한)과 두 자산의 상품·계약 크기·틱, 자산별 비용을 확인한다. 지문 테스트는 deps가 임시 트리에서 B가 import하는 모듈(직접·간접·상대·함수 안)만 모으고, import되지 않는 파일(`live/`, `cli.py`, 다른 A 모듈, B 자신의 파일)의 변경에는 그대로이며 import되는 A 모듈의 변경에는 바뀌는지, 실제 저장소의 deps가 A 모듈뿐인지 확인한다.
 
 ```bash
 mkdir -p src/ewbot/stratb tests/stratb
@@ -237,8 +238,14 @@ import shutil
 
 import pytest
 
-from ewbot.paper.fingerprint import PROJECT_ROOT, current_fingerprint
-from ewbot.stratb.fingerprint import STRATB_PREFIX, stratb_files, stratb_fingerprint
+from ewbot.paper.fingerprint import PROJECT_ROOT, current_fingerprint, fingerprint_of
+from ewbot.stratb.fingerprint import (
+    STRATB_PREFIX,
+    deps_files,
+    deps_fingerprint,
+    stratb_files,
+    stratb_fingerprint,
+)
 
 
 def _copy(tmp_path):
@@ -286,6 +293,48 @@ def test_strategy_a_and_b_fingerprints_are_independent(tmp_path):
 def test_an_empty_tree_has_no_fingerprint(tmp_path):
     with pytest.raises(FileNotFoundError):
         stratb_fingerprint(tmp_path)
+
+
+def _tree(root, files):
+    for rel, text in files.items():
+        f = root / "src" / "ewbot" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    return root
+
+
+def test_deps_are_the_modules_b_imports_directly_or_through_others(tmp_path):
+    root = _tree(tmp_path, {
+        "__init__.py": "", "config.py": "", "cli.py": "from ewbot.stratb import x\n",
+        "stratb/__init__.py": "", "stratb/y.py": "def f():\n    from ewbot.paper import ledger\n",
+        "stratb/x.py": "from ewbot.backtest.metrics import m\nimport ewbot.risk.sizing\nfrom ewbot.stratb import y\n",
+        "paperb/__init__.py": "from ewbot.config import C\n",
+        "backtest/__init__.py": "", "backtest/metrics.py": "from ewbot.engine.loop import E\nfrom . import report\n",
+        "backtest/report.py": "", "backtest/unused.py": "", "engine/__init__.py": "", "engine/loop.py": "",
+        "risk/__init__.py": "", "risk/sizing.py": "", "paper/__init__.py": "", "paper/ledger.py": "",
+        "paper/runner.py": "", "live/__init__.py": "", "live/app.py": "from ewbot.stratb import x\n",
+    })
+    files = deps_files(root)
+    assert sorted(files) == ["src/ewbot/" + r for r in (
+        "__init__.py", "backtest/__init__.py", "backtest/metrics.py", "backtest/report.py", "config.py",
+        "engine/__init__.py", "engine/loop.py", "paper/__init__.py", "paper/ledger.py", "risk/__init__.py",
+        "risk/sizing.py")]
+    base = deps_fingerprint(root)
+    assert base == fingerprint_of(files)
+    for rel in ("cli.py", "live/app.py", "backtest/unused.py", "paper/runner.py", "stratb/y.py"):
+        f = root / "src" / "ewbot" / rel
+        f.write_text(f.read_text(encoding="utf-8") + "# not imported, or B's own\n", encoding="utf-8")
+    assert deps_fingerprint(root) == base
+    loop = root / "src/ewbot/engine/loop.py"
+    loop.write_text("E = 2\n", encoding="utf-8")
+    assert deps_fingerprint(root) != base
+
+
+def test_the_real_deps_are_strategy_a_modules_only():
+    files = deps_files()
+    assert {"src/ewbot/config.py", "src/ewbot/paper/fingerprint.py"} <= set(files)
+    assert not [p for p in files if p.startswith(("src/ewbot/stratb/", "src/ewbot/paperb/", "src/ewbot/live/"))]
+    assert "src/ewbot/cli.py" not in files and deps_fingerprint() == fingerprint_of(files)
 ```
 
 **파일 `tests/stratb/test_isolation.py`** (새 파일, 전체 내용)
@@ -575,20 +624,31 @@ def scale_costs(c: CostParams, mult: float) -> CostParams:
 **파일 `src/ewbot/stratb/fingerprint.py`** (새 파일, 전체 내용)
 
 ```python
-"""Strategy-B fingerprint (Plan 4 spec 3, 7): sha256 over every *.py file below src/ewbot/stratb.
+"""Strategy-B fingerprints (Plan 4 spec 3, 6.4, 7), in strategy A's format (ewbot.paper.fingerprint.fingerprint_of:
+sorted repo-relative paths, each path NUL bytes NUL).
 
-Same format as strategy A's (ewbot.paper.fingerprint.fingerprint_of: sorted repo-relative paths, each
-path NUL bytes NUL), over a disjoint file set: stratb/ is outside A's fingerprinted folders and no A file
-is in this one, so either fingerprint can change without the other. Any byte change, addition, removal or
-rename below stratb/ changes it; paperb/ and cli.py are not part of it."""
+stratb_fingerprint: every *.py file below src/ewbot/stratb. stratb/ is outside A's fingerprinted folders and no
+A file is in this set, so either fingerprint can change without the other. Any byte change, addition, removal
+or rename below stratb/ changes it; paperb/ and cli.py are not part of it.
+
+deps_fingerprint: the strategy-A side of B's results - every module outside stratb/ and paperb/ that a module
+of stratb/ or paperb/ imports, directly or through other modules, with the __init__.py of their packages. The
+imports are found statically (ast): every `import ewbot...` and `from ewbot... import ...` (relative imports
+too) anywhere in a file, function bodies and TYPE_CHECKING blocks included. It covers A's config defaults,
+costs, sizing, breakers, ZigZag, indicators, metrics, buy & hold, walk-forward windows, data hashing and the
+paper/ modules paper-B uses; modules B never reaches (live/, cli.py, A's paper runner) are not part of it.
+holdout-b.lock binds it (deps_sha256): the holdout and paper-B refuse a change. After the lock, a new import
+of another A module from paperb/ changes it too."""
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
-from ewbot.paper.fingerprint import PROJECT_ROOT, fingerprint_of
+from ewbot.paper.fingerprint import PKG_PREFIX, PROJECT_ROOT, fingerprint_of
 
 STRATB_PREFIX = "src/ewbot/stratb/"
+B_PACKAGES = ("stratb", "paperb")  # strategy B's packages below src/ewbot: the roots of deps_files
 
 
 def stratb_files(repo_root: Path | None = None) -> dict[str, bytes]:
@@ -602,6 +662,59 @@ def stratb_fingerprint(repo_root: Path | None = None) -> str:
     if not files:
         raise FileNotFoundError(f"no strategy-B source files below {repo_root or PROJECT_ROOT}/src/ewbot/stratb")
     return fingerprint_of(files)
+
+
+def _module_file(pkg: Path, parts: tuple[str, ...]) -> Path | None:
+    """The file of module ewbot.<parts> (a .py file or a package's __init__.py), or None."""
+    base = pkg.joinpath(*parts)
+    for f in ((base.with_name(base.name + ".py"),) if parts else ()) + (base / "__init__.py",):
+        if f.is_file():
+            return f
+    return None
+
+
+def _imported(f: Path, pkg: Path) -> set[tuple[str, ...]]:
+    """Every ewbot module a file may import (its parts below ewbot), wherever the import statement is."""
+    here = f.relative_to(pkg).parts[:-1]  # the file's package below ewbot
+    out: set[tuple[str, ...]] = set()
+    for node in ast.walk(ast.parse(f.read_bytes(), filename=str(f))):
+        if isinstance(node, ast.Import):
+            out.update(tuple(a.name.split("."))[1:] for a in node.names if a.name.split(".")[0] == "ewbot")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:  # relative: from the file's package, one level up per extra dot
+                if node.level - 1 > len(here):
+                    continue
+                mod = here[: len(here) - node.level + 1] + (tuple(node.module.split(".")) if node.module else ())
+            elif node.module and node.module.split(".")[0] == "ewbot":
+                mod = tuple(node.module.split("."))[1:]
+            else:
+                continue
+            out.add(mod)
+            out.update(mod + (a.name,) for a in node.names)  # `from ewbot.x import y` may name module x.y
+    return out
+
+
+def deps_files(repo_root: Path | None = None) -> dict[str, bytes]:
+    """{"src/ewbot/<rel>": bytes} of the modules outside stratb/ and paperb/ that B imports (module docstring)."""
+    pkg = (PROJECT_ROOT if repo_root is None else Path(repo_root)) / "src" / "ewbot"
+    todo = [f for d in B_PACKAGES for f in sorted((pkg / d).rglob("*.py")) if f.is_file()]
+    seen = set(todo)
+    while todo:
+        for parts in _imported(todo.pop(), pkg):
+            for k in range(len(parts) + 1):  # the module and every package above it
+                g = _module_file(pkg, parts[:k])
+                if g is not None and g not in seen:
+                    seen.add(g)
+                    todo.append(g)
+    rels = (f.relative_to(pkg).as_posix() for f in seen)
+    return {PKG_PREFIX + r: (pkg / r).read_bytes() for r in rels if r.split("/")[0] not in B_PACKAGES}
+
+
+def deps_fingerprint(repo_root: Path | None = None) -> str:
+    files = deps_files(repo_root)
+    if not files:
+        raise FileNotFoundError(f"no module imported by strategy B below {repo_root or PROJECT_ROOT}/src/ewbot")
+    return fingerprint_of(files)
 ```
 
 - [ ] **Step 4: 테스트를 실행해 통과를 확인**
@@ -610,13 +723,13 @@ def stratb_fingerprint(repo_root: Path | None = None) -> str:
 uv run --group live pytest tests/stratb -q
 ```
 
-예상: `17 passed`
+예상: `19 passed`
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add src/ewbot/stratb/__init__.py src/ewbot/stratb/config.py src/ewbot/stratb/fingerprint.py tests/stratb/__init__.py tests/stratb/test_config.py tests/stratb/test_fingerprint_b.py tests/stratb/test_isolation.py
-git commit -m "feat(stratb): strategy-B grid, run config for BTC and ETH, B fingerprint and the strategy-A protection guard" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "feat(stratb): strategy-B grid, run config for BTC and ETH, B and deps fingerprints and the strategy-A protection guard" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -629,13 +742,13 @@ git commit -m "feat(stratb): strategy-B grid, run config for BTC and ETH, B fing
 
 **Interfaces:**
 - Consumes: `ewbot.data.coinbase_history`: `API`, `COLUMNS`, `MAX_PER_REQUEST`, `_get_json(session, url, params) -> list`(429·5xx 재시도; 파일은 수정하지 않고 import만). `ewbot.data.candles`: `IntegrityReport`, `check_integrity(df, tf)`. `ewbot.backtest.walkforward`: `HOLDOUT_START = 1704067200`, `WF_START = "2017-01-01"`. `ewbot.backtest.runner.utc_ts(date) -> int`. `ewbot.paper.fingerprint.PROJECT_ROOT`. Task 1: `ASSET_SPECS`, `M15`.
-- Produces: `ewbot.stratb.data15`: `PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}`; `START_TS = 1483228800`(2017-01-01); `REPLAY_ANCHOR = 1696118400`(2023-10-01); `DEFAULT_LOCK_PATH = <저장소 루트>/holdout-b.lock`; `LOCK_KIND = "ewbot-stratb-holdout"`; `FETCH_TRIES = 3`, `FETCH_BACKOFF_S = 1.0`; `class HoldoutGuardError(RuntimeError)`; `cache_path(cache_dir, product) -> Path`(`<cache_dir>/<product>_15m.parquet`); `cache_paths(cache_dir) -> dict[str, Path]`(자산마다, `ASSETS` 순서); `lock_exists(lock_path) -> bool`(`kind == LOCK_KIND`이고 `sha256`이 문자열인 JSON 객체일 때만 참); `fetch_15m(product, start_ts, end_ts, session=None, sleep_s=0.15, *, lock_path=DEFAULT_LOCK_PATH, on_page=None) -> DataFrame`(`[start_ts, end_ts)`의 마감된 봉, 오름차순, 표준 스키마 `ts:int64, open, high, low, close, volume:float64`; 잠금 없이 2024-01-01에 닿는 구간이면 요청 전에 `HoldoutGuardError`; `on_page`는 받은 300봉 페이지마다 불림); `update_cache_15m(cache_dir, *, product, lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> Path`(페이지마다 저장); `update_caches_15m(cache_dir, *, lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> dict[str, Path]`(두 자산, 같은 시계); `load_15m(path, *, include_holdout=False, lock_path=DEFAULT_LOCK_PATH) -> DataFrame`; `load_caches_15m(cache_dir) -> dict[str, DataFrame]`(두 자산의 2024 이전 봉; `include_holdout` 인자 없음); `gap_report(df15) -> IntegrityReport`; `resample_1h(df15) -> DataFrame`(완성된 UTC 시간만, `synthetic` 열 포함).
+- Produces: `ewbot.stratb.data15`: `PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}`; `START_TS = 1483228800`(2017-01-01); `REPLAY_ANCHOR = 1696118400`(2023-10-01); `DEFAULT_LOCK_PATH = <저장소 루트>/holdout-b.lock`; `LOCK_KIND = "ewbot-stratb-holdout"`; `LOCK_BOUND`(잠금의 `sha256`이 묶는 필드: `kind`, `version`, `keys`, `params`, `config`, `grid`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `random_runs`, `random_seed`, `code_sha256`, `deps_sha256`, `wf_data`, `wf_report_sha256`); `lock_digest_b(lock) -> str`(`LOCK_BOUND` 필드의 정렬된 압축 JSON의 sha256); `FETCH_TRIES = 3`, `FETCH_BACKOFF_S = 1.0`; `class HoldoutGuardError(RuntimeError)`; `cache_path(cache_dir, product) -> Path`(`<cache_dir>/<product>_15m.parquet`); `cache_paths(cache_dir) -> dict[str, Path]`(자산마다, `ASSETS` 순서); `lock_exists(lock_path) -> bool`(`kind == LOCK_KIND`이고 `sha256`이 `lock_digest_b(lock)`와 같은 JSON 객체일 때만 참); `fetch_15m(product, start_ts, end_ts, session=None, sleep_s=0.15, *, lock_path=DEFAULT_LOCK_PATH, on_page=None) -> DataFrame`(`[start_ts, end_ts)`의 마감된 봉, 오름차순, 표준 스키마 `ts:int64, open, high, low, close, volume:float64`; 잠금 없이 2024-01-01에 닿는 구간이면 요청 전에 `HoldoutGuardError`; `on_page`는 받은 300봉 페이지마다 불림); `update_cache_15m(cache_dir, *, product, lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> Path`(페이지마다 저장); `update_caches_15m(cache_dir, *, lock_path=DEFAULT_LOCK_PATH, start_ts=START_TS, now_ts=None, session=None, sleep_s=0.15) -> dict[str, Path]`(두 자산, 같은 시계); `load_15m(path, *, include_holdout=False, lock_path=DEFAULT_LOCK_PATH) -> DataFrame`; `load_caches_15m(cache_dir) -> dict[str, DataFrame]`(두 자산의 2024 이전 봉; `include_holdout` 인자 없음); `gap_report(df15) -> IntegrityReport`; `resample_1h(df15) -> DataFrame`(완성된 UTC 시간만, `synthetic` 열 포함).
 
-A의 `coinbase_history.py`와 같은 공개 엔드포인트와 같은 요청 방식(최신순 최대 300행, start·end 포함)을 granularity 900으로 BTC-USD와 ETH-USD에 쓴다. 캐시는 자산마다 하나이고 A의 1시간봉 파일과 다르다(`BTC-USD_15m.parquet`, `ETH-USD_15m.parquet`). 진행 중인 봉은 저장하지 않고, 누락 봉은 채우지 않는다. 수집은 300봉 페이지마다 캐시 파일에 덧붙여 저장하므로(임시 파일에 쓴 뒤 바꿔 끼움) 중단돼도 다음 실행이 마지막 저장 봉부터 이어 받고, 연결 오류와 시간 초과는 페이지마다 3회까지 1초·2초 간격으로 재시도한다(429·5xx는 A의 `_get_json`이 재시도한다). **가드:** 잠금 파일이 없으면 `fetch_15m`은 2024-01-01에 닿는 구간을 요청 전에 거부하고, `update_cache_15m`은 그런 구간을 요청조차 하지 않으며, `load_15m`은 pyarrow 필터로 읽는 순간 걸러내고, `include_holdout=True`는 `HoldoutGuardError`를 낸다. 두 자산을 읽는 `load_caches_15m`에는 `include_holdout` 인자가 없다(2024 데이터를 읽는 홀드아웃과 모의매매 실행기는 자산마다 `load_15m(..., include_holdout=True)`를 직접 부른다). 네트워크는 `update_cache_15m`(→ `fetch_15m`)에서만 쓰고, 그것을 부르는 곳은 CLI의 `stratb fetch`·`stratb holdout run`과 모의매매 실행기뿐이다(모두 테스트에서는 가짜로 바꾼다). 모의매매는 빈 캐시를 `REPLAY_ANCHOR`부터 받는다(`start_ts`).
+A의 `coinbase_history.py`와 같은 공개 엔드포인트와 같은 요청 방식(최신순 최대 300행, start·end 포함)을 granularity 900으로 BTC-USD와 ETH-USD에 쓴다. 캐시는 자산마다 하나이고 A의 1시간봉 파일과 다르다(`BTC-USD_15m.parquet`, `ETH-USD_15m.parquet`). 진행 중인 봉은 저장하지 않고, 누락 봉은 채우지 않는다. 수집은 300봉 페이지마다 캐시 파일에 덧붙여 저장하므로(임시 파일에 쓴 뒤 바꿔 끼움) 중단돼도 다음 실행이 마지막 저장 봉부터 이어 받고, 연결 오류와 시간 초과는 페이지마다 3회까지 1초·2초 간격으로 재시도한다(429·5xx는 A의 `_get_json`이 재시도한다). **가드:** 잠금 파일이 없으면 `fetch_15m`은 2024-01-01에 닿는 구간을 요청 전에 거부하고, `update_cache_15m`은 그런 구간을 요청조차 하지 않으며, `load_15m`은 pyarrow 필터로 읽는 순간 걸러내고, `include_holdout=True`는 `HoldoutGuardError`를 낸다. "잠금이 있다"는 것은 그 이름의 파일이 있는 것이 아니라 `sha256`이 묶인 필드의 다이제스트와 맞는 잠금이 있다는 뜻이다(손으로 만든 파일은 2024를 열지 못한다). 그래서 잠금의 다이제스트(`LOCK_BOUND`, `lock_digest_b`)를 여기 두고, 잠금을 쓰는 Task 8이 import한다. 두 자산을 읽는 `load_caches_15m`에는 `include_holdout` 인자가 없다(2024 데이터를 읽는 홀드아웃과 모의매매 실행기는 자산마다 `load_15m(..., include_holdout=True)`를 직접 부른다). 네트워크는 `update_cache_15m`(→ `fetch_15m`)에서만 쓰고, 그것을 부르는 곳은 CLI의 `stratb fetch`·`stratb holdout run`과 모의매매 실행기뿐이다(모두 테스트에서는 가짜로 바꾼다). 모의매매는 빈 캐시를 `REPLAY_ANCHOR`부터 받는다(`start_ts`).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-가짜 세션(요청한 구간만 최신순으로 돌려주고 요청을 기록하며, 정해 둔 예외나 몇 번째 요청부터의 연결 오류를 낼 수 있다)으로 페이지 나누기, 잠금 없는 2024 구간 수집 거부, 연결 오류·시간 초과의 재시도와 대기 시간, 중단된 수집이 저장한 페이지와 이어 받기, 두 자산 캐시의 2024 차단, 잠금 후 확장, 로더 가드, 1시간봉 합성, 누락 보고를 확인한다.
+가짜 세션(요청한 구간만 최신순으로 돌려주고 요청을 기록하며, 정해 둔 예외나 몇 번째 요청부터의 연결 오류를 낼 수 있다)으로 페이지 나누기, 잠금 없는 2024 구간 수집 거부, 연결 오류·시간 초과의 재시도와 대기 시간, 중단된 수집이 저장한 페이지와 이어 받기, 두 자산 캐시의 2024 차단, 잠금 후 확장, 로더 가드, 잠금 판정(이름이나 모양만 맞는 파일과 묶인 필드를 고친 파일은 잠금이 아님), 1시간봉 합성, 누락 보고를 확인한다.
 
 **파일 `tests/stratb/test_data15.py`** (새 파일, 전체 내용)
 
@@ -652,6 +765,7 @@ import requests
 from ewbot.data import coinbase_history as ch
 from ewbot.stratb import data15 as d15
 from ewbot.stratb.data15 import (
+    LOCK_BOUND,
     LOCK_KIND,
     REPLAY_ANCHOR,
     START_TS,
@@ -661,6 +775,7 @@ from ewbot.stratb.data15 import (
     fetch_15m,
     gap_report,
     load_15m,
+    lock_digest_b,
     lock_exists,
     resample_1h,
     update_cache_15m,
@@ -708,8 +823,11 @@ class FakeSession:
         return R()
 
 
-def _lock(path, kind=LOCK_KIND):
-    path.write_text(json.dumps({"kind": kind, "sha256": "ab" * 32}), encoding="utf-8")
+def _lock(path, kind=LOCK_KIND, **fields):
+    """A lock file whose sha256 is the digest of its bound fields (the rest of a real lock does not matter here)."""
+    lock = {"kind": kind, "last_bar_ts": HS + 3600, **fields}
+    lock["sha256"] = lock_digest_b(lock)
+    path.write_text(json.dumps(lock), encoding="utf-8")
     return path
 
 
@@ -813,6 +931,12 @@ def test_lock_exists_needs_a_strategy_b_lock(tmp_path):
     assert not lock_exists(tmp_path / "x")
     assert not lock_exists(_lock(tmp_path / "a", kind="other"))
     assert lock_exists(_lock(tmp_path / "b"))
+    (tmp_path / "c").write_text(json.dumps({"kind": LOCK_KIND, "sha256": "ab" * 32}), encoding="utf-8")
+    assert not lock_exists(tmp_path / "c")  # the right shape is not enough: the digest must match
+    edited = json.loads((tmp_path / "b").read_text(encoding="utf-8"))
+    edited["last_bar_ts"] += 900
+    (tmp_path / "d").write_text(json.dumps(edited), encoding="utf-8")
+    assert not lock_exists(tmp_path / "d") and "last_bar_ts" in LOCK_BOUND
 
 
 def test_resample_keeps_complete_hours_only_and_flags_synthetic():
@@ -863,16 +987,19 @@ from the last saved bar; a connection error or a timeout is retried FETCH_TRIES 
 Holdout guard (spec 6.3): until holdout-b.lock exists, fetch_15m refuses a window that reaches
 HOLDOUT_START (2024-01-01), update_cache_15m never asks for one, and load_15m never returns a bar at or
 after it - the parquet read itself filters them out. load_15m(include_holdout=True) raises
-HoldoutGuardError until the lock exists."""
+HoldoutGuardError until the lock exists. A lock "exists" only when its sha256 is the digest of its bound
+fields (lock_digest_b, defined here for stratb.holdout, which writes the lock): a hand-made file with the
+right name or shape does not unlock 2024."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 import requests
@@ -890,6 +1017,8 @@ START_TS = utc_ts(WF_START)  # 2017-01-01: the first bar fetched
 REPLAY_ANCHOR = utc_ts("2023-10-01")  # spec 6.4: holdout and paper runs both recompute from here
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout-b.lock"
 LOCK_KIND = "ewbot-stratb-holdout"
+LOCK_BOUND = ("kind", "version", "keys", "params", "config", "grid", "holdout_start", "replay_anchor", "last_bar_ts",
+              "random_runs", "random_seed", "code_sha256", "deps_sha256", "wf_data", "wf_report_sha256")  # sha256 binds
 FETCH_TRIES = 3  # per page, on a connection error or a timeout
 FETCH_BACKOFF_S = 1.0  # waits 1 s, then 2 s
 
@@ -907,9 +1036,15 @@ def cache_paths(cache_dir: Path) -> dict[str, Path]:
     return {a: cache_path(cache_dir, p) for a, p in PRODUCTS.items()}
 
 
+def lock_digest_b(lock: Mapping[str, Any]) -> str:
+    """sha256 of the sorted compact JSON of the lock's LOCK_BOUND fields."""
+    blob = json.dumps({k: lock.get(k) for k in LOCK_BOUND}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def lock_exists(lock_path: Path) -> bool:
-    """True only for a strategy-B holdout lock (a JSON object of kind LOCK_KIND with a sha256), not for
-    any file that happens to have the name."""
+    """True only for a strategy-B holdout lock: a JSON object of kind LOCK_KIND whose sha256 is the digest of
+    its bound fields - not for a file that merely has the name or the shape."""
     p = Path(lock_path)
     if not p.is_file():
         return False
@@ -917,7 +1052,7 @@ def lock_exists(lock_path: Path) -> bool:
         lock = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(lock, dict) and lock.get("kind") == LOCK_KIND and isinstance(lock.get("sha256"), str)
+    return isinstance(lock, dict) and lock.get("kind") == LOCK_KIND and lock.get("sha256") == lock_digest_b(lock)
 
 
 def _empty() -> pd.DataFrame:
@@ -1908,13 +2043,13 @@ git commit -m "feat(stratb): 1h reference legs on A's ZigZag and 15m divergence-
 
 **Interfaces:**
 - Consumes: Task 1: `M15`, `BConfig`, `asset_costs`. Task 4: `Frame15`, `SignalB`(테스트는 `build_frame`, `build_frames`, `generate_signals`, `tests.stratb.helpers.T0`, `RANDOM_T0`, `random_df`도 쓴다). A: `ewbot.engine.loop.EquityPoint(ts, equity)`, `Trade(entry_ts, exit_ts, setup, direction, contracts, entry_price, exit_price_avg, stop0, tp1, tp2, pnl, fees, funding, r_multiple, exit_reason, snapshot)`; `ewbot.execution.costs.fee(price, contracts, c)`, `slip(price, side, c)`, `funding_per_hour(mark, contracts, direction, c)`; `ewbot.risk.sizing.size_contracts(equity, entry, stop, direction, risk, risk_mult, c) -> int`; `ewbot.risk.breakers.CircuitBreakers(p, equity0)`(`on_equity(ts, equity)`, `on_trade_closed(ts, pnl)`, `can_enter(ts)`, `halted`).
-- Produces: `ewbot.stratb.engine`: `SETUP = "B"`; `setup_of(asset) -> str`(`"B-BTC"`, `"B-ETH"`); `asset_of(trade) -> str`(스냅숏의 자산); `@dataclass(frozen=True) FillB(ts, asset, kind, contracts, price, fee, trade_key)`(`kind` ∈ ENTRY, TP1, TP2, STOP, EXIT; `trade_key` = 진입 봉 ts, 자산마다 고유); `@dataclass(frozen=True) StopMoveB(ts, asset, trade_key, old, new, kind="BREAKEVEN")`; `@dataclass(frozen=True) OrderB(ts, asset, direction, contracts, tp1_contracts)`; `@dataclass(frozen=True) BResult(trades, equity, signals, orders, fills, stops, end_fills, events)`(`signals`와 `orders`는 진입 주문을 낸 신호와 그 주문, 같은 순서; `end_fills`는 마지막 봉에 강제 청산한 포지션의 `FillB(kind="END")`들, 자산 순서; `events`는 `(ts, 자산 — 계좌의 손실 한도 사건이면 "", "ENTRY_SKIPPED:gap" | "ENTRY_SKIPPED:open_beyond_stop" | "SIGNAL_REJECTED:size" | "SIGNAL_REJECTED:leverage" | "SIGNAL_REJECTED:breaker" | "DAILY_HALT" | "TOTAL_HALT" | "CONSEC_PAUSE")`); `tp1_contracts(n, frac) -> int`; `run_engine(frames: Mapping[str, Frame15], signals: Mapping[str, Iterable[SignalB]], cfg, start_ts=None) -> BResult`(프레임은 `cfg.assets`의 자산이고 같은 봉에서 끝나야 한다, 아니면 `ValueError`). 거래는 A의 `Trade`이고 `setup = setup_of(asset)`, `snapshot = {"asset", "signal_ts", "entry_ref", "leg", "pivots", "level", "reason"}`, `r_multiple = pnl / (|entry_price − stop0| × contracts × 그 자산의 계약 크기)`, `exit_reason` ∈ STOP, TP1(1계약), TP2, TIME, BREAKER, END. 자산 곡선(`equity`)은 매시 마지막 15분봉 마감의 계좌 평가액이고 시각은 그 시간의 시작이다.
+- Produces: `ewbot.stratb.engine`: `SETUP = "B"`; `setup_of(asset) -> str`(`"B-BTC"`, `"B-ETH"`); `asset_of(trade) -> str`(스냅숏의 자산); `@dataclass(frozen=True) FillB(ts, asset, kind, contracts, price, fee, trade_key)`(`kind` ∈ ENTRY, TP1, TP2, STOP, EXIT; `trade_key` = 진입 봉 ts, 자산마다 고유); `@dataclass(frozen=True) StopMoveB(ts, asset, trade_key, old, new, kind="BREAKEVEN")`; `@dataclass(frozen=True) OrderB(ts, asset, direction, contracts, tp1_contracts)`; `@dataclass(frozen=True) BResult(trades, equity, signals, orders, fills, stops, end_fills, events)`(`signals`와 `orders`는 진입 주문을 낸 신호와 그 주문, 같은 순서; `end_fills`는 마지막 봉에 강제 청산한 포지션의 `FillB(kind="END")`들, 자산 순서; `events`는 `(ts, 자산 — 계좌의 손실 한도 사건이면 "", "ENTRY_SKIPPED:gap" | "ENTRY_SKIPPED:open_beyond_stop" | "SIGNAL_REJECTED:size" | "SIGNAL_REJECTED:leverage" | "SIGNAL_REJECTED:breaker" | "DAILY_HALT" | "TOTAL_HALT" | "CONSEC_PAUSE")`); `tp1_contracts(n, frac) -> int`; `run_engine(frames: Mapping[str, Frame15], signals: Mapping[str, Iterable[SignalB]], cfg, start_ts=None) -> BResult`(프레임은 `cfg.assets`의 자산이고 같은 봉에서 끝나야 한다, 아니면 `ValueError`). 거래는 A의 `Trade`이고 `setup = setup_of(asset)`, `snapshot = {"asset", "signal_ts", "entry_ref", "leg", "pivots", "level", "reason"}`, `r_multiple = pnl / (|entry_price − stop0| × contracts × 그 자산의 계약 크기)`, `exit_reason` ∈ STOP, TP1(1계약), TP2, TIME, BREAKER, END. 자산 곡선(`equity`)은 매시 마지막 15분봉 마감의 계좌 평가액이고 시각은 그 시간의 시작이다. `start_ts`가 있으면 마감이 floor(`start_ts`, 1시간) 이후인 시간부터 기록하므로, 첫 점은 시작 직전 시간(`start_ts` 시점의 계좌, 어떤 진입도 체결되기 전)이고 A의 `compute_metrics(start_ts=…)`가 첫 시간의 수익(00:15 진입의 비용 포함)을 시작 자금에서 잰다(시작 전 봉이 없으면 첫 시간부터).
 
 BTC와 ETH를 한 계좌(현금 하나, 손실 한도 하나)에서 자산마다 포지션 하나씩 돌리는 포트폴리오 엔진이다. 시간축은 두 자산 프레임의 모든 15분봉이고, 파일 머리의 docstring이 봉 안의 처리 순서(1~9)와 자산 순서(설정 순서 BTC → ETH, 시가의 대기 주문은 청산 먼저)를 정의한다(해석 20). 체결 규칙은 A의 `PaperBroker`와 같다(명세 해석 9). 비용·수량·손실 한도는 A의 함수를 그대로 부르므로 같은 값이 쓰이고, 비용과 수량의 계약 크기만 자산별이다. 수량은 계좌 평가액(현금 + 열린 포지션의 평가 손익)으로 정하고, 포지션마다 3배(`size_contracts`)와 모든 포지션 합계 3배(`max_total_leverage`: 열린 포지션은 종가, 대기 진입은 기준가로 셈)를 넘지 않게 줄인다. 엔진은 신호를 받기만 하므로(신호 생성과 분리) 무작위 대조군(Task 7)도 같은 엔진을 쓴다. 엔진이 판단 추적(주문 수량, 체결, 본절 이동, 마지막 봉 청산)을 직접 내므로 A처럼 클래스를 바꿔 끼우는 추적이 필요 없다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-손으로 만든 15분봉과 손으로 만든 `SignalB`로 다음 체결을 확인한다: 다음 시가 체결과 0.5% 수량(41계약), 3배 상한(150계약), 같은 봉의 손절 우선, TP1 절반·본절 이동·TP2, 본절 잔량의 손절과 원래 손절 유지, 숏의 TP1 절반과 본절 손절, 시가 갭 손절, 48시간 시간 손절과 15분 펀딩(숏은 펀딩을 받음), 1계약 TP1 전량, 포지션이나 대기 주문이 있는 자산의 신호 버리기, 마지막 봉 청산과 시간 단위 자산, 누락 봉·손절 너머 시가의 진입 취소, 전체 낙폭 한도의 청산과 진입 차단, 두 자산의 동시 포지션(한 계좌, 자산별 계약 크기, BTC 먼저), 모든 포지션 합계 3배 상한(줄이기와 `SIGNAL_REJECTED:leverage`), 계좌 손실 한도가 두 자산을 모두 정리하는지, 그리고 포지션이 겹치는 두 자산 데이터를 잘라도 체결·주문이 전체와 같은지.
+손으로 만든 15분봉과 손으로 만든 `SignalB`로 다음 체결을 확인한다: 다음 시가 체결과 0.5% 수량(41계약), 3배 상한(150계약), 같은 봉의 손절 우선, TP1 절반·본절 이동·TP2, 본절 잔량의 손절과 원래 손절 유지, 숏의 TP1 절반과 본절 손절, 시가 갭 손절, 48시간 시간 손절과 15분 펀딩(숏은 펀딩을 받음), 1계약 TP1 전량, 포지션이나 대기 주문이 있는 자산의 신호 버리기, 마지막 봉 청산과 시간 단위 자산, 누락 봉·손절 너머 시가의 진입 취소, 전체 낙폭 한도의 청산과 진입 차단, 두 자산의 동시 포지션(한 계좌, 자산별 계약 크기, BTC 먼저), 모든 포지션 합계 3배 상한(줄이기와 `SIGNAL_REJECTED:leverage`), 계좌 손실 한도가 두 자산을 모두 정리하는지, 그리고 시작 시각이 있으면 곡선이 시작 직전 시간의 초기 자금에서 시작해 첫 시간의 진입 비용이 성과 지표에 들어가는지, 포지션이 겹치는 두 자산 데이터를 잘라도 체결·주문이 전체와 같은지.
 
 **파일 `tests/stratb/test_engine.py`** (새 파일, 전체 내용)
 
@@ -1926,7 +2061,9 @@ import dataclasses
 import pandas as pd
 import pytest
 
+from ewbot.backtest.metrics import compute_metrics
 from ewbot.config import BreakerParams, CostParams
+from ewbot.engine.loop import EquityPoint
 from ewbot.execution.costs import fee, funding_per_hour, slip
 from ewbot.risk.sizing import size_contracts
 from ewbot.stratb.config import RISK_B, BConfig, StratBParams, asset_costs
@@ -2066,11 +2203,21 @@ def test_end_of_data_entries_from_start_and_hourly_equity():
     s = [sig(2, f, 19_900.0, 20_100.0, 20_300.0), sig(15, f, 19_900.0, 20_100.0, 20_300.0)]
     res = run(f, s, start_ts=T0 + H1)
     assert res.orders == ()  # bar 2 is before start_ts, bar 15 is the last bar
-    assert [p.ts for p in res.equity] == [T0 + H1, T0 + 2 * H1, T0 + 3 * H1]
+    assert [p.ts for p in res.equity] == [T0, T0 + H1, T0 + 2 * H1, T0 + 3 * H1]  # T0: the account at start_ts
     res = run(f, s[:1])
     (end,) = res.end_fills
     assert end.kind == "END" and end.asset == "BTC" and res.trades[-1].exit_reason == "END"
     assert [x.kind for x in res.fills] == ["ENTRY"] and res.equity[-1].equity == pytest.approx(res.trades[-1].pnl + 10_000.0)
+
+
+def test_a_start_time_measures_the_first_hour_from_the_starting_equity():
+    f = bars(flat(16))
+    res = run(f, [sig(4, f, 19_900.0, 20_100.0, 20_300.0)], start_ts=T0 + H1)  # fills at T0 + H1 + 15 min
+    assert res.equity[0] == EquityPoint(T0, 10_000.0) and res.equity[1].ts == T0 + H1
+    assert res.equity[1].equity < 10_000.0  # the entry's fee and slippage fall in the first hour
+    m = compute_metrics(res.equity, res.trades, T0 + H1, T0 + 4 * H1)
+    assert m.total_return == pytest.approx(res.equity[-1].equity / 10_000.0 - 1.0) and m.n_trades == 1
+    assert run(f, [], start_ts=T0).equity[0].ts == T0  # no bar before the start: no earlier point
 
 
 def test_entries_are_dropped_on_a_gap_bar_or_an_open_beyond_the_stop():
@@ -2195,8 +2342,12 @@ ETH):
      equity; TP1 takes half (1 contract: all of it). A signal on an asset that holds a position or has an
      entry queued is dropped;
   8. last bar: every open position is closed at its close (END, not a decision);
-  9. at each hour's close with hour >= start_ts: EquityPoint(hour open ts, account equity at the close) -
-     hourly equity, so A's metrics (annualised with 8760 hours) apply unchanged."""
+  9. at each hour's close from start_ts's hour boundary on (every close at or after floor(start_ts, 1 h)):
+     EquityPoint(hour open ts, account equity at the close) - hourly equity, so A's metrics (annualised with
+     8760 hours) apply unchanged. With a start time the first point is the hour before it, the account just
+     before the first entry can fill, so compute_metrics(start_ts=...) measures the first hour (an entry's
+     costs at hh:15 included) from the starting value; with none, or no bar before it, the curve starts at the
+     first hour."""
 
 from __future__ import annotations
 
@@ -2467,7 +2618,7 @@ def run_engine(
                     key = p.entry_ts
                     f_end = close(j, t, "EXIT", slip(mark_px[j], -p.direction, costs[j]), p.contracts, "END")
                     end_fills.append(FillB(f_end.ts, f_end.asset, "END", f_end.contracts, f_end.price, f_end.fee, key))
-        if hour_close and (start_ts is None or t - _HOUR_LAST >= start_ts):  # 9.
+        if hour_close and (start_ts is None or t + M15 >= start_ts // H1 * H1):  # 9.
             equity.append(EquityPoint(t - _HOUR_LAST, account_equity()))
     return BResult(tuple(trades), tuple(equity), tuple(sigs), tuple(orders), tuple(fills), tuple(stops),
                    tuple(end_fills), tuple(events))
@@ -2497,7 +2648,7 @@ def _trade(pos: _Pos, exit_ts: int, reason: str, cs: float) -> Trade:
 uv run --group live pytest tests/stratb/test_engine.py -q
 ```
 
-예상: `18 passed`
+예상: `19 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -2515,14 +2666,14 @@ git commit -m "feat(stratb): 15m BTC + ETH portfolio engine on one account with 
 - Test: `tests/stratb/test_research.py`
 
 **Interfaces:**
-- Consumes: Task 1: `ASSETS`, `GRID_B`, `BConfig`, `Combo`, `StratBParams`, `combo_to_json`, `config_for`, `grid_combos`. Task 4: `Frame15`, `RefLeg`, `build_frames`, `generate_signals`, `reference_legs`. Task 5: `BResult`, `asset_of`, `run_engine`. A: `ewbot.backtest.metrics.compute_metrics(equity, trades, start_ts=None, end_ts=None) -> Metrics`; `ewbot.backtest.walkforward`: `HOLDOUT_START`, `WF_START`, `MIN_TRAIN_TRADES = 12`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5`, `folds() -> list[tuple[int, int, int, int]]`, `oos_returns(res, ts0, ts1) -> list[tuple[int, float]]`(`res.equity`만 읽음); `ewbot.backtest.runner.utc_ts`; `ewbot.engine.loop.EquityPoint`, `Trade`.
-- Produces: `ewbot.stratb.research`: `refuse_holdout_bars(df15, end_ts, include_holdout=False) -> None`(2024 봉을 볼 실행이면 `ValueError`); `backtest_b(dfs: Mapping[str, DataFrame], cfg, start_ts=None, end_ts=None, *, include_holdout=False) -> BResult`(자산마다 end_ts 이전 봉으로 프레임을 만들고 신호, 포트폴리오 엔진 실행); `trades_by_asset(trades) -> dict[str, int]`(`ASSETS` 순서); `run_grid_b(dfs, start_ts, end_ts, workers=1) -> dict[Combo, BResult]`(32개, 손실 한도 끔, `grid_combos()` 순서); `pick_plateau_b(calmar, n_trades, min_trades=12) -> Combo`(고를 것이 없으면 `ValueError`); `evaluate_folds_b(results, fold_list, equity0, min_trades=12) -> dict`(키 `keys`, `folds`[각 `train`, `test`, `chosen`, `train_calmar`, `oos`], `stitched_equity`, `stitched_metrics`, `oos_trades`, `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`, `proceed`); `walk_forward_b(dfs, workers=1) -> dict`(두 자산이 모두 있어야 한다, 아니면 `ValueError`; 위 키 + `combo_table`, 행마다 `combo`, `calmar`, `sharpe`, `n_trades`, `n_trades_by_asset`, `total_return`).
+- Consumes: Task 1: `ASSETS`, `GRID_B`, `BConfig`, `Combo`, `StratBParams`, `combo_to_json`, `config_for`, `grid_combos`. Task 4: `Frame15`, `RefLeg`, `build_frames`, `generate_signals`, `reference_legs`. Task 5: `BResult`, `asset_of`, `run_engine`. Task 1(지문): `deps_fingerprint`, `stratb_fingerprint`. A: `ewbot.backtest.holdout.data_fingerprint(df, start_ts, last_ts) -> str`; `ewbot.backtest.metrics.compute_metrics(equity, trades, start_ts=None, end_ts=None) -> Metrics`; `ewbot.backtest.walkforward`: `HOLDOUT_START`, `WF_START`, `MIN_TRAIN_TRADES = 12`, `MIN_ELIGIBLE_NEIGHBOUR_FRAC = 0.5`, `folds() -> list[tuple[int, int, int, int]]`, `oos_returns(res, ts0, ts1) -> list[tuple[int, float]]`(`res.equity`만 읽음); `ewbot.backtest.runner.utc_ts`; `ewbot.engine.loop.EquityPoint`, `Trade`.
+- Produces: `ewbot.stratb.research`: `refuse_holdout_bars(df15, end_ts, include_holdout=False) -> None`(2024 봉을 볼 실행이면 `ValueError`); `backtest_b(dfs: Mapping[str, DataFrame], cfg, start_ts=None, end_ts=None, *, include_holdout=False) -> BResult`(자산마다 end_ts 이전 봉으로 프레임을 만들고 신호, 포트폴리오 엔진 실행); `trades_by_asset(trades) -> dict[str, int]`(`ASSETS` 순서); `wf_data_record(dfs_wf) -> dict`(`{자산: {first_ts, last_ts, n_bars, sha256}}`, A의 `data_fingerprint`로 2024 이전 봉을 해시; 모든 자산에 봉이 있어야 한다, 아니면 `ValueError`); `wf_provenance(dfs_wf) -> dict`(`{"wf_data", "code_sha256"(B 지문), "deps_sha256"}`: 워크포워드가 쓴 봉과 코드); `run_grid_b(dfs, start_ts, end_ts, workers=1) -> dict[Combo, BResult]`(32개, 손실 한도 끔, `grid_combos()` 순서); `pick_plateau_b(calmar, n_trades, min_trades=12) -> Combo`(고를 것이 없으면 `ValueError`); `evaluate_folds_b(results, fold_list, equity0, min_trades=12) -> dict`(키 `keys`, `folds`[각 `train`, `test`, `chosen`, `train_calmar`, `oos`], `stitched_equity`, `stitched_metrics`, `oos_trades`, `chosen_final`, `chosen_final_from_fold`, `chosen_final_fallback`, `proceed`); `walk_forward_b(dfs, workers=1) -> dict`(두 자산이 모두 있어야 한다, 아니면 `ValueError`; 위 키 + `combo_table`, 행마다 `combo`, `calmar`, `sharpe`, `n_trades`, `n_trades_by_asset`, `total_return` + `wf_provenance`의 `wf_data`, `code_sha256`, `deps_sha256`).
 
-명세 해석 1~3을 구현한다. 모든 실행은 BTC+ETH 포트폴리오 하나이고(입력은 자산별 15분봉 사전), 워크포워드는 포트폴리오 결과로 조합을 고른다(명세 6.3 개정). A의 구간 함수와 지표는 import하고, A의 전역 그리드에 묶인 plateau 선택과 구간 평가만 B 그리드로 다시 쓴다(규칙은 문자 그대로 같다). 그리드는 자산별 프레임을 한 번만 만들고(15분 지표는 조합과 무관), 기준 구간은 (자산, `zz_k`)마다 한 번만 계산한다. 다중 처리 도우미 이름은 `_pool_init`/`_pool_run`이다(A의 정적 검사가 `_init_worker`·`_map_tasks` 이름을 금지한다).
+명세 해석 1~3을 구현한다. 모든 실행은 BTC+ETH 포트폴리오 하나이고(입력은 자산별 15분봉 사전), 워크포워드는 포트폴리오 결과로 조합을 고른다(명세 6.3 개정). A의 구간 함수와 지표는 import하고, A의 전역 그리드에 묶인 plateau 선택과 구간 평가만 B 그리드로 다시 쓴다(규칙은 문자 그대로 같다). 그리드는 자산별 프레임을 한 번만 만들고(15분 지표는 조합과 무관), 기준 구간은 (자산, `zz_k`)마다 한 번만 계산한다. 다중 처리 도우미 이름은 `_pool_init`/`_pool_run`이다(A의 정적 검사가 `_init_worker`·`_map_tasks` 이름을 금지한다). 워크포워드 출력은 자신이 쓴 봉(자산별 해시)과 B 지문, `deps_sha256`을 기록하고, 잠금(Task 8)이 이것을 잠금 시점의 봉·코드와 비교한다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-2024 거부(한 자산만 2024에 닿아도), 백테스트 = 자산별 신호의 포트폴리오 엔진 실행(같은 봉의 BTC 롱과 ETH 숏), 2단계 그리드에서 plateau가 '자신의 Calmar 최대'로 퇴화함(동점이면 첫 조합), 17개 적격 조건, 구간 선택·이어 붙이기·`proceed`(음수 표본 외, fallback), 두 자산 그리드 32회(1개와 2개 작업자가 같은 결과), 워크포워드가 2024를 자르고 A의 10개 구간을 쓰며 두 자산을 요구하는지를 확인한다.
+2024 거부(한 자산만 2024에 닿아도), 백테스트 = 자산별 신호의 포트폴리오 엔진 실행(같은 봉의 BTC 롱과 ETH 숏), 2단계 그리드에서 plateau가 '자신의 Calmar 최대'로 퇴화함(동점이면 첫 조합), 17개 적격 조건, 구간 선택·이어 붙이기·`proceed`(음수 표본 외, fallback), 두 자산 그리드 32회(1개와 2개 작업자가 같은 결과, 곡선의 첫 점은 시작 직전 시간의 초기 자금), 워크포워드가 2024를 자르고 A의 10개 구간을 쓰며 두 자산을 요구하고 쓴 봉의 해시·B 지문·deps를 기록하는지를 확인한다.
 
 **파일 `tests/stratb/test_research.py`** (새 파일, 전체 내용)
 
@@ -2537,6 +2688,7 @@ from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.stratb import research
 from ewbot.stratb.config import BConfig, StratBParams, grid_combos
 from ewbot.stratb.engine import BResult, run_engine
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.research import (
     backtest_b,
     evaluate_folds_b,
@@ -2544,6 +2696,7 @@ from ewbot.stratb.research import (
     run_grid_b,
     trades_by_asset,
     walk_forward_b,
+    wf_data_record,
 )
 from ewbot.stratb.signals import build_frames, generate_signals
 from tests.stratb.helpers import SIGNAL_BAR, long_setup_df, mirror, random_df
@@ -2633,7 +2786,7 @@ def test_the_grid_runs_every_combo_once_on_both_assets_with_the_breakers_off():
     dfs = {"BTC": random_df(3000, 3), "ETH": random_df(3000, 4)}
     start, end = int(dfs["BTC"]["ts"].iloc[400]), int(dfs["BTC"]["ts"].iloc[-1]) + 900
     out = run_grid_b(dfs, start, end, workers=1)
-    assert list(out) == COMBOS and all(r.equity[0].ts >= start for r in out.values())
+    assert list(out) == COMBOS and all(r.equity[0] == EquityPoint(start - H1, 10_000.0) for r in out.values())
     assert {a for r in out.values() for a, n in trades_by_asset(r.trades).items() if n} == {"BTC", "ETH"}
     assert run_grid_b(dfs, start, end, workers=2) == out
 
@@ -2653,8 +2806,13 @@ def test_walk_forward_cuts_2024_and_uses_strategy_a_folds(monkeypatch):
     assert len(out["folds"]) == 10 and out["folds"][0]["test"][0] == 1_546_300_800  # 2019-01-01
     assert out["chosen_final"] is None and out["proceed"] is False and len(out["combo_table"]) == 32
     assert out["combo_table"][0]["n_trades_by_asset"] == {"BTC": 0, "ETH": 0}
+    assert out["wf_data"] == wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a in ("BTC", "ETH")})
+    assert out["wf_data"]["ETH"]["n_bars"] == 50 and out["wf_data"]["ETH"]["last_ts"] == HOLDOUT_START - 900
+    assert (out["code_sha256"], out["deps_sha256"]) == (stratb_fingerprint(), deps_fingerprint())
     with pytest.raises(ValueError, match="every asset"):
         walk_forward_b({"BTC": df}, workers=1)
+    with pytest.raises(ValueError, match="no ETH 15m bars"):
+        wf_data_record({"BTC": df, "ETH": df.iloc[:0]})
 ```
 
 - [ ] **Step 2: 테스트를 실행해 실패를 확인**
@@ -2692,7 +2850,10 @@ The walk-forward uses strategy A's rules (ewbot.backtest.walkforward, read 2026-
 A's pick_plateau reads A's own GRID, so the identical rule is implemented here over GRID_B. With two
 values per axis every combo neighbours every other: the score is the same for all, the pick is the
 highest own Calmar, and it needs >= 17 of the 32 combos eligible. Spec 6.3: a negative stitched
-out-of-sample return ends strategy B (proceed = False); so does a fallback pick (A's CLI refuses it too)."""
+out-of-sample return ends strategy B (proceed = False); so does a fallback pick (A's CLI refuses it too).
+The walk-forward output also records what it ran on (wf_provenance: every asset's bars before 2024 - wf_data -,
+the B fingerprint and the strategy-A modules B imports); holdout.create_lock checks them against the bars
+and the code at lock time."""
 
 from __future__ import annotations
 
@@ -2705,6 +2866,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from ewbot.backtest.holdout import data_fingerprint
 from ewbot.backtest.metrics import compute_metrics
 from ewbot.backtest.runner import utc_ts
 from ewbot.backtest.walkforward import (
@@ -2727,6 +2889,7 @@ from ewbot.stratb.config import (
     grid_combos,
 )
 from ewbot.stratb.engine import BResult, asset_of, run_engine
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.signals import Frame15, RefLeg, build_frames, generate_signals, reference_legs
 from ewbot.types import H1
 
@@ -2765,6 +2928,26 @@ def backtest_b(
 def trades_by_asset(trades: Sequence[Trade]) -> dict[str, int]:
     """{asset: number of trades} in config.ASSETS order."""
     return {a: sum(1 for t in trades if asset_of(t) == a) for a in ASSETS}
+
+
+def wf_data_record(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
+    """{asset: {first_ts, last_ts, n_bars, sha256}} of every asset's walk-forward bars (A's data_fingerprint of
+    the bars before 2024). ValueError unless every asset of config.ASSETS has bars."""
+    if sorted(dfs_wf) != sorted(ASSETS):
+        raise ValueError(f"the walk-forward bars of every asset {list(ASSETS)} are needed, got {sorted(dfs_wf)}")
+    out: dict[str, Any] = {}
+    for a in ASSETS:
+        df = dfs_wf[a]
+        if df.empty:
+            raise ValueError(f"no {a} 15m bars before 2024-01-01")
+        out[a] = {"first_ts": int(df["ts"].iloc[0]), "last_ts": int(df["ts"].iloc[-1]), "n_bars": int(len(df)),
+                  "sha256": data_fingerprint(df, 0, HOLDOUT_START - 1)}
+    return out
+
+
+def wf_provenance(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
+    """What a walk-forward runs on: wf_data (every asset's bars), code_sha256 (B fingerprint), deps_sha256."""
+    return {"wf_data": wf_data_record(dfs_wf), "code_sha256": stratb_fingerprint(), "deps_sha256": deps_fingerprint()}
 
 
 # ----------------------------------------------------------------------------- grid
@@ -2911,10 +3094,11 @@ def evaluate_folds_b(
 
 def walk_forward_b(dfs: Mapping[str, pd.DataFrame], workers: int = 1) -> dict[str, Any]:
     """The full walk-forward over [2017-01-01, 2024-01-01) on the BTC + ETH portfolio (both assets
-    required). Bars at/after 2024-01-01 are dropped here."""
+    required). Bars at/after 2024-01-01 are dropped here. The output carries wf_provenance of the bars."""
     if sorted(dfs) != sorted(ASSETS):
         raise ValueError(f"the walk-forward runs on every asset {list(ASSETS)}, got {sorted(dfs)}")
     start, end = utc_ts(WF_START), HOLDOUT_START
+    provenance = wf_provenance(_cut(dfs, end))
     results = run_grid_b(_cut(dfs, end), start, end, workers)
     out = evaluate_folds_b(results, folds(), BConfig().initial_equity)
     full = {c: compute_metrics(r.equity, r.trades, start, end) for c, r in results.items()}
@@ -2924,6 +3108,7 @@ def walk_forward_b(dfs: Mapping[str, pd.DataFrame], workers: int = 1) -> dict[st
          "total_return": m.total_return}
         for c, m in full.items()
     ]
+    out.update(provenance)
     return out
 ```
 
@@ -3014,13 +3199,13 @@ ETH에 약 820번의 공개 Coinbase API 요청(수 분; 페이지마다 저장�
 
 **Interfaces:**
 - Consumes: Task 1: `BConfig`, `asset_costs`. Task 2: `resample_1h`. Task 4: `Frame15`, `SignalB`(테스트: `build_frame`, `build_frames`). Task 5: `asset_of`, `run_engine`. Task 6(테스트): `backtest_b`, `trades_by_asset`. A: `ewbot.backtest.benchmarks.buy_hold(df1h, start_ts, end_ts, costs, equity0) -> (list[EquityPoint], list[Trade])`; `ewbot.backtest.metrics.compute_metrics`.
-- Produces: `ewbot.stratb.baselines`: `RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")`; `@dataclass(frozen=True) Shape(direction, stop_frac, tp1_r, tp2_r)`; `trade_shapes(trades) -> list[Shape]`(스냅숏의 `entry_ref` 기준); `buy_hold_b(frames, start_ts, end_ts, cfg) -> (list[EquityPoint], list[Trade])`(자산마다 초기 자금을 똑같이 나눈 A의 `buy_hold`의 합: 50:50, 재조정 없음); `random_signals(f, shapes, n, start_ts, end_ts, seed) -> list[SignalB]`(`seed`는 정수나 정수 목록); `random_control(frames, cfg, b_trades, start_ts, end_ts, runs=1000, seed=0, workers=1) -> dict`(`{"runs", "n_signals": {자산: 그 자산의 B 거래 수}, "seed", "dist": {지표: {"mean", "p05", "p50", "p95"}}}`; 실행 r에서 k번째 자산의 진입은 시드 `[seed + r, k]`; B 거래가 없으면 `runs = 0`, `dist = {}`).
+- Produces: `ewbot.stratb.baselines`: `RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")`; `@dataclass(frozen=True) Shape(direction, stop_frac, tp1_r, tp2_r)`; `trade_shapes(trades) -> list[Shape]`(스냅숏의 `entry_ref` 기준); `buy_hold_b(frames, start_ts, end_ts, cfg) -> (list[EquityPoint], list[Trade])`(자산마다 초기 자금을 똑같이 나눈 A의 `buy_hold`의 합: 50:50, 재조정 없음; 엔진처럼 첫 점은 시작 직전 시간의 초기 자금 — 프레임에 그 시간이 있을 때); `random_signals(f, shapes, n, start_ts, end_ts, seed) -> list[SignalB]`(`seed`는 정수나 정수 목록); `random_control(frames, cfg, b_trades, start_ts, end_ts, runs=1000, seed=0, workers=1) -> dict`(`{"runs", "n_signals": {자산: 그 자산의 B 거래 수}, "seed", "dist": {지표: {"mean", "p05", "p50", "p95"}}}`; 실행 r에서 k번째 자산의 진입은 시드 `[seed + r, k]`; B 거래가 없으면 `runs = 0`, `dist = {}`).
 
-명세 6.5(2026-10-07 개정)와 해석 10을 구현한다. 매수 후 보유는 BTC/ETH 50:50 포트폴리오다: 초기 자금을 반씩 나눠 자산마다 A의 함수를 그 15분 프레임에서 만든 1시간봉에 그대로 쓰고(현물, 그 몫 전부, 양쪽 수수료·슬리피지), 두 곡선을 시간마다 더한다(재조정 없음). 대조군은 B와 같은 포트폴리오 엔진·설정으로 돌고 진입 시각만 무작위이며, 자산마다 그 자산의 B 거래 수와 거래 모양을 쓴다(각 자산의 평균 빈도). 시드가 고정되어 있어 작업자 수와 관계없이 결과가 같다.
+명세 6.5(2026-10-07 개정)와 해석 10을 구현한다. 매수 후 보유는 BTC/ETH 50:50 포트폴리오다: 초기 자금을 반씩 나눠 자산마다 A의 함수를 그 15분 프레임에서 만든 1시간봉에 그대로 쓰고(현물, 그 몫 전부, 양쪽 수수료·슬리피지), 두 곡선을 시간마다 더한다(재조정 없음). 그 앞에 엔진 곡선과 같은 첫 점(시작 직전 시간의 초기 자금)을 두어, B와 매수 후 보유가 같은 시간들로 측정된다. 대조군은 B와 같은 포트폴리오 엔진·설정으로 돌고 진입 시각만 무작위이며, 자산마다 그 자산의 B 거래 수와 거래 모양을 쓴다(각 자산의 평균 빈도). 시드가 고정되어 있어 작업자 수와 관계없이 결과가 같다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-50:50 매수 후 보유가 자산마다 A의 매수 후 보유(자금 절반)의 합인지, 스냅숏 기준 거래 모양, 무작위 진입의 시드 재현(정수와 목록 시드)·적격 봉·모양 1회씩 사용, 대조군의 자산별 신호 수와 분포 키와 결정성(1개와 2개 작업자), B 거래가 없을 때를 확인한다.
+50:50 매수 후 보유가 자산마다 A의 매수 후 보유(자금 절반)의 합인지, B와 매수 후 보유가 같은 시간들(시작 직전 시간의 초기 자금부터)로 측정되는지, 스냅숏 기준 거래 모양, 무작위 진입의 시드 재현(정수와 목록 시드)·적격 봉·모양 1회씩 사용, 대조군의 자산별 신호 수와 분포 키와 결정성(1개와 2개 작업자), B 거래가 없을 때를 확인한다.
 
 **파일 `tests/stratb/test_baselines.py`** (새 파일, 전체 내용)
 
@@ -3030,7 +3215,7 @@ from __future__ import annotations
 import pytest
 
 from ewbot.backtest.benchmarks import buy_hold
-from ewbot.engine.loop import Trade
+from ewbot.engine.loop import EquityPoint, Trade
 from ewbot.stratb.baselines import buy_hold_b, random_control, random_signals, trade_shapes
 from ewbot.stratb.config import BConfig, StratBParams, asset_costs
 from ewbot.stratb.data15 import resample_1h
@@ -3051,9 +3236,21 @@ def test_buy_hold_is_a_50_50_portfolio_of_strategy_a_buy_holds():
     start, end = int(frames["BTC"].ts[100]) // 3600 * 3600, int(frames["BTC"].ts[900]) // 3600 * 3600
     eq, trades = buy_hold_b(frames, start, end, BConfig())
     parts = [buy_hold(resample_1h(dfs[a]), start, end, asset_costs(BConfig(), a), 5_000.0) for a in ("BTC", "ETH")]
-    assert [p.ts for p in eq] == [p.ts for p in parts[0][0]] == [p.ts for p in parts[1][0]]
-    assert [p.equity for p in eq] == pytest.approx([a.equity + b.equity for a, b in zip(parts[0][0], parts[1][0])])
-    assert trades == parts[0][1] + parts[1][1] and eq[0].equity == 10_000.0 and trades[0].setup == "BH"
+    assert eq[0] == EquityPoint(start - 3600, 10_000.0)  # the account before the window, as the engine's
+    assert [p.ts for p in eq[1:]] == [p.ts for p in parts[0][0]] == [p.ts for p in parts[1][0]]
+    assert [p.equity for p in eq[1:]] == pytest.approx([a.equity + b.equity for a, b in zip(parts[0][0], parts[1][0])])
+    assert trades == parts[0][1] + parts[1][1] and eq[1].equity == 10_000.0 and trades[0].setup == "BH"
+
+
+def test_strategy_b_and_buy_and_hold_are_measured_on_the_same_hours():
+    dfs = {"BTC": random_df(3000, 3), "ETH": random_df(3000, 4, start=2_000.0)}
+    cfg = BConfig()
+    frames = build_frames(dfs, cfg.params)
+    start, end = RANDOM_T0 + 100 * 3600, RANDOM_T0 + 600 * 3600
+    res = backtest_b(dfs, cfg, start, end)
+    bh, _ = buy_hold_b(frames, start, end, cfg)
+    assert [p.ts for p in res.equity] == [p.ts for p in bh] == list(range(start - 3600, end, 3600))
+    assert res.equity[0] == bh[0] == EquityPoint(start - 3600, 10_000.0)
 
 
 def test_shapes_come_from_the_signal_reference_price():
@@ -3126,7 +3323,9 @@ of a 50/50 BTC/ETH portfolio and the random-entry control.
 
 Buy & hold splits the initial equity equally between the assets and runs A's backtest.benchmarks.buy_hold
 on each asset's 1h bars built from its 15m frame (spot, the part's whole equity, one fee and one slippage
-each way, hourly marks; no rebalancing); its equity is the sum of the parts. The random control keeps
+each way, hourly marks; no rebalancing); its equity is the sum of the parts, after the same starting point
+as the engine's curve (the initial equity at the hour before start_ts, when the frames have that hour), so
+strategy B and buy & hold are measured over the same hours. The random control keeps
 everything of strategy B but the entry times, per asset: the same window, as many entries on each asset
 as B's trades on it (each asset's own frequency), that asset's own trade shapes (direction, stop distance
 as a fraction of the reference price, TP1 and TP2 in R) in a seeded random order, on uniformly drawn 15m
@@ -3146,10 +3345,11 @@ import pandas as pd
 from ewbot.backtest.benchmarks import buy_hold
 from ewbot.backtest.metrics import compute_metrics
 from ewbot.engine.loop import EquityPoint, Trade
-from ewbot.stratb.config import BConfig, asset_costs
+from ewbot.stratb.config import M15, BConfig, asset_costs
 from ewbot.stratb.data15 import resample_1h
 from ewbot.stratb.engine import asset_of, run_engine
 from ewbot.stratb.signals import Frame15, SignalB
+from ewbot.types import H1
 
 RANDOM_METRICS = ("sharpe", "max_dd", "total_return", "calmar", "n_trades")
 
@@ -3193,6 +3393,9 @@ def buy_hold_b(
         parts.append(eq)
         trades.extend(tr)
     out: list[EquityPoint] = []
+    base = start_ts // H1 * H1 - H1  # run_engine's first point with a start time: the account before the window
+    if any(parts) and min(int(frames[a].ts[0]) for a in names) <= base + H1 - M15:
+        out.append(EquityPoint(base, float(cfg.initial_equity)))
     cur, nxt = [share] * len(parts), [0] * len(parts)
     for t in sorted({p.ts for eq in parts for p in eq}):
         for k, eq in enumerate(parts):  # each part at its latest point at or before t
@@ -3294,7 +3497,7 @@ def random_control(
 uv run --group live pytest tests/stratb/test_baselines.py -q
 ```
 
-예상: `5 passed`
+예상: `6 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -3312,38 +3515,47 @@ git commit -m "feat(stratb): 50/50 BTC/ETH buy & hold and the per-asset random-e
 - Test: `tests/stratb/test_holdout.py`
 
 **Interfaces:**
-- Consumes: Task 1: `ASSETS`, `GRID_B`, `M15`, `combo_to_json`, `config_for`, `normalize_combo`, `scale_costs`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `LOCK_KIND`, `REPLAY_ANCHOR`, `cache_paths`, `load_15m`, `load_caches_15m`·`HoldoutGuardError`(테스트). Task 4: `build_frames`, `generate_signals`; 테스트 도우미 `save_world`, `world_dfs`. Task 5: `run_engine`. Task 6: `backtest_b`, `trades_by_asset`. Task 7: `buy_hold_b`, `random_control`. A: `ewbot.backtest.holdout.data_fingerprint(df, start_ts, last_ts) -> str`, `git_state() -> dict`; `ewbot.backtest.metrics.Metrics`, `compute_metrics`; `ewbot.backtest.report.to_jsonable`; 테스트: `tests.paper.helpers.git(repo, *args)`.
-- Produces: `ewbot.stratb.holdout`: `LOCK_VERSION = 1`, `RANDOM_RUNS = 1000`, `MAX_DD = 0.15`, `MIN_TRADES = 50`, `COST_MULT = 1.5`, `BOUND`(다이제스트 대상 필드); `class HoldoutBError(RuntimeError)`; `lock_digest_b(lock) -> str`; `read_lock(path) -> dict`(종류·다이제스트 확인); `committed_lock(path) -> dict`(git HEAD의 내용; 커밋 안 됐으면 `HoldoutBError`); `wf_data_record(dfs_wf) -> dict`(`{자산: {first_ts, last_ts, n_bars, sha256}}`, 두 자산이 모두 있어야 한다); `data_fingerprint_b(dfs, start_ts, last_ts) -> str`(자산마다 A의 `data_fingerprint`를 `"<자산>:<해시>"` 줄로 `ASSETS` 순서로 이어 sha256); `create_lock(params, dfs_wf, *, params_source, now_ts, lock_path=DEFAULT_LOCK_PATH, random_runs=1000, random_seed=0) -> dict`; `evaluate_criteria_b(b, bh, rnd, cost) -> dict`(`c1_sharpe_beats_bh_and_random_p95`, `c2_max_dd_le_15pct`, `c3_trades_ge_50`, `c4_cost_x1_5_net_profit`, `passed` 등); `run_holdout_b(*, confirm, cache_dir, lock_path=DEFAULT_LOCK_PATH, workers=1, fingerprint=stratb_fingerprint) -> dict`(`{"lock_path", "result": BResult, "first_run"}`).
-  잠금 파일 필드: `kind`, `version`, `keys`, `params`, `config`, `grid`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `random_runs`, `random_seed`, `code_sha256`, `wf_data`{`BTC`, `ETH`: 각각 {`first_ts`, `last_ts`, `n_bars`, `sha256`}}, `sha256`, `params_source`, `locked_at`, `git_head`, `git_dirty`, `attempts`[{`started`, `data_sha256`, `git_head`, `git_dirty`, `completed`?}], `first_run`{`started`, `completed`, `start_ts`, `end_ts`, `last_bar_ts`, `data`{`start_ts`, `last_bar_ts`, `n_bars`{자산}, `sha256`(두 자산, `data_fingerprint_b`), `assets`{자산: 해시}}, `metrics`{`B`, `BH`, `B_cost_x1_5`}, `n_trades_by_asset`, `random`, `criteria`}. `config`에는 두 자산의 상품·계약 크기·틱과 `max_total_leverage`도 들어간다.
+- Consumes: Task 1: `ASSETS`, `GRID_B`, `M15`, `combo_to_json`, `config_for`, `normalize_combo`, `scale_costs`, `deps_fingerprint`, `stratb_fingerprint`, `deps_files`(테스트). Task 2: `DEFAULT_LOCK_PATH`, `LOCK_KIND`, `REPLAY_ANCHOR`, `cache_paths`, `load_15m`, `lock_digest_b`, `LOCK_BOUND`·`load_caches_15m`·`HoldoutGuardError`(테스트). Task 4: `build_frames`, `generate_signals`; 테스트 도우미 `save_world`, `world_dfs`. Task 5: `run_engine`. Task 6: `backtest_b`, `trades_by_asset`, `wf_data_record`, `wf_provenance`. Task 7: `buy_hold_b`, `random_control`. A: `ewbot.backtest.holdout.data_fingerprint(df, start_ts, last_ts) -> str`, `git_state() -> dict`; `ewbot.backtest.metrics.Metrics`, `compute_metrics`; `ewbot.backtest.report.to_jsonable`; 테스트: `tests.paper.helpers.git(repo, *args)`.
+- Produces: `ewbot.stratb.holdout`: `LOCK_VERSION = 1`, `RANDOM_RUNS = 1000`, `MAX_DD = 0.15`, `MIN_TRADES = 50`, `COST_MULT = 1.5`; `class HoldoutBError(RuntimeError)`; `read_lock(path) -> dict`(종류·다이제스트 확인); `committed_lock(path) -> dict`(git HEAD의 내용; 커밋 안 됐으면 `HoldoutBError`); `lock_mismatch_b(lock) -> list[str]`(이 코드가 잠금의 조합으로 쓸 값과 다른 필드: `keys`, `grid`, `config`(`config_for(params)`), `holdout_start`, `replay_anchor`; 그리드 밖 조합이면 `["params"]`); `data_fingerprint_b(dfs, start_ts, last_ts) -> str`(자산마다 A의 `data_fingerprint`를 `"<자산>:<해시>"` 줄로 `ASSETS` 순서로 이어 sha256); `create_lock(report_path, dfs_wf, *, now_ts, lock_path=DEFAULT_LOCK_PATH, random_runs=1000, random_seed=0) -> dict`(워크포워드 보고서 파일에서 만든다; `proceed`가 아니거나 fallback이거나 조합이 없는 보고서, `wf_data`·`code_sha256`·`deps_sha256`이 지금의 `wf_provenance(dfs_wf)`와 다른 보고서, 읽을 수 없는 보고서, 그리드 밖 조합, 2024 데이터, 한 자산뿐인 데이터, 이른 시각, 잠금의 작업 트리에서 추적 파일의 커밋 안 된 변경은 `HoldoutBError`); `evaluate_criteria_b(b, bh, rnd, cost) -> dict`(`c1_sharpe_beats_bh_and_random_p95`, `c2_max_dd_le_15pct`, `c3_trades_ge_50`, `c4_cost_x1_5_net_profit`, `passed` 등); `run_holdout_b(*, confirm, cache_dir, lock_path=DEFAULT_LOCK_PATH, workers=1, fingerprint=stratb_fingerprint, deps=deps_fingerprint) -> dict`(`{"lock_path", "result": BResult, "first_run"}`).
+  잠금 파일 필드: `kind`, `version`, `keys`, `params`, `config`, `grid`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `random_runs`, `random_seed`, `code_sha256`, `deps_sha256`, `wf_data`{`BTC`, `ETH`: 각각 {`first_ts`, `last_ts`, `n_bars`, `sha256`}}, `wf_report_sha256`(워크포워드 보고서 파일의 sha256), `sha256`(`LOCK_BOUND` 필드의 다이제스트), `params_source`(`walkforward:<보고서 경로>#chosen_final`), `locked_at`, `git_head`, `git_dirty`, `attempts`[{`started`, `data_sha256`, `git_head`, `git_dirty`, `completed`?}], `first_run`{`started`, `completed`, `start_ts`, `end_ts`, `last_bar_ts`, `data`{`start_ts`, `last_bar_ts`, `n_bars`{자산}, `sha256`(두 자산, `data_fingerprint_b`), `assets`{자산: 해시}}, `metrics`{`B`, `BH`, `B_cost_x1_5`}, `n_trades_by_asset`, `random`, `criteria`}. `config`에는 두 자산의 상품·계약 크기·틱과 `max_total_leverage`도 들어간다.
 
-명세 6.4~6.5(2026-10-07 개정)와 해석 11을 구현한다. 잠금은 2024+ 데이터 없이 만들어지고(두 자산 각각의 2024 이전 데이터 해시만 묶음), 커밋된 뒤에야 홀드아웃이 돈다. 홀드아웃은 두 자산을 `REPLAY_ANCHOR`부터 잠금의 마지막 봉까지 손실 한도를 켠 채 다시 계산하고 2024-01-01부터 거래한다. 이어서 50:50 매수 후 보유, 자산별 무작위 대조군(잠금의 횟수·시드), 비용 1.5배 재실행을 같은 프레임에서 돌린다. 포트폴리오 합격 기준 4개(거래 수는 두 자산 합계)를 모두 `first_run.criteria`에 기록한다. 테스트의 두 자산 합성 세계(`world_dfs`, 2023-10-01부터)는 232봉마다 같은 봉에서 BTC 롱과 ETH 숏이 나와 홀드아웃 구간에 124건(자산마다 62건), 네 기준 모두 합격이다(무작위 대조군은 테스트 속도를 위해 4회).
+명세 6.4~6.5(2026-10-07 개정, 같은 날 잠금 전 최종 검토 수정)와 해석 11을 구현한다. 잠금은 워크포워드 보고서(`ewbot stratb walkforward`의 JSON)에서만 만든다: `proceed`이고 fallback이 아니며, 보고서가 기록한 봉 해시(`wf_data`)·B 지문·`deps_sha256`이 지금의 봉과 코드(`wf_provenance`)와 같아야 하고, 잠금은 보고서 파일의 sha256을 묶는다. 잠금은 2024+ 데이터 없이 만들어지고(두 자산 각각의 2024 이전 데이터 해시만 묶음), 추적 파일에 커밋 안 된 변경이 있으면 거부되며, 커밋된 뒤에야 홀드아웃이 돈다. 홀드아웃은 잠금의 키·그리드·설정·홀드아웃 시작·앵커가 이 코드가 쓸 값과 같고(`lock_mismatch_b`), B 지문과 `deps_sha256`(B가 import하는 A 모듈, Task 1)이 같고, 잠금 파일 말고는 추적 파일에 커밋 안 된 변경이 없을 때만 돈다(잠금이 있는 작업 트리의 `git status --porcelain --untracked-files=no`; 시도 기록 때문에 잠금 파일 자체는 바뀌어 있을 수 있다). 홀드아웃은 두 자산을 `REPLAY_ANCHOR`부터 잠금의 마지막 봉까지 손실 한도를 켠 채 다시 계산하고 2024-01-01부터 거래한다. 이어서 50:50 매수 후 보유, 자산별 무작위 대조군(잠금의 횟수·시드), 비용 1.5배 재실행을 같은 프레임에서 돌린다. 넷 모두 2024-01-01 직전 시간의 초기 자금에서 시작하는 같은 시간들로 측정된다(Task 5·7). 포트폴리오 합격 기준 4개(거래 수는 두 자산 합계)를 모두 `first_run.criteria`에 기록한다. 테스트의 두 자산 합성 세계(`world_dfs`, 2023-10-01부터)는 232봉마다 같은 봉에서 BTC 롱과 ETH 숏이 나와 홀드아웃 구간에 124건(자산마다 62건), 네 기준 모두 합격이다(무작위 대조군은 테스트 속도를 위해 4회).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-잠금 전 두 자산의 2024 읽기 거부, 잠금 내용(자산별 데이터 해시, 두 자산 설정)과 1회 작성, 그리드 밖·2024 데이터·한 자산뿐인 데이터·이른 시각 거부, 필드 수정 감지, `--confirm`과 커밋 요구, B 코드 변경·한 자산의 2024 이전 데이터 변경 거부, 1회 실행과 기록(124건 = 자산마다 62건, 합격), 재실행 거부, 끝나지 않은 시도의 데이터 일치, 기준 하나하나의 실패를 확인한다.
+잠금 전 두 자산의 2024 읽기 거부, 잠금 내용(자산별 데이터 해시, 두 자산 설정, `deps_sha256`과 그것이 덮는 A 모듈)과 1회 작성, 그리드 밖·2024 데이터·한 자산뿐인 데이터·이른 시각 거부, 워크포워드 보고서의 조건(`proceed`가 아님·fallback·조합 없음, 다른 봉·B 코드·A 모듈로 만든 보고서, 읽을 수 없는 보고서는 거부; 보고서의 sha256과 출처 기록), 필드 수정 감지, `--confirm`과 커밋 요구, B 코드 변경·한 자산의 2024 이전 데이터 변경 거부, 이 코드의 것이 아닌 잠금 필드(설정·그리드·키·홀드아웃 시작·앵커)와 A 모듈 변경 거부, 잠금과 실행 때 더러운 작업 트리 거부(잠금 파일 자체의 변경은 예외, git 작업 트리가 아니면 거부), 1회 실행과 기록(124건 = 자산마다 62건, 합격, 곡선의 첫 점은 2024-01-01 직전 시간의 초기 자금), 재실행 거부, 끝나지 않은 시도의 데이터 일치, 기준 하나하나의 실패를 확인한다.
 
 **파일 `tests/stratb/test_holdout.py`** (새 파일, 전체 내용)
 
 ```python
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pandas as pd
 import pytest
 
 from ewbot.backtest.metrics import Metrics
-from ewbot.stratb.data15 import REPLAY_ANCHOR, HoldoutGuardError, cache_paths, load_15m, load_caches_15m
-from ewbot.stratb.fingerprint import stratb_fingerprint
+from ewbot.stratb.data15 import (
+    LOCK_BOUND,
+    REPLAY_ANCHOR,
+    HoldoutGuardError,
+    cache_paths,
+    load_15m,
+    load_caches_15m,
+    lock_digest_b,
+)
+from ewbot.stratb.fingerprint import deps_files, deps_fingerprint, stratb_fingerprint
 from ewbot.stratb.holdout import (
     HoldoutBError,
     create_lock,
     data_fingerprint_b,
     evaluate_criteria_b,
-    lock_digest_b,
     read_lock,
     run_holdout_b,
 )
+from ewbot.stratb.research import wf_provenance
 from tests.paper.helpers import git
 from tests.stratb.helpers import save_world, world_dfs
 
@@ -3363,17 +3575,37 @@ def world(tmp_path):
     return repo, cache, repo / "holdout-b.lock"
 
 
+def _report(world, dfs=None, **edit):
+    """A walk-forward report as `ewbot stratb walkforward` writes it: it proceeds with COMBO and was made on
+    the cache's bars (or dfs) and this code."""
+    repo, cache, _ = world
+    rep = {"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True,
+           **wf_provenance(load_caches_15m(cache) if dfs is None else dfs), **edit}
+    path = repo.parent / "wf.json"  # outside the repo, like the gitignored reports/
+    path.write_text(json.dumps(rep), encoding="utf-8")
+    return path
+
+
 def _lock(world, **kw):
     _, cache, lock_path = world
-    args = dict(params_source="test", now_ts=NOW, lock_path=lock_path, random_runs=4)
+    args = dict(now_ts=NOW, lock_path=lock_path, random_runs=4)
     args.update(kw)
-    return create_lock(COMBO, load_caches_15m(cache), **args)
+    return create_lock(_report(world), load_caches_15m(cache), **args)
 
 
 def _commit(world):
     repo, _, lock_path = world
     git(repo, "add", lock_path.name)
     git(repo, "commit", "-q", "-m", "lock")
+
+
+def _recommit(world, edit):
+    """Edit the committed lock (its sha256 recomputed, so only the code checks can catch it) and commit it."""
+    lock = json.loads(world[2].read_text())
+    edit(lock)
+    lock["sha256"] = lock_digest_b(lock)
+    world[2].write_text(json.dumps(lock))
+    _commit(world)
 
 
 def test_2024_bars_are_unreadable_until_the_lock_exists(world):
@@ -3392,6 +3624,11 @@ def test_the_lock_binds_params_code_data_and_window_and_is_written_once(world):
     assert lock["params"] == COMBO and lock["sha256"] == lock_digest_b(lock)
     assert lock["last_bar_ts"] == NOW // 3600 * 3600 - 900 and (lock["holdout_start"], lock["replay_anchor"]) == (HS, REPLAY_ANCHOR)
     assert lock["code_sha256"] == stratb_fingerprint() and lock["random_runs"] == 4 and lock["first_run"] is None
+    assert lock["deps_sha256"] == deps_fingerprint() and {"code_sha256", "deps_sha256", "wf_data"} <= set(LOCK_BOUND)
+    a_side = {f"src/ewbot/{m}" for m in ("config.py", "indicators.py", "backtest/metrics.py", "backtest/benchmarks.py",
+              "backtest/holdout.py", "backtest/walkforward.py", "execution/costs.py", "risk/sizing.py",
+              "risk/breakers.py", "waves/zigzag.py", "data/coinbase_history.py")}
+    assert a_side <= set(deps_files())
     assert [(a, w["last_ts"]) for a, w in lock["wf_data"].items()] == [("BTC", HS - 900), ("ETH", HS - 900)]
     assert lock["wf_data"]["BTC"]["sha256"] != lock["wf_data"]["ETH"]["sha256"]
     assert lock["config"]["risk"]["risk_pct"] == 0.005 and lock["config"]["max_total_leverage"] == 3.0
@@ -3403,16 +3640,36 @@ def test_the_lock_binds_params_code_data_and_window_and_is_written_once(world):
 def test_the_lock_refuses_off_grid_params_2024_or_one_asset_data_and_an_early_clock(world):
     _, cache, lock_path = world
     wf = load_caches_15m(cache)
-    with pytest.raises(HoldoutBError):
-        create_lock([2.5, [0.382, 0.618], 1.0, 1.272, "breakeven"], wf, params_source="t", now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="not a combo"):
+        create_lock(_report(world, chosen_final=[2.5, [0.382, 0.618], 1.0, 1.272, "breakeven"]), wf, now_ts=NOW,
+                    lock_path=lock_path)
     full = {a: pd.read_parquet(p) for a, p in cache_paths(cache).items()}
     with pytest.raises(HoldoutBError, match="before 2024"):
-        create_lock(COMBO, full, params_source="t", now_ts=NOW, lock_path=lock_path)
+        create_lock(_report(world), full, now_ts=NOW, lock_path=lock_path)
     with pytest.raises(HoldoutBError, match="every asset"):
-        create_lock(COMBO, {"BTC": wf["BTC"]}, params_source="t", now_ts=NOW, lock_path=lock_path)
+        create_lock(_report(world), {"BTC": wf["BTC"]}, now_ts=NOW, lock_path=lock_path)
     with pytest.raises(HoldoutBError, match="after 2024"):
-        create_lock(COMBO, wf, params_source="t", now_ts=HS + 600, lock_path=lock_path)
+        create_lock(_report(world), wf, now_ts=HS + 600, lock_path=lock_path)
     assert not lock_path.exists()
+
+
+def test_the_lock_comes_from_a_proceeding_walk_forward_report_of_these_bars_and_this_code(world):
+    repo, cache, lock_path = world
+    wf = load_caches_15m(cache)
+    for edit, match in (({"proceed": False}, "proceed is false"), ({"chosen_final_fallback": True}, "proceed is false"),
+                        ({"chosen_final": None}, "proceed is false"), ({"code_sha256": "0" * 64}, r"\['code_sha256'\]"),
+                        ({"deps_sha256": "0" * 64}, r"\['deps_sha256'\]")):
+        with pytest.raises(HoldoutBError, match=match):
+            create_lock(_report(world, **edit), wf, now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match=r"\['wf_data'\]"):  # the walk-forward saw other bars
+        create_lock(_report(world, {a: df.iloc[1:] for a, df in wf.items()}), wf, now_ts=NOW, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="unreadable"):
+        create_lock(repo.parent / "missing.json", wf, now_ts=NOW, lock_path=lock_path)
+    assert not lock_path.exists()
+    report = _report(world)
+    lock = create_lock(report, wf, now_ts=NOW, lock_path=lock_path, random_runs=4)
+    assert lock["wf_report_sha256"] == hashlib.sha256(report.read_bytes()).hexdigest() and "wf_report_sha256" in LOCK_BOUND
+    assert lock["params_source"] == f"walkforward:{report}#chosen_final" and read_lock(lock_path) == lock
 
 
 def test_an_edited_bound_field_breaks_the_lock(world):
@@ -3445,6 +3702,50 @@ def test_a_b_code_change_or_other_walk_forward_bars_are_refused(world):
     df.to_parquet(eth, index=False)
     with pytest.raises(HoldoutBError, match=r"\['ETH'\] 15m bars before 2024-01-01 differ"):
         run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+
+
+def test_the_holdout_refuses_a_lock_that_is_not_this_codes_and_changed_strategy_a_modules(world):
+    _, cache, lock_path = world
+    _lock(world)
+    _commit(world)
+    with pytest.raises(HoldoutBError, match="strategy-A modules"):
+        run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path, deps=lambda: "0" * 64)
+    edits = {"config": lambda x: x["config"].update(initial_equity=20_000.0),
+             "grid": lambda x: x["grid"]["zz_k"].append(4.0), "keys": lambda x: x["keys"].reverse(),
+             "holdout_start": lambda x: x.update(holdout_start=HS + 3600),
+             "replay_anchor": lambda x: x.update(replay_anchor=REPLAY_ANCHOR - 86_400)}
+    for field, edit in edits.items():
+        original = lock_path.read_text()
+        _recommit(world, edit)
+        with pytest.raises(HoldoutBError, match=rf"\['{field}'\] are not this code's"):
+            run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+        _recommit(world, lambda x: x.clear() or x.update(json.loads(original)))
+    assert read_lock(lock_path)["attempts"] == []
+
+
+def test_a_dirty_tracked_tree_is_refused_at_lock_and_run_but_not_the_lock_itself(world, tmp_path):
+    repo, cache, lock_path = world
+    (repo / "notes.txt").write_text("a\n")
+    git(repo, "add", "notes.txt")
+    git(repo, "commit", "-q", "-m", "notes")
+    (repo / "notes.txt").write_text("b\n")
+    with pytest.raises(HoldoutBError, match="uncommitted changes"):
+        _lock(world)
+    assert not lock_path.exists()
+    git(repo, "checkout", "-q", "notes.txt")
+    _lock(world)
+    _commit(world)
+    (repo / "notes.txt").write_text("b\n")
+    with pytest.raises(HoldoutBError, match="uncommitted changes"):
+        run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+    git(repo, "checkout", "-q", "notes.txt")
+    lock = json.loads(lock_path.read_text())
+    lock["attempts"].append({"started": "x", "data_sha256": "f" * 64})  # an uncommitted change of the lock itself
+    lock_path.write_text(json.dumps(lock))
+    with pytest.raises(HoldoutBError, match="other holdout bars"):  # past the clean-tree check
+        run_holdout_b(confirm=True, cache_dir=cache, lock_path=lock_path)
+    with pytest.raises(HoldoutBError, match="not a git working tree"):
+        create_lock(_report(world), load_caches_15m(cache), now_ts=NOW, lock_path=tmp_path / "holdout-b.lock")
 
 
 def test_the_holdout_runs_once_and_records_the_criteria(world):
@@ -3518,19 +3819,26 @@ uv run --group live pytest tests/stratb/test_holdout.py -q
 """Strategy-B holdout lock and its one-shot run (Plan 4 spec 6.4-6.5).
 
 create_lock() writes <project root>/holdout-b.lock BEFORE any 2024+ candle can be read (data15 refuses
-them until a lock exists): the walk-forward's final combo, the full run config (assets included), the
-grid, the B fingerprint, the sha256 of each asset's pre-2024 15m bars the walk-forward used (wf_data:
-BTC and ETH), the holdout start, the replay anchor (2023-10-01), the 1,000-run random control and its
-seed, and last_bar_ts - the last 15m bar of the last complete hour at lock time, where the holdout ends
-(spec 6.4). The user commits it.
+them until a lock exists), from the walk-forward report (`ewbot stratb walkforward` JSON): only one that
+proceeds (spec 6.3) and was made on the same bars, B code and strategy-A modules (its wf_data, code_sha256
+and deps_sha256 equal research.wf_provenance of the bars and the code now). The lock holds the report's
+final combo and sha256 (wf_report_sha256), the full run config (assets included), the grid, the B
+fingerprint, deps_sha256 (fingerprint.deps_fingerprint: the strategy-A modules B imports -
+config defaults, costs, sizing, breakers, metrics, buy & hold, walk-forward windows, data hashing, ...),
+the sha256 of each asset's pre-2024 15m bars the walk-forward used (wf_data: BTC and ETH), the holdout
+start, the replay anchor (2023-10-01), the 1,000-run random control and its seed, and last_bar_ts - the
+last 15m bar of the last complete hour at lock time, where the holdout ends (spec 6.4). It refuses when a
+tracked file of the lock's git working tree has uncommitted changes. The user commits it.
 
 run_holdout_b() runs the holdout ONCE after the user's approval (confirm=True) and records the result in
 first_run. It refuses (HoldoutBError) unless: the lock's sha256 is the digest of its own bound fields and
 equals the committed version's (git HEAD); first_run is empty there and in the file (one completed run,
 ever: no rerun, no other combo); the running B fingerprint equals code_sha256 (no B code change after the
-lock); every asset's pre-2024 bars hash to its wf_data sha256; every asset's data reaches last_bar_ts;
-an unfinished earlier attempt saw the same holdout bars. Each attempt is recorded in the lock before it
-runs.
+lock); the lock's keys, grid, config, holdout_start and replay_anchor are what this code writes for its
+params (lock_mismatch_b); the strategy-A modules B imports hash to deps_sha256; no tracked file but the
+lock itself has uncommitted changes; every asset's pre-2024 bars hash to its wf_data sha256; every
+asset's data reaches last_bar_ts; an unfinished earlier attempt saw the same holdout bars. Each attempt
+is recorded in the lock before it runs.
 
 Criteria (spec 6.5 as revised 2026-10-07, on the BTC + ETH portfolio, all four): Sharpe above the 50/50
 buy & hold and above the 95th percentile of the random control (each asset's own entry frequency); max
@@ -3545,7 +3853,7 @@ import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 
@@ -3555,10 +3863,10 @@ from ewbot.backtest.report import to_jsonable
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.stratb.baselines import buy_hold_b, random_control
 from ewbot.stratb.config import ASSETS, GRID_B, M15, combo_to_json, config_for, normalize_combo, scale_costs
-from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m, lock_digest_b
 from ewbot.stratb.engine import run_engine
-from ewbot.stratb.fingerprint import stratb_fingerprint
-from ewbot.stratb.research import backtest_b, trades_by_asset
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
+from ewbot.stratb.research import backtest_b, trades_by_asset, wf_data_record, wf_provenance
 from ewbot.stratb.signals import build_frames, generate_signals
 from ewbot.types import H1
 
@@ -3567,18 +3875,10 @@ RANDOM_RUNS = 1000
 MAX_DD = 0.15
 MIN_TRADES = 50
 COST_MULT = 1.5
-BOUND = ("kind", "version", "keys", "params", "config", "grid", "holdout_start", "replay_anchor", "last_bar_ts",
-         "random_runs", "random_seed", "code_sha256", "wf_data")
 
 
 class HoldoutBError(RuntimeError):
     """The strategy-B lock cannot be written, or the holdout may not run."""
-
-
-def lock_digest_b(lock: dict[str, Any]) -> str:
-    """sha256 of the sorted compact JSON of the lock's BOUND fields."""
-    blob = json.dumps({k: lock.get(k) for k in BOUND}, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:
@@ -3619,18 +3919,36 @@ def committed_lock(path: Path) -> dict[str, Any]:
         raise HoldoutBError(f"the committed {p.name} is not JSON") from exc
 
 
-def wf_data_record(dfs_wf: Mapping[str, pd.DataFrame]) -> dict[str, Any]:
-    """{asset: {first_ts, last_ts, n_bars, sha256}} of every asset's walk-forward bars (all before 2024)."""
-    if sorted(dfs_wf) != sorted(ASSETS):
-        raise HoldoutBError(f"the lock needs the walk-forward bars of every asset {list(ASSETS)}, got {sorted(dfs_wf)}")
-    out: dict[str, Any] = {}
-    for a in ASSETS:
-        df = dfs_wf[a]
-        if df.empty:
-            raise HoldoutBError(f"no {a} 15m bars before 2024-01-01")
-        out[a] = {"first_ts": int(df["ts"].iloc[0]), "last_ts": int(df["ts"].iloc[-1]), "n_bars": int(len(df)),
-                  "sha256": data_fingerprint(df, 0, HOLDOUT_START - 1)}
-    return out
+def _dirty(path: Path) -> list[str]:
+    """Tracked files of the lock's git working tree with uncommitted changes, the lock itself excepted."""
+    p = Path(path)
+    cmd = ["git", "-C", str(p.parent), "status", "--porcelain", "--untracked-files=no", "--", ":/", f":!{p.name}"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HoldoutBError(f"git is not available to check the working tree: {exc}") from exc
+    if r.returncode != 0:
+        raise HoldoutBError(f"{p.parent} is not a git working tree (the lock is committed there): {r.stderr.strip()}")
+    return [line[3:] for line in r.stdout.splitlines() if line.strip()]
+
+
+def _refuse_dirty(path: Path) -> None:
+    dirty = _dirty(path)
+    if dirty:
+        raise HoldoutBError(f"uncommitted changes to tracked files {dirty[:5]}{' ...' if len(dirty) > 5 else ''}: "
+                            "the lock is written and the holdout runs on a clean tree (commit or discard them)")
+
+
+def lock_mismatch_b(lock: Mapping[str, Any]) -> list[str]:
+    """The lock fields that are not what this code writes for the lock's params: keys, grid, config
+    (config_for(params)), holdout_start, replay_anchor; ["params"] when the params are not a grid combo."""
+    try:
+        combo = normalize_combo(lock.get("params") or [])
+    except (TypeError, ValueError):
+        return ["params"]
+    want = {"keys": list(GRID_B), "grid": to_jsonable(GRID_B), "config": to_jsonable(dataclasses.asdict(config_for(combo))),
+            "holdout_start": HOLDOUT_START, "replay_anchor": REPLAY_ANCHOR}
+    return [k for k, v in want.items() if lock.get(k) != v]
 
 
 def data_fingerprint_b(dfs: Mapping[str, pd.DataFrame], start_ts: int, last_ts: int) -> str:
@@ -3640,31 +3958,52 @@ def data_fingerprint_b(dfs: Mapping[str, pd.DataFrame], start_ts: int, last_ts: 
     return hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
 
+_PROVENANCE = {"wf_data": "15m bars", "code_sha256": "B code", "deps_sha256": "strategy-A modules B imports"}
+
+
 def create_lock(
-    params: Sequence[Any],
+    report_path: Path,
     dfs_wf: Mapping[str, pd.DataFrame],
     *,
-    params_source: str,
     now_ts: int,
     lock_path: Path = DEFAULT_LOCK_PATH,
     random_runs: int = RANDOM_RUNS,
     random_seed: int = 0,
 ) -> dict[str, Any]:
-    """Write the lock (once). dfs_wf: every asset's walk-forward 15m bars, all before 2024-01-01."""
+    """Write the lock (once) from the walk-forward report at report_path. dfs_wf: every asset's walk-forward
+    15m bars, all before 2024-01-01 (the report must have been made on them)."""
     path = Path(lock_path)
     if path.exists():
         raise HoldoutBError(f"{path} exists: the strategy-B lock is written once")
     try:
-        combo = normalize_combo(params)
-    except ValueError as exc:
+        raw = Path(report_path).read_bytes()
+        report = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise HoldoutBError(f"{report_path}: unreadable walk-forward report: {exc}") from exc
+    if (not isinstance(report, dict) or not report.get("proceed") or not report.get("chosen_final")
+            or report.get("chosen_final_fallback")):
+        raise HoldoutBError(f"{report_path}: proceed is false (spec 6.3: negative out-of-sample, fallback or no "
+                            "pick); strategy B ends without a holdout")
+    try:
+        combo = normalize_combo(report["chosen_final"])
+    except (TypeError, ValueError) as exc:
         raise HoldoutBError(str(exc)) from exc
     if any(len(df) and int(df["ts"].max()) >= HOLDOUT_START for df in dfs_wf.values()):
         raise HoldoutBError("the walk-forward data must end before 2024-01-01")
+    try:
+        made_on = wf_provenance(dfs_wf)
+    except ValueError as exc:
+        raise HoldoutBError(str(exc)) from exc
+    stale = [k for k in _PROVENANCE if report.get(k) != made_on[k]]
+    if stale:
+        raise HoldoutBError(f"{report_path} was made on other {stale} ({', '.join(_PROVENANCE[k] for k in stale)}) "
+                            "than now: re-run `ewbot stratb walkforward`")
     last_bar = int(now_ts) // H1 * H1 - M15
     if last_bar < HOLDOUT_START:
         raise HoldoutBError("the lock must be written after 2024-01-01")
     if int(random_runs) < 1:
         raise HoldoutBError("random_runs must be >= 1 (criterion 1 compares with the random control)")
+    _refuse_dirty(path)
     lock: dict[str, Any] = {
         "kind": LOCK_KIND,
         "version": LOCK_VERSION,
@@ -3677,11 +4016,13 @@ def create_lock(
         "last_bar_ts": last_bar,
         "random_runs": int(random_runs),
         "random_seed": int(random_seed),
-        "code_sha256": stratb_fingerprint(),
-        "wf_data": wf_data_record(dfs_wf),
+        "code_sha256": made_on["code_sha256"],
+        "deps_sha256": made_on["deps_sha256"],
+        "wf_data": made_on["wf_data"],
+        "wf_report_sha256": hashlib.sha256(raw).hexdigest(),
     }
-    lock.update(sha256=lock_digest_b(lock), params_source=params_source, locked_at=_now(), **git_state(),
-                attempts=[], first_run=None)
+    lock.update(sha256=lock_digest_b(lock), params_source=f"walkforward:{report_path}#chosen_final", locked_at=_now(),
+                **git_state(), attempts=[], first_run=None)
     _write(path, lock)
     return lock
 
@@ -3709,6 +4050,7 @@ def run_holdout_b(
     lock_path: Path = DEFAULT_LOCK_PATH,
     workers: int = 1,
     fingerprint: Callable[[], str] = stratb_fingerprint,
+    deps: Callable[[], str] = deps_fingerprint,
 ) -> dict[str, Any]:
     """The one-shot holdout over [2024-01-01, last_bar_ts], recomputed from REPLAY_ANCHOR (2023-10-01)."""
     if not confirm:
@@ -3722,8 +4064,19 @@ def run_holdout_b(
         raise HoldoutBError("the strategy-B holdout has already run once: no rerun, no other combo (spec 6.4)")
     if fingerprint() != lock["code_sha256"]:
         raise HoldoutBError("the strategy-B code changed after the lock (B fingerprint differs): refusing")
+    stale = lock_mismatch_b(lock)
+    if stale:
+        raise HoldoutBError(f"the lock's {stale} are not this code's (keys, grid, config_for(params), holdout start, "
+                            "replay anchor): refusing")
+    if deps() != lock.get("deps_sha256"):
+        raise HoldoutBError("the strategy-A modules strategy B imports changed after the lock (deps_sha256 differs): "
+                            "refusing")
+    _refuse_dirty(path)
     dfs = {a: load_15m(p, include_holdout=True, lock_path=path) for a, p in cache_paths(cache_dir).items()}
-    wf = wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a, df in dfs.items()})
+    try:
+        wf = wf_data_record({a: df[df["ts"] < HOLDOUT_START] for a, df in dfs.items()})
+    except ValueError as exc:
+        raise HoldoutBError(str(exc)) from exc
     changed = [a for a in ASSETS if wf[a]["sha256"] != lock["wf_data"][a]["sha256"]]
     if changed:
         raise HoldoutBError(f"the {changed} 15m bars before 2024-01-01 differ from the ones the walk-forward used")
@@ -3774,7 +4127,7 @@ def run_holdout_b(
 uv run --group live pytest tests/stratb/test_holdout.py -q
 ```
 
-예상: `9 passed`
+예상: `12 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -3799,13 +4152,13 @@ git commit -m "feat(stratb): holdout-b.lock pinning both assets' pre-2024 bars, 
 - Consumes: Task 1: `ASSETS`. Task 5: `BResult`, `asset_of`, `setup_of`, `run_engine`(테스트), `SignalB`·`build_frame`(테스트). A(import만): `ewbot.paper.ledger.Ledger`, `current_epoch`, `ensure_epoch`, `replace_epoch_trades`, `save_ledger`, `load_ledger`; `ewbot.paper.decisions.decision_id(kind, ts, trade_key)`, `verify_decisions`(테스트); `ewbot.paper.notify`: `HEAD = "[ewbot paper]"`, `make_event(kind, ts, trade_key, text)`, `close_text(t, count, counted)`, `stop_move_text(dec, t)`, `failure_text`, `position_line(pos)`.
 - Produces: `ewbot.paperb.ledger`: `PAPER_B_REQUIRED = 30`(두 자산 합계); `holdout_summary_b(lock) -> dict`(`lock_sha256`, `params`, `holdout_start`, `replay_anchor`, `last_bar_ts`, `data_sha256`(두 자산), `n_trades: {"B": n}`(합계), `passed`); `new_ledger_b(lock) -> Ledger`(구간 1 = 잠금의 B 지문, 시작 = 잠금의 마지막 봉; `open_position`에는 `{자산: 포지션}` 또는 `None`); `paper_count_b(ledger) -> dict`(`epoch_id`, `eligible`, `paper`, `required`).
   `ewbot.paperb.decisions`: `trade_key_b(asset, ts) -> int`(ts + `ASSETS`에서의 자산 인덱스); `key_of(trade) -> int`; `split_result_b(res) -> (list[Trade], list[Trade])`(닫힌 거래, 마지막 봉에 열려 있던 포지션들); `build_decisions_b(res) -> list[dict]`(A의 판단 형식: `id`, `kind`, `ts`, `price`, `contracts`, `reason`, `trade_key`, `levels`, `setup`, `direction`; (ts, 종류, 거래 키) 순서); `open_positions_b(still, res, epoch_start) -> dict[str, dict] | None`(자산마다 A의 `position_line`이 읽는 키 + `asset`).
-  `ewbot.paperb.notify`: `HEAD_B = "[ewbot paper-B]"`; `b_head(text) -> str`(A 메시지의 접두어 교체, A 메시지가 아니면 `ValueError`); `entry_text_b(t) -> str`; `close_text_b(t, n_at, required, counted) -> str`; `holdout_trades_text_b(expected, got) -> str`; `daily_text_b(ny_date, lines) -> str`; `position_lines_b(open_position) -> list[str]`(포지션마다 A의 한 줄, 없으면 `포지션: 없음`); `decision_events_b(fresh, trades, open_keys, epoch_start, count, cur_closed) -> list[dict]`(`trades`는 B 거래 키로 찾음).
+  `ewbot.paperb.notify`: `HEAD_B = "[ewbot paper-B]"`; `b_head(text) -> str`(A 메시지의 접두어 교체, A 메시지가 아니면 `ValueError`); `entry_text_b(t) -> str`; `close_text_b(t, n_at, required, counted) -> str`; `holdout_trades_text_b(expected, got) -> str`; `daily_text_b(ny_date, lines) -> str`; `position_lines_b(open_position) -> list[str]`(포지션마다 A의 한 줄, 없으면 `포지션: 없음`); `decision_events_b(fresh, trades, open_keys, epoch_start, count, cur_closed) -> list[dict]`(`trades`는 B 거래 키로 찾음; 청산 알림의 n/30은 현재 구간의 청산 거래를 (청산 ts, 거래 키) 순서로 센 번호라 같은 봉에 청산된 두 거래도 차례로 매겨진다).
 
 A의 `paper/` 부품을 수정하지 않고 재사용하기 위한 얇은 어댑터다. 장부는 A의 `Ledger` 스키마(버전 1)와 원자적 입출력을 그대로 쓰고, 묶이는 대상만 `holdout-b.lock`으로 바꾼다. B는 자산마다 포지션을 하나씩 가질 수 있으므로 `open_position`에는 `{자산: 포지션}`을 담는다(B의 장부는 B만 읽는다). 판단은 A의 형식으로 만들어 A의 대조 함수를 그대로 쓴다(해석 13): 두 자산이 같은 봉에 진입할 수 있으므로 거래 키는 진입 ts에 자산 인덱스(BTC +0, ETH +1초)를 더한 정수다. 거래의 `setup`이 `B-BTC`·`B-ETH`라서 A의 청산·손절 이동·포지션 문구가 자산을 밝힌다. 메시지는 A의 형식을 쓰되 접두어를 `[ewbot paper-B]`로 바꾸고, 파동 카운트를 설명하는 A의 진입 메시지만 B용으로 새로 쓴다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-장부가 A 스키마로 저장·적재되는지, 카운트가 30건 기준이고 지문 변경 시 0이 되는지, 판단 종류·수량·본절 기록과 A의 대조 결과(그대로면 불일치 없음, 가격을 바꾸면 CHANGED·UNEXPLAINED), 마지막 봉 포지션 분리, 같은 봉에 진입한 두 자산의 서로 다른 판단 id·포지션 줄·알림, 접두어, 알림 이벤트를 확인한다.
+장부가 A 스키마로 저장·적재되는지, 카운트가 30건 기준이고 지문 변경 시 0이 되는지, 판단 종류·수량·본절 기록과 A의 대조 결과(그대로면 불일치 없음, 가격을 바꾸면 CHANGED·UNEXPLAINED), 마지막 봉 포지션 분리, 같은 봉에 진입한 두 자산의 서로 다른 판단 id·포지션 줄·알림, 같은 봉에 청산된 두 거래의 n/30(1/30, 2/30), 접두어, 알림 이벤트를 확인한다.
 
 ```bash
 mkdir -p src/ewbot/paperb tests/paperb
@@ -3938,6 +4291,20 @@ def test_two_assets_entering_on_the_same_bar_have_distinct_decisions_and_message
     events = decision_events_b(dec, {key_of(t): t for t in res.trades}, {key_of(t) for t in still}, 0, {"required": 30}, [])
     assert [e["id"] for e in events] == [f"ENTRY:{t3}:{t3}", f"ENTRY:{t3}:{t3 + 1}"]
     assert "B-BTC 롱" in events[0]["text"] and "B-ETH 숏" in events[1]["text"]
+
+
+def test_two_trades_closing_on_the_same_bar_count_one_after_the_other():
+    eth_flat = tuple(x / 10 for x in FLAT[0])
+    f = _frame(FLAT * 5 + [(20_000.0, 20_005.0, 19_850.0, 19_860.0)] + FLAT * 2)  # BTC long: stop at bar 5
+    g = _frame([eth_flat] * 5 + [(2_000.0, 2_015.0, 1_999.5, 2_012.0)] + [eth_flat] * 2)  # ETH short: stop at bar 5
+    res = run_engine({"BTC": f, "ETH": g}, {"BTC": [_sig(f)], "ETH": [_sig(g, d=-1, scale=0.1)]}, BConfig())
+    assert [(t.setup, t.exit_reason, t.exit_ts) for t in res.trades] == [("B-BTC", "STOP", int(f.ts[5])),
+                                                                          ("B-ETH", "STOP", int(f.ts[5]))]
+    dec = build_decisions_b(res)
+    events = decision_events_b(dec, {key_of(t): t for t in res.trades}, set(), 0, {"required": 30}, list(res.trades))
+    closes = [e["text"] for e in events if e["kind"] == "CLOSE"]
+    assert len(closes) == 2 and "B-BTC" in closes[0] and "1/30" in closes[0]
+    assert "B-ETH" in closes[1] and "2/30" in closes[1]
 
 
 def test_messages_carry_the_paper_b_prefix():
@@ -4211,7 +4578,9 @@ def decision_events_b(
     cur_closed: Sequence[Trade],
 ) -> list[dict[str, Any]]:
     """ENTRY, BREAKEVEN and CLOSE events for the decisions first recorded in this run (A's rules). `trades`
-    maps the B trade key (decisions.key_of) to every trade of the run; open_keys are the open positions'."""
+    maps the B trade key (decisions.key_of) to every trade of the run; open_keys are the open positions'.
+    A close's n/30 counts the epoch's closed trades up to it in (exit ts, trade key) order, so two trades
+    closing on the same bar get consecutive numbers."""
     out: list[dict[str, Any]] = []
     for d in fresh:
         t = trades.get(d["trade_key"])
@@ -4223,7 +4592,7 @@ def decision_events_b(
             out.append(make_event("BREAKEVEN", d["ts"], d["trade_key"], b_head(a_notify.stop_move_text(d, t))))
         elif d["kind"] in ("STOP", "TP1", "TP2", "EXIT") and key_of(t) not in open_keys and t.exit_ts == d["ts"]:
             counted = t.entry_ts > int(epoch_start)
-            n_at = sum(1 for x in cur_closed if x.exit_ts <= t.exit_ts)
+            n_at = sum(1 for x in cur_closed if (x.exit_ts, key_of(x)) <= (t.exit_ts, key_of(t)))
             out.append(make_event("CLOSE", d["ts"], d["trade_key"], close_text_b(t, n_at, count["required"], counted)))
     return out
 ```
@@ -4234,7 +4603,7 @@ def decision_events_b(
 uv run --group live pytest tests/paperb/test_adapters.py -q
 ```
 
-예상: `7 passed`
+예상: `8 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -4254,15 +4623,15 @@ git commit -m "feat(paperb): ledger, decision and message adapters over strategy
 - Test: `tests/paperb/test_runner.py`
 
 **Interfaces:**
-- Consumes: Task 1: `ASSETS`, `config_for`, `normalize_combo`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `REPLAY_ANCHOR`, `load_15m`, `update_caches_15m`, `cache_paths`·`load_caches_15m`(테스트). Task 4(테스트): `save_world`, `world_dfs`. Task 6: `backtest_b`. Task 8: `HoldoutBError`, `committed_lock`, `data_fingerprint_b`, `read_lock`, `lock_digest_b`(테스트), `create_lock`·`run_holdout_b`(테스트 도우미). Task 9: 모든 어댑터. A(import만): `ewbot.backtest.report.to_jsonable`; `ewbot.paper.decisions`: `decisions_to_record`, `known_at`, `paper_trades`, `verify_decisions`; `ewbot.paper.environment`: `environment_digest`, `runtime_environment`; `ewbot.paper.ledger`: `RUNS_LOG`, `Ledger`, `LedgerError`, `append_log_line`, `ensure_epoch`, `load_ledger`, `replace_epoch_trades`, `save_ledger`; `ewbot.paper.notify`: `NY`, `Sender`, `daily_summary_due`, `data_hash_text`, `deliver`, `discrepancy_text`, `epoch_text`, `make_event`, `queue_events`. 테스트: `tests.paper.helpers.Clock`, `FakeSender`, `git`.
-- Produces: `ewbot.paperb.runner`: `FETCH_ATTEMPTS = 3`, `DAILY_HOUR_NY = 9`; `class PaperBRunError(RuntimeError)`(`.stage`, `.message`); `default_fetch_b(cache_dir, lock_path) -> dict[str, Path]`(두 자산 캐시를 늘림); `@dataclass PaperBEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch_b, sender=None, clock=<벽시계>, fingerprint=stratb_fingerprint, sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)`; `@dataclass(frozen=True) RunOutcomeB(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, count)`; `precheck_lock_b(lock_path) -> dict`; `status_lines_b(ledger, count) -> list[str]`; `run_paper_b(env) -> RunOutcomeB`. 실행 기록(`ledger.runs[]`)의 키: `id`, `ts`, `status`, `last_bar_ts`, `data_sha256`, `holdout_data_ok`, `holdout_trades_recomputed`, `epoch_id`, `paper_trades`, `new_decisions`, `new_discrepancies`, `env`, `env_sha256`, `warnings`, `notify`. 장부 디렉터리에는 `ledger.json`과 `runs.log`만 쓴다.
-  `tests/paperb/helpers.py`: `HS`, `LOCK_NOW`, `LAST_BAR`, `COMBO`, `M15`, `world() -> {자산: DataFrame}`, `build_passed_lock(tmp) -> str`, `commit_lock_b(repo, text) -> Path`, `FakeFetchB(source, clock, fail=0)`(두 자산 캐시를 씀), `make_env(tmp_path, lock_text, now, source=None, **kw) -> (PaperBEnv, Clock, FakeSender)`. `tests/paperb/conftest.py`: 세션 픽스처 `lock_text`(합성 홀드아웃을 실제로 한 번 돌린 잠금 파일 내용).
+- Consumes: Task 1: `ASSETS`, `config_for`, `normalize_combo`, `deps_fingerprint`, `stratb_fingerprint`, `deps_files`(테스트). Task 2: `DEFAULT_LOCK_PATH`, `REPLAY_ANCHOR`, `load_15m`, `update_caches_15m`, `cache_paths`·`load_caches_15m`·`lock_digest_b`(테스트). Task 4(테스트): `save_world`, `world_dfs`. Task 6: `backtest_b`, `wf_provenance`(테스트 도우미). Task 8: `HoldoutBError`, `committed_lock`, `data_fingerprint_b`, `lock_mismatch_b`, `read_lock`, `create_lock`·`run_holdout_b`(테스트 도우미). Task 9: 모든 어댑터. A(import만): `ewbot.paper.decisions`: `decisions_to_record`, `known_at`, `paper_trades`, `verify_decisions`; `ewbot.paper.environment`: `environment_digest`, `runtime_environment`; `ewbot.paper.ledger`: `RUNS_LOG`, `Ledger`, `LedgerError`, `append_log_line`, `ensure_epoch`, `load_ledger`, `replace_epoch_trades`, `save_ledger`; `ewbot.paper.notify`: `NY`, `Sender`, `daily_summary_due`, `data_hash_text`, `deliver`, `discrepancy_text`, `epoch_text`, `make_event`, `queue_events`. 테스트: `tests.paper.helpers.Clock`, `FakeSender`, `git`.
+- Produces: `ewbot.paperb.runner`: `FETCH_ATTEMPTS = 3`, `DAILY_HOUR_NY = 9`; `class PaperBRunError(RuntimeError)`(`.stage`, `.message`); `default_fetch_b(cache_dir, lock_path) -> dict[str, Path]`(두 자산 캐시를 늘림); `@dataclass PaperBEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch_b, sender=None, clock=<벽시계>, fingerprint=stratb_fingerprint, deps=deps_fingerprint, sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)`; `@dataclass(frozen=True) RunOutcomeB(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, count)`; `precheck_lock_b(lock_path, deps=deps_fingerprint) -> dict`; `status_lines_b(ledger, count) -> list[str]`; `run_paper_b(env) -> RunOutcomeB`. 실행 기록(`ledger.runs[]`)의 키: `id`, `ts`, `status`, `last_bar_ts`, `data_sha256`, `holdout_data_ok`, `holdout_trades_recomputed`, `epoch_id`, `paper_trades`, `new_decisions`, `new_discrepancies`, `env`, `env_sha256`, `warnings`, `notify`. 장부 디렉터리에는 `ledger.json`과 `runs.log`만 쓴다.
+  `tests/paperb/helpers.py`: `HS`, `LOCK_NOW`, `LAST_BAR`, `COMBO`, `M15`, `world() -> {자산: DataFrame}`, `build_passed_lock(tmp) -> str`(합성 워크포워드 보고서로 잠금을 만들고 홀드아웃을 실제로 한 번 돌림), `commit_lock_b(repo, text) -> Path`, `FakeFetchB(source, clock, fail=0)`(두 자산 캐시를 씀), `make_env(tmp_path, lock_text, now, source=None, **kw) -> (PaperBEnv, Clock, FakeSender)`. `tests/paperb/conftest.py`: 세션 픽스처 `lock_text`(합성 홀드아웃을 실제로 한 번 돌린 잠금 파일 내용).
 
-명세 7·8(2026-10-07 개정)과 해석 12~14를 구현한다. BTC와 ETH는 이 실행기 하나, 장부 하나에서 함께 돈다. 단계: 사전 점검(잠금) → 장부(이 잠금에서 시작된 장부인지) → 데이터(두 자산 캐시 갱신 3회 재시도, `REPLAY_ANCHOR` 이후, 자산마다 잠금의 마지막 봉 이상; 두 자산의 홀드아웃 구간 해시 `data_fingerprint_b`가 다르면 거부하지 않고 해시마다 한 번 경고 — 명세 8절 2026-10-07 수정) → 지문·구간 → 재계산(`backtest_b(..., HOLDOUT_START, None, include_holdout=True)`, 홀드아웃 거래 수(합계) 재현 확인) → A의 대조(데이터가 바뀌어 달라진 판단은 `DATA_REVISION`; 판단의 데이터 해시도 두 자산을 함께 본다) → 이벤트(진입, 본절, 청산 — 자산을 밝힘, 불일치, 구간, 데이터 해시 경고, 뉴욕 9시 일일 요약 n/30과 자산별 포지션) → 쓰기 → 알림. 각 단계의 실패는 `PaperBRunError(stage)`이며, 쓰기 단계 전에는 아무것도 쓰지 않는다. 일일 요약의 실거래 전환 조건 4줄(명세 7.1)은 `status_lines_b`가 만든다. 시간마다 전체를 다시 계산하는 데 수 초가 걸린다(두 자산 3년치 15분봉 약 20만 개).
+명세 7·8(2026-10-07 개정)과 해석 12~14를 구현한다. BTC와 ETH는 이 실행기 하나, 장부 하나에서 함께 돈다. 단계: 사전 점검(잠금: 다이제스트, 커밋된 그대로, 합격, `lock_mismatch_b`, `deps_sha256` — B가 import하는 A 모듈이 바뀌면 새 구간이 아니라 잠금 문제처럼 거부) → 장부(이 잠금에서 시작된 장부인지) → 데이터(두 자산 캐시 갱신 3회 재시도, `REPLAY_ANCHOR` 이후, 자산마다 잠금의 마지막 봉 이상; 실행은 두 자산이 모두 가진 마지막 봉에서 끝난다 — 한 자산의 최신 봉이 늦으면 다른 자산의 더 새 봉은 다음 실행을 기다리고 실행 기록에 경고를 남긴다, 늦은 자산을 평평한 봉으로 채워 판단하지 않는다; 두 자산의 홀드아웃 구간 해시 `data_fingerprint_b`가 다르면 거부하지 않고 해시마다 한 번 경고 — 명세 8절 2026-10-07 수정) → 지문·구간 → 재계산(`backtest_b(..., HOLDOUT_START, None, include_holdout=True)`, 홀드아웃 거래 수(합계) 재현 확인) → A의 대조(데이터가 바뀌어 달라진 판단은 `DATA_REVISION`; 판단의 데이터 해시도 두 자산을 함께 본다) → 이벤트(진입, 본절, 청산 — 자산을 밝힘, 불일치, 구간, 데이터 해시 경고, 뉴욕 9시 일일 요약 n/30과 자산별 포지션) → 쓰기 → 알림. 각 단계의 실패는 `PaperBRunError(stage)`이며, 쓰기 단계 전에는 아무것도 쓰지 않는다. 일일 요약의 실거래 전환 조건 4줄(명세 7.1)은 `status_lines_b`가 만든다. 시간마다 전체를 다시 계산하는 데 수 초가 걸린다(두 자산 3년치 15분봉 약 20만 개).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-테스트 도우미(두 자산 합성 세계, 실제로 한 번 돈 합성 홀드아웃의 잠금, 시계 기준으로 마감된 봉만 두 자산 캐시에 쓰는 가짜 수집기)와 실행기 테스트를 만든다.
+테스트 도우미(두 자산 합성 세계, 실제로 한 번 돈 합성 홀드아웃의 잠금, 시계 기준으로 마감된 봉만 두 자산 캐시에 쓰는 가짜 수집기)와 실행기 테스트를 만든다. 사전 점검은 이 코드의 것이 아닌 설정과 A 모듈 변경(`deps_sha256`)을 거부하고, 한 자산의 최신 봉이 늦으면 실행이 두 자산이 모두 가진 마지막 봉에서 끝나는지도 확인한다.
 
 **파일 `tests/paperb/helpers.py`** (새 파일, 전체 내용)
 
@@ -4284,6 +4653,7 @@ import pandas as pd
 from ewbot.paperb.runner import PaperBEnv
 from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths, load_caches_15m
 from ewbot.stratb.holdout import create_lock, run_holdout_b
+from ewbot.stratb.research import wf_provenance
 from tests.paper.helpers import Clock, FakeSender, git
 from tests.stratb.helpers import save_world, world_dfs
 
@@ -4306,7 +4676,10 @@ def build_passed_lock(tmp: Path) -> str:
     git(repo, "init", "-q")
     save_world(cache, world())
     lp = repo / "holdout-b.lock"
-    create_lock(COMBO, load_caches_15m(cache), params_source="test", now_ts=LOCK_NOW, lock_path=lp, random_runs=2)
+    report = tmp / "wf.json"  # a walk-forward report that proceeds with COMBO, made on these bars and this code
+    report.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True,
+                                  **wf_provenance(load_caches_15m(cache))}), encoding="utf-8")
+    create_lock(report, load_caches_15m(cache), now_ts=LOCK_NOW, lock_path=lp, random_runs=2)
     git(repo, "add", lp.name)
     git(repo, "commit", "-q", "-m", "lock")
     run_holdout_b(confirm=True, cache_dir=cache, lock_path=lp)
@@ -4393,7 +4766,8 @@ from ewbot.paper.ledger import load_ledger
 from ewbot.paper.notify import NY
 from ewbot.paperb.notify import HEAD_B
 from ewbot.paperb.runner import PaperBRunError, precheck_lock_b, run_paper_b
-from ewbot.stratb.holdout import lock_digest_b
+from ewbot.stratb.data15 import lock_digest_b
+from ewbot.stratb.fingerprint import deps_files, deps_fingerprint
 from tests.paper.helpers import git
 from tests.paperb.helpers import LAST_BAR, FakeFetchB, commit_lock_b, make_env, world
 
@@ -4427,8 +4801,16 @@ def test_the_precheck_needs_the_committed_passed_lock_of_this_code(tmp_path, loc
     other = json.loads(lock_text)
     other["config"]["initial_equity"] = 20_000.0
     other["sha256"] = lock_digest_b(other)
-    with pytest.raises(PaperBRunError, match="not this code's config"):
+    with pytest.raises(PaperBRunError, match=r"\['config'\] are not this code's"):
         precheck_lock_b(commit_lock_b(tmp_path / "e", json.dumps(other)))
+    assert lock["deps_sha256"] == deps_fingerprint()
+    assert {f"src/ewbot/paper/{m}.py" for m in ("ledger", "decisions", "notify", "environment")} <= set(deps_files())
+    with pytest.raises(PaperBRunError, match="strategy-A modules"):
+        precheck_lock_b(commit_lock_b(tmp_path / "g", lock_text), deps=lambda: "0" * 64)
+    env, _, _ = make_env(tmp_path / "f", lock_text, LAST_BAR + 900 + 60, deps=lambda: "0" * 64)
+    with pytest.raises(PaperBRunError, match="strategy-A modules") as exc:
+        run_paper_b(env)
+    assert exc.value.stage == "precheck" and not env.ledger_dir.exists()
 
 
 def test_the_first_run_reproduces_the_holdout_and_writes_only_the_b_ledger(tmp_path, lock_text):
@@ -4458,6 +4840,22 @@ def test_hourly_runs_count_paper_trades_and_notify_with_the_b_prefix(tmp_path, l
     fresh, _, _ = make_env(tmp_path / "fresh", lock_text, clock.now)
     run_paper_b(fresh)
     assert {d["id"] for d in load_ledger(fresh.ledger_dir).decisions} == {d["id"] for d in led.decisions}
+
+
+def test_a_run_ends_at_the_last_bar_both_assets_have(tmp_path, lock_text):
+    now = LAST_BAR + 900 + 6 * H1 + 60
+    newest = now // 900 * 900 - 900  # the newest closed bar (hh:45)
+    full = world()
+    late = {"BTC": full["BTC"], "ETH": full["ETH"][full["ETH"]["ts"] < newest]}  # ETH's newest bar is not out yet
+    env, clock, _ = make_env(tmp_path, lock_text, now, source=late)
+    out = run_paper_b(env)
+    led = load_ledger(env.ledger_dir)
+    assert out.last_bar_ts == led.runs[0]["last_bar_ts"] == newest - 900  # BTC's newest bar waits for ETH's
+    assert all(d["ts"] <= newest - 900 for d in led.decisions) and "ETH" in out.notes[0]
+    env.fetch = FakeFetchB(full, clock)
+    clock.now += H1
+    out = run_paper_b(env)
+    assert out.last_bar_ts == newest + H1 and out.notes == [] and out.new_discrepancies == 0
 
 
 def test_a_changed_recorded_decision_is_an_unexplained_discrepancy(tmp_path, lock_text):
@@ -4551,11 +4949,15 @@ uv run --group live pytest tests/paperb/test_runner.py -q
 """One `ewbot stratb paper run` (Plan 4 spec 7, 8): precheck -> data -> fingerprint/epoch -> full recompute
 from REPLAY_ANCHOR -> replay check -> ledger and runs.log -> Telegram. BTC and ETH run together in this one
 runtime and ledger (spec 7 as revised 2026-10-07): one portfolio recompute, one count of 30 trades of both
-assets, messages that name the asset.
+assets, messages that name the asset. A run ends at the latest bar BOTH assets have: when one asset's newest
+bar is not out yet, the other's newer bars wait for the next run (they are never decided against a flat
+padded bar of the late asset), and the run records a warning.
 
 Inputs are frozen by holdout-b.lock: the params and the whole run config come from it (the precheck refuses
 a lock whose sha256 is not the digest of its fields, that is not committed unchanged, whose holdout has
-not run or failed - strategy B ended -, or whose config is not config_for(params) of this code). The
+not run or failed - strategy B ended -, whose keys, grid, config, holdout start or replay anchor are not
+this code's (holdout.lock_mismatch_b), or whose deps_sha256 is not the hash of the strategy-A modules B
+imports now - a changed A module is refused like a lock problem, not a new epoch). The
 recompute starts at REPLAY_ANCHOR (2023-10-01) and trades from HOLDOUT_START, exactly like the holdout
 run, so it reproduces the holdout and continues it; trades entering after the lock's last bar are paper
 trades. When the holdout window's bars (both assets) no longer hash to first_run.data.sha256 (a Coinbase candle
@@ -4570,7 +4972,6 @@ alert. Nothing is written before the write stage."""
 
 from __future__ import annotations
 
-import dataclasses
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -4581,7 +4982,6 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ewbot.backtest.report import to_jsonable
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.paper.decisions import decisions_to_record, known_at, paper_trades, verify_decisions
 from ewbot.paper.environment import environment_digest, runtime_environment
@@ -4611,8 +5011,8 @@ from ewbot.paperb.ledger import holdout_summary_b, new_ledger_b, paper_count_b
 from ewbot.paperb.notify import b_head, daily_text_b, decision_events_b, holdout_trades_text_b, position_lines_b
 from ewbot.stratb.config import ASSETS, config_for, normalize_combo
 from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, REPLAY_ANCHOR, load_15m, update_caches_15m
-from ewbot.stratb.fingerprint import stratb_fingerprint
-from ewbot.stratb.holdout import HoldoutBError, committed_lock, data_fingerprint_b, read_lock
+from ewbot.stratb.fingerprint import deps_fingerprint, stratb_fingerprint
+from ewbot.stratb.holdout import HoldoutBError, committed_lock, data_fingerprint_b, lock_mismatch_b, read_lock
 from ewbot.stratb.research import backtest_b
 from ewbot.types import H1
 
@@ -4647,6 +5047,7 @@ class PaperBEnv:
     sender: Sender | None = None
     clock: Callable[[], int] = _wall_clock
     fingerprint: Callable[[], str] = stratb_fingerprint
+    deps: Callable[[], str] = deps_fingerprint
     sleep: Callable[[float], None] = time.sleep
     fetch_backoff_s: float = 10.0
     environment: Callable[[], dict[str, Any]] = runtime_environment
@@ -4678,8 +5079,9 @@ def _stage(name: str, *, detail: bool = True) -> Iterator[None]:
         raise PaperBRunError(name, f"{type(exc).__name__} (details withheld: may contain the token)") from None
 
 
-def precheck_lock_b(lock_path: Path) -> dict[str, Any]:
-    """The committed, passed strategy-B lock whose config is this code's config for its params."""
+def precheck_lock_b(lock_path: Path, deps: Callable[[], str] = deps_fingerprint) -> dict[str, Any]:
+    """The committed, passed strategy-B lock of this code: its config is this code's config for its params, and
+    the strategy-A modules B imports still hash to its deps_sha256."""
     try:
         lock = read_lock(lock_path)
         if committed_lock(lock_path) != lock:
@@ -4691,14 +5093,13 @@ def precheck_lock_b(lock_path: Path) -> dict[str, Any]:
         raise PaperBRunError("precheck", "the strategy-B holdout has not run: paper trading starts after it passes")
     if not fr["criteria"].get("passed"):
         raise PaperBRunError("precheck", "the strategy-B holdout failed (spec 6.5): strategy B ended, no paper trading")
-    try:
-        combo = normalize_combo(lock["params"])
-    except ValueError as exc:
-        raise PaperBRunError("precheck", str(exc)) from exc
-    if int(lock["holdout_start"]) != HOLDOUT_START or int(lock["replay_anchor"]) != REPLAY_ANCHOR:
-        raise PaperBRunError("precheck", "the lock's holdout start or replay anchor is not this code's")
-    if lock["config"] != to_jsonable(dataclasses.asdict(config_for(combo))):
-        raise PaperBRunError("precheck", "the lock's run config is not this code's config for its params")
+    stale = lock_mismatch_b(lock)
+    if stale:
+        raise PaperBRunError("precheck", f"the lock's {stale} are not this code's (keys, grid, config_for(params), "
+                                         "holdout start, replay anchor)")
+    if deps() != lock.get("deps_sha256"):
+        raise PaperBRunError("precheck", "the strategy-A modules strategy B imports changed since the lock "
+                                         "(deps_sha256 differs): refusing")
     return lock
 
 
@@ -4774,7 +5175,7 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
     with _stage("precheck"):
         now = int(env.clock())
         run_id = _run_id(now)
-        lock = precheck_lock_b(Path(env.lock_path))
+        lock = precheck_lock_b(Path(env.lock_path), env.deps)
         cfg = config_for(normalize_combo(lock["params"]))
         ledger_dir = Path(env.ledger_dir)
         run_env = dict(env.environment())
@@ -4788,7 +5189,9 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         early = {a: e for a, e in ends.items() if e < hs["last_bar_ts"]}
         if early:
             raise PaperBRunError("data", f"data ends at {early}, before the lock's last bar {hs['last_bar_ts']}")
-        last_bar = max(ends.values())  # the recompute pads an asset that ends earlier (signals.build_frames)
+        last_bar = min(ends.values())  # the latest bar both assets have: no flat padding of a late asset's bar
+        late = [a for a in ASSETS if ends[a] == last_bar < max(ends.values())]
+        dfs = {a: df[df["ts"] <= last_bar].reset_index(drop=True) for a, df in dfs.items()}
         holdout_sha = data_fingerprint_b(dfs, REPLAY_ANCHOR, hs["last_bar_ts"])
         holdout_ok = holdout_sha == hs["data_sha256"]
     with _stage("fingerprint"):
@@ -4845,6 +5248,10 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         events: list[dict[str, Any]] = []
         warnings: list[str] = []
         lock_n = int(hs["n_trades"]["B"])
+        if late:
+            newest = datetime.fromtimestamp(max(ends.values()), UTC).isoformat(timespec="minutes")
+            warnings.append(f"{late} data ends before the newest bar {newest}: the run ends at the last bar both "
+                            "assets have")
         if not holdout_ok:  # one message per distinct revised hash (the event id carries it)
             warnings.append(f"holdout data hash {holdout_sha[:12]} != lock {hs['data_sha256'][:12]}")
             text = b_head(data_hash_text(hs["data_sha256"], holdout_sha))
@@ -4908,7 +5315,7 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
 uv run --group live pytest tests/paperb/test_runner.py -q
 ```
 
-예상: `8 passed`
+예상: `9 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -4927,10 +5334,10 @@ git commit -m "feat(paperb): hourly deterministic paper-B run of BTC and ETH fro
 - Test: `tests/paperb/test_cli_paper_b.py`
 
 **Interfaces:**
-- Consumes: Task 1: `combo_to_json`, `config_for`, `normalize_combo`. Task 2: `DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`), `cache_paths`(`b_cache_paths`), `gap_report`, `load_caches_15m`, `lock_exists`, `update_caches_15m`. Task 4(테스트): `save_world`, `world_dfs`. Task 6: `backtest_b`, `trades_by_asset`, `walk_forward_b`. Task 8: `HoldoutBError`, `create_lock`, `run_holdout_b`. Task 9: `paper_count_b`, `b_head`, `position_lines_b`. Task 10: `PaperBEnv`, `PaperBRunError`, `run_paper_b`, `status_lines_b`. cli.py에 이미 있는 것: `_refuse`, `_requested_window`, `_print_comparison`, `to_jsonable`, `compute_metrics`, `deliver`, `failure_text`, `make_event`, `position_line`, `sender_from_env`, `load_ledger`, `LedgerError`, `current_epoch`, `RUN_URL_ENV`, `FAILURE_MARKER_ENV`, `WF_END`.
+- Consumes: Task 1: `combo_to_json`, `config_for`, `normalize_combo`. Task 2: `DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`), `cache_paths`(`b_cache_paths`), `gap_report`, `load_caches_15m`, `lock_exists`, `update_caches_15m`. Task 4(테스트): `save_world`, `world_dfs`. Task 6: `backtest_b`, `trades_by_asset`, `walk_forward_b`, `wf_provenance`(테스트). Task 8: `HoldoutBError`, `create_lock`, `run_holdout_b`. Task 9: `paper_count_b`, `b_head`, `position_lines_b`. Task 10: `PaperBEnv`, `PaperBRunError`, `run_paper_b`, `status_lines_b`. cli.py에 이미 있는 것: `_refuse`, `_requested_window`, `_print_comparison`, `to_jsonable`, `compute_metrics`, `deliver`, `failure_text`, `make_event`, `position_line`, `sender_from_env`, `load_ledger`, `LedgerError`, `current_epoch`, `RUN_URL_ENV`, `FAILURE_MARKER_ENV`, `WF_END`.
 - Produces: `ewbot stratb fetch [--cache-dir]`; `ewbot stratb backtest --params zz_k,z_lo,z_hi,tp1_r,ext,remainder [--start] [--end] [--cache-dir] [--out reports/stratb-backtest.json]`; `ewbot stratb walkforward [--workers] [--cache-dir] [--out reports/stratb-walkforward.json]`; `ewbot stratb holdout lock --params-from <walkforward json> [--cache-dir]`; `ewbot stratb holdout run --confirm [--workers] [--cache-dir]`; `ewbot stratb paper run --ledger-dir <dir> [--cache-dir]`; `ewbot stratb paper status --ledger-dir <dir>`. cli.py의 새 이름: `STRATB_LOCK`, `_b_params(text) -> Combo`(그리드 밖이면 종료 코드 2), `_b_dfs`(두 자산 캐시, 2024 이전), `_b_write_json`, `_b_fetch`, `_b_backtest`, `_b_walkforward`, `_b_holdout_lock`, `_b_holdout_run`, `_b_paper_env(args) -> PaperBEnv`(테스트가 바꿔 끼움), `_b_alert_failure`, `_b_paper_run`, `_b_paper_status`, `cmd_stratb`. 잠금 경로는 CLI 옵션이 아니다(항상 `<저장소 루트>/holdout-b.lock`).
 
-명세 3절의 CLI를 `cli.py`에 추가한다(`cli.py`는 A의 지문 대상이 아니다). 모든 명령이 BTC와 ETH를 함께 다룬다: `fetch`는 두 캐시를 늘리고 자산마다 봉 수와 누락을 보이며, `backtest`는 두 자산 포트폴리오를 돌려 자산별 거래 수도 JSON에 쓴다. 연구 명령은 `load_15m`의 가드 때문에 2024 이후 봉을 읽지 못하고, `--start`/`--end`가 홀드아웃에 닿으면 A와 같은 `_requested_window`가 종료 코드 2로 거부한다. `holdout lock`은 워크포워드 JSON의 `proceed`가 참이고 fallback이 아닐 때만 잠금을 쓰고 커밋 명령을 출력한다. `holdout run`은 `--confirm` 없이는 2를 돌려주고, 잠금이 있으면 두 캐시를 지금까지 늘린 뒤(네트워크) 1회 실행한다. `paper run`의 실패 알림은 A와 같은 방식(실행 로그 링크, 실패 표시 파일)이며 접두어만 `[ewbot paper-B]`다. `paper status`는 자산별 포지션, 마지막 실행의 홀드아웃 데이터 상태(`ok` 또는 `MISMATCH (warned, not refused)`)와 홀드아웃 거래 재현 수를 보여 준다. 수정은 여섯 군데이며 각 '찾을 부분'은 `cli.py`에서 한 번만 나온다.
+명세 3절의 CLI를 `cli.py`에 추가한다(`cli.py`는 A의 지문 대상이 아니다). 모든 명령이 BTC와 ETH를 함께 다룬다: `fetch`는 두 캐시를 늘리고 자산마다 봉 수와 누락을 보이며, `backtest`는 두 자산 포트폴리오를 돌려 자산별 거래 수도 JSON에 쓴다. 연구 명령은 `load_15m`의 가드 때문에 2024 이후 봉을 읽지 못하고, `--start`/`--end`가 홀드아웃에 닿으면 A와 같은 `_requested_window`가 종료 코드 2로 거부한다. `holdout lock`은 워크포워드 JSON 경로를 `create_lock`에 넘긴다: 보고서가 `proceed`이고 fallback이 아니며 지금의 봉·B 코드·A 모듈로 만들어졌고 작업 트리가 깨끗할 때만 잠금을 쓰고(아니면 종료 코드 2) 커밋 명령을 출력한다. `holdout run`은 `--confirm` 없이는 2를 돌려주고, 잠금이 있으면 두 캐시를 지금까지 늘린 뒤(네트워크) 1회 실행한다. `paper run`의 실패 알림은 A와 같은 방식(실행 로그 링크, 실패 표시 파일)이며 접두어만 `[ewbot paper-B]`다. `paper status`는 자산별 포지션, 마지막 실행의 홀드아웃 데이터 상태(`ok` 또는 `MISMATCH (warned, not refused)`)와 홀드아웃 거래 재현 수를 보여 준다. 수정은 여섯 군데이며 각 '찾을 부분'은 `cli.py`에서 한 번만 나온다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -4947,8 +5354,10 @@ import pytest
 
 from ewbot import cli
 from ewbot.cli import build_parser, main
-from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths
+from ewbot.stratb.data15 import REPLAY_ANCHOR, cache_paths, load_caches_15m
 from ewbot.stratb.holdout import read_lock
+from ewbot.stratb.research import wf_provenance
+from tests.paper.helpers import git
 from tests.stratb.helpers import save_world, world_dfs
 
 HS = 1_704_067_200
@@ -5021,17 +5430,20 @@ def test_walkforward_writes_json_and_says_whether_to_proceed(tmp_path, cache, mo
 
 
 def test_holdout_lock_needs_a_walk_forward_that_proceeds(tmp_path, cache, monkeypatch, capsys):
-    lock_path = tmp_path / "holdout-b.lock"
+    (tmp_path / "repo").mkdir()
+    git(tmp_path / "repo", "init", "-q")
+    lock_path = tmp_path / "repo" / "holdout-b.lock"
     monkeypatch.setattr(cli, "STRATB_LOCK", lock_path)
     wf = tmp_path / "wf.json"
     wf.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": False}))
     with pytest.raises(SystemExit) as exc:
         main(["stratb", "holdout", "lock", "--params-from", str(wf), "--cache-dir", str(cache)])
     assert exc.value.code == 2 and not lock_path.exists()
-    wf.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True}))
+    wf.write_text(json.dumps({"chosen_final": COMBO, "chosen_final_fallback": False, "proceed": True,
+                              **wf_provenance(load_caches_15m(cache))}))
     assert main(["stratb", "holdout", "lock", "--params-from", str(wf), "--cache-dir", str(cache)]) == 0
     lock = read_lock(lock_path)
-    assert lock["params"] == COMBO and lock["random_runs"] == 1000 and lock["params_source"].startswith("walkforward:")
+    assert lock["params"] == COMBO and lock["random_runs"] == 1000 and lock["params_source"] == f"walkforward:{wf}#chosen_final"
     assert "Commit it NOW" in capsys.readouterr().out
 
 
@@ -5041,7 +5453,11 @@ def test_holdout_run_needs_confirm_and_a_lock(tmp_path, monkeypatch, capsys):
     assert "--confirm" in capsys.readouterr().err
     with pytest.raises(SystemExit) as exc:
         main(["stratb", "holdout", "run", "--confirm"])
-    assert exc.value.code == 2
+    assert exc.value.code == 2 and "missing or not a valid strategy-B lock" in capsys.readouterr().err
+    (tmp_path / "holdout-b.lock").write_text(json.dumps({"kind": "ewbot-stratb-holdout", "sha256": "ab" * 32}))
+    with pytest.raises(SystemExit) as exc:  # a hand-made file with the lock's shape is not a lock
+        main(["stratb", "holdout", "run", "--confirm"])
+    assert exc.value.code == 2 and "missing or not a valid strategy-B lock" in capsys.readouterr().err
 ```
 
 **파일 `tests/paperb/test_cli_paper_b.py`** (새 파일, 전체 내용)
@@ -5308,13 +5724,10 @@ def _b_walkforward(args: argparse.Namespace) -> int:
 
 
 def _b_holdout_lock(args: argparse.Namespace) -> int:
-    wf = json.loads(Path(args.params_from).read_text(encoding="utf-8"))
-    if not wf.get("proceed") or not wf.get("chosen_final") or wf.get("chosen_final_fallback"):
-        _refuse(f"{args.params_from}: proceed is false (spec 6.3: negative out-of-sample, fallback or no pick); "
-                "strategy B ends without a holdout")
+    """The lock from the walk-forward report; stratb.holdout.create_lock refuses one that does not proceed or
+    was made on other bars or code, and a dirty tracked tree."""
     try:
-        lock = create_lock(wf["chosen_final"], _b_dfs(args), params_source=f"walkforward:{args.params_from}#chosen_final",
-                           now_ts=int(time.time()), lock_path=STRATB_LOCK)
+        lock = create_lock(Path(args.params_from), _b_dfs(args), now_ts=int(time.time()), lock_path=STRATB_LOCK)
     except HoldoutBError as exc:
         _refuse(str(exc))
     print(f"holdout-b.lock written: {STRATB_LOCK} (sha256 {lock['sha256'][:12]}, params {lock['params']}, "
@@ -5330,7 +5743,8 @@ def _b_holdout_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     if not lock_exists(STRATB_LOCK):
-        _refuse(f"{STRATB_LOCK} does not exist: `ewbot stratb holdout lock` first")
+        _refuse(f"{STRATB_LOCK} is missing or not a valid strategy-B lock (its sha256 must be the digest of its "
+                "fields): `ewbot stratb holdout lock` first")
     update_caches_15m(args.cache_dir, lock_path=STRATB_LOCK)
     try:
         out = run_holdout_b(confirm=True, cache_dir=args.cache_dir, lock_path=STRATB_LOCK, workers=args.workers)
@@ -5466,7 +5880,7 @@ git commit -m "feat(cli): ewbot stratb fetch | backtest | walkforward | holdout 
 - Consumes: Task 10·11: `ewbot stratb paper run --ledger-dir`. A의 `paper.yml`(구조만 따름), A의 `tests/paper/test_static.py`의 `SRC`, `WORKFLOWS`, `yaml`.
 - Produces: `ewbot.paperb.sync`: `BRANCH = "paper-b"`, `LEDGER_FILES = ("ledger.json", "runs.log")`, `ATTEMPTS = 3`, `class SyncError(RuntimeError)`, `origin_branch(cwd) -> str`, `checkout(repo, paper_dir) -> None`, `commit_ledger(paper_dir) -> bool`, `push(paper_dir, recompute, *, attempts=3, backoff=5.0, sleep=time.sleep) -> str`, `main(argv=None) -> int`(`python -m ewbot.paperb.sync checkout | push RECOMPUTE...`, 환경 변수 `PAPER_B_DIR`, `PAPER_B_PUSH_BACKOFF`). `.github/workflows/paper-b.yml`: `workflow_dispatch` + `schedule: "47 */3 * * *"`, 동시성 그룹 `paper-b`, `if: vars.PAPER_B_ENABLED == 'true'`, 두 자산 캐시의 키 `stratb-15m-`, 텔레그램 시크릿은 실행·푸시·대체 알림 단계에만. `docs/strategy-b.md`: 운영 안내.
 
-A의 `paper.yml` 구조를 따르는 별도 워크플로를 만든다(해석 15~17). 이 작업에서 `tests/paper/test_static.py`를 고쳐야 한다: 이 파일의 `test_the_repository_has_exactly_the_paper_and_ci_workflows`는 워크플로가 정확히 `ci.yml`과 `paper.yml`뿐이라고 단언하므로 `paper-b.yml`을 더하면 `ci.yml`이 실패한다. 이 한 테스트를 세 파일로 바꾸고, `ci.yml`이 실행하는 파일이 이것뿐이므로 B 보호 검사 두 개(B 파일이 A 지문 밖, `paper-b.yml`이 A의 것을 건드리지 않음)를 여기에 더한다. A의 다른 테스트와 `ci.yml` 자체는 바꾸지 않는다. 동기화 모듈은 A의 `scripts/paper_sync.sh`와 같은 규칙(고아 브랜치, 얕은 가져오기, 3회 푸시, 원격이 움직였을 때만 재계산)을 `paper-b`에 적용한다. 문서는 두 자산의 상품·계약 크기·틱과 같은 봉 처리 순서, Plan 5에서 확인할 것(ETP 최소 수수료, ETH 펀딩), 연구·잠금·승인·홀드아웃 순서와 포트폴리오 합격 기준, 휴면 해제(`PAPER_B_ENABLED`), 두 번째 Cloudflare Worker 코드, Actions 사용량 확인, 실패 대응을 담는다.
+A의 `paper.yml` 구조를 따르는 별도 워크플로를 만든다(해석 15~17). 이 작업에서 `tests/paper/test_static.py`를 고쳐야 한다: 이 파일의 `test_the_repository_has_exactly_the_paper_and_ci_workflows`는 워크플로가 정확히 `ci.yml`과 `paper.yml`뿐이라고 단언하므로 `paper-b.yml`을 더하면 `ci.yml`이 실패한다. 이 한 테스트를 세 파일로 바꾸고, `ci.yml`이 실행하는 파일이 이것뿐이므로 B 보호 검사 두 개(B 파일이 A 지문 밖, `paper-b.yml`이 A의 것을 건드리지 않음)를 여기에 더한다. A의 다른 테스트와 `ci.yml` 자체는 바꾸지 않는다. 동기화 모듈은 A의 `scripts/paper_sync.sh`와 같은 규칙(고아 브랜치, 얕은 가져오기, 3회 푸시, 원격이 움직였을 때만 재계산)을 `paper-b`에 적용한다. 문서는 두 자산의 상품·계약 크기·틱과 같은 봉 처리 순서, Plan 5에서 확인할 것(ETP 최소 수수료, ETH 펀딩), 연구·잠금·승인·홀드아웃 순서와 포트폴리오 합격 기준, B가 import하는 A 모듈의 해시(`deps_sha256`)와 그 결과(잠금 뒤에는 그 A 모듈이 바뀌면 홀드아웃과 모의매매가 거부된다), 잠금·홀드아웃 전제 조건(깨끗한 작업 트리, 잠금 커밋, A 보호 테스트, `first_run` 즉시 커밋, 모의매매가 홀드아웃을 재현할 때까지 캐시 보존), 휴면 해제(`PAPER_B_ENABLED`), 두 번째 Cloudflare Worker 코드, Actions 사용량 확인, 실패 대응을 담는다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -6001,6 +6415,7 @@ When both assets act on the same 15m bar, every step of the bar goes BTC first, 
 ## Isolation from strategy A
 
 - B's code lives in `src/ewbot/stratb/` (the B fingerprint hashes every `*.py` there) and `src/ewbot/paperb/` (the paper-B runtime). A's fingerprinted folders, `paper/`, `backtest/`, `live/`, `holdout.lock`, `paper.yml`, `ci.yml`, `scripts/` and `uv.lock` are never changed; B only imports from them.
+- The strategy-A modules B imports, directly or through other modules (42 files today: A's config defaults, costs, sizing, breakers, ZigZag, metrics, buy & hold, walk-forward windows, data hashing and the `paper/` modules paper-B uses; not `live/`, `cli.py` or A's paper runner), are hashed into `deps_sha256` (`ewbot.stratb.fingerprint.deps_fingerprint`). `holdout-b.lock` binds it: after the lock, a change to any of them - an A maintenance change included - makes the holdout and paper-B refuse to run, and so does a new import of another A module from `paperb/`. Check with `uv run python -c "from ewbot.stratb.fingerprint import deps_files; print(*sorted(deps_files()), sep=chr(10))"`.
 - B has its own cache files (`data/cache/BTC-USD_15m.parquet`, `data/cache/ETH-USD_15m.parquet`), lock (`holdout-b.lock`), ledger branch (`paper-b`), workflow (`.github/workflows/paper-b.yml`) and Actions cache key (`stratb-15m-`).
 - `tests/stratb/test_isolation.py` checks A's fingerprint, that B is outside A's fingerprinted folders and that no A path changed since `master`; `tests/paper/test_static.py` (run by `ci.yml`) carries the CI part.
 
@@ -6020,14 +6435,14 @@ uv run ewbot stratb paper status --ledger-dir <paper-b worktree>   # read-only
 ## Research and holdout (in this order)
 
 1. `uv run ewbot stratb fetch` (about 820 requests per asset to the public Coinbase API, a few minutes each; an interrupted download resumes from the last saved page). Check the printed missing-bar counts.
-2. `uv run ewbot stratb walkforward`. It scores the 32 combos on the BTC + ETH portfolio and prints the stitched out-of-sample metrics, `chosen_final` and `proceed`. If `proceed` is false (negative out-of-sample return, or the last fold had no selectable combo), strategy B ends here (spec 6.3).
-3. `uv run ewbot stratb holdout lock --params-from reports/stratb-walkforward.json`, then commit `holdout-b.lock` right away. The lock fixes the combo, the run config (assets included), the B fingerprint, the hash of each asset's pre-2024 bars and the holdout's last bar (the last 15m bar of the last complete hour at lock time).
-4. Ask the user for approval. Only then: `uv run ewbot stratb holdout run --confirm`, and commit `holdout-b.lock` again (it now holds `first_run`). The holdout runs once: a second run, a changed B file or other pre-2024 bars of either asset are refused. The criteria are the portfolio's: Sharpe above the 50/50 BTC/ETH buy & hold and above the random control's 95th percentile (random entries per asset at each asset's own frequency), max drawdown at most 15%, at least 50 trades of both assets together, and a net profit with costs x 1.5.
+2. `uv run ewbot stratb walkforward`. It scores the 32 combos on the BTC + ETH portfolio and prints the stitched out-of-sample metrics, `chosen_final` and `proceed`. If `proceed` is false (negative out-of-sample return, or the last fold had no selectable combo), strategy B ends here (spec 6.3). The report also records what it ran on: each asset's bar hashes (`wf_data`), the B fingerprint (`code_sha256`) and `deps_sha256`.
+3. On a clean working tree (`git status --porcelain --untracked-files=no` prints nothing): `uv run ewbot stratb holdout lock --params-from reports/stratb-walkforward.json`, then commit `holdout-b.lock` right away and note the commit (`git rev-parse HEAD`). The lock is refused when tracked files have uncommitted changes, or when the report does not proceed or was made on other bars, other B code or other A modules (re-run the walk-forward). The lock fixes the combo, the run config (assets included), the grid, the B fingerprint, `deps_sha256`, the hash of each asset's pre-2024 bars, the report's sha256 and the holdout's last bar (the last 15m bar of the last complete hour at lock time).
+4. Ask the user for approval. Only then, before the run: the working tree is clean, `HEAD` is the lock commit, and the A-protection tests pass (`uv run --group live pytest tests/paper/test_fingerprint.py tests/paper/test_static.py tests/stratb/test_isolation.py -q`). Then `uv run ewbot stratb holdout run --confirm`, and commit `holdout-b.lock` **immediately** (it now holds `first_run`; until that commit, discarding the file would allow a second run - never do that). The holdout runs once: a second run, a changed B file, changed A modules (`deps_sha256`), a lock whose keys, grid, config, holdout start or replay anchor are not this code's, uncommitted changes to tracked files, or other pre-2024 bars of either asset are refused. B, the random control, the cost run and buy & hold are all measured on the same hours, from the account's value at 2024-01-01 00:00. The criteria are the portfolio's: Sharpe above the 50/50 BTC/ETH buy & hold and above the random control's 95th percentile (random entries per asset at each asset's own frequency), max drawdown at most 15%, at least 50 trades of both assets together, and a net profit with costs x 1.5. Keep `data/cache/` (the holdout window's 15m bars exist only there) until paper-B has reproduced the holdout (`ewbot stratb paper status`: `holdout data ok` and `holdout trades recomputed` equal to the lock's).
 5. If `first_run.criteria.passed` is false, strategy B ends (spec 6.5): no paper trading, no retuning on the same data.
 
 ## Paper trading (only after a passed holdout)
 
-What runs: `.github/workflows/paper-b.yml` recomputes both assets from 2023-10-01 (the replay anchor) with the params in the committed `holdout-b.lock`, records the decisions in `ledger.json` and `runs.log` on the orphan branch `paper-b` (only the workflow writes it: never push to it by hand), and sends Telegram messages prefixed `[ewbot paper-B]` with the same bot and secrets as strategy A; each trade message names its asset (`B-BTC`, `B-ETH`). Paper trades are the trades of either asset that enter after the lock's last bar; 30 are needed in all (spec 7.1), with no unexplained discrepancy. A change of any file in `src/ewbot/stratb/` opens a new epoch and restarts the count.
+What runs: `.github/workflows/paper-b.yml` recomputes both assets from 2023-10-01 (the replay anchor) with the params in the committed `holdout-b.lock`, records the decisions in `ledger.json` and `runs.log` on the orphan branch `paper-b` (only the workflow writes it: never push to it by hand), and sends Telegram messages prefixed `[ewbot paper-B]` with the same bot and secrets as strategy A; each trade message names its asset (`B-BTC`, `B-ETH`). Paper trades are the trades of either asset that enter after the lock's last bar; 30 are needed in all (spec 7.1), with no unexplained discrepancy. A change of any file in `src/ewbot/stratb/` opens a new epoch and restarts the count; a change of the strategy-A modules B imports (`deps_sha256`) stops paper-B at the precheck instead. Each run ends at the latest 15m bar both assets have: when one asset's newest bar is late, the other's newer bars wait for the next run (the run records a warning).
 
 One-time setup (you):
 
@@ -6071,7 +6486,7 @@ One-time setup (you):
 ## Failures
 
 - A failed run sends `[ewbot paper-B] 실패 · 단계 <stage>` with the log link (the workflow's fallback alert covers checkout, setup and push failures). Nothing is committed after a failed run; the next run recomputes everything.
-- Stage `precheck`: `holdout-b.lock` is missing, not committed, edited, not run, failed, or its config is not the code's. Stage `data`: the candle update failed three times, or an asset's data ends before the lock's last bar.
+- Stage `precheck`: `holdout-b.lock` is missing, not committed, edited, not run, failed, its keys, grid, config, holdout start or replay anchor are not the code's, or the strategy-A modules B imports changed since the lock (`deps_sha256`: revert the A change; paper-B has no re-lock). Stage `data`: the candle update failed three times, or an asset's data ends before the lock's last bar.
 - `[ewbot paper-B] 경고: 홀드아웃 구간 데이터 해시 불일치`: the 15m bars of the holdout window (either asset) no longer hash to the holdout run's (a Coinbase candle revision, or a full re-download after the Actions cache was evicted). The run is not refused (spec 8 as amended 2026-10-07): it warns once per distinct hash, and any recorded decision that changes because of it is classified `DATA_REVISION`. `ewbot stratb paper status` shows `holdout data MISMATCH` until the data is back.
 - Discrepancies (`[ewbot paper-B] 경고: 결정 불일치`) are classified like A's: `DATA_REVISION`, `FINGERPRINT_CHANGE`, `ENVIRONMENT_CHANGE`, `UNEXPLAINED`. Any `UNEXPLAINED` one blocks the go-live condition.
 
@@ -6177,9 +6592,9 @@ git commit -m "feat(paperb): paper-b workflow and git sync, CI guard for strateg
 uv run --group live pytest -q
 ```
 
-예상: `1372 passed` 또는 `1371 passed, 1 skipped`
+예상: `1381 passed` 또는 `1380 passed, 1 skipped`
 
-`data/cache/BTC-USD_1h.parquet`가 없으면 `tests/backtest/test_e2e_real.py` 1개가 건너뛰어진다. 기준선보다 정확히 126개가 많아야 한다.
+`data/cache/BTC-USD_1h.parquet`가 없으면 `tests/backtest/test_e2e_real.py` 1개가 건너뛰어진다. 기준선보다 정확히 135개가 많아야 한다.
 
 - [ ] **Step 2: A 지문이 그대로인지 확인**
 
@@ -6296,18 +6711,19 @@ Task 6b에서 이미 받았다면 새로 받을 것이 없다(아니면 자산�
 uv run ewbot stratb walkforward
 ```
 
-몇 분 안에 끝난다(조합 32개, BTC+ETH 포트폴리오). 사용자에게 보고한다: 구간별 선택 조합, 이어 붙인 표본 외 성과(`WF-OOS` 줄), 조합표(`reports/stratb-walkforward.json`의 `combo_table`: 조합별 Calmar·샤프·거래 수·자산별 거래 수), `chosen_final`, `chosen_final_fallback`, `proceed`. 2단계 그리드에서는 선택이 '자신의 Calmar 최대'와 같다는 점(명세 해석 2)도 함께 보고한다. 월 거래 수가 명세 목표(두 자산 합계 월 10~15건)에서 크게 벗어나면 그것도 보고한다(규칙은 바꾸지 않는다). **`proceed`가 거짓이면 B를 여기서 끝낸다**(명세 6.3): 잠금을 만들지 않는다.
+몇 분 안에 끝난다(조합 32개, BTC+ETH 포트폴리오). 사용자에게 보고한다: 구간별 선택 조합, 이어 붙인 표본 외 성과(`WF-OOS` 줄), 조합표(`reports/stratb-walkforward.json`의 `combo_table`: 조합별 Calmar·샤프·거래 수·자산별 거래 수), `chosen_final`, `chosen_final_fallback`, `proceed`. 2단계 그리드에서는 선택이 '자신의 Calmar 최대'와 같다는 점(명세 해석 2)도 함께 보고한다. 보고서에는 자산별 봉 해시(`wf_data`), B 지문(`code_sha256`), `deps_sha256`도 기록된다(Step 4의 잠금이 확인한다). 월 거래 수가 명세 목표(두 자산 합계 월 10~15건)에서 크게 벗어나면 그것도 보고한다(규칙은 바꾸지 않는다). **`proceed`가 거짓이면 B를 여기서 끝낸다**(명세 6.3): 잠금을 만들지 않는다.
 
 - [ ] **Step 4: 잠금 작성과 즉시 커밋**
 
 ```bash
-git status --porcelain src/ewbot/stratb
+git status --porcelain --untracked-files=no
 uv run ewbot stratb holdout lock --params-from reports/stratb-walkforward.json
 git add holdout-b.lock
 git commit -m "chore(stratb): lock the strategy-B holdout" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git rev-parse HEAD
 ```
 
-첫 줄의 출력이 비어 있어야 한다(잠금의 B 지문은 작업 트리의 `stratb/`로 계산된다). 잠금의 `last_bar_ts`는 지금 시각의 마지막 완성 시간의 마지막 15분봉이며 홀드아웃의 끝이다.
+첫 줄의 출력이 비어 있어야 한다: 추적 파일에 커밋 안 된 변경이 있으면 `holdout lock`이 거부한다(잠금의 B 지문과 `deps_sha256`은 작업 트리로 계산된다). 보고서가 `proceed`가 아니거나 fallback이거나, 다른 봉·B 코드·A 모듈로 만들어졌으면 거부된다(그때는 워크포워드를 다시 돌린다). 마지막 줄의 커밋(잠금 커밋)을 사용자 보고에 적는다. 잠금의 `last_bar_ts`는 지금 시각의 마지막 완성 시간의 마지막 15분봉이며 홀드아웃의 끝이다.
 
 - [ ] **Step 5: 사용자 승인(필수)**
 
@@ -6316,10 +6732,15 @@ git commit -m "chore(stratb): lock the strategy-B holdout" -m "Co-Authored-By: C
 - [ ] **Step 6: 홀드아웃 1회 실행과 커밋(네트워크)**
 
 ```bash
+git status --porcelain --untracked-files=no
+test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- holdout-b.lock)" && echo "HEAD is the lock commit"
+uv run --group live pytest tests/paper/test_fingerprint.py tests/paper/test_static.py tests/stratb/test_isolation.py -q
 uv run ewbot stratb holdout run --confirm
 git add holdout-b.lock
 git commit -m "chore(stratb): record the strategy-B holdout run" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
+
+실행 전 확인(2026-10-07 최종 검토 I1·M4): 첫 줄의 출력이 비어 있고(깨끗한 작업 트리; `holdout run`도 잠금 파일 말고 추적 파일의 변경을 거부한다), 둘째 줄이 `HEAD is the lock commit`을 출력하고(잠금 커밋 뒤에 다른 커밋이 없음), A 보호 테스트가 모두 통과해야 한다(`51 passed`). 하나라도 어긋나면 실행하지 않고 사용자에게 보고한다. `holdout run`은 이 밖에도 B 지문, `deps_sha256`(B가 import하는 A 모듈), 잠금의 키·그리드·설정·홀드아웃 시작·앵커가 이 코드와 다르면 거부한다. 실행이 끝나면 **바로** `first_run`을 커밋한다(마지막 두 줄): 커밋 전에는 `git checkout holdout-b.lock`으로 두 번째 실행이 가능해지므로(결과는 결정적이라 무엇을 조정할 수는 없지만 1회 규칙을 지키기 위해) 그 파일을 되돌리거나 지우지 않는다. `data/cache/`(두 자산 15분봉 캐시, gitignore)는 지우지 않는다: 홀드아웃 구간의 봉은 이 캐시에만 있고, Coinbase가 옛 캔들을 고치면 그 뒤에는 사후에만 알 수 있다(`first_run.data`에 자산별 해시가 있다). 모의매매가 홀드아웃을 재현한 뒤(Step 8의 `paper status`에서 `holdout data ok`이고 `holdout trades recomputed`가 잠금의 거래 수와 같을 때)에만 정리할 수 있다.
 
 두 캐시를 지금까지 늘린 뒤 2023-10-01부터 잠금의 마지막 봉까지 두 자산을 다시 계산하고, 50:50 매수 후 보유·자산별 무작위 대조군 1,000회·비용 1.5배를 돈다(작업자 수에 따라 2~10분). 출력의 기준 4개, 자산별 거래 수와 `PASSED`/`FAILED`를 그대로 사용자에게 보고한다. 다시 실행하거나, 기준을 낮추거나, 다른 조합을 시험하지 않는다(명세 6.5). 같은 명령을 다시 실행하면 거부된다.
 
@@ -6370,12 +6791,12 @@ git worktree remove "$TMPDIR/paper-b"
 | 6.1 데이터 | BTC-USD·ETH-USD 2017-01부터 15m(자산별 캐시, 같은 2024 가드, 이어 받기), 1h 합성, 누락 봉 기록·미보충, 확정 봉만 | 2, 4(해석 8) |
 | 6.2 체결 | 15m 체결, A의 비용(자산별 계약 크기; ETP 최소 수수료·ETH 펀딩은 Plan 5 확인), 손절 우선, A의 초기 자금 하나, 자산별 정수 계약 내림, 같은 봉의 결정적 처리 순서 | 1, 5(해석 20) |
 | 6.3 워크포워드 | A의 구간 길이·최소 거래·선택 점수·최종 조합(실제 값 확인), 포트폴리오로 평가, 음수면 종료, 2024 가드와 테스트 | 2, 6(해석 1~3), 11 |
-| 6.4 잠금·홀드아웃 1회 | 조합·B 지문·데이터 해시(두 자산 각각)·그리드·시작일, 승인 후 1회, `first_run`, `REPLAY_ANCHOR` 2023-10-01 | 2, 8(해석 11), 11, 14 |
-| 6.5 합격 기준(포트폴리오) | 샤프 > BTC/ETH 50:50 BH·자산별 빈도의 무작위 p95(1,000회), MDD ≤ 15%, 두 자산 합계 거래 ≥ 50, 비용 1.5배 순이익 > 0 | 7, 8(해석 10) |
+| 6.4 잠금·홀드아웃 1회 | 조합·B 지문·데이터 해시(두 자산 각각)·그리드·시작일, 승인 후 1회, `first_run`, `REPLAY_ANCHOR` 2023-10-01; 최종 검토: B가 import하는 A 모듈의 해시, 워크포워드 보고서의 출처(봉·코드)와 sha256, 잠금 필드가 이 코드의 것인지, 깨끗한 작업 트리, 진짜 잠금만 2024를 엶 | 1, 2, 6, 8(해석 11), 11, 14 |
+| 6.5 합격 기준(포트폴리오) | 샤프 > BTC/ETH 50:50 BH·자산별 빈도의 무작위 p95(1,000회), MDD ≤ 15%, 두 자산 합계 거래 ≥ 50, 비용 1.5배 순이익 > 0; 최종 검토: 넷 모두 시작 시점의 자금부터 같은 시간들로 측정 | 5, 7, 8(해석 9, 10) |
 | 6.6 해석의 한계 | 합격 = 버릴 이유 없음, 확인은 모의매매 | 14(보고), 문서 |
-| 7 모의매매 | 두 자산을 한 실행·장부로, 앵커부터 결정적 재계산, A의 불일치 분류(자산을 넣은 거래 키), `paper-b.yml`(매시 47분, 예비 schedule), 사용량, orphan `paper-b`, A 장부 스키마, 잠금 이후 진입만 카운트(합계), B 지문 구간, `[ewbot paper-B]` 진입·청산(자산 표시)·일일 요약(n/30, 불일치, 손익, 자산별 포지션), 실패 알림 | 9, 10, 11, 12(해석 12~17), 14 |
+| 7 모의매매 | 두 자산을 한 실행·장부로, 앵커부터 결정적 재계산, A의 불일치 분류(자산을 넣은 거래 키), `paper-b.yml`(매시 47분, 예비 schedule), 사용량, orphan `paper-b`, A 장부 스키마, 잠금 이후 진입만 카운트(합계), B 지문 구간, `[ewbot paper-B]` 진입·청산(자산 표시, 같은 봉 청산도 차례로 n/30)·일일 요약(n/30, 불일치, 손익, 자산별 포지션), 실패 알림, 두 자산이 모두 가진 마지막 봉까지 | 9, 10, 11, 12(해석 8, 12~17), 14 |
 | 7.1 실거래 전환 조건 | 합격, 모의 30건(두 자산 합계), 원인 불명 0건, 사용자 승인 | 10(`status_lines_b`), 문서 |
-| 8 오류 처리(2026-10-07 수정 포함) | 수집 재시도(연결 오류·시간 초과 포함) 후 알림·중단, 한 자산이라도 실패하면 실행하지 않음, 누락 봉 판단 없음, 잠금 불일치 시 거부·알림, 홀드아웃 구간 데이터 해시 불일치는 거부 없이 한 번 경고·`DATA_REVISION` 분류, A와 충돌 없음(테스트) | 2, 4, 10, 11, 1, 12 |
+| 8 오류 처리(2026-10-07 수정 포함) | 수집 재시도(연결 오류·시간 초과 포함) 후 알림·중단, 한 자산이라도 실패하면 실행하지 않음, 누락 봉 판단 없음, 잠금 불일치 시 거부·알림(B가 import하는 A 모듈의 해시 포함), 홀드아웃 구간 데이터 해시 불일치는 거부 없이 한 번 경고·`DATA_REVISION` 분류, A와 충돌 없음(테스트) | 2, 4, 10, 11, 1, 12 |
 | 9 테스트 | 규칙 단위, 미래 정보 차단(두 자산 잘라내기), 체결(롱·숏, 시간 손절, 자산별 계약, 두 상한, 같은 봉 순서, 계좌 손실 한도), 홀드아웃 보호, A 보호(CI), 모의매매(A 도우미 재사용) | 3, 4, 5, 8, 1·12·13, 9·10·11·12 |
 | 10 진행 절차 | 승인 → 계획 → 작업별 구현·검토(Task 6 뒤 빈도 점검, 개정 뒤 두 자산으로 다시) → PR(A의 CI 통과) → 수집·워크포워드·보고 → 잠금 → 승인 → 홀드아웃 1회 → 합격 시 크론·모의매매 | 1~13, 6b, 14 |
 
@@ -6383,6 +6804,8 @@ git worktree remove "$TMPDIR/paper-b"
 
 **3. 타입 일관성:** `Combo`(튜플)와 JSON 조합(리스트)은 `normalize_combo`/`combo_to_json`으로만 오간다. 여러 자산의 데이터는 어디서나 `ASSETS` 순서의 사전 `{자산: …}`이다(15분봉, 프레임, 신호, 캐시 경로, 잠금의 `wf_data`). `SignalB.i`는 그 자산 프레임의 인덱스, 비교는 `ts`로 한다. `BResult`의 `signals`와 `orders`는 같은 순서이고 자산은 `OrderB.asset`에 있다(`build_decisions_b`가 `zip(strict=True)`). 엔진 안의 거래 키는 (자산, 진입 ts)이고, A의 판단 형식에 넣을 때만 정수 `trade_key_b`(ts + 자산 인덱스)로 바꾼다. `run_holdout_b`, `create_lock`, `run_paper_b`, `precheck_lock_b`, `PaperBEnv`의 이름과 인자는 Task 8·10·11·12에서 같다. 잠금 경로는 어디서나 `stratb.data15.DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`)다.
 
-**4. 검증:** 이 계획은 작성 시점(2026-10-07)에 새 클론(`feat/plan4-strategy-b`, Python 3.12.13)에 문서 그대로 적용해 확인했다: 모든 파일과 수정을 적힌 대로 쓰고 모든 명령을 실행했으며, 39개의 `예상` 항목이 모두 맞았다(각 Step 2는 적힌 대로 실패, 각 Step 4는 적힌 수로 통과, Task 13의 전체 테스트 `1359 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함). 적용 결과의 42개 파일은 개발 사본과 바이트 단위로 같았다. Task 6b와 Task 14는 네트워크와 사용자 승인이 필요한 수동 단계라 재생에서 제외했다(6b의 스크립트는 합성 캐시로 따로 실행해 확인).
+**4. 검증:** 이 계획은 작성 시점(2026-10-07)과 아래 두 개정 뒤에 매번 새 클론(`feat/plan4-strategy-b`, Python 3.12.13)에 문서 그대로 적용해 확인했다: 모든 파일과 수정을 적힌 대로 쓰고 모든 명령을 실행했으며, 모든 `예상` 항목이 맞았다(각 Step 2는 적힌 대로 실패, 각 Step 4는 적힌 수로 통과, Task 13의 전체 테스트(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함). 적용 결과의 42개 파일은 개발 사본과 바이트 단위로 같았다. 마지막 확인의 수치는 6에 있다. Task 6b와 Task 14는 네트워크와 사용자 승인이 필요한 수동 단계라 재생에서 제외했다(6b의 스크립트는 합성 캐시로 따로 실행해 확인).
 
 **5. 2026-10-07 개정(BTC+ETH)의 재검증:** 개정한 이 계획 전체를 같은 날 새 클론의 계획 커밋 `4969109`(Task 1 코드 이전)에서 문서 그대로 다시 적용했다: 모든 Step 2가 적힌 대로 실패하고 모든 Step 4가 적힌 수로 통과했으며(`예상` 항목 39개 모두 일치), Task 13의 전체 테스트는 `1371 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함. 적용 결과에서 Task 1~6의 파일은 저장소에 커밋된 개정 코드와, Task 7~12의 파일은 개발 사본과 바이트 단위로 같았다. Task 6b의 두 자산 스크립트는 2017~2023 두 자산 합성 캐시로 따로 실행해 출력 형식을 확인했다(실제 데이터와 네트워크는 쓰지 않았다).
+
+**6. 2026-10-07 최종 검토 수정(잠금 전)의 재검증:** 잠금 전 최종 검토의 수정 — I1(잠금이 `deps_sha256`을 묶고, 홀드아웃이 이 코드의 것이 아닌 잠금 필드·A 모듈 변경·더러운 작업 트리를 거부하며, 잠금 작성도 더러운 작업 트리를 거부하고, 모의매매 사전 점검이 A 모듈 변경을 거부), M1(B·무작위 대조군·비용 1.5배·매수 후 보유를 시작 시점의 자금부터 같은 시간들로 측정), M2(모의매매는 두 자산이 모두 가진 마지막 봉까지), M3(같은 봉에 청산된 두 거래의 n/30), M5(워크포워드 보고서가 쓴 봉·B 지문·deps를 기록하고 잠금이 이를 확인하며 보고서의 sha256을 묶음), M6(다이제스트까지 확인하는 잠금 판정; 그에 맞춘 `holdout run`의 거부 문구) — 을 반영한 이 계획 전체를 같은 날 새 클론의 계획 커밋 `4969109`(Task 1 코드 이전)에서 문서 그대로 다시 적용했다: 모든 Step 2가 적힌 대로 실패하고 모든 Step 4가 적힌 수로 통과했으며(`예상` 항목 39개 모두 일치; 테스트 수는 앞에 다른 숫자가 붙지 않는지까지 확인), Task 13의 전체 테스트는 `1380 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, A 보호 검사 `51 passed`, 바뀐 파일 목록 일치, 작업 트리 깨끗함. 적용 결과의 42개 파일은 모두 저장소의 수정 코드(커밋 `2864bd0`까지)와 바이트 단위로 같았다. M4(`first_run`을 곧바로 커밋)와 M7(앞선 검토에서 수용한 사항)은 코드 변경 없이 받아들였고, M4와 홀드아웃 전 확인 사항(깨끗한 작업 트리, `HEAD` = 잠금 커밋, A 보호 테스트, 캐시 보존)은 Task 14 Step 4·6에 적었다.
