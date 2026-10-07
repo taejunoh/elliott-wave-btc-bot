@@ -1,7 +1,9 @@
-"""Strategy-B parameters (Plan 4 spec 4-5): the 32-combo grid, the fixed values and the run config.
+"""Strategy-B parameters (Plan 4 spec 4-5): the 32-combo grid, the fixed values, the two assets and the run
+config.
 
 Separate from ewbot.config (strategy A): A's RiskProfile / BreakerParams / CostParams types are only
-imported, never changed. Combos are tuples in GRID_B key order: (zz_k, (z_lo, z_hi), tp1_r, ext, remainder)."""
+imported, never changed. Combos are tuples in GRID_B key order: (zz_k, (z_lo, z_hi), tp1_r, ext, remainder).
+One combo serves both assets (spec 1 as revised 2026-10-07: BTC and ETH, one shared parameter set)."""
 
 from __future__ import annotations
 
@@ -58,10 +60,33 @@ RISK_B = RiskProfile("stratb", 0.005, 3.0)  # spec 4.4: 0.5% of equity per trade
 
 
 @dataclass(frozen=True, slots=True)
+class AssetSpec:
+    """One traded asset (spec 1, 6.1-6.2): signals from the Coinbase spot candles of `product`; trades are
+    modelled in the CFM futures contract `future`, `contract_size` coins per contract (whole contracts).
+    `tick` is the contract's price increment, kept for Plan 5's live orders: like A's, the backtest does not
+    round prices to ticks."""
+
+    asset: str
+    product: str
+    future: str
+    contract_size: float
+    tick: float
+
+
+ASSET_SPECS = (
+    AssetSpec("BTC", "BTC-USD", "BIP-20DEC30-CDE", 0.01, 5.0),
+    AssetSpec("ETH", "ETH-USD", "ETP-20DEC30-CDE", 0.1, 0.5),
+)
+ASSETS = tuple(s.asset for s in ASSET_SPECS)  # also the order in which a bar's steps visit the assets
+
+
+@dataclass(frozen=True, slots=True)
 class BConfig:
     """Everything a strategy-B run depends on. Breakers, costs and the initial equity are A's values
-    (spec 4.4, 6.2): daily -3%, total -15%, 5 losses -> 24h pause; fee 0.05%, slippage 0.05%, funding
-    10% APR; 10,000 USD; contracts of 0.01 BTC."""
+    (spec 4.4, 6.2): daily -3%, total -15%, 5 losses -> 24h pause, all on the one account shared by the
+    assets; fee 0.05%, slippage 0.05%, funding 10% APR, with each asset's contract size (asset_costs);
+    10,000 USD. At most one position per asset; each is sized against the account equity and capped at
+    risk.max_leverage (3x), and all of them together at max_total_leverage (3x) of the equity."""
 
     params: StratBParams = StratBParams()
     risk: RiskProfile = RISK_B
@@ -69,6 +94,20 @@ class BConfig:
     costs: CostParams = CostParams()
     initial_equity: float = 10_000.0
     tp1_frac: float = 0.5
+    assets: tuple[AssetSpec, ...] = ASSET_SPECS
+    max_total_leverage: float = 3.0
+
+
+def asset_spec(cfg: BConfig, asset: str) -> AssetSpec:
+    for s in cfg.assets:
+        if s.asset == asset:
+            return s
+    raise KeyError(f"{asset!r} is not an asset of the run config {[s.asset for s in cfg.assets]}")
+
+
+def asset_costs(cfg: BConfig, asset: str) -> CostParams:
+    """A's cost model with the asset's contract size; fee rate, minimum fee, slippage and funding are A's."""
+    return dataclasses.replace(cfg.costs, contract_size=asset_spec(cfg, asset).contract_size)
 
 
 def grid_combos() -> list[Combo]:

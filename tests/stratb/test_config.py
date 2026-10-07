@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from ewbot.config import CostParams
 from ewbot.stratb.config import (
+    ASSET_SPECS,
+    ASSETS,
     GRID_B,
     M15,
     RISK_B,
     BConfig,
     StratBParams,
+    asset_costs,
+    asset_spec,
     combo_of,
     combo_to_json,
     config_for,
@@ -54,8 +60,20 @@ def test_run_config_uses_the_spec_risk_and_strategy_a_breakers_costs_and_equity(
     assert cfg.risk == RISK_B and (RISK_B.risk_pct, RISK_B.max_leverage) == (0.005, 3.0)
     assert (cfg.breakers.daily_loss, cfg.breakers.total_dd, cfg.breakers.enabled) == (0.03, 0.15, True)
     assert cfg.costs == CostParams() and cfg.initial_equity == 10_000.0 and cfg.tp1_frac == 0.5
+    assert cfg.assets == ASSET_SPECS and cfg.max_total_leverage == 3.0
     assert config_for(grid_combos()[0], breakers_enabled=False).breakers.enabled is False
     assert BConfig().params == StratBParams()
+
+
+def test_btc_and_eth_trade_their_own_contracts_with_strategy_a_costs():
+    assert ASSETS == ("BTC", "ETH")
+    btc, eth = (asset_spec(BConfig(), a) for a in ASSETS)
+    assert (btc.product, btc.future, btc.contract_size, btc.tick) == ("BTC-USD", "BIP-20DEC30-CDE", 0.01, 5.0)
+    assert (eth.product, eth.future, eth.contract_size, eth.tick) == ("ETH-USD", "ETP-20DEC30-CDE", 0.1, 0.5)
+    assert asset_costs(BConfig(), "BTC") == CostParams()
+    assert asset_costs(BConfig(), "ETH") == dataclasses.replace(CostParams(), contract_size=0.1)
+    with pytest.raises(KeyError):
+        asset_spec(BConfig(), "SOL")
 
 
 def test_scale_costs_scales_fees_and_slippage_only():
