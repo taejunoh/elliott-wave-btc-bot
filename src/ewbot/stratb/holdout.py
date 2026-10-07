@@ -38,7 +38,7 @@ from ewbot.backtest.report import to_jsonable
 from ewbot.backtest.walkforward import HOLDOUT_START
 from ewbot.stratb.baselines import buy_hold_b, random_control
 from ewbot.stratb.config import ASSETS, GRID_B, M15, combo_to_json, config_for, normalize_combo, scale_costs
-from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, LOCK_KIND, REPLAY_ANCHOR, cache_paths, load_15m, lock_digest_b
 from ewbot.stratb.engine import run_engine
 from ewbot.stratb.fingerprint import stratb_fingerprint
 from ewbot.stratb.research import backtest_b, trades_by_asset
@@ -50,18 +50,10 @@ RANDOM_RUNS = 1000
 MAX_DD = 0.15
 MIN_TRADES = 50
 COST_MULT = 1.5
-BOUND = ("kind", "version", "keys", "params", "config", "grid", "holdout_start", "replay_anchor", "last_bar_ts",
-         "random_runs", "random_seed", "code_sha256", "wf_data")
 
 
 class HoldoutBError(RuntimeError):
     """The strategy-B lock cannot be written, or the holdout may not run."""
-
-
-def lock_digest_b(lock: dict[str, Any]) -> str:
-    """sha256 of the sorted compact JSON of the lock's BOUND fields."""
-    blob = json.dumps({k: lock.get(k) for k in BOUND}, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:

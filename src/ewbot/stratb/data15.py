@@ -12,16 +12,19 @@ from the last saved bar; a connection error or a timeout is retried FETCH_TRIES 
 Holdout guard (spec 6.3): until holdout-b.lock exists, fetch_15m refuses a window that reaches
 HOLDOUT_START (2024-01-01), update_cache_15m never asks for one, and load_15m never returns a bar at or
 after it - the parquet read itself filters them out. load_15m(include_holdout=True) raises
-HoldoutGuardError until the lock exists."""
+HoldoutGuardError until the lock exists. A lock "exists" only when its sha256 is the digest of its bound
+fields (lock_digest_b, defined here for stratb.holdout, which writes the lock): a hand-made file with the
+right name or shape does not unlock 2024."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 import requests
@@ -39,6 +42,8 @@ START_TS = utc_ts(WF_START)  # 2017-01-01: the first bar fetched
 REPLAY_ANCHOR = utc_ts("2023-10-01")  # spec 6.4: holdout and paper runs both recompute from here
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "holdout-b.lock"
 LOCK_KIND = "ewbot-stratb-holdout"
+LOCK_BOUND = ("kind", "version", "keys", "params", "config", "grid", "holdout_start", "replay_anchor", "last_bar_ts",
+              "random_runs", "random_seed", "code_sha256", "wf_data")  # the lock fields its sha256 binds
 FETCH_TRIES = 3  # per page, on a connection error or a timeout
 FETCH_BACKOFF_S = 1.0  # waits 1 s, then 2 s
 
@@ -56,9 +61,15 @@ def cache_paths(cache_dir: Path) -> dict[str, Path]:
     return {a: cache_path(cache_dir, p) for a, p in PRODUCTS.items()}
 
 
+def lock_digest_b(lock: Mapping[str, Any]) -> str:
+    """sha256 of the sorted compact JSON of the lock's LOCK_BOUND fields."""
+    blob = json.dumps({k: lock.get(k) for k in LOCK_BOUND}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def lock_exists(lock_path: Path) -> bool:
-    """True only for a strategy-B holdout lock (a JSON object of kind LOCK_KIND with a sha256), not for
-    any file that happens to have the name."""
+    """True only for a strategy-B holdout lock: a JSON object of kind LOCK_KIND whose sha256 is the digest of
+    its bound fields - not for a file that merely has the name or the shape."""
     p = Path(lock_path)
     if not p.is_file():
         return False
@@ -66,7 +77,7 @@ def lock_exists(lock_path: Path) -> bool:
         lock = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(lock, dict) and lock.get("kind") == LOCK_KIND and isinstance(lock.get("sha256"), str)
+    return isinstance(lock, dict) and lock.get("kind") == LOCK_KIND and lock.get("sha256") == lock_digest_b(lock)
 
 
 def _empty() -> pd.DataFrame:

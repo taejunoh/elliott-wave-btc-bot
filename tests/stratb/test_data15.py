@@ -10,6 +10,7 @@ import requests
 from ewbot.data import coinbase_history as ch
 from ewbot.stratb import data15 as d15
 from ewbot.stratb.data15 import (
+    LOCK_BOUND,
     LOCK_KIND,
     REPLAY_ANCHOR,
     START_TS,
@@ -19,6 +20,7 @@ from ewbot.stratb.data15 import (
     fetch_15m,
     gap_report,
     load_15m,
+    lock_digest_b,
     lock_exists,
     resample_1h,
     update_cache_15m,
@@ -66,8 +68,11 @@ class FakeSession:
         return R()
 
 
-def _lock(path, kind=LOCK_KIND):
-    path.write_text(json.dumps({"kind": kind, "sha256": "ab" * 32}), encoding="utf-8")
+def _lock(path, kind=LOCK_KIND, **fields):
+    """A lock file whose sha256 is the digest of its bound fields (the rest of a real lock does not matter here)."""
+    lock = {"kind": kind, "last_bar_ts": HS + 3600, **fields}
+    lock["sha256"] = lock_digest_b(lock)
+    path.write_text(json.dumps(lock), encoding="utf-8")
     return path
 
 
@@ -171,6 +176,12 @@ def test_lock_exists_needs_a_strategy_b_lock(tmp_path):
     assert not lock_exists(tmp_path / "x")
     assert not lock_exists(_lock(tmp_path / "a", kind="other"))
     assert lock_exists(_lock(tmp_path / "b"))
+    (tmp_path / "c").write_text(json.dumps({"kind": LOCK_KIND, "sha256": "ab" * 32}), encoding="utf-8")
+    assert not lock_exists(tmp_path / "c")  # the right shape is not enough: the digest must match
+    edited = json.loads((tmp_path / "b").read_text(encoding="utf-8"))
+    edited["last_bar_ts"] += 900
+    (tmp_path / "d").write_text(json.dumps(edited), encoding="utf-8")
+    assert not lock_exists(tmp_path / "d") and "last_bar_ts" in LOCK_BOUND
 
 
 def test_resample_keeps_complete_hours_only_and_flags_synthetic():

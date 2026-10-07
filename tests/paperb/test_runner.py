@@ -10,7 +10,7 @@ from ewbot.paper.ledger import load_ledger
 from ewbot.paper.notify import NY
 from ewbot.paperb.notify import HEAD_B
 from ewbot.paperb.runner import PaperBRunError, precheck_lock_b, run_paper_b
-from ewbot.stratb.holdout import lock_digest_b
+from ewbot.stratb.data15 import lock_digest_b
 from tests.paper.helpers import git
 from tests.paperb.helpers import LAST_BAR, FakeFetchB, commit_lock_b, make_env, world
 

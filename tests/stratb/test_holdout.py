@@ -6,14 +6,13 @@ import pandas as pd
 import pytest
 
 from ewbot.backtest.metrics import Metrics
-from ewbot.stratb.data15 import REPLAY_ANCHOR, HoldoutGuardError, cache_paths, load_15m, load_caches_15m
+from ewbot.stratb.data15 import REPLAY_ANCHOR, HoldoutGuardError, cache_paths, load_15m, load_caches_15m, lock_digest_b
 from ewbot.stratb.fingerprint import stratb_fingerprint
 from ewbot.stratb.holdout import (
     HoldoutBError,
     create_lock,
     data_fingerprint_b,
     evaluate_criteria_b,
-    lock_digest_b,
     read_lock,
     run_holdout_b,
 )
