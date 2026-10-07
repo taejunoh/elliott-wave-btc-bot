@@ -161,8 +161,25 @@ def _step(steps, step_id):
     return next(s for s in steps if s.get("id") == step_id)
 
 
-def test_the_repository_has_exactly_the_paper_and_ci_workflows():
-    assert sorted(p.name for p in WORKFLOWS.iterdir()) == ["ci.yml", "paper.yml"]
+def test_the_repository_has_exactly_the_paper_ci_and_paper_b_workflows():
+    assert sorted(p.name for p in WORKFLOWS.iterdir()) == ["ci.yml", "paper-b.yml", "paper.yml"]
+
+
+def test_strategy_b_code_is_outside_the_strategy_a_fingerprint():
+    """Plan 4 spec 2, 9 (A protection, run by ci.yml): strategy B lives in stratb/ and paperb/ only, and
+    none of its files is in A's fingerprinted set (A's fingerprint itself is pinned in test_fingerprint.py)."""
+    from ewbot.paper.fingerprint import is_fingerprinted, tree_files
+
+    b_files = [f.relative_to(SRC).as_posix() for d in ("stratb", "paperb") for f in (SRC / d).rglob("*.py")]
+    assert b_files and not [r for r in b_files if is_fingerprinted(r)]
+    assert not [p for p in tree_files() if p.startswith(("src/ewbot/stratb/", "src/ewbot/paperb/"))]
+
+
+def test_the_paper_b_workflow_never_touches_strategy_a():
+    text = (WORKFLOWS / "paper-b.yml").read_text(encoding="utf-8")
+    assert yaml.safe_load(text)["concurrency"]["group"] == "paper-b"
+    for a_thing in ("paper_sync.sh", "btc-usd-1h", "ewbot paper run", "holdout.lock"):
+        assert a_thing not in text
 
 
 def test_workflow_triggers_concurrency_and_permissions():

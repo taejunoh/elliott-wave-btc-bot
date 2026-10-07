@@ -9,6 +9,7 @@ The project was built in three layers. Each layer has to prove itself before the
 | **Research** (Plan 1) | Backtest, walk-forward on 2017–2023, one-shot holdout from 2024-01-01 | Your laptop (`ewbot backtest / compare / walkforward / holdout`) | Done. The holdout was run once and is locked in `holdout.lock`. |
 | **Paper trading** (Plan 2) | Every hour, replays the frozen strategy on fresh Coinbase candles and records each decision. Builds the out-of-sample trade count. | GitHub Actions, hourly (Cloudflare cron at :37). Ledger on the orphan `paper` branch. | Running since 2026-10-02 |
 | **Live trading** (Plan 3) | Turns the same decisions into Coinbase CFM futures orders (`BIP-20DEC30-CDE`, nano BTC perp, 0.01 BTC per contract) with exchange-side stops | A US-East VPS, in Docker | **SHADOW** since 2026-10-05 (no real orders) |
+| **Strategy B** (Plan 4) | A separate 15m strategy on BTC and ETH (1h swing structure, Fibonacci zone with an earlier swing, 15m RSI divergence and breakout). Its own walk-forward, one-shot holdout (`holdout-b.lock`) and paper trading (`paper-b` branch). Never touches A. | Your laptop, then GitHub Actions (`paper-b.yml`) | Research ([`docs/strategy-b.md`](docs/strategy-b.md)) |
 
 ## Live stages
 
@@ -41,7 +42,8 @@ uv run --group live pytest
 ## Rules that must not be broken
 
 - **Never edit a strategy file.** That covers `types.py`, `config.py`, `indicators.py`, `data/candles.py`, `waves/`, `strategy/`, `engine/`, `execution/` and `risk/`. Any change alters the strategy fingerprint (`e0435223…`), which resets the 50-trade count for good.
-- **Never re-run or tune the holdout,** and never edit `holdout.lock`.
+- **Never re-run or tune the holdout,** and never edit `holdout.lock`. The same holds for strategy B's `holdout-b.lock`.
+- **Strategy B never touches A:** its code stays in `src/ewbot/stratb/` and `src/ewbot/paperb/`, and any change in `stratb/` restarts B's paper count (B fingerprint), never A's.
 - **The live Coinbase account belongs to the bot alone.** Never place a manual BIP order or hold a manual BIP position in it. Never deposit, withdraw, buy spot or set up recurring buys while the bot runs; use `ewbot live rebase --confirm` after a deliberate capital change.
 - **Secrets live only on the VPS** (`/etc/ewbot/`, mode 600) **and in GitHub secrets.** Never put them in the repository.
 - **Code changes after SHADOW starts restart its 14-day count.** Documentation changes don't.
@@ -52,10 +54,12 @@ uv run --group live pytest
   - [`docs/live-trading.md`](docs/live-trading.md): live-trading runbook. Setup, deploy, backups and restore, emergencies, stage changes.
   - [`docs/paper-trading.md`](docs/paper-trading.md): paper-trading runtime.
   - [`docs/backtest-runtime.md`](docs/backtest-runtime.md): backtest runtime.
+  - [`docs/strategy-b.md`](docs/strategy-b.md): strategy B research, holdout and paper trading.
 - Design specs (`docs/superpowers/specs/`):
   - [Plan 1: research](docs/superpowers/specs/2026-10-01-elliott-wave-btc-bot-design.md)
   - [Plan 2: paper trading](docs/superpowers/specs/2026-10-02-ewbot-plan2-paper-trading-design.md)
   - [Plan 3: live trading](docs/superpowers/specs/2026-10-03-ewbot-plan3-live-trading-design.md)
+  - [Plan 4: strategy B](docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md)
 - Implementation plans: `docs/superpowers/plans/`.
 
 ## Layout
@@ -64,6 +68,8 @@ uv run --group live pytest
 src/ewbot/            strategy (fingerprinted), backtest, data, cli.py
 src/ewbot/paper/      paper-trading runtime (Plan 2)
 src/ewbot/live/       live runtime (Plan 3): exchange adapter, reconcile, executor, watchdog, Telegram, stages
+src/ewbot/stratb/     strategy B (Plan 4): BTC and ETH 15m data, rules, portfolio engine, walk-forward, holdout (B fingerprint)
+src/ewbot/paperb/     strategy B paper trading (Plan 4): runner, ledger adapters, paper-b git sync
 deploy/live/          Dockerfile, compose service, deploy.sh, backup.sh and its systemd timer
 tests/                research, paper/ and live/ suites
 holdout.lock          the one-shot holdout result and its frozen parameters
