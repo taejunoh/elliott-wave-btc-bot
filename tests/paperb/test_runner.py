@@ -77,6 +77,22 @@ def test_hourly_runs_count_paper_trades_and_notify_with_the_b_prefix(tmp_path, l
     assert {d["id"] for d in load_ledger(fresh.ledger_dir).decisions} == {d["id"] for d in led.decisions}
 
 
+def test_a_run_ends_at_the_last_bar_both_assets_have(tmp_path, lock_text):
+    now = LAST_BAR + 900 + 6 * H1 + 60
+    newest = now // 900 * 900 - 900  # the newest closed bar (hh:45)
+    full = world()
+    late = {"BTC": full["BTC"], "ETH": full["ETH"][full["ETH"]["ts"] < newest]}  # ETH's newest bar is not out yet
+    env, clock, _ = make_env(tmp_path, lock_text, now, source=late)
+    out = run_paper_b(env)
+    led = load_ledger(env.ledger_dir)
+    assert out.last_bar_ts == led.runs[0]["last_bar_ts"] == newest - 900  # BTC's newest bar waits for ETH's
+    assert all(d["ts"] <= newest - 900 for d in led.decisions) and "ETH" in out.notes[0]
+    env.fetch = FakeFetchB(full, clock)
+    clock.now += H1
+    out = run_paper_b(env)
+    assert out.last_bar_ts == newest + H1 and out.notes == [] and out.new_discrepancies == 0
+
+
 def test_a_changed_recorded_decision_is_an_unexplained_discrepancy(tmp_path, lock_text):
     env, clock, sender = make_env(tmp_path, lock_text, LAST_BAR + 900 + 3 * 86_400)
     run_paper_b(env)

@@ -1,7 +1,9 @@
 """One `ewbot stratb paper run` (Plan 4 spec 7, 8): precheck -> data -> fingerprint/epoch -> full recompute
 from REPLAY_ANCHOR -> replay check -> ledger and runs.log -> Telegram. BTC and ETH run together in this one
 runtime and ledger (spec 7 as revised 2026-10-07): one portfolio recompute, one count of 30 trades of both
-assets, messages that name the asset.
+assets, messages that name the asset. A run ends at the latest bar BOTH assets have: when one asset's newest
+bar is not out yet, the other's newer bars wait for the next run (they are never decided against a flat
+padded bar of the late asset), and the run records a warning.
 
 Inputs are frozen by holdout-b.lock: the params and the whole run config come from it (the precheck refuses
 a lock whose sha256 is not the digest of its fields, that is not committed unchanged, whose holdout has
@@ -238,7 +240,9 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         early = {a: e for a, e in ends.items() if e < hs["last_bar_ts"]}
         if early:
             raise PaperBRunError("data", f"data ends at {early}, before the lock's last bar {hs['last_bar_ts']}")
-        last_bar = max(ends.values())  # the recompute pads an asset that ends earlier (signals.build_frames)
+        last_bar = min(ends.values())  # the latest bar both assets have: no flat padding of a late asset's bar
+        late = [a for a in ASSETS if ends[a] == last_bar < max(ends.values())]
+        dfs = {a: df[df["ts"] <= last_bar].reset_index(drop=True) for a, df in dfs.items()}
         holdout_sha = data_fingerprint_b(dfs, REPLAY_ANCHOR, hs["last_bar_ts"])
         holdout_ok = holdout_sha == hs["data_sha256"]
     with _stage("fingerprint"):
@@ -295,6 +299,10 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         events: list[dict[str, Any]] = []
         warnings: list[str] = []
         lock_n = int(hs["n_trades"]["B"])
+        if late:
+            newest = datetime.fromtimestamp(max(ends.values()), UTC).isoformat(timespec="minutes")
+            warnings.append(f"{late} data ends before the newest bar {newest}: the run ends at the last bar both "
+                            "assets have")
         if not holdout_ok:  # one message per distinct revised hash (the event id carries it)
             warnings.append(f"holdout data hash {holdout_sha[:12]} != lock {hs['data_sha256'][:12]}")
             text = b_head(data_hash_text(hs["data_sha256"], holdout_sha))
