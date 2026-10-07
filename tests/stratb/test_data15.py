@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pandas as pd
 import pytest
+import requests
 
 from ewbot.data import coinbase_history as ch
 from ewbot.stratb import data15 as d15
@@ -14,12 +15,14 @@ from ewbot.stratb.data15 import (
     START_TS,
     HoldoutGuardError,
     cache_path,
+    cache_paths,
     fetch_15m,
     gap_report,
     load_15m,
     lock_exists,
     resample_1h,
     update_cache_15m,
+    update_caches_15m,
 )
 
 HS = 1_704_067_200  # 2024-01-01 00:00 UTC
@@ -32,14 +35,20 @@ def _row(ts: int) -> list[float]:
 
 
 class FakeSession:
-    """Honours start/end (inclusive), at most 300 rows, newest first; records every request."""
+    """Honours start/end (inclusive), at most 300 rows, newest first; records every request. Raises the
+    queued exceptions first (one per request), and every request from fail_from on fails."""
 
-    def __init__(self, first_ts: int, last_ts: int):
+    def __init__(self, first_ts: int, last_ts: int, errors=(), fail_from: int | None = None):
         self.first, self.last = first_ts, last_ts
+        self.errors, self.fail_from = list(errors), fail_from
         self.calls: list[dict] = []
 
     def get(self, url, params=None, timeout=None):
         self.calls.append({"url": url, **params})
+        if self.errors:
+            raise self.errors.pop(0)
+        if self.fail_from is not None and len(self.calls) > self.fail_from:
+            raise requests.ConnectionError("coinbase down")
         assert params["granularity"] == 900
         s = int(datetime.strptime(params["start"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp())
         e = int(datetime.strptime(params["end"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp())
@@ -69,8 +78,9 @@ def no_sleep(monkeypatch):
 
 def test_constants():
     assert (START_TS, REPLAY_ANCHOR) == (1_483_228_800, 1_696_118_400)
-    assert cache_path("data/cache").name == "BTC-USD_15m.parquet"
-    assert d15.DEFAULT_LOCK_PATH.name == "holdout-b.lock"
+    assert {a: p.name for a, p in cache_paths("data/cache").items()} == {
+        "BTC": "BTC-USD_15m.parquet", "ETH": "ETH-USD_15m.parquet"}
+    assert d15.DEFAULT_LOCK_PATH.name == "holdout-b.lock" and d15.PRODUCTS == {"BTC": "BTC-USD", "ETH": "ETH-USD"}
 
 
 def test_fetch_pages_300_bars_at_granularity_900():
@@ -83,21 +93,59 @@ def test_fetch_pages_300_bars_at_granularity_900():
     assert df.loc[0, "open"] == _row(t0)[3] and df.loc[0, "low"] == _row(t0)[1]
 
 
-def test_without_a_lock_the_cache_stops_before_2024(tmp_path):
-    sess = FakeSession(HS - 50 * M15, HS + 500 * M15)
-    path = update_cache_15m(tmp_path, lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15,
-                            now_ts=HS + 400 * M15, session=sess, sleep_s=0)
+def test_fetch_refuses_a_2024_window_without_the_lock(tmp_path):
+    sess = FakeSession(HS - 50 * M15, HS + 50 * M15)
+    with pytest.raises(HoldoutGuardError):
+        fetch_15m("ETH-USD", HS - 10 * M15, HS + M15, session=sess, sleep_s=0, lock_path=tmp_path / "none.lock")
+    assert sess.calls == []
+    df = fetch_15m("ETH-USD", HS - 10 * M15, HS + M15, session=sess, sleep_s=0, lock_path=_lock(tmp_path / "l.lock"))
+    assert int(df["ts"].max()) == HS
+
+
+def test_connection_errors_and_timeouts_are_retried_with_backoff(monkeypatch):
+    waits = []
+    monkeypatch.setattr(d15.time, "sleep", waits.append)
+    t0 = HS - 400 * M15
+    sess = FakeSession(t0, HS, errors=[requests.ConnectionError("reset"), requests.Timeout("slow")])
+    assert len(fetch_15m("BTC-USD", t0, t0 + 10 * M15, session=sess, sleep_s=0)) == 10
+    assert waits == [1.0, 2.0] and len(sess.calls) == 3
+    sess = FakeSession(t0, HS, errors=[requests.ConnectionError("x")] * 3)
+    with pytest.raises(requests.ConnectionError):
+        fetch_15m("BTC-USD", t0, t0 + 10 * M15, session=sess, sleep_s=0)
+
+
+def test_an_interrupted_download_keeps_its_pages_and_resumes(tmp_path):
+    t0 = HS - 1000 * M15
+    none = tmp_path / "none.lock"
+    with pytest.raises(requests.ConnectionError):
+        update_cache_15m(tmp_path, product="BTC-USD", lock_path=none, start_ts=t0, now_ts=HS,
+                         session=FakeSession(t0, HS, fail_from=2), sleep_s=0)
+    assert len(pd.read_parquet(cache_path(tmp_path, "BTC-USD"))) == 600
+    sess = FakeSession(t0, HS)
+    path = update_cache_15m(tmp_path, product="BTC-USD", lock_path=none, now_ts=HS, session=sess, sleep_s=0)
     df = pd.read_parquet(path)
-    assert int(df["ts"].max()) == HS - M15 and len(df) == 50 and len(sess.calls) == 1
+    assert sess.calls[0]["start"] == datetime.fromtimestamp(t0 + 600 * M15, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert df["ts"].tolist() == [t0 + k * M15 for k in range(1000)]
+
+
+def test_without_a_lock_the_caches_stop_before_2024(tmp_path):
+    sess = FakeSession(HS - 50 * M15, HS + 500 * M15)
+    paths = update_caches_15m(tmp_path, lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15,
+                              now_ts=HS + 400 * M15, session=sess, sleep_s=0)
+    assert list(paths) == ["BTC", "ETH"] and [c["url"].split("/")[-2] for c in sess.calls] == ["BTC-USD", "ETH-USD"]
+    for p in paths.values():
+        df = pd.read_parquet(p)
+        assert int(df["ts"].max()) == HS - M15 and len(df) == 50
     assert all(c["end"] < "2024-01-01" for c in sess.calls)
 
 
 def test_with_a_lock_the_cache_extends_to_the_last_closed_bar(tmp_path):
     sess = FakeSession(HS - 50 * M15, HS + 500 * M15)
     lock = _lock(tmp_path / "holdout-b.lock")
-    update_cache_15m(tmp_path, lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15, now_ts=HS + 400 * M15,
-                     session=sess, sleep_s=0)
-    path = update_cache_15m(tmp_path, lock_path=lock, now_ts=HS + 10 * M15 + 899, session=sess, sleep_s=0)
+    update_cache_15m(tmp_path, product="BTC-USD", lock_path=tmp_path / "none.lock", start_ts=HS - 50 * M15,
+                     now_ts=HS + 400 * M15, session=sess, sleep_s=0)
+    path = update_cache_15m(tmp_path, product="BTC-USD", lock_path=lock, now_ts=HS + 10 * M15 + 899, session=sess,
+                            sleep_s=0)
     df = pd.read_parquet(path)
     assert int(df["ts"].max()) == HS + 9 * M15 and df["ts"].is_unique and len(df) == 60
     assert sess.calls[-1]["start"] == "2024-01-01T00:00:00Z"
