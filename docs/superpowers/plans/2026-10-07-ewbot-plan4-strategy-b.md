@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12 (uv), 기존 의존성만(numpy, pandas 3, pyarrow, requests, PyYAML); pytest; GitHub Actions(`actions/checkout@v7`, `astral-sh/setup-uv` v10.2.0 커밋 `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Coinbase Exchange 공개 캔들 API(granularity 900); Telegram Bot API(A와 같은 봇·시크릿).
 
-**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`(사용자 승인 2026-10-07). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`, Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`.
+**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`(사용자 승인 2026-10-07; 8절의 데이터 해시 항목은 같은 날 컨트롤러 결정으로 수정). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`, Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`.
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - 고정값(명세 5절): RSI 14, 피벗 좌우 3봉, 매물대 허용 ±0.25×ATR1h, 손절 여유 0.2×ATR15m, 최대 손절 2.5×ATR1h, 확인 기한 72시간, 시간 손절 48시간, ATR 14. 그리드 32개: `zz_k` (2.0, 3.0) × 되돌림 구간 ((0.382, 0.618), (0.5, 0.786)) × `tp1_r` (1.0, 1.5) × `e` (1.272, 1.618) × `remainder` (breakeven, original).
 - 위험·비용(명세 4.4, 6.2): 거래당 0.5%, 레버리지 상한 3배(`RiskProfile("stratb", 0.005, 3.0)`), A의 `BreakerParams()`(하루 −3%, 전체 −15%, 5연패 후 24시간 휴지), A의 `CostParams()`(수수료 0.05%, 슬리피지 0.05%, 펀딩 연 10%: 15분봉마다 시간당 값의 1/4), 초기 자금 10,000 USD, 0.01 BTC 정수 계약으로 내림.
 - `REPLAY_ANCHOR` = 2023-10-01 00:00 UTC(`1696118400`): 홀드아웃 실행과 모의매매 재계산의 시작점(명세 6.4).
-- 테스트는 네트워크, 실제 `data/cache`, 실제 `holdout-b.lock`·`holdout.lock`을 쓰지 않는다(합성 15분봉, 임시 git 저장소, 가짜 세션·발송기·수집기). 실제 데이터 수집, 워크포워드, 잠금, 홀드아웃은 Task 14(수동, 사용자 승인)에서만 한다.
+- 테스트는 네트워크, 실제 `data/cache`, 실제 `holdout-b.lock`·`holdout.lock`을 쓰지 않는다(합성 15분봉, 임시 git 저장소, 가짜 세션·발송기·수집기). 실제 데이터 수집은 Task 6b(2017~2023 거래 빈도 점검, 컨트롤러 수동)와 Task 14(수동, 사용자 승인)에서만, 워크포워드·잠금·홀드아웃은 Task 14에서만 한다.
 - 모든 커밋 메시지는 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` 줄로 끝난다(`git commit -m "<제목>" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"`).
 
 ## 명세 해석 (이 계획이 정함, 모든 작업에 구속력)
@@ -39,13 +39,14 @@
 9. **체결(명세 6.2).** A의 `PaperBroker` 규칙을 15분봉에 그대로 쓴다: 시가가 손절가를 넘으면 시가에 손절, 같은 봉에서 손절가에 닿으면 손절가에 손절(목표보다 우선), 아니면 TP1(절반, 지정가, 엄격한 돌파)과 TP2. 1계약이면 TP1에서 전량. 본절 이동은 TP1이 체결된 봉의 다음 봉부터. 손실 한도 관측은 매시 마지막 15분봉 마감(A와 같은 시각). 자산 곡선은 시간 단위(시각 = 그 시간의 시작)라서 A의 `compute_metrics`(연 8760시간)를 그대로 쓴다. Coinbase 선물의 금요일 정기 휴장은 명세에 없어 모델링하지 않는다(실거래는 Plan 5).
 10. **무작위 대조군(명세 6.5-1).** 같은 기간, 같은 진입 횟수(B의 거래 수), 같은 엔진(청산, 시간 손절, 잔량 규칙, 0.5% 수량, 3배 상한, 손실 한도, 비용). B 거래의 모양(방향, 기준가 대비 손절 거리, TP1·TP2의 R 배수)을 시드 고정 무작위 순서로 무작위 15분봉(마지막 봉·누락 봉·누락 체결 봉 제외)에 놓는다. 포지션 중에 온 진입은 B와 똑같이 건너뛰므로 실현 횟수는 같거나 적다. 1,000회(시드 0~999), B의 샤프를 대조군 샤프의 95번째 백분위수와 비교한다.
 11. **잠금과 1회 실행(명세 6.4).** `holdout-b.lock`은 2024+ 데이터를 보기 **전에** 만든다. 조합, 전체 실행 설정, 그리드, B 지문, 2024 이전 15분봉 해시(`wf_data`), 홀드아웃 시작, 앵커, 무작위 대조군 1,000회와 시드, `last_bar_ts`(잠금 시각의 마지막 완성 시간의 마지막 15분봉 = "잠금 시점의 마지막 확정 봉"), 그리고 이 필드들의 다이제스트 `sha256`을 담는다. 홀드아웃 데이터의 해시는 잠금 시점에 읽을 수 없으므로 `first_run.data`에 기록한다. 홀드아웃은 잠금이 커밋되어 있고, `first_run`이 비어 있고, B 지문과 2024 이전 데이터가 잠금과 같을 때만 1회 돈다. 시도는 실행 전에 기록되고, 끝나지 않은 시도 뒤의 재시도는 같은 홀드아웃 데이터일 때만 허용된다.
-12. **모의매매의 잠금 불일치(명세 7, 8).** 잠금 파일 자체(다이제스트, 커밋된 그대로인지, 설정이 이 코드의 `config_for(params)`와 같은지, `first_run`이 합격인지)가 맞지 않거나 홀드아웃 구간 15분봉의 해시가 `first_run.data.sha256`과 다르면 실행을 거부하고 알린다. 현재 B 지문이 잠금의 `code_sha256`과 다르면 거부하지 않고 새 구간을 연다(명세 7절).
+12. **모의매매의 잠금 불일치(명세 7, 8; 8절은 2026-10-07 수정).** 잠금 파일 자체(다이제스트, 커밋된 그대로인지, 설정이 이 코드의 `config_for(params)`와 같은지, `first_run`이 합격인지)가 맞지 않으면 실행을 거부하고 알린다. 홀드아웃 구간 15분봉의 해시가 `first_run.data.sha256`과 다르면(Coinbase의 캔들 수정, Actions 캐시 삭제 뒤의 재수집) 거부하지 않고 A처럼 해시마다 한 번 경고(`DATA_HASH` 이벤트, 텔레그램)하고 계속하며, 그 때문에 바뀐 판단은 A의 대조 규칙대로 `DATA_REVISION`이 된다(거부하면 이런 일만으로 모의매매가 무기한 멈춘다). 현재 B 지문이 잠금의 `code_sha256`과 다르면 거부하지 않고 새 구간을 연다(명세 7절).
 13. **판단 기록.** A의 판단 형식과 대조 함수(`verify_decisions`, `decisions_to_record`, `classify`, `same_decision`)를 그대로 쓴다. B의 종류는 SIGNAL, ENTRY, TP1, TP2, STOP, EXIT(TIME, BREAKER), BREAKEVEN이다. A의 `known_at`은 SIGNAL을 ts + 1시간으로 셈하는데 B의 신호는 ts + 15분부터 알 수 있다. 기록 시점은 같고 APPEARED 검사만 최대 45분 늦어진다(오탐 없음).
 14. **모의 카운트(명세 7, 7.1).** 잠금의 마지막 봉 이후에 진입한 현재 구간의 청산 거래만 센다(홀드아웃 거래는 세지 않는다). 필요 30건. B 지문이 바뀌면 새 구간에서 0부터 세고, 그 구간은 실거래 전환 판정 대상이 아니다(A와 같은 규칙).
 15. **워크플로 휴면.** 명세 10절 순서상 `paper-b.yml`은 홀드아웃보다 먼저 `master`에 들어간다. 그동안 예비 `schedule`이 실패 알림을 보내지 않도록 작업은 저장소 변수 `PAPER_B_ENABLED`가 `true`일 때만 돈다(합격 후 사용자가 켠다. 건너뛴 작업은 실행 시간을 쓰지 않는다).
 16. **1차 트리거.** 기존 Cloudflare Worker 코드는 크론과 관계없이 `paper.yml`만 부르므로 크론 1줄만 더하면 A가 두 번 돈다. 그래서 `docs/strategy-b.md`에 `paper-b.yml`을 부르는 두 번째 Worker 코드를 싣는다(사용자 작업, `ops/`는 바꾸지 않는다).
 17. **git 동기화.** A의 `scripts/paper_sync.sh`는 `paper` 브랜치에 묶여 있고 수정할 수 없으므로 같은 규칙을 `paper-b`용 파이썬 모듈 `ewbot.paperb.sync`로 구현한다(`python -m ewbot.paperb.sync checkout | push …`).
 18. **파일 배치.** 명세 3절의 `research.py`(워크포워드와 홀드아웃)는 책임별로 `research.py`(워크포워드)와 `holdout.py`(잠금·1회 실행·합격 기준)로 나누고, 신호 생성은 `signals.py`에 둔다(`rules.py`는 순수 함수만). 모두 `stratb/` 안이라 B 지문 대상이다.
+19. **거래 빈도 조기 점검(컨트롤러 결정 2026-10-07).** Task 6 다음의 Task 6b(컨트롤러 전용 수동 단계)에서 실제 2017~2023 15분봉으로 32개 조합 모두의 월 거래 수를 센다(조합 선택 없음, 성과 지표 없음, 2024+ 데이터 없음, 홀드아웃 없음). 중앙값이 월 4건 미만이면 Task 7~14를 멈추고 사용자에게 보고한다. 홀드아웃이 아직 보이지 않았으므로 그때의 규칙 변경은 정당하지만, 사용자 재승인과 명세 개정이 먼저다.
 
 ## File Structure
 
@@ -83,6 +84,7 @@
 | 4 | 15분 프레임, 기준 구간, 신호(+ 합성 데이터 도우미) | 11 |
 | 5 | 15분 엔진 | 13 |
 | 6 | 백테스트 가드, 그리드, 워크포워드 | 7 |
+| 6b | 실제 2017~2023 거래 빈도 점검(컨트롤러 수동, 네트워크; 중앙값 < 월 4건이면 중단·보고) | — |
 | 7 | 매수 후 보유, 무작위 대조군 | 5 |
 | 8 | 잠금, 1회 홀드아웃, 합격 기준 | 9 |
 | 9 | 모의매매 어댑터(장부, 판단, 알림) | 6 |
@@ -2493,6 +2495,59 @@ git commit -m "feat(stratb): 2024 guard, 32-combo grid and walk-forward with str
 
 ---
 
+### Task 6b: 실제 2017~2023 거래 빈도 점검 (컨트롤러 전용 수동 단계, 네트워크 — 서브에이전트 금지)
+
+**Files:** 없음. 코드를 바꾸지 않는다(캐시 `data/cache/BTC-USD_15m.parquet`만 생기며 git에서 제외된다).
+
+**Interfaces:**
+- Consumes: Task 1: `combo_to_json`. Task 2: `DEFAULT_LOCK_PATH`, `gap_report`, `load_15m`, `lock_exists`, `update_cache_15m`. Task 6: `run_grid_b`. A: `ewbot.backtest.walkforward.HOLDOUT_START`, `WF_START`, `ewbot.backtest.runner.utc_ts`.
+- Produces: 32개 조합 각각의 2017~2023 거래 수, 월 거래 수, 롱/숏 수와 아래 결정 규칙의 판정. Task 7~14를 진행할지의 근거.
+
+이유: 명세의 목표 빈도는 월 10~15건이고 홀드아웃 합격에는 약 33개월에 50건 이상이 필요한데, 합성 무작위 경로에서는 이 규칙이 월 1건 안팎만 낸다. Task 7~14에 들어가기 전에 실제 데이터의 빈도를 확인한다. 이 단계는 2024-01-01 이후 데이터를 받지도 읽지도 않고(잠금이 없으므로 수집기가 2024 이전에서 멈추고, 로더가 읽을 때 걸러내며, 스크립트가 다시 확인한다), 홀드아웃을 건드리지 않고, 조합을 고르지 않으며(32개 모두, 손실 한도 끔 — 워크포워드 그리드와 같은 실행), **수익률·낙폭·샤프 같은 성과 지표는 계산하거나 출력하지 않는다**(성과를 보고 설계를 고치지 않는다는 이 프로젝트의 연구 규칙). 2017~2023은 84개월이다.
+
+- [ ] **Step 1: 실제 15분봉 수집(2017-01-01 ~ 2023-12-31)과 조합별 빈도 출력**
+
+```bash
+uv run python - <<'PY'
+import statistics
+from pathlib import Path
+
+from ewbot.backtest.runner import utc_ts
+from ewbot.backtest.walkforward import HOLDOUT_START, WF_START
+from ewbot.stratb.config import combo_to_json
+from ewbot.stratb.data15 import DEFAULT_LOCK_PATH, gap_report, load_15m, lock_exists, update_cache_15m
+from ewbot.stratb.research import run_grid_b
+
+assert not lock_exists(DEFAULT_LOCK_PATH), "holdout-b.lock must not exist yet"
+path = update_cache_15m(Path("data/cache"))  # no lock: never requests a bar at/after 2024-01-01
+df = load_15m(path)  # the read filters out any 2024+ bar
+assert int(df["ts"].max()) < HOLDOUT_START
+rep = gap_report(df)
+print(f"15m bars 2017-01..2023-12: {rep.n}, missing {len(rep.missing_ts)}")
+start, months = utc_ts(WF_START), 84  # 2017-01-01 .. 2023-12-31
+res = run_grid_b(df, start, HOLDOUT_START, workers=1)  # about 15 s; a stdin script cannot spawn workers
+rates = []
+for combo, r in res.items():
+    n = len(r.trades)
+    longs = sum(1 for t in r.trades if t.direction > 0)
+    rates.append(n / months)
+    print(f"{str(combo_to_json(combo)):48} trades {n:5d}  per month {n / months:5.2f}  long {longs:5d}  short {n - longs:5d}")
+med = statistics.median(rates)
+verdict = "STOP: report to the user before Task 7" if med < 4.0 else "continue with Task 7"
+print(f"median trades/month over the 32 combos: {med:.2f} (min {min(rates):.2f}, max {max(rates):.2f}) -> {verdict}")
+PY
+```
+
+약 820번의 공개 Coinbase API 요청(수 분)과 약 15초의 계산(작업자 1개: 표준 입력으로 받은 스크립트는 작업자 프로세스를 띄울 수 없다). 출력은 데이터 요약 1줄, 조합 32줄(`[zz_k, [z_lo, z_hi], tp1_r, ext, remainder]  trades N  per month X  long L  short S`), 판정 1줄이다: `median trades/month over the 32 combos: <중앙값> (min …, max …) -> continue with Task 7` 또는 `-> STOP: report to the user before Task 7`. 이 스크립트는 계획 작성 시 2017~2023 합성 캐시(네트워크 없음)로 실행해 출력 형식을 확인했다.
+
+- [ ] **Step 2: 결정 규칙에 따라 판정하고 보고**
+
+- 32개 조합의 월 거래 수 **중앙값이 4건 미만이면 멈춘다**: Task 7~14를 진행하지 않고, 조합별 표(거래 수, 월 거래 수, 롱/숏)와 누락 봉 수를 사용자에게 보고한다. 홀드아웃이 아직 보이지 않았으므로 이때의 규칙 변경은 정당하지만, 사용자의 재승인과 명세 개정(새 명세 또는 개정판, 이 계획의 개정)이 먼저이며, 이미 끝난 Task 1~6의 코드는 그 개정에 따라 고친다.
+- 중앙값이 4건 이상이면 표를 사용자에게 공유하고 Task 7로 넘어간다. 명세 목표(월 10~15건)에 못 미치면 그 사실도 함께 보고한다(규칙은 바꾸지 않는다).
+- 어느 경우에도 성과 지표는 보고하지 않는다. 이 캐시는 Task 14 Step 2에서 그대로 이어 쓴다.
+
+---
+
 ### Task 7: 매수 후 보유와 무작위 진입 대조군
 
 **Files:**
@@ -3610,10 +3665,10 @@ git commit -m "feat(paperb): ledger, decision and message adapters over strategy
 
 **Interfaces:**
 - Consumes: Task 1: `config_for`, `normalize_combo`, `stratb_fingerprint`. Task 2: `DEFAULT_LOCK_PATH`, `REPLAY_ANCHOR`, `load_15m`, `update_cache_15m`, `cache_path`(테스트). Task 6: `backtest_b`. Task 8: `HoldoutBError`, `committed_lock`, `read_lock`, `lock_digest_b`(테스트), `create_lock`·`run_holdout_b`(테스트 도우미). Task 9: 모든 어댑터. A(import만): `ewbot.backtest.holdout.data_fingerprint`; `ewbot.backtest.report.to_jsonable`; `ewbot.paper.decisions`: `decisions_to_record`, `known_at`, `paper_trades`, `verify_decisions`; `ewbot.paper.environment`: `environment_digest`, `runtime_environment`; `ewbot.paper.ledger`: `RUNS_LOG`, `Ledger`, `LedgerError`, `append_log_line`, `ensure_epoch`, `load_ledger`, `replace_epoch_trades`, `save_ledger`; `ewbot.paper.notify`: `NY`, `Sender`, `daily_summary_due`, `deliver`, `discrepancy_text`, `epoch_text`, `make_event`, `position_line`, `queue_events`. 테스트: `tests.paper.helpers.Clock`, `FakeSender`, `git`.
-- Produces: `ewbot.paperb.runner`: `FETCH_ATTEMPTS = 3`, `DAILY_HOUR_NY = 9`; `class PaperBRunError(RuntimeError)`(`.stage`, `.message`); `default_fetch_b(cache_dir, lock_path) -> Path`; `@dataclass PaperBEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch_b, sender=None, clock=<벽시계>, fingerprint=stratb_fingerprint, sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)`; `@dataclass(frozen=True) RunOutcomeB(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, count)`; `precheck_lock_b(lock_path) -> dict`; `status_lines_b(ledger, count) -> list[str]`; `run_paper_b(env) -> RunOutcomeB`. 실행 기록(`ledger.runs[]`)의 키: `id`, `ts`, `status`, `last_bar_ts`, `data_sha256`, `holdout_trades_recomputed`, `epoch_id`, `paper_trades`, `new_decisions`, `new_discrepancies`, `env`, `env_sha256`, `warnings`, `notify`. 장부 디렉터리에는 `ledger.json`과 `runs.log`만 쓴다.
+- Produces: `ewbot.paperb.runner`: `FETCH_ATTEMPTS = 3`, `DAILY_HOUR_NY = 9`; `class PaperBRunError(RuntimeError)`(`.stage`, `.message`); `default_fetch_b(cache_dir, lock_path) -> Path`; `@dataclass PaperBEnv(ledger_dir, lock_path=DEFAULT_LOCK_PATH, cache_dir=Path("data/cache"), fetch=default_fetch_b, sender=None, clock=<벽시계>, fingerprint=stratb_fingerprint, sleep=time.sleep, fetch_backoff_s=10.0, environment=runtime_environment)`; `@dataclass(frozen=True) RunOutcomeB(run_id, last_bar_ts, epoch_id, new_decisions, new_discrepancies, events, sent, pending, notes, count)`; `precheck_lock_b(lock_path) -> dict`; `status_lines_b(ledger, count) -> list[str]`; `run_paper_b(env) -> RunOutcomeB`. 실행 기록(`ledger.runs[]`)의 키: `id`, `ts`, `status`, `last_bar_ts`, `data_sha256`, `holdout_data_ok`, `holdout_trades_recomputed`, `epoch_id`, `paper_trades`, `new_decisions`, `new_discrepancies`, `env`, `env_sha256`, `warnings`, `notify`. 장부 디렉터리에는 `ledger.json`과 `runs.log`만 쓴다.
   `tests/paperb/helpers.py`: `HS`, `LOCK_NOW`, `LAST_BAR`, `COMBO`, `M15`, `world_df()`, `build_passed_lock(tmp) -> str`, `commit_lock_b(repo, text) -> Path`, `FakeFetchB(source, clock, fail=0)`, `make_env(tmp_path, lock_text, now, source=None, **kw) -> (PaperBEnv, Clock, FakeSender)`. `tests/paperb/conftest.py`: 세션 픽스처 `lock_text`(합성 홀드아웃을 실제로 한 번 돌린 잠금 파일 내용).
 
-명세 7·8과 해석 12~14를 구현한다. 단계: 사전 점검(잠금) → 장부(이 잠금에서 시작된 장부인지) → 데이터(3회 재시도, `REPLAY_ANCHOR` 이후, 잠금의 마지막 봉 이상, 홀드아웃 구간 해시 일치) → 지문·구간 → 재계산(`backtest_b(..., HOLDOUT_START, None, include_holdout=True)`, 홀드아웃 거래 수 재현 확인) → A의 대조 → 이벤트(진입, 본절, 청산, 불일치, 구간, 뉴욕 9시 일일 요약 n/30) → 쓰기 → 알림. 각 단계의 실패는 `PaperBRunError(stage)`이며, 쓰기 단계 전에는 아무것도 쓰지 않는다. 일일 요약의 실거래 전환 조건 4줄(명세 7.1)은 `status_lines_b`가 만든다. 시간마다 전체를 다시 계산하는 데 수 초가 걸린다(3년치 15분봉 약 10만 개).
+명세 7·8과 해석 12~14를 구현한다. 단계: 사전 점검(잠금) → 장부(이 잠금에서 시작된 장부인지) → 데이터(3회 재시도, `REPLAY_ANCHOR` 이후, 잠금의 마지막 봉 이상; 홀드아웃 구간 해시가 다르면 거부하지 않고 해시마다 한 번 경고 — 명세 8절 2026-10-07 수정) → 지문·구간 → 재계산(`backtest_b(..., HOLDOUT_START, None, include_holdout=True)`, 홀드아웃 거래 수 재현 확인) → A의 대조(데이터가 바뀌어 달라진 판단은 `DATA_REVISION`) → 이벤트(진입, 본절, 청산, 불일치, 구간, 데이터 해시 경고, 뉴욕 9시 일일 요약 n/30) → 쓰기 → 알림. 각 단계의 실패는 `PaperBRunError(stage)`이며, 쓰기 단계 전에는 아무것도 쓰지 않는다. 일일 요약의 실거래 전환 조건 4줄(명세 7.1)은 `status_lines_b`가 만든다. 시간마다 전체를 다시 계산하는 데 수 초가 걸린다(3년치 15분봉 약 10만 개).
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -3835,13 +3890,25 @@ def test_a_new_b_fingerprint_opens_a_new_epoch_and_resets_the_count(tmp_path, lo
     assert any(x.startswith(f"{HEAD_B} 경고: 전략 지문 변경 · 구간 2") for x in sender.texts)
 
 
-def test_revised_holdout_bars_refuse_the_run(tmp_path, lock_text):
+def test_revised_holdout_bars_warn_once_and_changed_decisions_are_data_revisions(tmp_path, lock_text):
+    env, clock, sender = make_env(tmp_path, lock_text, LAST_BAR + 900 + 3 * 86_400)
+    run_paper_b(env)
+    raw = json.loads((env.ledger_dir / "ledger.json").read_text())
+    raw["decisions"][0]["price"] += 1.0  # a recorded decision that will not reappear unchanged
+    (env.ledger_dir / "ledger.json").write_text(json.dumps(raw))
     df = world_df()
-    df.loc[(df["ts"] - LAST_BAR).abs().idxmin() - 500, "close"] += 0.5
-    env, _, _ = make_env(tmp_path, lock_text, LAST_BAR + 900 + 60, source=df)
-    with pytest.raises(PaperBRunError) as exc:
-        run_paper_b(env)
-    assert exc.value.stage == "data" and "spec 8" in exc.value.message and not (env.ledger_dir / "ledger.json").exists()
+    df.loc[(df["ts"] - LAST_BAR).abs().idxmin() - 500, "close"] += 0.5  # a bar inside the holdout window
+    env.fetch = FakeFetchB(df, clock)
+    for _ in range(2):
+        clock.now += H1
+        out = run_paper_b(env)
+    led = load_ledger(env.ledger_dir)
+    assert [r["holdout_data_ok"] for r in led.runs] == [True, False, False]
+    assert out.notes and out.notes[0].startswith("holdout data hash ")
+    assert raw["decisions"][0]["id"] in {d["decision_id"] for d in led.discrepancies}
+    assert {d["cause"] for d in led.discrepancies} == {"DATA_REVISION"}
+    warned = [x for x in sender.texts if "홀드아웃 구간 데이터 해시 불일치" in x]
+    assert len(warned) == 1 and warned[0].startswith(f"{HEAD_B} 경고")
 
 
 def test_candle_updates_are_retried_three_times(tmp_path, lock_text):
@@ -3893,9 +3960,12 @@ a lock whose sha256 is not the digest of its fields, that is not committed uncha
 not run or failed - strategy B ended -, or whose config is not config_for(params) of this code). The
 recompute starts at REPLAY_ANCHOR (2023-10-01) and trades from HOLDOUT_START, exactly like the holdout
 run, so it reproduces the holdout and continues it; trades entering after the lock's last bar are paper
-trades. The holdout window's bars must still hash to first_run.data.sha256, else the run is refused
-(spec 8). A different B fingerprint opens a new epoch (spec 7). Decisions, discrepancies, the
-environment record and Telegram delivery are strategy A's (paper/ imported, never changed).
+trades. When the holdout window's bars no longer hash to first_run.data.sha256 (a Coinbase candle
+revision, a re-download after a cache eviction) the run is NOT refused (spec 8 as amended 2026-10-07):
+like A it warns once per distinct hash (DATA_HASH event) and goes on, and a recorded decision that changes
+because of it is classified DATA_REVISION by A's replay check. A different B fingerprint opens a new epoch
+(spec 7). Decisions, discrepancies, the environment record and Telegram delivery are strategy A's (paper/
+imported, never changed).
 
 Every step runs inside a named stage: any failure raises PaperBRunError(stage); the CLI sends the failure
 alert. Nothing is written before the write stage."""
@@ -3932,6 +4002,7 @@ from ewbot.paper.notify import (
     NY,
     Sender,
     daily_summary_due,
+    data_hash_text,
     deliver,
     discrepancy_text,
     epoch_text,
@@ -4116,8 +4187,8 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         last_bar = int(df["ts"].iloc[-1])
         if last_bar < hs["last_bar_ts"]:
             raise PaperBRunError("data", f"data ends at {last_bar}, before the lock's last bar {hs['last_bar_ts']}")
-        if data_fingerprint(df, REPLAY_ANCHOR, hs["last_bar_ts"]) != hs["data_sha256"]:
-            raise PaperBRunError("data", "the holdout window's 15m bars differ from the holdout run's (spec 8)")
+        holdout_sha = data_fingerprint(df, REPLAY_ANCHOR, hs["last_bar_ts"])
+        holdout_ok = holdout_sha == hs["data_sha256"]
     with _stage("fingerprint"):
         epoch, created = ensure_epoch(ledger, env.fingerprint(), last_bar)
         floor = _recording_floor(ledger)
@@ -4172,6 +4243,10 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         events: list[dict[str, Any]] = []
         warnings: list[str] = []
         lock_n = int(hs["n_trades"]["B"])
+        if not holdout_ok:  # one message per distinct revised hash (the event id carries it)
+            warnings.append(f"holdout data hash {holdout_sha[:12]} != lock {hs['data_sha256'][:12]}")
+            text = b_head(data_hash_text(hs["data_sha256"], holdout_sha))
+            events.append(make_event("DATA_HASH", hs["last_bar_ts"], holdout_sha[:12], text))
         if holdout_n != lock_n:
             warnings.append(f"holdout trades recomputed {holdout_n} != lock {lock_n}")
             events.append(make_event("HOLDOUT_TRADES", hs["last_bar_ts"], holdout_n, holdout_trades_text_b(lock_n, holdout_n)))
@@ -4185,7 +4260,8 @@ def run_paper_b(env: PaperBEnv) -> RunOutcomeB:
         data_sha = prefix(last_bar)
         run: dict[str, Any] = {
             "id": run_id, "ts": now, "status": "ok", "last_bar_ts": last_bar, "data_sha256": data_sha,
-            "holdout_trades_recomputed": holdout_n, "epoch_id": epoch["id"], "paper_trades": count["paper"],
+            "holdout_data_ok": holdout_ok, "holdout_trades_recomputed": holdout_n, "epoch_id": epoch["id"],
+            "paper_trades": count["paper"],
             "new_decisions": len(fresh), "new_discrepancies": len(new_disc), "env": run_env, "env_sha256": env_sha,
             "warnings": warnings,
         }
@@ -4252,7 +4328,7 @@ git commit -m "feat(paperb): hourly deterministic paper-B run from REPLAY_ANCHOR
 - Consumes: Task 1: `combo_to_json`, `config_for`, `normalize_combo`. Task 2: `DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`), `cache_path`(`b_cache_path`), `gap_report`, `load_15m`, `lock_exists`, `update_cache_15m`. Task 6: `backtest_b`, `walk_forward_b`. Task 8: `HoldoutBError`, `create_lock`, `run_holdout_b`. Task 9: `paper_count_b`, `b_head`. Task 10: `PaperBEnv`, `PaperBRunError`, `run_paper_b`, `status_lines_b`. cli.py에 이미 있는 것: `_refuse`, `_requested_window`, `_print_comparison`, `to_jsonable`, `compute_metrics`, `deliver`, `failure_text`, `make_event`, `position_line`, `sender_from_env`, `load_ledger`, `LedgerError`, `current_epoch`, `RUN_URL_ENV`, `FAILURE_MARKER_ENV`, `WF_END`.
 - Produces: `ewbot stratb fetch [--cache-dir]`; `ewbot stratb backtest --params zz_k,z_lo,z_hi,tp1_r,ext,remainder [--start] [--end] [--cache-dir] [--out reports/stratb-backtest.json]`; `ewbot stratb walkforward [--workers] [--cache-dir] [--out reports/stratb-walkforward.json]`; `ewbot stratb holdout lock --params-from <walkforward json> [--cache-dir]`; `ewbot stratb holdout run --confirm [--workers] [--cache-dir]`; `ewbot stratb paper run --ledger-dir <dir> [--cache-dir]`; `ewbot stratb paper status --ledger-dir <dir>`. cli.py의 새 이름: `STRATB_LOCK`, `_b_params(text) -> Combo`(그리드 밖이면 종료 코드 2), `_b_df`, `_b_write_json`, `_b_fetch`, `_b_backtest`, `_b_walkforward`, `_b_holdout_lock`, `_b_holdout_run`, `_b_paper_env(args) -> PaperBEnv`(테스트가 바꿔 끼움), `_b_alert_failure`, `_b_paper_run`, `_b_paper_status`, `cmd_stratb`. 잠금 경로는 CLI 옵션이 아니다(항상 `<저장소 루트>/holdout-b.lock`).
 
-명세 3절의 CLI를 `cli.py`에 추가한다(`cli.py`는 A의 지문 대상이 아니다). 연구 명령은 `load_15m`의 가드 때문에 2024 이후 봉을 읽지 못하고, `--start`/`--end`가 홀드아웃에 닿으면 A와 같은 `_requested_window`가 종료 코드 2로 거부한다. `holdout lock`은 워크포워드 JSON의 `proceed`가 참이고 fallback이 아닐 때만 잠금을 쓰고 커밋 명령을 출력한다. `holdout run`은 `--confirm` 없이는 2를 돌려주고, 잠금이 있으면 캐시를 지금까지 늘린 뒤(네트워크) 1회 실행한다. `paper run`의 실패 알림은 A와 같은 방식(실행 로그 링크, 실패 표시 파일)이며 접두어만 `[ewbot paper-B]`다. 수정은 여섯 군데이며 각 '찾을 부분'은 `cli.py`에서 한 번만 나온다.
+명세 3절의 CLI를 `cli.py`에 추가한다(`cli.py`는 A의 지문 대상이 아니다). 연구 명령은 `load_15m`의 가드 때문에 2024 이후 봉을 읽지 못하고, `--start`/`--end`가 홀드아웃에 닿으면 A와 같은 `_requested_window`가 종료 코드 2로 거부한다. `holdout lock`은 워크포워드 JSON의 `proceed`가 참이고 fallback이 아닐 때만 잠금을 쓰고 커밋 명령을 출력한다. `holdout run`은 `--confirm` 없이는 2를 돌려주고, 잠금이 있으면 캐시를 지금까지 늘린 뒤(네트워크) 1회 실행한다. `paper run`의 실패 알림은 A와 같은 방식(실행 로그 링크, 실패 표시 파일)이며 접두어만 `[ewbot paper-B]`다. `paper status`는 마지막 실행의 홀드아웃 데이터 상태(`ok` 또는 `MISMATCH (warned, not refused)`)와 홀드아웃 거래 재현 수를 보여 준다. 수정은 여섯 군데이며 각 '찾을 부분'은 `cli.py`에서 한 번만 나온다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -4411,7 +4487,7 @@ def test_paper_b_run_then_status(senders, tmp_path, capsys):
     assert main(["stratb", "paper", "status", "--ledger-dir", str(ledger_dir)]) == 0
     out = capsys.readouterr().out
     assert "실거래 전환 조건 (Plan 4 명세 7.1)" in out and "1. 홀드아웃 합격: 충족" in out
-    assert "holdout trades recomputed 62 (lock: 62)" in out and "discrepancies 0" in out
+    assert "holdout data ok, holdout trades recomputed 62 (lock: 62)" in out and "discrepancies 0" in out
 
 
 def test_a_failed_run_alerts_with_the_paper_b_prefix(senders, tmp_path, monkeypatch, capsys):
@@ -4717,6 +4793,7 @@ def _b_paper_status(args: argparse.Namespace) -> int:
     if led.runs:
         r = led.runs[-1]
         print(f"last run {r['id']}: last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(r['last_bar_ts']))} UTC, "
+              f"holdout data {'ok' if r['holdout_data_ok'] else 'MISMATCH (warned, not refused)'}, "
               f"holdout trades recomputed {r['holdout_trades_recomputed']} (lock: {led.holdout['n_trades']['B']})")
     print(f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)}, "
           f"pending events {len(led.pending_events)}")
@@ -5377,7 +5454,8 @@ One-time setup (you):
 ## Failures
 
 - A failed run sends `[ewbot paper-B] 실패 · 단계 <stage>` with the log link (the workflow's fallback alert covers checkout, setup and push failures). Nothing is committed after a failed run; the next run recomputes everything.
-- Stage `precheck`: `holdout-b.lock` is missing, not committed, edited, not run, failed, or its config is not the code's. Stage `data`: the candle update failed three times, or the holdout window's 15m bars no longer hash to the holdout run's (spec 8: the run is refused until this is understood).
+- Stage `precheck`: `holdout-b.lock` is missing, not committed, edited, not run, failed, or its config is not the code's. Stage `data`: the candle update failed three times.
+- `[ewbot paper-B] 경고: 홀드아웃 구간 데이터 해시 불일치`: the 15m bars of the holdout window no longer hash to the holdout run's (a Coinbase candle revision, or a full re-download after the Actions cache was evicted). The run is not refused (spec 8 as amended 2026-10-07): it warns once per distinct hash, and any recorded decision that changes because of it is classified `DATA_REVISION`. `ewbot stratb paper status` shows `holdout data MISMATCH` until the data is back.
 - Discrepancies (`[ewbot paper-B] 경고: 결정 불일치`) are classified like A's: `DATA_REVISION`, `FINGERPRINT_CHANGE`, `ENVIRONMENT_CHANGE`, `UNEXPLAINED`. Any `UNEXPLAINED` one blocks the go-live condition.
 
 ## Go-live (Plan 5, never automatic)
@@ -5593,7 +5671,7 @@ git switch master && git pull --ff-only && git switch -c chore/stratb-holdout
 uv run ewbot stratb fetch
 ```
 
-약 820번의 공개 API 요청(수 분). 출력의 `bars before 2024-01-01`(약 245,000)과 `missing`(누락 봉 수)을 기록한다. 중단되면 다시 실행한다(이어서 받는다). 잠금 전이므로 2024 이후 봉은 받지 않는다(`fetch window: stops at 2024-01-01 (no lock)`).
+Task 6b에서 이미 받았다면 새로 받을 것이 없다(아니면 약 820번의 공개 API 요청, 수 분). 출력의 `bars before 2024-01-01`(약 245,000)과 `missing`(누락 봉 수)을 기록한다. 중단되면 다시 실행한다(이어서 받는다). 잠금 전이므로 2024 이후 봉은 받지 않는다(`fetch window: stops at 2024-01-01 (no lock)`).
 
 - [ ] **Step 3: 워크포워드 실행과 보고(2024 데이터 없음)**
 
@@ -5661,6 +5739,7 @@ git worktree remove "$TMPDIR/paper-b"
 | 명세 | 요구 | 작업 |
 |---|---|---|
 | 1 목표·결정 사항 | 별도 전략 B, 1h 방향·15m 진입, 확인 후 다음 봉 시가 진입, TP1 절반·잔량 규칙 그리드, 0.5%·3배·−3%/−15% | 1, 4, 5 |
+| 1 거래 빈도(주 2~3회) | 실제 2017~2023 빈도 조기 점검, 중앙값 < 월 4건이면 중단·보고(컨트롤러 결정) | 6b(해석 19) |
 | 1 비목표 | A 변경 없음, 실거래 없음(Plan 5) | Global Constraints, 1(`test_isolation`), 12(`test_static`), 13 |
 | 2 격리 | `stratb/`·`paperb/`만, import만, `uv.lock` 불변, CI A 지문 통과, B 검사 추가 | 1, 12, 13 |
 | 3 구조 | `data15`, `rules`, `engine`, `config`, `research`, `baselines`, `fingerprint`, `paperb/runner`, `paper-b.yml`, `holdout-b.lock`, `paper-b` 브랜치, CLI 6개 | 1~12(해석 18) |
@@ -5678,12 +5757,12 @@ git worktree remove "$TMPDIR/paper-b"
 | 6.6 해석의 한계 | 합격 = 버릴 이유 없음, 확인은 모의매매 | 14(보고), 문서 |
 | 7 모의매매 | 앵커부터 결정적 재계산, A의 불일치 분류, `paper-b.yml`(매시 47분, 예비 schedule), 사용량, orphan `paper-b`, A 장부 스키마, 잠금 이후 진입만 카운트, B 지문 구간, `[ewbot paper-B]` 진입·청산·일일 요약(n/30, 불일치, 손익), 실패 알림 | 9, 10, 11, 12(해석 12~17), 14 |
 | 7.1 실거래 전환 조건 | 합격, 모의 30건, 원인 불명 0건, 사용자 승인 | 10(`status_lines_b`), 문서 |
-| 8 오류 처리 | 수집 재시도 후 알림·중단, 누락 봉 판단 없음, 잠금 불일치 시 거부·알림, A와 충돌 없음(테스트) | 2, 4, 10, 11, 1, 12 |
+| 8 오류 처리(2026-10-07 수정 포함) | 수집 재시도 후 알림·중단, 누락 봉 판단 없음, 잠금 불일치 시 거부·알림, 홀드아웃 구간 데이터 해시 불일치는 거부 없이 한 번 경고·`DATA_REVISION` 분류, A와 충돌 없음(테스트) | 2, 4, 10, 11, 1, 12 |
 | 9 테스트 | 규칙 단위, 미래 정보 차단(잘라내기), 체결, 홀드아웃 보호, A 보호(CI), 모의매매(A 도우미 재사용) | 3, 4, 5, 8, 1·12·13, 9·10·11·12 |
-| 10 진행 절차 | 승인 → 계획 → 작업별 구현·검토 → PR(A의 CI 통과) → 수집·워크포워드·보고 → 잠금 → 승인 → 홀드아웃 1회 → 합격 시 크론·모의매매 | 1~13, 14 |
+| 10 진행 절차 | 승인 → 계획 → 작업별 구현·검토(Task 6 뒤 빈도 점검) → PR(A의 CI 통과) → 수집·워크포워드·보고 → 잠금 → 승인 → 홀드아웃 1회 → 합격 시 크론·모의매매 | 1~13, 6b, 14 |
 
 **2. 자리 표시자 검사:** "TBD", "TODO", "나중에", "적절히 처리", "Task N과 같이" 같은 표현이 없다. 모든 코드 단계에 전체 코드가 있고, 모든 명령에 예상 출력이 있다.
 
 **3. 타입 일관성:** `Combo`(튜플)와 JSON 조합(리스트)은 `normalize_combo`/`combo_to_json`으로만 오간다. `SignalB.i`는 프레임 인덱스, 비교는 `ts`로 한다. `BResult`의 `signals`와 `orders`는 같은 순서다(`build_decisions_b`가 `zip(strict=True)`). `run_holdout_b`, `create_lock`, `run_paper_b`, `precheck_lock_b`, `PaperBEnv`의 이름과 인자는 Task 8·10·11·12에서 같다. 잠금 경로는 어디서나 `stratb.data15.DEFAULT_LOCK_PATH`(cli.py에서 `STRATB_LOCK`)다.
 
-**4. 검증:** 이 계획은 작성 시점(2026-10-07)에 새 클론(`feat/plan4-strategy-b`, Python 3.12.13)에 문서 그대로 적용해 확인했다: 모든 파일과 수정을 적힌 대로 쓰고 모든 명령을 실행했으며, 39개의 `예상` 항목이 모두 맞았다(각 Step 2는 적힌 대로 실패, 각 Step 4는 적힌 수로 통과, Task 13의 전체 테스트 `1359 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함). 적용 결과의 42개 파일은 개발 사본과 바이트 단위로 같았다.
+**4. 검증:** 이 계획은 작성 시점(2026-10-07)에 새 클론(`feat/plan4-strategy-b`, Python 3.12.13)에 문서 그대로 적용해 확인했다: 모든 파일과 수정을 적힌 대로 쓰고 모든 명령을 실행했으며, 39개의 `예상` 항목이 모두 맞았다(각 Step 2는 적힌 대로 실패, 각 Step 4는 적힌 수로 통과, Task 13의 전체 테스트 `1359 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문 `e0435223…` 그대로, 바뀐 파일 목록 일치, 작업 트리 깨끗함). 적용 결과의 42개 파일은 개발 사본과 바이트 단위로 같았다. Task 6b와 Task 14는 네트워크와 사용자 승인이 필요한 수동 단계라 재생에서 제외했다(6b의 스크립트는 합성 캐시로 따로 실행해 확인).
