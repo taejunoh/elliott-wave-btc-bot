@@ -1,3 +1,5 @@
+> **Status (2026-10-07): ENDED.** Strategy B failed its walk-forward twice (B1, and a pre-registered B2 retry with a 4h trend filter); no holdout was run. See spec section 12. Do not enable `PAPER_B_ENABLED`.
+
 # Strategy B (Plan 4) — research, one-shot holdout, paper trading
 
 Spec: `docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md`. Plan: `docs/superpowers/plans/2026-10-07-ewbot-plan4-strategy-b.md`.
