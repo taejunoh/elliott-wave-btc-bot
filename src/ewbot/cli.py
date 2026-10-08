@@ -1126,8 +1126,11 @@ def _e_fetch(args: argparse.Namespace) -> int:
     from ewbot.aeth.data import fetch_eth
     from ewbot.aeth.lockfile import lock_exists
 
-    path = fetch_eth(args.cache_dir, lock_path=ec.LOCK_PATH)
-    raw = _e_raw(args)
+    try:
+        path = fetch_eth(args.cache_dir, lock_path=ec.LOCK_PATH)
+        raw = _e_raw(args)
+    except ec.AethError as exc:
+        _refuse(str(exc))
     first = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(raw["ts"].iloc[0]))) if len(raw) else "-"
     last = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(raw["ts"].iloc[-1]))) if len(raw) else "-"
     print(f"ETH cache: {path}\nETH bars before {WF_END}: {len(raw)} ({first} .. {last} UTC)")
@@ -1148,9 +1151,8 @@ def _e_stage1(args: argparse.Namespace) -> int:
     from ewbot.aeth import config as ec
     from ewbot.aeth.stage1 import write_stage1
 
-    raw = _e_raw(args)
     try:
-        rec = write_stage1(raw, out_path=ec.STAGE1_PATH, a_lock_path=ec.A_LOCK_PATH, workers=args.workers)
+        rec = write_stage1(_e_raw(args), out_path=ec.STAGE1_PATH, a_lock_path=ec.A_LOCK_PATH, workers=args.workers)
     except ec.AethError as exc:
         _refuse(str(exc))
     _e_head_lines(rec["headline"])

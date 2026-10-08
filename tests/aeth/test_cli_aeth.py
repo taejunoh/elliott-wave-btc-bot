@@ -107,6 +107,16 @@ def test_the_lock_needs_the_committed_stage1_record(tmp_path, monkeypatch, capsy
     assert "must be committed unchanged" in capsys.readouterr().err and not ec.LOCK_PATH.exists()
 
 
+@pytest.mark.parametrize("argv", [["fetch"], ["stage1"], ["holdout", "lock"]])
+def test_a_cache_with_2024_bars_before_the_lock_is_refused_not_a_traceback(tmp_path, monkeypatch, capsys, argv):
+    _stage1_world(tmp_path, monkeypatch)
+    save_cache(tmp_path / "cache", eth_frame())  # reaches 2024 without a lock: not A-ETH's (A's `ewbot fetch`)
+    assert _code(["aeth", *argv, "--cache-dir", str(tmp_path / "cache")]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refusing: ") and "did not come from A-ETH" in err
+    assert not ec.STAGE1_PATH.exists() and not ec.LOCK_PATH.exists()
+
+
 @pytest.mark.parametrize("argv, why", [
     (["--confirm"], "not a valid A-ETH lock"),
     ([], "runs once, after the user's approval"),
