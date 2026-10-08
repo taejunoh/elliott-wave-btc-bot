@@ -6,7 +6,8 @@ that passed (its criteria are stage1_verdict of its own headline) and was made w
 strategy A's holdout.lock, this A-ETH code (aeth_sha256), strategy A's frozen fingerprint and the same pre-2024 ETH
 bars. The lock fixes the product and contract, the params and A's lock sha256, the full config (ETH costs), the
 holdout start and its last bar (the last complete hour at lock time), the 100-run random control, A's
-fingerprint, the A-ETH fingerprint, the code state like A's lock (code_sha256: A's code_fingerprint over every
+fingerprint, the A-ETH fingerprint, the A-ETH decision fingerprint (config.py and data.py: what the paper
+epoch is bound to, spec 8), the code state like A's lock (code_sha256: A's code_fingerprint over every
 src/ewbot *.py), the pre-2024 bars (data_record) and the stage-1 record's sha256, and their digest. It refuses a
 dirty tracked tree. The user commits it at once.
 
@@ -45,7 +46,7 @@ from ewbot.aeth.config import (
     frozen_a_params,
 )
 from ewbot.aeth.data import cache_path, load_eth
-from ewbot.aeth.fingerprint import aeth_fingerprint
+from ewbot.aeth.fingerprint import aeth_decision_fingerprint, aeth_fingerprint
 from ewbot.aeth.lockfile import (
     LOCK_KIND,
     LOCK_VERSION,
@@ -145,6 +146,7 @@ def create_lock(
         "random_runs": int(random_runs),
         "a_fingerprint": a_fp,
         "aeth_sha256": aeth_sha,
+        "aeth_decision_sha256": aeth_decision_fingerprint(),
         "code_sha256": code_fingerprint(),
         "pre2024": pre,
         "stage1_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -193,7 +195,7 @@ def run_holdout_aeth(
     last = int(lock["last_bar_ts"])
     if raw.empty or int(raw["ts"].iloc[-1]) < last:
         raise AethError(f"the ETH cache ends before the lock's last bar {last}: run `ewbot aeth fetch` first")
-    filled = fill_gaps(raw)  # like the paper runtime: a missing last bar is filled from the bars after it
+    filled = fill_gaps(raw)  # like the paper runtime: fill all, then cut (a missing last bar: flat at the prior close)
     df = filled[filled["ts"] <= last].reset_index(drop=True)
     data = {"start_ts": HOLDOUT_START, "last_bar_ts": last,
             "n_bars": int(((df["ts"] >= HOLDOUT_START) & (df["ts"] <= last)).sum()),

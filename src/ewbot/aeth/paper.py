@@ -11,11 +11,15 @@ Each run recomputes from the first cached bar (2017-01-01) and trades from 2024-
 reproduces the holdout and continues it; closed trades entering after the lock's last bar are paper trades, and the
 count to 50 is the holdout's A trades plus the paper trades of the baseline epoch (strategy A's golive_count, on
 this ledger only: ETH trades are never pooled with strategy A's BTC count). An epoch is bound to strategy A's
-fingerprint and the A-ETH fingerprint together (fingerprint.epoch_fingerprint): a change of either opens a new epoch
-and restarts the count. The holdout window's bars no longer hashing to first_run.data.sha256 is warned once per
-hash, never refused; decisions that change because of it are DATA_REVISION. No report.html and no daily criteria
-1-2 recompute (spec 8): the go-live block is status_aeth / status_lines_aeth. Every step runs inside a named stage:
-any failure raises AethPaperError(stage); nothing is written before the write stage."""
+fingerprint and the A-ETH decision fingerprint (aeth/config.py, aeth/data.py) together
+(fingerprint.epoch_fingerprint): a change of either opens a new epoch and restarts the count; a fix to this runtime,
+sync.py or the CLI does not (spec 8, amended 2026-10-08). Like strategy A's paper/runner.py, this module is outside
+the epoch fingerprint, so during paper trading only its messages, retries, ledger IO and alerts change - not what it
+computes (the data path, the recompute, the count): a decision changed here shows up as a discrepancy, not as a new
+epoch. The holdout window's bars no longer hashing to first_run.data.sha256 is warned once per hash, never refused;
+decisions that change because of it are DATA_REVISION. No report.html and no daily criteria 1-2 recompute (spec 8):
+the go-live block is status_aeth / status_lines_aeth. Every step runs inside a named stage: any failure raises
+AethPaperError(stage); nothing is written before the write stage."""
 
 from __future__ import annotations
 
@@ -185,9 +189,10 @@ def holdout_summary_aeth(lock: dict[str, Any]) -> dict[str, Any]:
 
 
 def new_ledger_aeth(lock: dict[str, Any]) -> Ledger:
-    """Epoch 1 starts at the lock's last bar with the lock's epoch fingerprint (A's and A-ETH's at the lock)."""
+    """Epoch 1 starts at the lock's last bar with the lock's epoch fingerprint (A's and the A-ETH decision
+    fingerprint at the lock)."""
     hs = holdout_summary_aeth(lock)
-    fp = epoch_fingerprint(lock["a_fingerprint"], lock["aeth_sha256"])
+    fp = epoch_fingerprint(lock["a_fingerprint"], lock["aeth_decision_sha256"])
     start = hs["last_bar_ts"]
     epoch = {"id": 1, "fingerprint": fp, "started_ts": start, "reason": "baseline: holdout-aeth.lock",
              "through_ts": start}
@@ -215,7 +220,7 @@ def status_lines_aeth(st: dict[str, Any]) -> list[str]:
     count, c4 = st["count"], st["c4"]
     lines = ["A-ETH 실거래 검토 조건 (Plan 5a 명세 8.1)"]
     if not st["eligible"]:
-        lines.append(f"현재 구간 {st['epoch_id']}의 지문(A 지문 + A-ETH 지문)이 잠금 파일과 다름: 판정 대상 아님")
+        lines.append(f"현재 구간 {st['epoch_id']}의 지문(A 지문 + A-ETH 판단 지문)이 잠금 파일과 다름: 판정 대상 아님")
     lines.append(f"1. 단계 2 홀드아웃 합격 (A의 9.6절 1·2번): {_mark(st['holdout_passed'])}")
     lines.append(f"2. ETH 표본 외 거래 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 "
                  f"{count['paper']}): {_mark(st['count_met'])}")

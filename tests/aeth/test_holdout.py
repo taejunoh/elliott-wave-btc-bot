@@ -6,7 +6,7 @@ import json
 import pytest
 
 from ewbot.aeth.config import FROZEN_A_FINGERPRINT, AethError, config_json
-from ewbot.aeth.fingerprint import aeth_fingerprint
+from ewbot.aeth.fingerprint import aeth_decision_fingerprint, aeth_fingerprint
 from ewbot.aeth.holdout import create_lock, lock_mismatch, run_holdout_aeth, stage2_verdict
 from ewbot.aeth.lockfile import LOCK_KIND, lock_digest, lock_exists
 from ewbot.aeth.stage1 import data_record, headline
@@ -67,6 +67,7 @@ def test_the_lock_binds_the_passed_stage_1_record_and_what_it_ran_on(tmp_path):
     assert lock["config"] == config_json(PARAMS) and lock["holdout_start"] == HS
     assert lock["last_bar_ts"] == BOUNDARY and lock["random_runs"] == 2
     assert lock["a_fingerprint"] == FROZEN_A_FINGERPRINT and lock["aeth_sha256"] == aeth_fingerprint()
+    assert lock["aeth_decision_sha256"] == aeth_decision_fingerprint()  # the paper epoch's baseline
     assert lock["code_sha256"] == code_fingerprint() and lock["pre2024"] == data_record(w["raw"])
     assert lock["stage1_sha256"] == hashlib.sha256(w["text"].encode("utf-8")).hexdigest()
     assert lock["sha256"] == lock_digest(lock) and lock["first_run"] is None and lock["attempts"] == []
@@ -134,7 +135,7 @@ def test_the_holdout_runs_a_s_comparison_and_criteria_on_the_window(ran):
     assert len(lock["attempts"]) == 1 and lock["attempts"][0]["data_sha256"] == fr["data"]["sha256"]
 
 
-def test_a_missing_last_bar_is_filled_from_the_later_bars_like_the_paper_runtime_does(tmp_path):
+def test_a_missing_last_bar_is_filled_before_the_cut_like_the_paper_runtime_does(tmp_path):
     w = _world(tmp_path)
     gap = w["df"][w["df"]["ts"] != BOUNDARY].reset_index(drop=True)
     save_cache(w["cache"], gap)

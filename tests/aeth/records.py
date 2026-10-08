@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 
 from ewbot.aeth.config import FUTURE, PRODUCT, config_json
-from ewbot.aeth.fingerprint import aeth_fingerprint
+from ewbot.aeth.fingerprint import aeth_decision_fingerprint, aeth_fingerprint
 from ewbot.aeth.lockfile import LOCK_KIND, LOCK_VERSION, lock_digest
 from ewbot.aeth.stage1 import STAGE1_KIND, data_record, stage1_verdict
 from ewbot.backtest.holdout import data_fingerprint
@@ -53,8 +53,8 @@ def aeth_lock(df: pd.DataFrame, a_lock: Path, *, passed: bool = True, n_trades: 
         "kind": LOCK_KIND, "version": LOCK_VERSION, "product": PRODUCT, "future": FUTURE, "params": list(PARAMS),
         "a_lock_sha256": a_lock_sha(a_lock), "config": config_json(PARAMS), "holdout_start": HS,
         "last_bar_ts": last_bar, "random_runs": 2, "a_fingerprint": current_fingerprint(),
-        "aeth_sha256": aeth_fingerprint(), "code_sha256": "c0de" * 16, "pre2024": data_record(df),
-        "stage1_sha256": "5" * 64,
+        "aeth_sha256": aeth_fingerprint(), "aeth_decision_sha256": aeth_decision_fingerprint(),
+        "code_sha256": "c0de" * 16, "pre2024": data_record(df), "stage1_sha256": "5" * 64,
     }
     lock.update(overrides)
     lock.update(sha256=lock_digest(lock), git_head="f" * 40, git_dirty=False, attempts=[], first_run={

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 
-from ewbot.aeth.fingerprint import current_epoch_fingerprint
+from ewbot.aeth.fingerprint import aeth_fingerprint, current_epoch_fingerprint
 from ewbot.aeth.paper import (
     HEAD_AETH,
     AethPaperEnv,
@@ -17,6 +18,7 @@ from ewbot.aeth.paper import (
     status_lines_aeth,
 )
 from ewbot.paper.environment import environment_digest
+from ewbot.paper.fingerprint import PROJECT_ROOT
 from ewbot.paper.ledger import LEDGER_FILE, RUNS_LOG, load_ledger
 from ewbot.types import H1
 from tests.aeth.helpers import FakeCacheFetch, commit_file, eth_frame, write_a_lock
@@ -57,7 +59,7 @@ def test_first_run_reproduces_the_holdout_and_records_the_eth_paper_trades(make_
     led = load_ledger(env.ledger_dir)
     assert sorted(os.listdir(env.ledger_dir)) == [LEDGER_FILE, RUNS_LOG]  # no report.html
     assert [e["id"] for e in led.epochs] == [1] and led.epochs[0]["started_ts"] == BOUNDARY
-    assert led.baseline["fingerprint"] == current_epoch_fingerprint()  # A's + A-ETH's at the lock = now
+    assert led.baseline["fingerprint"] == current_epoch_fingerprint()  # A's + A-ETH decision at the lock = now
     assert [t["entry_ts"] for t in led.trades] == [ts("2024-01-12 15:00"), ts("2024-02-07 21:00")]
     run = led.runs[0]
     assert run["holdout_trades_recomputed"] == 2 and run["holdout_data_ok"] is True and run["warnings"] == []
@@ -88,7 +90,7 @@ def test_a_rerun_in_the_same_hour_adds_nothing_and_new_bars_add_only_their_decis
     assert "A-ETH 실거래 검토 조건" in new[2] and "A-BTC CANARY" in new[2]
 
 
-def test_a_changed_strategy_a_or_aeth_fingerprint_opens_a_new_epoch_and_restarts_the_count(make_env):
+def test_a_changed_strategy_a_or_aeth_decision_fingerprint_opens_a_new_epoch_and_restarts_the_count(make_env):
     env = make_env()
     run_paper_aeth(env)
     env.fingerprint = lambda: "edited"
@@ -100,6 +102,29 @@ def test_a_changed_strategy_a_or_aeth_fingerprint_opens_a_new_epoch_and_restarts
                                    "required": 50}
     assert out.status["auto_met"] is False and "판정 대상 아님" in status_lines_aeth(out.status)[1]
     assert env.sender.texts[-1].startswith(HEAD_AETH) and "구간 2" in env.sender.texts[-1]
+
+
+def test_a_runtime_fix_during_paper_trading_keeps_the_epoch_and_a_config_edit_opens_one(make_env, tmp_path):
+    """Spec 8 (amended 2026-10-08): the epoch is bound to strategy A's fingerprint and the A-ETH decision
+    fingerprint (aeth/config.py, aeth/data.py) - a fix to paper.py or sync.py while paper trading keeps the count."""
+    root = tmp_path / "tree"
+    shutil.copytree(PROJECT_ROOT / "src" / "ewbot", root / "src" / "ewbot")
+    aeth = root / "src" / "ewbot" / "aeth"
+    env = make_env(fingerprint=lambda: current_epoch_fingerprint(root))
+    run_paper_aeth(env)
+    for name in ("paper.py", "sync.py"):  # sync.py is created while the plan has not added it yet (Task 7)
+        f = aeth / name
+        f.write_bytes((f.read_bytes() if f.exists() else b"") + b"# a runtime fix: messages, retries\n")
+    assert aeth_fingerprint(root) != aeth_fingerprint()  # the lock's A-ETH fingerprint no longer holds
+    env.clock.now += H1
+    out = run_paper_aeth(env)
+    assert [e["id"] for e in load_ledger(env.ledger_dir).epochs] == [1]
+    assert out.status["eligible"] is True and out.status["count"]["total"] == 4
+    (aeth / "config.py").write_bytes((aeth / "config.py").read_bytes() + b"# a decision file edit\n")
+    env.clock.now += H1
+    out = run_paper_aeth(env)
+    assert [e["id"] for e in load_ledger(env.ledger_dir).epochs] == [1, 2]
+    assert out.status["eligible"] is False and out.status["count"]["total"] == 0
 
 
 @pytest.mark.parametrize("case, why", [

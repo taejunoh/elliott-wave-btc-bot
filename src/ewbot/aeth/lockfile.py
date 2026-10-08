@@ -21,7 +21,8 @@ from ewbot.backtest.report import to_jsonable
 LOCK_KIND = "ewbot-aeth-holdout"
 LOCK_VERSION = 1
 LOCK_BOUND = ("kind", "version", "product", "future", "params", "a_lock_sha256", "config", "holdout_start",
-              "last_bar_ts", "random_runs", "a_fingerprint", "aeth_sha256", "code_sha256", "pre2024", "stage1_sha256")
+              "last_bar_ts", "random_runs", "a_fingerprint", "aeth_sha256", "aeth_decision_sha256", "code_sha256",
+              "pre2024", "stage1_sha256")
 
 
 def lock_digest(lock: Mapping[str, Any]) -> str:
