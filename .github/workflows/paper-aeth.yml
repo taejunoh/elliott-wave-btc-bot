@@ -1,0 +1,107 @@
+# ewbot paper trading of A-ETH (Plan 5a spec 8): strategy A, frozen, on ETH - one deterministic recompute per run.
+# Code comes from master; ledger.json / runs.log live on the orphan `paper-aeth` branch, which only this workflow
+# writes (docs/aeth.md: never push to it by hand). Strategy A's workflow, branch, sync script and candle cache key
+# and strategy B's are never touched. The git side (paper-aeth worktree, commit, push and retry) is
+# `python -m ewbot.aeth.sync`.
+name: paper-aeth
+
+# Primary trigger: a second Cloudflare Workers cron calls workflow_dispatch at minute 42 of every hour
+# (docs/aeth.md, user step). `schedule` is only a sparse backup (minute 42, every 3 hours).
+on:
+  schedule:
+    - cron: "42 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: paper-aeth
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  paper-aeth:
+    # Dormant until the user sets the repository variable PAPER_AETH_ENABLED=true after a passed ETH holdout
+    # (docs/aeth.md): a skipped job uses no runner minutes and sends nothing.
+    if: vars.PAPER_AETH_ENABLED == 'true'
+    # pinned like strategy A's paper workflow: the runner image is part of each run's recorded environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      EWBOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - name: Install uv (with its cache)
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        timeout-minutes: 10
+        run: uv sync --frozen
+
+      - name: Check out the paper-aeth branch (orphan on first use)
+        id: checkout-paper-aeth
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          echo "PAPER_AETH_DIR=$RUNNER_TEMP/paper-aeth" >> "$GITHUB_ENV"
+          echo "EWBOT_FAILURE_MARKER=$RUNNER_TEMP/ewbot-aeth-failure-notified" >> "$GITHUB_ENV"
+          git config --global user.name "ewbot-paper-aeth"
+          git config --global user.email "ewbot-paper-aeth@users.noreply.github.com"
+          PAPER_AETH_DIR="$RUNNER_TEMP/paper-aeth" uv run python -m ewbot.aeth.sync checkout
+
+      - name: Restore the ETH 1h candle cache
+        uses: actions/cache@v6
+        with:
+          path: data/cache
+          key: eth-usd-1h-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            eth-usd-1h-
+
+      - name: Paper-A-ETH run
+        id: paper-aeth
+        timeout-minutes: 15
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run ewbot aeth paper run --ledger-dir "$PAPER_AETH_DIR"
+
+      - name: Commit and push the ledger
+        id: push
+        timeout-minutes: 15
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run python -m ewbot.aeth.sync push uv run ewbot aeth paper run --ledger-dir "$PAPER_AETH_DIR"
+
+      - name: Telegram failure alert (fallback when ewbot did not send one)
+        id: alert
+        if: failure() || cancelled()
+        timeout-minutes: 2
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          if [ -f "${EWBOT_FAILURE_MARKER:-/nonexistent}" ]; then
+            echo "ewbot already sent the failure alert"
+            exit 0
+          fi
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "no Telegram secrets: skipping the alert"
+            exit 0
+          fi
+          text="[ewbot paper-A-ETH] 실패 · 단계 workflow (checkout / setup / sync / timeout / push) · ${JOB_STATUS}"$'\n'"로그: ${EWBOT_RUN_URL}"
+          curl -sS --fail-with-body --retry 3 --max-time 20 -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}"
+          echo
