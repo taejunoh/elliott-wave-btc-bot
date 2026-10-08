@@ -18,7 +18,8 @@ WORKFLOW = WORKFLOWS / "paper.yml"
 CI_WORKFLOW = WORKFLOWS / "ci.yml"
 PYTHON_PATCH = "3.12.13"  # the exact patch both workflows resolve; part of the compared environment
 RUNNER_IMAGE = "ubuntu-24.04"  # pinned while paper trading runs (spec 8): part of the recorded environment
-ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py", "live/target.py"}  # Plan 2 spec 7.1, Plan 3 spec 3.1
+ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py", "live/target.py",  # Plan 2 spec 7.1, Plan 3 spec 3.1
+                "aeth/holdout.py", "aeth/paper.py"}  # Plan 5a spec 7.2, 8: the one-shot ETH holdout, paper-A-ETH
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
 # backtest/runner.py helpers that skip the holdout check or forward allow_holdout unchecked
 GUARDED = {"check_before_holdout", "_map_tasks", "_init_worker"}
@@ -161,8 +162,8 @@ def _step(steps, step_id):
     return next(s for s in steps if s.get("id") == step_id)
 
 
-def test_the_repository_has_exactly_the_paper_ci_and_paper_b_workflows():
-    assert sorted(p.name for p in WORKFLOWS.iterdir()) == ["ci.yml", "paper-b.yml", "paper.yml"]
+def test_the_repository_has_exactly_the_paper_ci_paper_b_and_paper_aeth_workflows():
+    assert sorted(p.name for p in WORKFLOWS.iterdir()) == ["ci.yml", "paper-aeth.yml", "paper-b.yml", "paper.yml"]
 
 
 def test_strategy_b_code_is_outside_the_strategy_a_fingerprint():
@@ -175,9 +176,26 @@ def test_strategy_b_code_is_outside_the_strategy_a_fingerprint():
     assert not [p for p in tree_files() if p.startswith(("src/ewbot/stratb/", "src/ewbot/paperb/"))]
 
 
+def test_aeth_code_is_outside_the_strategy_a_fingerprint():
+    """Plan 5a spec 3, 11 (A protection, run by ci.yml): A-ETH lives in aeth/ only, and none of its files is in
+    A's fingerprinted set (A's fingerprint itself is pinned in test_fingerprint.py)."""
+    from ewbot.paper.fingerprint import is_fingerprinted, tree_files
+
+    files = [f.relative_to(SRC).as_posix() for f in (SRC / "aeth").rglob("*.py")]
+    assert files and not [r for r in files if is_fingerprinted(r)]
+    assert not [p for p in tree_files() if p.startswith("src/ewbot/aeth/")]
+
+
 def test_the_paper_b_workflow_never_touches_strategy_a():
     text = (WORKFLOWS / "paper-b.yml").read_text(encoding="utf-8")
     assert yaml.safe_load(text)["concurrency"]["group"] == "paper-b"
+    for a_thing in ("paper_sync.sh", "btc-usd-1h", "ewbot paper run", "holdout.lock"):
+        assert a_thing not in text
+
+
+def test_the_paper_aeth_workflow_never_touches_strategy_a():
+    text = (WORKFLOWS / "paper-aeth.yml").read_text(encoding="utf-8")
+    assert yaml.safe_load(text)["concurrency"]["group"] == "paper-aeth"
     for a_thing in ("paper_sync.sh", "btc-usd-1h", "ewbot paper run", "holdout.lock"):
         assert a_thing not in text
 
