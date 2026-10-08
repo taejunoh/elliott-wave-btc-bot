@@ -175,6 +175,16 @@ def test_strategy_b_code_is_outside_the_strategy_a_fingerprint():
     assert not [p for p in tree_files() if p.startswith(("src/ewbot/stratb/", "src/ewbot/paperb/"))]
 
 
+def test_aeth_code_is_outside_the_strategy_a_fingerprint():
+    """Plan 5a spec 3, 11 (A protection, run by ci.yml): A-ETH lives in aeth/ only, and none of its files is in
+    A's fingerprinted set (A's fingerprint itself is pinned in test_fingerprint.py)."""
+    from ewbot.paper.fingerprint import is_fingerprinted, tree_files
+
+    files = [f.relative_to(SRC).as_posix() for f in (SRC / "aeth").rglob("*.py")]
+    assert files and not [r for r in files if is_fingerprinted(r)]
+    assert not [p for p in tree_files() if p.startswith("src/ewbot/aeth/")]
+
+
 def test_the_paper_b_workflow_never_touches_strategy_a():
     text = (WORKFLOWS / "paper-b.yml").read_text(encoding="utf-8")
     assert yaml.safe_load(text)["concurrency"]["group"] == "paper-b"
