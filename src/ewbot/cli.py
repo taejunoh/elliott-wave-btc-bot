@@ -10,7 +10,11 @@ options (ewbot.paper.runner). `live run | preflight | status | stage | rebase | 
 inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options.
 `stratb fetch | backtest | walkforward | holdout lock | holdout run | paper run | paper status` (Plan 4) is
 strategy B (ewbot.stratb, ewbot.paperb) on BTC and ETH with its own 15m caches, lock (holdout-b.lock) and
-ledger (paper-b branch); its research commands never read a bar from 2024-01-01 on (data15 filters them out)."""
+ledger (paper-b branch); its research commands never read a bar from 2024-01-01 on (data15 filters them out).
+`aeth fetch | stage1 | holdout lock | holdout run | paper run | paper status` (Plan 5a) is A-ETH (ewbot.aeth):
+strategy A, frozen, on ETH-USD with its own 1h cache, stage-1 record (aeth-stage1.json), lock (holdout-aeth.lock)
+and ledger (paper-aeth branch); like `paper` it has no strategy or config options, and ewbot.aeth is imported only
+inside its handlers, so `ewbot live …` and `ewbot paper …` never load it."""
 
 from __future__ import annotations
 
@@ -159,6 +163,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_bpr.add_argument("--ledger-dir", type=Path, required=True)
     p_bps = bp_sub.add_parser("status", help="print the paper-B ledger's status (read-only, no network)")
     p_bps.add_argument("--ledger-dir", type=Path, required=True)
+
+    p_e = sub.add_parser("aeth", help="A-ETH (Plan 5a): strategy A, frozen, on ETH - stage 1, one-shot holdout, paper")
+    e_sub = p_e.add_subparsers(dest="e_cmd", required=True)
+    e_cache = argparse.ArgumentParser(add_help=False)
+    e_cache.add_argument("--cache-dir", type=Path, default=Path("data/cache"))
+    e_sub.add_parser("fetch", parents=[e_cache], help="update the ETH-USD 1h cache (before 2024 until holdout-aeth.lock)")
+    p_e1 = e_sub.add_parser("stage1", parents=[e_cache], help="stage 1, ONCE: A on ETH 2017-2023 -> aeth-stage1.json")
+    p_e1.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p_eh = e_sub.add_parser("holdout", help="holdout-aeth.lock and the ONE-SHOT ETH holdout")
+    eh_sub = p_eh.add_subparsers(dest="eh_cmd", required=True)
+    eh_sub.add_parser("lock", parents=[e_cache], help="write holdout-aeth.lock from aeth-stage1.json (commit it)")
+    p_ehr = eh_sub.add_parser("run", parents=[e_cache], help="run the ETH holdout ONCE (the user's approval: --confirm)")
+    p_ehr.add_argument("--confirm", action="store_true")
+    p_ehr.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p_ep = e_sub.add_parser("paper", help="paper trading of A on ETH (ledger on the paper-aeth branch)")
+    ep_sub = p_ep.add_subparsers(dest="ep_cmd", required=True)
+    p_epr = ep_sub.add_parser("run", parents=[e_cache], help="one paper-A-ETH run; everything comes from holdout-aeth.lock")
+    p_epr.add_argument("--ledger-dir", type=Path, required=True)
+    p_eps = ep_sub.add_parser("status", help="print the paper-A-ETH ledger's status (read-only, no network)")
+    p_eps.add_argument("--ledger-dir", type=Path, required=True)
     return parser
 
 
@@ -1079,6 +1103,195 @@ def cmd_stratb(args: argparse.Namespace) -> int:
     return {"fetch": _b_fetch, "backtest": _b_backtest, "walkforward": _b_walkforward}[args.b_cmd](args)
 
 
+# ----------------------------------------------------------------------------- A-ETH (Plan 5a)
+# ewbot.aeth is imported inside these handlers only: `ewbot live …` and `ewbot paper …` never load it.
+
+
+def _e_raw(args: argparse.Namespace) -> pd.DataFrame:
+    """The cached ETH bars before 2024-01-01 (load_eth filters the rest out while reading)."""
+    from ewbot.aeth import config as ec
+    from ewbot.aeth.data import cache_path, load_eth
+
+    path = cache_path(args.cache_dir)
+    if not path.exists():
+        raise SystemExit(f"ETH candle cache not found: {path} - run `ewbot aeth fetch` first")
+    raw = load_eth(path, lock_path=ec.LOCK_PATH)
+    rep = check_integrity(raw)
+    print(f"[data] ETH-USD: {rep.n} 1h bars before {WF_END}, {len(rep.missing_ts)} missing", file=sys.stderr)
+    return raw
+
+
+def _e_fetch(args: argparse.Namespace) -> int:
+    from ewbot.aeth import config as ec
+    from ewbot.aeth.data import fetch_eth
+    from ewbot.aeth.lockfile import lock_exists
+
+    path = fetch_eth(args.cache_dir, lock_path=ec.LOCK_PATH)
+    raw = _e_raw(args)
+    first = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(raw["ts"].iloc[0]))) if len(raw) else "-"
+    last = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(raw["ts"].iloc[-1]))) if len(raw) else "-"
+    print(f"ETH cache: {path}\nETH bars before {WF_END}: {len(raw)} ({first} .. {last} UTC)")
+    window = "2024+ included (holdout-aeth.lock exists)" if lock_exists(ec.LOCK_PATH) else f"stops at {WF_END} (no lock)"
+    print(f"fetch window: {window}")
+    return 0
+
+
+def _e_head_lines(head: dict[str, Any]) -> None:
+    _print_comparison({k: v for k, v in head.items() if k != "RANDOM"})
+    rnd = head.get("RANDOM") or {}
+    sharpe, calmar = (rnd.get("sharpe") or {}).get("mean"), (rnd.get("calmar") or {}).get("mean")
+    print(f"random control: {rnd.get('runs')} runs, {rnd.get('n_signals')} entries each; mean Sharpe {sharpe}, "
+          f"mean Calmar {calmar}")
+
+
+def _e_stage1(args: argparse.Namespace) -> int:
+    from ewbot.aeth import config as ec
+    from ewbot.aeth.stage1 import write_stage1
+
+    raw = _e_raw(args)
+    try:
+        rec = write_stage1(raw, out_path=ec.STAGE1_PATH, a_lock_path=ec.A_LOCK_PATH, workers=args.workers)
+    except ec.AethError as exc:
+        _refuse(str(exc))
+    _e_head_lines(rec["headline"])
+    print(json.dumps(rec["criteria"], indent=1))
+    sub, dear = rec["info"]["sub_period"]["headline"]["A"], rec["info"]["cost_x2"]["A"]
+    print(f"information only - A 2019..2023: return {sub['total_return']:.3f}, max dd {sub['max_dd']:.3f}, Sharpe "
+          f"{sub['sharpe']:.3f}; A with fees and slippage x 2: return {dear['total_return']:.3f}, Sharpe "
+          f"{dear['sharpe']:.3f}")
+    verdict = ("PASSED - next: `ewbot aeth holdout lock`" if rec["criteria"]["passed"]
+               else "FAILED - A-ETH ends (spec 6): no lock, no 2024 data, no other asset")
+    print(f"stage 1 {verdict}. Record: {ec.STAGE1_PATH}. Commit it NOW:\n  git add \"{ec.STAGE1_PATH}\"\n"
+          '  git commit -m "chore(aeth): record stage 1"')
+    return 0
+
+
+def _e_holdout_lock(args: argparse.Namespace) -> int:
+    from ewbot.aeth import config as ec
+    from ewbot.aeth.holdout import create_lock
+
+    try:
+        lock = create_lock(_e_raw(args), now_ts=int(time.time()), lock_path=ec.LOCK_PATH, stage1_path=ec.STAGE1_PATH,
+                           a_lock_path=ec.A_LOCK_PATH)
+    except ec.AethError as exc:
+        _refuse(str(exc))
+    print(f"holdout-aeth.lock written: {ec.LOCK_PATH} (sha256 {lock['sha256'][:12]}, params {lock['params']}, last bar "
+          f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(lock['last_bar_ts']))} UTC).\n"
+          "Commit it NOW, before the holdout runs:\n"
+          f'  git add "{ec.LOCK_PATH}"\n  git commit -m "chore(aeth): lock the ETH holdout {lock["sha256"][:12]}"')
+    return 0
+
+
+def _e_holdout_run(args: argparse.Namespace) -> int:
+    from ewbot.aeth import config as ec
+    from ewbot.aeth.data import fetch_eth
+    from ewbot.aeth.holdout import run_holdout_aeth
+    from ewbot.aeth.lockfile import lock_exists
+
+    if not args.confirm:
+        print("refusing: the ETH holdout runs once, after the user's approval: re-run with --confirm", file=sys.stderr)
+        return 2
+    if not lock_exists(ec.LOCK_PATH):
+        _refuse(f"{ec.LOCK_PATH} is missing or not a valid A-ETH lock: `ewbot aeth holdout lock` first")
+    fetch_eth(args.cache_dir, lock_path=ec.LOCK_PATH)
+    try:
+        out = run_holdout_aeth(confirm=True, cache_dir=args.cache_dir, lock_path=ec.LOCK_PATH,
+                               a_lock_path=ec.A_LOCK_PATH, workers=args.workers)
+    except ec.AethError as exc:
+        _refuse(str(exc))
+    fr = out["first_run"]
+    _e_head_lines(fr["headline"])
+    for line in fr["criteria"]["trade_count"]:
+        print(line)
+    print(json.dumps(fr["verdict"], indent=1))
+    verdict = "PASSED" if fr["verdict"]["passed"] else "FAILED - A-ETH ends (spec 7.3): no paper trading"
+    print(f"ETH holdout {verdict}; result in {ec.LOCK_PATH} first_run. Commit it NOW:\n  git add \"{ec.LOCK_PATH}\"\n"
+          '  git commit -m "chore(aeth): record the ETH holdout run"')
+    return 0
+
+
+def _e_paper_env(args: argparse.Namespace) -> Any:
+    """Production wiring (tests replace this function): real lock, Coinbase, git and Telegram."""
+    from ewbot.aeth.paper import AethPaperEnv
+
+    return AethPaperEnv(ledger_dir=args.ledger_dir, cache_dir=args.cache_dir, sender=sender_from_env())
+
+
+def _e_alert_failure(env: Any, stage: str, message: str) -> None:
+    from ewbot.aeth.paper import eth_head
+
+    if env.sender is None:
+        return
+    text = eth_head(failure_text(stage, message, os.environ.get(RUN_URL_ENV)))
+    _, sent, errors = deliver([make_event("FAILURE", env.clock(), stage, text)], [], env.sender, sleep=env.sleep)
+    if not sent:
+        print(f"failure alert not sent: {errors}", file=sys.stderr)
+        return
+    marker = os.environ.get(FAILURE_MARKER_ENV)
+    if marker:
+        Path(marker).write_text(stage, encoding="utf-8")
+
+
+def _e_paper_run(args: argparse.Namespace) -> int:
+    from ewbot.aeth.paper import AethPaperError, run_paper_aeth
+
+    env = _e_paper_env(args)
+    try:
+        out = run_paper_aeth(env)
+    except AethPaperError as exc:
+        print(f"paper-A-ETH run failed at stage {exc.stage}: {exc.message}", file=sys.stderr)
+        _e_alert_failure(env, exc.stage, exc.message)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - alert on anything, then fail the step
+        traceback.print_exc()
+        _e_alert_failure(env, "unexpected", f"{type(exc).__name__}: {exc}")
+        return 1
+    count = out.status["count"]
+    last = time.strftime("%Y-%m-%d %H:%M", time.gmtime(out.last_bar_ts))
+    print(f"paper-A-ETH run {out.run_id}: last bar {last} UTC, "
+          f"epoch {out.epoch_id}, ETH out-of-sample {count['total']}/{count['required']}, {out.new_decisions} new "
+          f"decision(s), {out.new_discrepancies} new discrepancy(ies), {len(out.sent)} sent, {out.pending} pending")
+    for note in out.notes:
+        print(f"note: {note}", file=sys.stderr)
+    return 0
+
+
+def _e_paper_status(args: argparse.Namespace) -> int:
+    from ewbot.aeth.paper import status_aeth, status_lines_aeth
+
+    try:
+        led = load_ledger(args.ledger_dir)
+    except LedgerError as exc:
+        print(f"ledger unreadable: {exc}", file=sys.stderr)
+        return 1
+    if led is None:
+        print(f"no ledger.json in {args.ledger_dir}", file=sys.stderr)
+        return 1
+    for line in status_lines_aeth(status_aeth(led, int(time.time()))):
+        print(line)
+    print(position_line(led.open_position))
+    cur = current_epoch(led)
+    print(f"epoch {cur['id']} of {len(led.epochs)}: fingerprint {cur['fingerprint'][:12]} "
+          f"(lock {led.baseline['fingerprint'][:12]})")
+    if led.runs:
+        r = led.runs[-1]
+        print(f"last run {r['id']}: last bar {time.strftime('%Y-%m-%d %H:%M', time.gmtime(r['last_bar_ts']))} UTC, "
+              f"holdout data {'ok' if r['holdout_data_ok'] else 'MISMATCH (warned, not refused)'}, "
+              f"holdout trades recomputed {r['holdout_trades_recomputed']} (lock: {led.holdout['n_trades']['A']})")
+    unexplained = sum(1 for d in led.discrepancies if d["cause"] == "UNEXPLAINED")
+    print(f"decisions {len(led.decisions)}, discrepancies {len(led.discrepancies)} (unexplained {unexplained}), "
+          f"pending events {len(led.pending_events)}")
+    return 0
+
+
+def cmd_aeth(args: argparse.Namespace) -> int:
+    if args.e_cmd == "holdout":
+        return _e_holdout_lock(args) if args.eh_cmd == "lock" else _e_holdout_run(args)
+    if args.e_cmd == "paper":
+        return _e_paper_status(args) if args.ep_cmd == "status" else _e_paper_run(args)
+    return {"fetch": _e_fetch, "stage1": _e_stage1}[args.e_cmd](args)
+
+
 _COMMANDS = {
     "fetch": cmd_fetch,
     "backtest": cmd_backtest,
@@ -1088,6 +1301,7 @@ _COMMANDS = {
     "paper": cmd_paper,
     "live": cmd_live,
     "stratb": cmd_stratb,
+    "aeth": cmd_aeth,
 }
 
 
