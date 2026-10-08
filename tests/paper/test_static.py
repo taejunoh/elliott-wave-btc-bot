@@ -18,7 +18,8 @@ WORKFLOW = WORKFLOWS / "paper.yml"
 CI_WORKFLOW = WORKFLOWS / "ci.yml"
 PYTHON_PATCH = "3.12.13"  # the exact patch both workflows resolve; part of the compared environment
 RUNNER_IMAGE = "ubuntu-24.04"  # pinned while paper trading runs (spec 8): part of the recorded environment
-ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py", "live/target.py"}  # Plan 2 spec 7.1, Plan 3 spec 3.1
+ALLOWED_TRUE = {"backtest/holdout.py", "paper/runner.py", "live/target.py",  # Plan 2 spec 7.1, Plan 3 spec 3.1
+                "aeth/holdout.py"}  # Plan 5a spec 7.2: the one-shot ETH holdout
 PASS_THROUGH = {"backtest/runner.py"}  # forwards its own allow_holdout argument to the engine run
 # backtest/runner.py helpers that skip the holdout check or forward allow_holdout unchecked
 GUARDED = {"check_before_holdout", "_map_tasks", "_init_worker"}
