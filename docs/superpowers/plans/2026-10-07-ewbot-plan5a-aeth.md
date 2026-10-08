@@ -8,7 +8,9 @@
 
 **Tech Stack:** Python 3.12 (uv), 기존 의존성만(numpy, pandas, pyarrow, requests, PyYAML); pytest; GitHub Actions(`actions/checkout@v7`, `astral-sh/setup-uv` v10.2.0 커밋 `c18668ad3cf93ea998bef934396af7bb5c839dc7`, `actions/cache@v6`); Coinbase Exchange 공개 캔들 API(granularity 3600, `ETH-USD`); Telegram Bot API(A와 같은 봇·시크릿).
 
-**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan5a-aeth-design.md`(사용자 승인 2026-10-07; 결정 사항 원문은 명세 1.3절). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`(9.6절), Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`, Plan 3 `2026-10-03-ewbot-plan3-live-trading-design.md`, Plan 4 `2026-10-07-ewbot-plan4-strategy-b-design.md`(격리 방식의 선례).
+**Spec:** `docs/superpowers/specs/2026-10-07-ewbot-plan5a-aeth-design.md`(사용자 승인 2026-10-07; 결정 사항 원문은 명세 1.3절; 2026-10-08 개정은 명세 15절). 상위 명세: Plan 1 `2026-10-01-elliott-wave-btc-bot-design.md`(9.6절), Plan 2 `2026-10-02-ewbot-plan2-paper-trading-design.md`, Plan 3 `2026-10-03-ewbot-plan3-live-trading-design.md`, Plan 4 `2026-10-07-ewbot-plan4-strategy-b-design.md`(격리 방식의 선례).
+
+**개정 (2026-10-08, 단계 1 전 — ETH 1시간봉을 받기 전):** 최종 검토 수정. 모의매매 구간 지문은 A 지문과 A-ETH 판단 지문(`aeth/config.py`·`aeth/data.py`)의 쌍이고 잠금이 판단 지문도 묶는다(해석 5·6·9, Task 1·2·4·5; 명세 3·8·15절), CLI의 거부는 캐시를 읽다 난 것도 `refusing:`과 종료 코드 2다(해석 12, Task 6), 운영 문서와 Task 9·10에 단계 1 전 누락 점검, 2024 이전 캐시 사본과 sha256, `src/` 깨끗함 확인, 기록의 즉시 푸시를 더했다(Task 7·9·10).
 
 ## Global Constraints
 
@@ -31,14 +33,14 @@
 2. **단계 1의 비교와 합격(명세 6).** A의 `compare(cfg, df, 2017-01-01, 2024-01-01, random_runs=100)`를 그대로 쓴다(A, C, HYBRID, BH, EMA, 무작위 100회: A의 실제 거래 수와 모양, 시드 0~99). 합격은 여섯 항목이 모두 참일 때다: A 순수익률 > 0, A 최대 낙폭 ≤ 0.15, A 샤프 > C 샤프, A Calmar > C Calmar, A 샤프 > 대조군 샤프 평균, A Calmar > 대조군 Calmar 평균. 값이 없거나(JSON의 null) 유한하지 않으면 그 항목은 거짓이다. BH·EMA·HYBRID는 보고만 한다(결정 사항이 C와 대조군만 기준으로 정했다). 판정은 기록에 쓰이는 JSON 값(`headline`)으로 계산하므로 잠금이 기록만으로 다시 계산할 수 있다.
 3. **정보 실행(명세 6).** 2019~2023은 같은 봉(2017년부터 준비)으로 `compare(cfg, df, 2019-01-01, 2024-01-01, 100)`를 따로 돌리고, 같은 여섯 항목을 `checks_info_only`로 보여 준다. 비용 2배는 수수료율·최소 수수료·슬리피지를 2배로 하고 펀딩은 그대로 둔 A 1회(`run_backtest`)다. 둘 다 판정에 쓰지 않는다.
 4. **단계 1 기록과 1회(명세 6).** `aeth-stage1.json`(저장소 루트, git에 커밋)에 한 번만 쓴다. 파일이 있으면 거부한다(결과와 상관없이 1회). 실행 전에 추적 파일의 커밋 안 된 변경, A 지문 ≠ `e0435223…`, 봉이 [2017-01-01, 2023-12-31 23:00]을 양 끝에서 하루 안으로 덮지 못함, 2024 봉을 거부한다. 기록의 `provenance`는 `holdout.lock`의 sha256, A 지문, A-ETH 지문, `code_sha256`(A의 `code_fingerprint`), 2024 이전 **원본**(캐시 그대로, 누락 봉을 채우기 전) 봉의 기록(`data_record`: 첫·끝 ts, 수, 누락 수, A의 `data_fingerprint`), 시각, git 상태다. 계산은 누락 봉을 A의 `fill_gaps`로 채운 봉으로 한다.
-5. **잠금(명세 7.1).** 잠금은 커밋된 그대로의 단계 1 기록에서만 만든다(`committed_text`가 파일 내용과 같아야 한다). 기록은 합격이어야 하고 그 `criteria`가 `stage1_verdict(headline)`과 같아야 하며(손으로 바꾼 합격을 막는다), 기록의 파라미터·`holdout.lock` sha256·설정·A 지문·A-ETH 지문·2024 이전 봉 기록이 지금의 것과 같아야 한다. 기록의 `code_sha256`은 비교하지 않는다(단계 1과 잠금 사이에 `live/` 같은 무관한 파일이 바뀌어도 잠글 수 있게; 잠금 → 실행 사이는 8의 `code_sha256`이 막는다). `last_bar_ts`는 잠금 시각의 마지막 완성 시간(`now // 3600 * 3600 − 3600`)이고 2024-01-01 이후여야 한다. 잠금의 바인딩 필드(`LOCK_BOUND`)는 `kind, version, product, future, params, a_lock_sha256, config, holdout_start, last_bar_ts, random_runs, a_fingerprint, aeth_sha256, code_sha256, pre2024, stage1_sha256`이고 `sha256`은 그 다이제스트다. `locked_at`, `git_head`, `git_dirty`, `attempts`, `first_run`은 바인딩되지 않는다.
-6. **"A의 잠금과 같은 코드 상태"(명세 7.1).** A의 잠금은 `code_sha256 = code_fingerprint()`(`src/ewbot` 아래 모든 `*.py`)를 묶었다. A-ETH 잠금도 같은 값을 묶고, 홀드아웃은 그 값이 다르면 거부한다. 거기에 A 지문과 A-ETH 지문을 따로 묶어, 어느 쪽이 바뀌었는지 거부 메시지가 말하게 한다.
+5. **잠금(명세 7.1).** 잠금은 커밋된 그대로의 단계 1 기록에서만 만든다(`committed_text`가 파일 내용과 같아야 한다). 기록은 합격이어야 하고 그 `criteria`가 `stage1_verdict(headline)`과 같아야 하며(손으로 바꾼 합격을 막는다), 기록의 파라미터·`holdout.lock` sha256·설정·A 지문·A-ETH 지문·2024 이전 봉 기록이 지금의 것과 같아야 한다. 기록의 `code_sha256`은 비교하지 않는다(단계 1과 잠금 사이에 `live/` 같은 무관한 파일이 바뀌어도 잠글 수 있게; 잠금 → 실행 사이는 8의 `code_sha256`이 막는다). `last_bar_ts`는 잠금 시각의 마지막 완성 시간(`now // 3600 * 3600 − 3600`)이고 2024-01-01 이후여야 한다. 잠금의 바인딩 필드(`LOCK_BOUND`)는 `kind, version, product, future, params, a_lock_sha256, config, holdout_start, last_bar_ts, random_runs, a_fingerprint, aeth_sha256, aeth_decision_sha256, code_sha256, pre2024, stage1_sha256`이고 `sha256`은 그 다이제스트다. `locked_at`, `git_head`, `git_dirty`, `attempts`, `first_run`은 바인딩되지 않는다.
+6. **"A의 잠금과 같은 코드 상태"(명세 7.1).** A의 잠금은 `code_sha256 = code_fingerprint()`(`src/ewbot` 아래 모든 `*.py`)를 묶었다. A-ETH 잠금도 같은 값을 묶고, 홀드아웃은 그 값이 다르면 거부한다. 거기에 A 지문과 A-ETH 지문을 따로 묶어, 어느 쪽이 바뀌었는지 거부 메시지가 말하게 한다. A-ETH 판단 지문(`aeth_decision_sha256`)도 묶는다: 홀드아웃은 A-ETH 지문 전체로 확인하고(판단 지문은 그 일부다), 판단 지문은 모의매매 구간의 기준값이다(해석 9).
 7. **홀드아웃 실행(명세 7.2).** 확인, 유효한 잠금, 커밋된 잠금과 같은 `sha256`, 두 곳 모두 빈 `first_run`, 세 지문, `lock_mismatch`(잠금의 `kind, version, product, future, params, a_lock_sha256, config, holdout_start`가 지금 A의 파라미터에 대한 이 코드의 값과 같은지), 깨끗한 작업 트리(잠금 파일은 예외), 2024 이전 봉 기록, 마지막 봉까지의 데이터, 이전 시도의 홀드아웃 봉 해시를 이 순서로 확인한 뒤 시도를 기록하고 실행한다. 봉은 캐시 전체를 `fill_gaps`로 채운 뒤 `last_bar_ts`에서 자른다(마지막 봉이 원본에 없어도 모의매매와 같은 값; 해석 11). 실행은 `compare(cfg, df, HOLDOUT_START, last_bar_ts + 3600, random_runs=잠금 값, allow_holdout=True)`다.
 8. **단계 2 합격(명세 7.3).** `evaluate_criteria(cmp)`(A의 함수, 바꾸지 않음)의 `winners`에 `"A"`가 있고(A의 샤프·Calmar > C, BH, 대조군 평균) A의 `max_dd ≤ 0.15`면 합격이다. HYBRID만 이긴 경우는 탈락이다(검증 대상은 A; A의 모의매매도 A만 센다). `first_run`에는 `evaluate_criteria`의 출력 전체, `headline`, `verdict`(`c1_a_beats_c_bh_random_mean`, `c2_max_dd_le_15pct`, `n_trades`, `passed`), 홀드아웃 구간 봉 해시가 들어간다.
-9. **모의매매 런타임(명세 8).** A의 `run_paper`를 옮기되 다음만 다르다: 설정은 `aeth_config`, 잠금 검사는 `precheck_lock_aeth`(유효, 커밋된 그대로, 홀드아웃 합격, `lock_mismatch` 없음), 데이터는 `fetch_eth`·`load_eth(unlock_2024=True)`·`fill_gaps`, 구간 지문은 `epoch_fingerprint(A 지문, A-ETH 지문)`(기준값은 잠금의 두 값), 장부의 홀드아웃 요약은 `holdout_summary_aeth`(키 `lock_sha256, params, holdout_start, last_bar_ts, data_sha256, n_trades{"A"}, passed`), 메시지 접두어는 `[ewbot paper-A-ETH]`(A의 메시지의 `[ewbot paper]`를 바꿈), `report.html`과 매일의 9.6절 1·2번 재계산은 없다, 상태 줄은 `status_lines_aeth`. 카운트는 A의 `golive_count`(이 장부의 홀드아웃 A 거래 + 현재 구간의 모의 거래, 50건)이고 4번 기준은 A의 `criterion4`다.
+9. **모의매매 런타임(명세 8).** A의 `run_paper`를 옮기되 다음만 다르다: 설정은 `aeth_config`, 잠금 검사는 `precheck_lock_aeth`(유효, 커밋된 그대로, 홀드아웃 합격, `lock_mismatch` 없음), 데이터는 `fetch_eth`·`load_eth(unlock_2024=True)`·`fill_gaps`, 구간 지문은 `epoch_fingerprint(A 지문, A-ETH 판단 지문)`(판단 지문은 `aeth/config.py`·`aeth/data.py`만 해시한다; 기준값은 잠금의 `a_fingerprint`·`aeth_decision_sha256`; 명세 8절 2026-10-08 개정: 모의매매 중 런타임 — `paper.py`의 메시지·입출력, `sync.py`, `cli.py` — 만 고친 것은 구간을 바꾸지 않는다), 장부의 홀드아웃 요약은 `holdout_summary_aeth`(키 `lock_sha256, params, holdout_start, last_bar_ts, data_sha256, n_trades{"A"}, passed`), 메시지 접두어는 `[ewbot paper-A-ETH]`(A의 메시지의 `[ewbot paper]`를 바꿈), `report.html`과 매일의 9.6절 1·2번 재계산은 없다, 상태 줄은 `status_lines_aeth`. 카운트는 A의 `golive_count`(이 장부의 홀드아웃 A 거래 + 현재 구간의 모의 거래, 50건)이고 4번 기준은 A의 `criterion4`다.
 10. **2024 가드의 세부(명세 5.3).** 잠금이 없을 때 캐시에 2024 이후 봉이 있으면(그 `ts` 열만 읽어 센다) `fetch_eth`와 `load_eth`가 `HoldoutGuardError`로 거부한다: A-ETH가 받은 것이 아니다(A의 `ewbot fetch --product ETH-USD`가 같은 파일을 지금까지 채운다). `fetch_eth`는 3,000시간 조각으로 A의 `fetch_1h(PRODUCT, start, stop)`를 부르고 조각마다 원자적으로 저장한다.
 11. **데이터 해시.** 2024 이전 봉의 출처는 원본 봉(`data_record`)으로, 홀드아웃 구간은 누락 봉을 채운 봉의 `data_fingerprint(df, 2024-01-01, last_bar_ts)`로 잰다(A의 모의매매와 같은 방식). 홀드아웃과 모의매매가 모두 "캐시 전체를 채운 뒤 자른" 봉을 쓰므로 같은 데이터면 같은 해시다.
-12. **CLI(명세 3).** `ewbot aeth fetch | stage1 | holdout lock | holdout run --confirm | paper run | paper status`. 처리 함수만 `ewbot.aeth`를 import하고 경로는 `ewbot.aeth.config`의 `LOCK_PATH`·`STAGE1_PATH`·`A_LOCK_PATH`를 호출할 때 읽는다(테스트가 바꿀 수 있게). `holdout run`은 `--confirm`과 유효한 잠금을 확인한 **뒤에만** 캐시를 지금까지 늘린다. 거부는 A·B의 CLI처럼 `refusing: …`과 종료 코드 2다.
+12. **CLI(명세 3).** `ewbot aeth fetch | stage1 | holdout lock | holdout run --confirm | paper run | paper status`. 처리 함수만 `ewbot.aeth`를 import하고 경로는 `ewbot.aeth.config`의 `LOCK_PATH`·`STAGE1_PATH`·`A_LOCK_PATH`를 호출할 때 읽는다(테스트가 바꿀 수 있게). `holdout run`은 `--confirm`과 유효한 잠금을 확인한 **뒤에만** 캐시를 지금까지 늘린다. 거부는 A·B의 CLI처럼 `refusing: …`과 종료 코드 2다(캐시를 받거나 읽는 호출도 거부 처리 안에서 한다: 잠금 없이 2024 봉이 든 캐시 등).
 13. **워크플로(명세 8).** `paper-b.yml`과 같은 모양: 저장소 변수 `PAPER_AETH_ENABLED`가 `true`일 때만 돌고(휴면), 1차 트리거는 두 번째 Cloudflare Worker의 크론 `42 * * * *`(코드는 `docs/aeth.md`), 예비 `schedule`은 `42 */3 * * *`, 동시성 그룹 `paper-aeth`, Actions 캐시 키 `eth-usd-1h-`, git 쪽은 `python -m ewbot.aeth.sync`(B의 `paperb.sync`와 같은 규칙, 브랜치 `paper-aeth`, 환경변수 `PAPER_AETH_DIR`·`PAPER_AETH_PUSH_BACKOFF`). B의 코드는 끝난 전략의 기록이므로 import하지 않고 같은 규칙을 다시 쓴다.
 14. **테스트 데이터.** 합성 ETH 봉은 A의 모의매매 테스트 경로(`tests.paper.helpers.synth_frame`, 2023-11-15 ~ 2024-03-18)의 가격에 0.1을 곱한 것이다: 0.1 ETH 계약에서 A의 BTC 테스트(0.01 BTC 계약)와 같은 거래가 난다(홀드아웃 2건, 2024-02-10까지 모의 2건). 단계 1 테스트는 같은 경로를 마지막 봉이 2023-12-31 23:00이 되게 앞으로 옮긴 3,000개 봉을 쓴다. 파라미터는 A의 모의매매 테스트와 같은 (2.0, 0.5, 0.0)이고, 합성 A 잠금(`tests.paper.helpers.make_lock`)이 그 값을 담는다.
 
@@ -48,7 +50,7 @@
 |---|---|---|
 | `src/ewbot/aeth/__init__.py` | 1 | 패키지 표시 |
 | `src/ewbot/aeth/config.py` | 1 | 상품·계약·기간·경로 상수, ETH 비용, A의 잠금에서 읽는 고정 파라미터, 실행 설정 |
-| `src/ewbot/aeth/fingerprint.py` | 1 | A-ETH 지문, 구간 지문 |
+| `src/ewbot/aeth/fingerprint.py` | 1 | A-ETH 지문, A-ETH 판단 지문, 구간 지문 |
 | `src/ewbot/aeth/lockfile.py` | 2 | 잠금 다이제스트·유효성·읽기, 원자적 JSON 쓰기, 커밋된 내용, 더러운 작업 트리 검사 |
 | `src/ewbot/aeth/data.py` | 2 | ETH 1시간봉 수집(조각 저장)·로드, 2024 가드 |
 | `src/ewbot/aeth/stage1.py` | 3 | 단계 1 비교·판정·정보 실행·1회 기록 |
@@ -65,19 +67,19 @@
 
 | 작업 | 구성 | 새 테스트 |
 |---|---|---|
-| 1 | 설정·고정 파라미터, 지문, A 보호 검사(+ CI 검사 1개) | 24 |
+| 1 | 설정·고정 파라미터, 지문, A 보호 검사(+ CI 검사 1개) | 34 |
 | 2 | 잠금 파일 기본 기능, ETH 데이터와 2024 가드 | 11 |
 | 3 | 단계 1(비교, 판정, 정보 실행, 1회 기록) | 21 |
 | 4 | 잠금 작성, 1회 ETH 홀드아웃, 단계 2 판정 | 27 |
-| 5 | ETH 모의매매 런타임 | 15 |
-| 6 | CLI `ewbot aeth …` | 12 |
+| 5 | ETH 모의매매 런타임 | 16 |
+| 6 | CLI `ewbot aeth …` | 15 |
 | 7 | `paper-aeth` 동기화, 워크플로, CI 검사 1개, 문서 | 11 |
 | 8 | 최종 검증(전체 테스트, A 지문, A 보호, 바뀐 파일) | — |
 | 9 | 수동: PR·병합(사용자), **단계 1**(컨트롤러 전용; 네트워크: 2024 이전 ETH만) | — |
 | 10 | 수동: **단계 2** — 잠금, **사용자 승인**, 홀드아웃 1회, 즉시 커밋 | — |
 | 11 | 수동: **단계 3** — 모의매매 시작(사용자) | — |
 
-Task 7 이후 전체: `1502 passed`(캐시가 없으면 `1501 passed, 1 skipped`) — 기준선보다 121개 많다(`tests/aeth` 119개, `tests/paper/test_static.py` 2개). 각 작업의 Step 4는 그 작업의 테스트만 돌린다.
+Task 7 이후 전체: `1516 passed`(캐시가 없으면 `1515 passed, 1 skipped`) — 기준선보다 135개 많다(`tests/aeth` 133개, `tests/paper/test_static.py` 2개). 각 작업의 Step 4는 그 작업의 테스트만 돌린다.
 
 ---
 
@@ -96,14 +98,14 @@ Task 7 이후 전체: `1502 passed`(캐시가 없으면 `1501 passed, 1 skipped`
 **Interfaces:**
 - Consumes: A의 `ewbot.backtest.holdout`: `DEFAULT_LOCK_PATH`, `holdout_config(cfg, params) -> BotConfig`, `lock_digest(cfg, params, random_runs=100, code_sha256=None) -> str`; `ewbot.backtest.runner.utc_ts(date) -> int`; `ewbot.backtest.walkforward`: `GRID`, `HOLDOUT_START`, `WF_START`, `grid_combos() -> list[tuple]`; `ewbot.config`: `BotConfig`, `CostParams`; `ewbot.paper.fingerprint`: `PROJECT_ROOT`, `current_fingerprint(repo_root=None) -> str`, `fingerprint_of(files: Mapping[str, bytes]) -> str`, `is_fingerprinted(rel) -> bool`, `tree_files(repo_root=None) -> dict[str, bytes]`. 테스트: `tests.paper.helpers.make_lock(df, boundary=BOUNDARY, params=PARAMS, n_a=2, **overrides) -> dict`(유효한 다이제스트의 합성 A 잠금), `synth_frame() -> DataFrame`.
 - Produces: `ewbot.aeth.config`: `PRODUCT = "ETH-USD"`, `FUTURE = "ETP-20DEC30-CDE"`, `CONTRACT_SIZE = 0.1`, `FROZEN_A_FINGERPRINT`(`e0435223…` 전체 64자), `DATA_START = 1483228800`(2017-01-01), `SUB_START = 1546300800`(2019-01-01), `RANDOM_RUNS = 100`, `COST_INFO_MULT = 2.0`, `LOCK_PATH = PROJECT_ROOT / "holdout-aeth.lock"`, `STAGE1_PATH = PROJECT_ROOT / "aeth-stage1.json"`, `A_LOCK_PATH`(A의 `DEFAULT_LOCK_PATH`), `Combo = tuple[float, ...]`, `class AethError(RuntimeError)`, `eth_costs() -> CostParams`, `scale_trading_costs(c: CostParams, mult: float) -> CostParams`(수수료율·최소 수수료·슬리피지만 배수), `frozen_a_params(a_lock_path: Path = A_LOCK_PATH) -> tuple[Combo, str]`(파라미터와 A 잠금의 `sha256`; 아니면 `AethError`), `aeth_config(params: Combo) -> BotConfig`, `config_json(params: Combo) -> dict[str, Any]`(`aeth_config`의 JSON).
-  `ewbot.aeth.fingerprint`: `AETH_PREFIX = "src/ewbot/aeth/"`, `aeth_files(repo_root=None) -> dict[str, bytes]`, `aeth_fingerprint(repo_root=None) -> str`(파일이 없으면 `FileNotFoundError`), `epoch_fingerprint(a_fingerprint: str, aeth_sha256: str) -> str`, `current_epoch_fingerprint(repo_root=None) -> str`.
+  `ewbot.aeth.fingerprint`: `AETH_PREFIX = "src/ewbot/aeth/"`, `aeth_files(repo_root=None) -> dict[str, bytes]`, `aeth_fingerprint(repo_root=None) -> str`(파일이 없으면 `FileNotFoundError`), `AETH_DECISION_FILES = ("config.py", "data.py")`, `aeth_decision_files(repo_root=None) -> dict[str, bytes]`, `aeth_decision_fingerprint(repo_root=None) -> str`(판단 파일이 하나라도 없으면 `FileNotFoundError`), `epoch_fingerprint(a_fingerprint: str, aeth_decision_sha256: str) -> str`, `current_epoch_fingerprint(repo_root=None) -> str`(A 지문과 A-ETH 판단 지문).
   `tests/aeth/test_isolation.py`: 이후 모든 작업에서 A·B 보호를 지키는 검사.
 
-A-ETH의 모든 상수와 실행 설정을 A의 `config.py`와 별개인 `aeth/config.py`에 둔다. 설정은 A의 홀드아웃 설정에서 비용의 계약 크기만 0.1로 바꾼 것이고(해석 1), 파라미터는 매번 A의 커밋된 `holdout.lock`에서 읽는다(읽기만 한다). `frozen_a_params`는 A의 모의매매가 하는 것과 같은 다이제스트 검사로 그 파일이 A의 진짜 잠금인지 확인한다. A-ETH 지문은 A와 같은 형식으로 `aeth/` 아래 파일만 해시하고, 모의매매의 구간 지문은 A 지문과 A-ETH 지문의 쌍이다(어느 쪽이 바뀌어도 ETH 카운트가 새로 시작한다). `tests/aeth/test_isolation.py`는 이 계획 전체의 안전장치다: A 지문 고정값, `aeth/`가 A 지문 대상 밖인지, `master`와의 merge-base 이후 A-ETH 경로를 바꾼 브랜치가 A·B의 경로(지문 대상, `data/`, `backtest/`, `paper/`, `live/`, `stratb/`, `paperb/`, `holdout.lock`, 세 워크플로, `scripts/`, `ops/`, `deploy/`, `uv.lock`, `pyproject.toml`)를 하나도 바꾸지 않았는지(추적되지 않은 새 파일 포함; `master`가 없는 얕은 클론에서는 건너뜀), 리터럴 `unlock_2024=True`를 쓰는 모듈이 `aeth/holdout.py`·`aeth/paper.py`뿐이고 변수로 넘기는 곳이 없는지, A-ETH 코드가 A·B의 산출물 이름을 문자열로 쓰지 않는지, `stratb`·`paperb`를 import하지 않는지 확인한다. 집합 검사는 부분집합(`<=`)이라 아직 없는 모듈이 있어도 통과한다. CI에서 도는 부분(`tests/paper/test_static.py`)에는 B의 같은 검사 옆에 A-ETH 검사 1개를 더한다.
+A-ETH의 모든 상수와 실행 설정을 A의 `config.py`와 별개인 `aeth/config.py`에 둔다. 설정은 A의 홀드아웃 설정에서 비용의 계약 크기만 0.1로 바꾼 것이고(해석 1), 파라미터는 매번 A의 커밋된 `holdout.lock`에서 읽는다(읽기만 한다). `frozen_a_params`는 A의 모의매매가 하는 것과 같은 다이제스트 검사로 그 파일이 A의 진짜 잠금인지 확인한다. A-ETH 지문은 A와 같은 형식으로 `aeth/` 아래 파일만 해시하고(단계 1 → 잠금 → 홀드아웃이 묶는다), A-ETH 판단 지문은 그중 모의매매의 거래를 정하는 `config.py`·`data.py`만 해시한다. 모의매매의 구간 지문은 A 지문과 A-ETH 판단 지문의 쌍이다(어느 쪽이 바뀌어도 ETH 카운트가 새로 시작하고, 모의매매 중 런타임만 고친 것은 구간을 바꾸지 않는다; 해석 9). 판단 파일은 A-ETH에서 판단 파일과 `lockfile`(잠금 확인)만 import한다(테스트): 판단 논리가 판단 지문 밖의 파일로 옮겨 가지 못하게 한다. `tests/aeth/test_isolation.py`는 이 계획 전체의 안전장치다: A 지문 고정값, `aeth/`가 A 지문 대상 밖인지, `master`와의 merge-base 이후 A-ETH 경로를 바꾼 브랜치가 A·B의 경로(지문 대상, `data/`, `backtest/`, `paper/`, `live/`, `stratb/`, `paperb/`, `holdout.lock`, 세 워크플로, `scripts/`, `ops/`, `deploy/`, `uv.lock`, `pyproject.toml`)를 하나도 바꾸지 않았는지(추적되지 않은 새 파일 포함; `master`가 없는 얕은 클론에서는 건너뜀), 리터럴 `unlock_2024=True`를 쓰는 모듈이 `aeth/holdout.py`·`aeth/paper.py`뿐이고 변수로 넘기는 곳이 없는지, A-ETH 코드가 A·B의 산출물 이름을 문자열로 쓰지 않는지, `stratb`·`paperb`를 import하지 않는지 확인한다. 집합 검사는 부분집합(`<=`)이라 아직 없는 모듈이 있어도 통과한다. CI에서 도는 부분(`tests/paper/test_static.py`)에는 B의 같은 검사 옆에 A-ETH 검사 1개를 더한다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-테스트 패키지와 테스트 파일 3개를 만들고 `tests/paper/test_static.py`에 CI 검사 1개를 더한다. 설정 테스트는 상수, ETH 비용, 비용 배수, 실제 `holdout.lock`의 파라미터(읽기만), 실행 설정, A의 잠금이 아닌 파일의 거부(이유별)를 확인한다. 지문 테스트는 임시 사본에서 A-ETH 편집·A 편집·둘 밖의 편집이 각 지문에 주는 영향을 확인한다. `src/ewbot/aeth/` 폴더는 아직 만들지 않는다(만들면 네임스페이스 패키지로 읽혀 Step 2의 메시지가 달라진다).
+테스트 패키지와 테스트 파일 3개를 만들고 `tests/paper/test_static.py`에 CI 검사 1개를 더한다. 설정 테스트는 상수, ETH 비용, 비용 배수, 실제 `holdout.lock`의 파라미터(읽기만), 실행 설정, A의 잠금이 아닌 파일의 거부(이유별)를 확인한다. 지문 테스트는 임시 사본에서 판단 파일 편집·나머지 A-ETH 파일 편집·A 편집·둘 밖의 편집이 각 지문(A, A-ETH, A-ETH 판단, 구간)에 주는 영향, 판단 파일이 없을 때의 오류, 판단 파일의 A-ETH import를 확인한다(`data.py`는 Task 2에서 생기므로 사본에는 자리 표시 파일을 두고, import 검사는 있는 파일만 본다). `src/ewbot/aeth/` 폴더는 아직 만들지 않는다(만들면 네임스페이스 패키지로 읽혀 Step 2의 메시지가 달라진다).
 
 ```bash
 mkdir -p tests/aeth
@@ -215,12 +217,16 @@ def test_frozen_params_refuse_anything_but_a_s_completed_lock(tmp_path, case, wh
 ```python
 from __future__ import annotations
 
+import ast
 import shutil
 
 import pytest
 
 from ewbot.aeth.fingerprint import (
+    AETH_DECISION_FILES,
     AETH_PREFIX,
+    aeth_decision_files,
+    aeth_decision_fingerprint,
     aeth_files,
     aeth_fingerprint,
     current_epoch_fingerprint,
@@ -228,10 +234,32 @@ from ewbot.aeth.fingerprint import (
 )
 from ewbot.paper.fingerprint import PROJECT_ROOT, current_fingerprint, fingerprint_of
 
+AETH = "src/ewbot/aeth"
+# Every A-ETH module that is not a decision file: runtime (paper, sync), the lock checks (lockfile, holdout),
+# stage 1, the fingerprints themselves and the package marker.
+RUNTIME = ("paper.py", "sync.py", "holdout.py", "lockfile.py", "stage1.py", "fingerprint.py", "__init__.py")
+
 
 def _copy_src(tmp_path):
+    """A copy of src/ewbot with both decision files (a stand-in data.py while the plan has not added it: Task 2)."""
     shutil.copytree(PROJECT_ROOT / "src" / "ewbot", tmp_path / "src" / "ewbot")
+    for name in AETH_DECISION_FILES:
+        p = tmp_path / AETH / name
+        if not p.exists():
+            p.write_text("# stand-in\n", encoding="utf-8")
     return tmp_path
+
+
+def _touch(root, rel):
+    """Append one comment line to <root>/src/ewbot/<rel> (the file is created when it does not exist yet)."""
+    p = root / "src/ewbot" / rel
+    p.write_bytes((p.read_bytes() if p.exists() else b"") + b"# one comment line\n")
+
+
+def _all(root):
+    """(strategy A's, A-ETH's, A-ETH's decision and the epoch fingerprint) of the tree at root."""
+    return (current_fingerprint(root), aeth_fingerprint(root), aeth_decision_fingerprint(root),
+            current_epoch_fingerprint(root))
 
 
 def test_aeth_files_are_every_py_file_below_aeth():
@@ -241,21 +269,41 @@ def test_aeth_files_are_every_py_file_below_aeth():
     assert aeth_fingerprint() == fingerprint_of(files)
 
 
-def test_an_aeth_edit_changes_the_aeth_and_epoch_fingerprints_but_not_strategy_a_s(tmp_path):
+def test_the_decision_files_are_config_and_data(tmp_path):
     root = _copy_src(tmp_path)
-    a0, e0, ep0 = current_fingerprint(root), aeth_fingerprint(root), current_epoch_fingerprint(root)
-    cfg = root / "src/ewbot/aeth/config.py"
-    cfg.write_bytes(cfg.read_bytes() + b"# one comment line\n")
-    assert current_fingerprint(root) == a0
-    assert aeth_fingerprint(root) != e0 and current_epoch_fingerprint(root) != ep0
+    assert AETH_DECISION_FILES == ("config.py", "data.py")
+    files = aeth_decision_files(root)
+    assert set(files) == {f"{AETH}/config.py", f"{AETH}/data.py"}
+    assert files.items() <= aeth_files(root).items()
+    assert aeth_decision_fingerprint(root) == fingerprint_of(files)
+
+
+@pytest.mark.parametrize("name", AETH_DECISION_FILES)
+def test_a_decision_file_edit_changes_both_aeth_fingerprints_and_the_epoch_but_not_strategy_a_s(tmp_path, name):
+    root = _copy_src(tmp_path)
+    a0, e0, d0, ep0 = _all(root)
+    _touch(root, f"aeth/{name}")
+    a1, e1, d1, ep1 = _all(root)
+    assert a1 == a0 and e1 != e0 and d1 != d0 and ep1 != ep0
+
+
+@pytest.mark.parametrize("name", RUNTIME)
+def test_a_runtime_edit_changes_the_aeth_fingerprint_but_not_the_epoch(tmp_path, name):
+    """Spec 8 (amended 2026-10-08): a runtime fix during paper trading keeps the paper epoch and the ETH count;
+    stage 1, the lock and the holdout still bind every A-ETH file."""
+    root = _copy_src(tmp_path)
+    a0, e0, d0, ep0 = _all(root)
+    _touch(root, f"aeth/{name}")
+    a1, e1, d1, ep1 = _all(root)
+    assert a1 == a0 and e1 != e0 and d1 == d0 and ep1 == ep0
 
 
 def test_a_strategy_a_edit_changes_the_epoch_fingerprint_but_not_aeth_s(tmp_path):
     root = _copy_src(tmp_path)
-    e0, ep0 = aeth_fingerprint(root), current_epoch_fingerprint(root)
-    loop = root / "src/ewbot/engine/loop.py"
-    loop.write_bytes(loop.read_bytes() + b"# one comment line\n")
-    assert aeth_fingerprint(root) == e0 and current_epoch_fingerprint(root) != ep0
+    _, e0, d0, ep0 = _all(root)
+    _touch(root, "engine/loop.py")
+    _, e1, d1, ep1 = _all(root)
+    assert e1 == e0 and d1 == d0 and ep1 != ep0
 
 
 def test_files_outside_both_change_neither(tmp_path):
@@ -266,14 +314,36 @@ def test_files_outside_both_change_neither(tmp_path):
     assert current_epoch_fingerprint(root) == ep0
 
 
-def test_epoch_fingerprint_is_the_ordered_pair():
+def test_epoch_fingerprint_is_the_ordered_pair_of_a_s_and_the_decision_fingerprint(tmp_path):
+    root = _copy_src(tmp_path)
     assert epoch_fingerprint("a", "b") != epoch_fingerprint("b", "a")
-    assert current_epoch_fingerprint() == epoch_fingerprint(current_fingerprint(), aeth_fingerprint())
+    assert current_epoch_fingerprint(root) == epoch_fingerprint(current_fingerprint(root),
+                                                                aeth_decision_fingerprint(root))
 
 
-def test_no_aeth_files_is_an_error(tmp_path):
+def test_no_aeth_files_or_a_missing_decision_file_is_an_error(tmp_path):
     with pytest.raises(FileNotFoundError):
         aeth_fingerprint(tmp_path)
+    root = _copy_src(tmp_path / "copy")
+    (root / AETH / "data.py").unlink()
+    with pytest.raises(FileNotFoundError, match="data.py"):
+        aeth_decision_fingerprint(root)
+
+
+def test_the_decision_files_take_from_a_eth_only_decision_files_and_the_lock_check():
+    """No decision logic can sit in an A-ETH module outside the decision fingerprint: config.py and data.py import
+    from ewbot.aeth only each other and lockfile (lock_exists lets the bars be read or refuses; it never changes
+    them)."""
+    allowed = {f"ewbot.aeth.{name[:-3]}" for name in AETH_DECISION_FILES} | {"ewbot.aeth.lockfile"}
+    for name in AETH_DECISION_FILES:
+        p = PROJECT_ROOT / AETH / name
+        if not p.exists():  # data.py arrives in Task 2
+            continue
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        mods |= {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level], name
+        assert {m for m in mods if m.startswith("ewbot.aeth")} <= allowed, name
 ```
 
 **파일 `tests/aeth/test_isolation.py`** (새 파일, 전체 내용)
@@ -523,13 +593,23 @@ def config_json(params: Combo) -> dict[str, Any]:
 **파일 `src/ewbot/aeth/fingerprint.py`** (새 파일, 전체 내용)
 
 ```python
-"""A-ETH fingerprints (Plan 5a spec 3, 8), in strategy A's format (ewbot.paper.fingerprint.fingerprint_of: sorted
-repo-relative paths, each path NUL bytes NUL).
+"""A-ETH fingerprints (Plan 5a spec 3, 8; amended 2026-10-08), in strategy A's format
+(ewbot.paper.fingerprint.fingerprint_of: sorted repo-relative paths, each path NUL bytes NUL).
 
-aeth_fingerprint: every *.py file below src/ewbot/aeth - A-ETH's own code (ETH costs, data, stages, runtime). It
-is outside strategy A's fingerprinted folders and no A file is in it, so either can change without the other.
-epoch_fingerprint: what a paper-A-ETH epoch is bound to - strategy A's fingerprint (the strategy files) and the
-A-ETH fingerprint together. A change of either opens a new epoch and restarts the ETH count."""
+aeth_fingerprint: every *.py file below src/ewbot/aeth - all of A-ETH's code. Stage 1, holdout-aeth.lock and the
+holdout run bind it: from stage 1 to the holdout no A-ETH file can change.
+aeth_decision_fingerprint: the A-ETH files that decide what a paper run trades (AETH_DECISION_FILES) - config.py
+(the params read from A's lock, the run config with the ETH costs, the product, the first bar) and data.py (which
+ETH bars are fetched and how they are read). A change there changes the bars or the config the paper run recomputes
+from, which the replay check alone would take for a data revision. Every other A-ETH file is runtime or a check:
+paper.py (the runner, like strategy A's paper/runner.py, which A's fingerprint leaves out too), sync.py, the lock
+checks of lockfile.py and holdout.py (they allow a run or refuse it), stage1.py (not used by the paper run) and
+this module.
+epoch_fingerprint: what a paper-A-ETH epoch is bound to - strategy A's fingerprint and the A-ETH decision
+fingerprint. A change of either opens a new epoch and restarts the ETH count; a runtime fix during paper trading
+does not (before the holdout run, the A-ETH files are frozen from stage 1 on and every src/ewbot *.py from the
+lock on).
+None of A-ETH's files is in strategy A's fingerprinted set, so either side can change without the other."""
 
 from __future__ import annotations
 
@@ -539,11 +619,16 @@ from pathlib import Path
 from ewbot.paper.fingerprint import PROJECT_ROOT, current_fingerprint, fingerprint_of
 
 AETH_PREFIX = "src/ewbot/aeth/"
+AETH_DECISION_FILES = ("config.py", "data.py")
+
+
+def _pkg(repo_root: Path | None) -> Path:
+    return (PROJECT_ROOT if repo_root is None else Path(repo_root)) / "src" / "ewbot" / "aeth"
 
 
 def aeth_files(repo_root: Path | None = None) -> dict[str, bytes]:
     """{"src/ewbot/aeth/<rel>": bytes} for every *.py file below src/ewbot/aeth."""
-    pkg = (PROJECT_ROOT if repo_root is None else Path(repo_root)) / "src" / "ewbot" / "aeth"
+    pkg = _pkg(repo_root)
     return {AETH_PREFIX + f.relative_to(pkg).as_posix(): f.read_bytes() for f in pkg.rglob("*.py") if f.is_file()}
 
 
@@ -554,13 +639,24 @@ def aeth_fingerprint(repo_root: Path | None = None) -> str:
     return fingerprint_of(files)
 
 
-def epoch_fingerprint(a_fingerprint: str, aeth_sha256: str) -> str:
-    """sha256 of the pair (strategy A's fingerprint, the A-ETH fingerprint)."""
-    return hashlib.sha256(f"strategy-a:{a_fingerprint}\naeth:{aeth_sha256}\n".encode("utf-8")).hexdigest()
+def aeth_decision_files(repo_root: Path | None = None) -> dict[str, bytes]:
+    """{"src/ewbot/aeth/<name>": bytes} for the AETH_DECISION_FILES (FileNotFoundError when one is missing)."""
+    pkg = _pkg(repo_root)
+    return {AETH_PREFIX + name: (pkg / name).read_bytes() for name in AETH_DECISION_FILES}
+
+
+def aeth_decision_fingerprint(repo_root: Path | None = None) -> str:
+    return fingerprint_of(aeth_decision_files(repo_root))
+
+
+def epoch_fingerprint(a_fingerprint: str, aeth_decision_sha256: str) -> str:
+    """sha256 of the pair (strategy A's fingerprint, the A-ETH decision fingerprint)."""
+    pair = f"strategy-a:{a_fingerprint}\naeth-decision:{aeth_decision_sha256}\n"
+    return hashlib.sha256(pair.encode("utf-8")).hexdigest()
 
 
 def current_epoch_fingerprint(repo_root: Path | None = None) -> str:
-    return epoch_fingerprint(current_fingerprint(repo_root), aeth_fingerprint(repo_root))
+    return epoch_fingerprint(current_fingerprint(repo_root), aeth_decision_fingerprint(repo_root))
 ```
 
 - [ ] **Step 4: 테스트를 실행해 통과를 확인**
@@ -569,9 +665,9 @@ def current_epoch_fingerprint(repo_root: Path | None = None) -> str:
 uv run --group live pytest tests/aeth tests/paper/test_static.py -q
 ```
 
-예상: `51 passed`
+예상: `61 passed`
 
-`tests/aeth` 23개와 `tests/paper/test_static.py` 28개(기존 27개 + 새 CI 검사 1개)다.
+`tests/aeth` 33개와 `tests/paper/test_static.py` 28개(기존 27개 + 새 CI 검사 1개)다.
 
 - [ ] **Step 5: 커밋**
 
@@ -592,7 +688,7 @@ git commit -m "feat(aeth): A-ETH config with strategy A's frozen params and ETH 
 
 **Interfaces:**
 - Consumes: Task 1: `ewbot.aeth.config`: `AethError`, `DATA_START`, `LOCK_PATH`, `PRODUCT`. A: `ewbot.backtest.report.to_jsonable(o) -> Any`; `ewbot.data.coinbase_history`: `COLUMNS = ["ts", "open", "high", "low", "close", "volume"]`, `fetch_1h(product, start_ts, end_ts, session=None, sleep_s=0.15) -> DataFrame`(열린 시각이 [start_ts, end_ts)인 마감 봉); `ewbot.backtest.walkforward.HOLDOUT_START`; `ewbot.types.H1`. 테스트: `tests.paper.helpers`: `BOUNDARY = 1704844800`(2024-01-10 00:00), `git(repo, *args)`, `make_lock`, `synth_frame`.
-- Produces: `ewbot.aeth.lockfile`: `LOCK_KIND = "ewbot-aeth-holdout"`, `LOCK_VERSION = 1`, `LOCK_BOUND`(해석 5의 15개 필드 이름 튜플), `lock_digest(lock: Mapping) -> str`, `lock_exists(lock_path: Path) -> bool`, `read_lock(lock_path: Path) -> dict`(유효하지 않으면 `AethError`), `write_json(path: Path, obj) -> None`(엄격한 JSON, 원자적), `committed_text(path: Path) -> str | None`(그 작업 트리의 git HEAD 내용), `dirty_files(anchor: Path, *ignore: str) -> list[str]`, `refuse_dirty(anchor: Path, *ignore: str) -> None`(`AethError`).
+- Produces: `ewbot.aeth.lockfile`: `LOCK_KIND = "ewbot-aeth-holdout"`, `LOCK_VERSION = 1`, `LOCK_BOUND`(해석 5의 16개 필드 이름 튜플), `lock_digest(lock: Mapping) -> str`, `lock_exists(lock_path: Path) -> bool`, `read_lock(lock_path: Path) -> dict`(유효하지 않으면 `AethError`), `write_json(path: Path, obj) -> None`(엄격한 JSON, 원자적), `committed_text(path: Path) -> str | None`(그 작업 트리의 git HEAD 내용), `dirty_files(anchor: Path, *ignore: str) -> list[str]`, `refuse_dirty(anchor: Path, *ignore: str) -> None`(`AethError`).
   `ewbot.aeth.data`: `CHUNK_HOURS = 3000`, `Fetch = Callable[[str, int, int], DataFrame]`, `class HoldoutGuardError(AethError)`, `cache_path(cache_dir: Path) -> Path`(`<cache_dir>/ETH-USD_1h.parquet`), `fetch_eth(cache_dir: Path, *, lock_path: Path = LOCK_PATH, now_ts: int | None = None, fetch: Fetch = fetch_1h) -> Path`, `load_eth(path: Path, *, unlock_2024: bool = False, lock_path: Path = LOCK_PATH) -> DataFrame`(표준 열, 정렬, ts 중복 없음).
   `tests/aeth/helpers.py`: `HS = 1704067200`, `ETH_SCALE = 0.1`, `HOLDOUT_TRADES = 2`, `LOCK_NOW = BOUNDARY + 3600 + 7`, `eth_frame() -> DataFrame`, `pre2024_frame() -> DataFrame`(마지막 봉 2023-12-31 23:00, 3,000개), `save_cache(cache_dir, df) -> Path`, `init_repo(repo) -> Path`(커밋 하나가 있는 git 저장소), `commit_file(repo, name, text) -> Path`(바뀌었을 때만 커밋), `write_a_lock(directory, **overrides) -> Path`(합성 A `holdout.lock`, 파라미터 (2.0, 0.5, 0.0)), `a_lock_sha(a_lock) -> str`, `class FakeFetch1h(source)`(`fetch_1h` 대역, `calls`에 `(product, start, end)` 기록), `class FakeCacheFetch(source, clock, fail=0)`(모의매매 `default_fetch` 대역, Task 5).
 
@@ -896,7 +992,8 @@ from ewbot.backtest.report import to_jsonable
 LOCK_KIND = "ewbot-aeth-holdout"
 LOCK_VERSION = 1
 LOCK_BOUND = ("kind", "version", "product", "future", "params", "a_lock_sha256", "config", "holdout_start",
-              "last_bar_ts", "random_runs", "a_fingerprint", "aeth_sha256", "code_sha256", "pre2024", "stage1_sha256")
+              "last_bar_ts", "random_runs", "a_fingerprint", "aeth_sha256", "aeth_decision_sha256", "code_sha256",
+              "pre2024", "stage1_sha256")
 
 
 def lock_digest(lock: Mapping[str, Any]) -> str:
@@ -1537,7 +1634,7 @@ git commit -m "feat(aeth): stage 1 - A's compare on ETH 2017-2023, the pre-regis
 - Modify: `tests/paper/test_static.py` (`ALLOWED_TRUE`에 `aeth/holdout.py`)
 
 **Interfaces:**
-- Consumes: Task 1~3 전부(특히 `frozen_a_params`, `config_json`, `aeth_config`, `aeth_fingerprint`, `lock_digest`, `read_lock`, `committed_text`, `refuse_dirty`, `write_json`, `LOCK_KIND`, `LOCK_VERSION`, `cache_path`, `load_eth(..., unlock_2024=True, ...)`, `STAGE1_KIND`, `MAX_DD`, `data_record`, `headline`, `stage1_verdict`). A: `ewbot.backtest.holdout.evaluate_criteria(cmp) -> dict`(`winners`, `max_dd_ok`, `n_trades_ok`, `n_trades`, `trade_count`, `random_control_evaluated`, `passing`, `paper_4_weeks`, `automatic_criteria_met`), `code_fingerprint()`, `data_fingerprint`, `git_state()`; `compare(..., allow_holdout=True)`; `fill_gaps`; `current_fingerprint()`.
+- Consumes: Task 1~3 전부(특히 `frozen_a_params`, `config_json`, `aeth_config`, `aeth_fingerprint`, `aeth_decision_fingerprint`, `lock_digest`, `read_lock`, `committed_text`, `refuse_dirty`, `write_json`, `LOCK_KIND`, `LOCK_VERSION`, `cache_path`, `load_eth(..., unlock_2024=True, ...)`, `STAGE1_KIND`, `MAX_DD`, `data_record`, `headline`, `stage1_verdict`). A: `ewbot.backtest.holdout.evaluate_criteria(cmp) -> dict`(`winners`, `max_dd_ok`, `n_trades_ok`, `n_trades`, `trade_count`, `random_control_evaluated`, `passing`, `paper_4_weeks`, `automatic_criteria_met`), `code_fingerprint()`, `data_fingerprint`, `git_state()`; `compare(..., allow_holdout=True)`; `fill_gaps`; `current_fingerprint()`.
 - Produces: `ewbot.aeth.holdout`: `stage2_verdict(criteria: Mapping, comparison: Mapping) -> dict`(`c1_a_beats_c_bh_random_mean`, `c2_max_dd_le_15pct`, `n_trades`, `passed`), `lock_mismatch(lock: Mapping, a_lock_path: Path = A_LOCK_PATH) -> list[str]`, `create_lock(raw_pre2024, *, now_ts: int, lock_path=LOCK_PATH, stage1_path=STAGE1_PATH, a_lock_path=A_LOCK_PATH, random_runs=RANDOM_RUNS) -> dict`, `run_holdout_aeth(*, confirm: bool, cache_dir: Path, lock_path=LOCK_PATH, a_lock_path=A_LOCK_PATH, workers=1, a_fingerprint=current_fingerprint, aeth_fp=aeth_fingerprint, code_fp=code_fingerprint) -> dict`(`{"lock_path", "compare", "first_run"}`; `first_run`: `started, completed, start_ts, end_ts, last_bar_ts, data{start_ts, last_bar_ts, n_bars, sha256}, headline, criteria, verdict`).
   `tests/aeth/records.py`: `PASSING_HEADLINE`, `stage1_record(raw_pre2024, a_lock, *, headline=None, **provenance) -> dict`, `aeth_lock(df, a_lock, *, passed=True, n_trades=HOLDOUT_TRADES, last_bar=BOUNDARY, **overrides) -> dict`(Task 5·6이 쓰는, 홀드아웃이 끝난 잠금).
 
@@ -1563,7 +1660,7 @@ from typing import Any
 import pandas as pd
 
 from ewbot.aeth.config import FUTURE, PRODUCT, config_json
-from ewbot.aeth.fingerprint import aeth_fingerprint
+from ewbot.aeth.fingerprint import aeth_decision_fingerprint, aeth_fingerprint
 from ewbot.aeth.lockfile import LOCK_KIND, LOCK_VERSION, lock_digest
 from ewbot.aeth.stage1 import STAGE1_KIND, data_record, stage1_verdict
 from ewbot.backtest.holdout import data_fingerprint
@@ -1605,8 +1702,8 @@ def aeth_lock(df: pd.DataFrame, a_lock: Path, *, passed: bool = True, n_trades: 
         "kind": LOCK_KIND, "version": LOCK_VERSION, "product": PRODUCT, "future": FUTURE, "params": list(PARAMS),
         "a_lock_sha256": a_lock_sha(a_lock), "config": config_json(PARAMS), "holdout_start": HS,
         "last_bar_ts": last_bar, "random_runs": 2, "a_fingerprint": current_fingerprint(),
-        "aeth_sha256": aeth_fingerprint(), "code_sha256": "c0de" * 16, "pre2024": data_record(df),
-        "stage1_sha256": "5" * 64,
+        "aeth_sha256": aeth_fingerprint(), "aeth_decision_sha256": aeth_decision_fingerprint(),
+        "code_sha256": "c0de" * 16, "pre2024": data_record(df), "stage1_sha256": "5" * 64,
     }
     lock.update(overrides)
     lock.update(sha256=lock_digest(lock), git_head="f" * 40, git_dirty=False, attempts=[], first_run={
@@ -1629,7 +1726,7 @@ import json
 import pytest
 
 from ewbot.aeth.config import FROZEN_A_FINGERPRINT, AethError, config_json
-from ewbot.aeth.fingerprint import aeth_fingerprint
+from ewbot.aeth.fingerprint import aeth_decision_fingerprint, aeth_fingerprint
 from ewbot.aeth.holdout import create_lock, lock_mismatch, run_holdout_aeth, stage2_verdict
 from ewbot.aeth.lockfile import LOCK_KIND, lock_digest, lock_exists
 from ewbot.aeth.stage1 import data_record, headline
@@ -1690,6 +1787,7 @@ def test_the_lock_binds_the_passed_stage_1_record_and_what_it_ran_on(tmp_path):
     assert lock["config"] == config_json(PARAMS) and lock["holdout_start"] == HS
     assert lock["last_bar_ts"] == BOUNDARY and lock["random_runs"] == 2
     assert lock["a_fingerprint"] == FROZEN_A_FINGERPRINT and lock["aeth_sha256"] == aeth_fingerprint()
+    assert lock["aeth_decision_sha256"] == aeth_decision_fingerprint()  # the paper epoch's baseline
     assert lock["code_sha256"] == code_fingerprint() and lock["pre2024"] == data_record(w["raw"])
     assert lock["stage1_sha256"] == hashlib.sha256(w["text"].encode("utf-8")).hexdigest()
     assert lock["sha256"] == lock_digest(lock) and lock["first_run"] is None and lock["attempts"] == []
@@ -1757,7 +1855,7 @@ def test_the_holdout_runs_a_s_comparison_and_criteria_on_the_window(ran):
     assert len(lock["attempts"]) == 1 and lock["attempts"][0]["data_sha256"] == fr["data"]["sha256"]
 
 
-def test_a_missing_last_bar_is_filled_from_the_later_bars_like_the_paper_runtime_does(tmp_path):
+def test_a_missing_last_bar_is_filled_before_the_cut_like_the_paper_runtime_does(tmp_path):
     w = _world(tmp_path)
     gap = w["df"][w["df"]["ts"] != BOUNDARY].reset_index(drop=True)
     save_cache(w["cache"], gap)
@@ -1852,7 +1950,8 @@ that passed (its criteria are stage1_verdict of its own headline) and was made w
 strategy A's holdout.lock, this A-ETH code (aeth_sha256), strategy A's frozen fingerprint and the same pre-2024 ETH
 bars. The lock fixes the product and contract, the params and A's lock sha256, the full config (ETH costs), the
 holdout start and its last bar (the last complete hour at lock time), the 100-run random control, A's
-fingerprint, the A-ETH fingerprint, the code state like A's lock (code_sha256: A's code_fingerprint over every
+fingerprint, the A-ETH fingerprint, the A-ETH decision fingerprint (config.py and data.py: what the paper
+epoch is bound to, spec 8), the code state like A's lock (code_sha256: A's code_fingerprint over every
 src/ewbot *.py), the pre-2024 bars (data_record) and the stage-1 record's sha256, and their digest. It refuses a
 dirty tracked tree. The user commits it at once.
 
@@ -1891,7 +1990,7 @@ from ewbot.aeth.config import (
     frozen_a_params,
 )
 from ewbot.aeth.data import cache_path, load_eth
-from ewbot.aeth.fingerprint import aeth_fingerprint
+from ewbot.aeth.fingerprint import aeth_decision_fingerprint, aeth_fingerprint
 from ewbot.aeth.lockfile import (
     LOCK_KIND,
     LOCK_VERSION,
@@ -1991,6 +2090,7 @@ def create_lock(
         "random_runs": int(random_runs),
         "a_fingerprint": a_fp,
         "aeth_sha256": aeth_sha,
+        "aeth_decision_sha256": aeth_decision_fingerprint(),
         "code_sha256": code_fingerprint(),
         "pre2024": pre,
         "stage1_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -2039,7 +2139,7 @@ def run_holdout_aeth(
     last = int(lock["last_bar_ts"])
     if raw.empty or int(raw["ts"].iloc[-1]) < last:
         raise AethError(f"the ETH cache ends before the lock's last bar {last}: run `ewbot aeth fetch` first")
-    filled = fill_gaps(raw)  # like the paper runtime: a missing last bar is filled from the bars after it
+    filled = fill_gaps(raw)  # like the paper runtime: fill all, then cut (a missing last bar: flat at the prior close)
     df = filled[filled["ts"] <= last].reset_index(drop=True)
     data = {"start_ts": HOLDOUT_START, "last_bar_ts": last,
             "n_bars": int(((df["ts"] >= HOLDOUT_START) & (df["ts"] <= last)).sum()),
@@ -2099,7 +2199,7 @@ A의 `paper/runner.py`의 `run_paper`를 해석 9대로 옮긴다: 단계 이름
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-합성 ETH 경로(해석 14)와 홀드아웃이 끝난 합성 잠금으로 첫 실행(홀드아웃 재현 2건, 모의 2건, 4/50, 장부와 `runs.log`만, 접두어), 같은 시간 재실행과 새 봉(진입, 실행 공백, 일일 요약과 상태 줄), 구간 변경(카운트 리셋, 판정 대상 아님), 사전 점검 거부(이유별 7가지; 아무것도 쓰지 않음), 홀드아웃 데이터·거래 수 경고(한 번씩, 실행은 계속), 수집 재시도(10초, 20초)와 3회 실패, 다른 잠금의 장부 거부, 상태 줄, 접두어 바꾸기를 확인한다.
+합성 ETH 경로(해석 14)와 홀드아웃이 끝난 합성 잠금으로 첫 실행(홀드아웃 재현 2건, 모의 2건, 4/50, 장부와 `runs.log`만, 접두어), 같은 시간 재실행과 새 봉(진입, 실행 공백, 일일 요약과 상태 줄), 구간 변경(카운트 리셋, 판정 대상 아님), 모의매매 중 런타임 수정(`paper.py`·`sync.py`; A-ETH 지문은 바뀜)은 구간을 유지하고 `config.py` 수정은 새 구간을 엶, 사전 점검 거부(이유별 7가지; 아무것도 쓰지 않음), 홀드아웃 데이터·거래 수 경고(한 번씩, 실행은 계속), 수집 재시도(10초, 20초)와 3회 실패, 다른 잠금의 장부 거부, 상태 줄, 접두어 바꾸기를 확인한다.
 
 **파일 `tests/aeth/test_paper.py`** (새 파일, 전체 내용)
 
@@ -2108,10 +2208,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 
-from ewbot.aeth.fingerprint import current_epoch_fingerprint
+from ewbot.aeth.fingerprint import aeth_fingerprint, current_epoch_fingerprint
 from ewbot.aeth.paper import (
     HEAD_AETH,
     AethPaperEnv,
@@ -2123,6 +2224,7 @@ from ewbot.aeth.paper import (
     status_lines_aeth,
 )
 from ewbot.paper.environment import environment_digest
+from ewbot.paper.fingerprint import PROJECT_ROOT
 from ewbot.paper.ledger import LEDGER_FILE, RUNS_LOG, load_ledger
 from ewbot.types import H1
 from tests.aeth.helpers import FakeCacheFetch, commit_file, eth_frame, write_a_lock
@@ -2163,7 +2265,7 @@ def test_first_run_reproduces_the_holdout_and_records_the_eth_paper_trades(make_
     led = load_ledger(env.ledger_dir)
     assert sorted(os.listdir(env.ledger_dir)) == [LEDGER_FILE, RUNS_LOG]  # no report.html
     assert [e["id"] for e in led.epochs] == [1] and led.epochs[0]["started_ts"] == BOUNDARY
-    assert led.baseline["fingerprint"] == current_epoch_fingerprint()  # A's + A-ETH's at the lock = now
+    assert led.baseline["fingerprint"] == current_epoch_fingerprint()  # A's + A-ETH decision at the lock = now
     assert [t["entry_ts"] for t in led.trades] == [ts("2024-01-12 15:00"), ts("2024-02-07 21:00")]
     run = led.runs[0]
     assert run["holdout_trades_recomputed"] == 2 and run["holdout_data_ok"] is True and run["warnings"] == []
@@ -2194,7 +2296,7 @@ def test_a_rerun_in_the_same_hour_adds_nothing_and_new_bars_add_only_their_decis
     assert "A-ETH 실거래 검토 조건" in new[2] and "A-BTC CANARY" in new[2]
 
 
-def test_a_changed_strategy_a_or_aeth_fingerprint_opens_a_new_epoch_and_restarts_the_count(make_env):
+def test_a_changed_strategy_a_or_aeth_decision_fingerprint_opens_a_new_epoch_and_restarts_the_count(make_env):
     env = make_env()
     run_paper_aeth(env)
     env.fingerprint = lambda: "edited"
@@ -2206,6 +2308,29 @@ def test_a_changed_strategy_a_or_aeth_fingerprint_opens_a_new_epoch_and_restarts
                                    "required": 50}
     assert out.status["auto_met"] is False and "판정 대상 아님" in status_lines_aeth(out.status)[1]
     assert env.sender.texts[-1].startswith(HEAD_AETH) and "구간 2" in env.sender.texts[-1]
+
+
+def test_a_runtime_fix_during_paper_trading_keeps_the_epoch_and_a_config_edit_opens_one(make_env, tmp_path):
+    """Spec 8 (amended 2026-10-08): the epoch is bound to strategy A's fingerprint and the A-ETH decision
+    fingerprint (aeth/config.py, aeth/data.py) - a fix to paper.py or sync.py while paper trading keeps the count."""
+    root = tmp_path / "tree"
+    shutil.copytree(PROJECT_ROOT / "src" / "ewbot", root / "src" / "ewbot")
+    aeth = root / "src" / "ewbot" / "aeth"
+    env = make_env(fingerprint=lambda: current_epoch_fingerprint(root))
+    run_paper_aeth(env)
+    for name in ("paper.py", "sync.py"):  # sync.py is created while the plan has not added it yet (Task 7)
+        f = aeth / name
+        f.write_bytes((f.read_bytes() if f.exists() else b"") + b"# a runtime fix: messages, retries\n")
+    assert aeth_fingerprint(root) != aeth_fingerprint()  # the lock's A-ETH fingerprint no longer holds
+    env.clock.now += H1
+    out = run_paper_aeth(env)
+    assert [e["id"] for e in load_ledger(env.ledger_dir).epochs] == [1]
+    assert out.status["eligible"] is True and out.status["count"]["total"] == 4
+    (aeth / "config.py").write_bytes((aeth / "config.py").read_bytes() + b"# a decision file edit\n")
+    env.clock.now += H1
+    out = run_paper_aeth(env)
+    assert [e["id"] for e in load_ledger(env.ledger_dir).epochs] == [1, 2]
+    assert out.status["eligible"] is False and out.status["count"]["total"] == 0
 
 
 @pytest.mark.parametrize("case, why", [
@@ -2331,11 +2456,15 @@ Each run recomputes from the first cached bar (2017-01-01) and trades from 2024-
 reproduces the holdout and continues it; closed trades entering after the lock's last bar are paper trades, and the
 count to 50 is the holdout's A trades plus the paper trades of the baseline epoch (strategy A's golive_count, on
 this ledger only: ETH trades are never pooled with strategy A's BTC count). An epoch is bound to strategy A's
-fingerprint and the A-ETH fingerprint together (fingerprint.epoch_fingerprint): a change of either opens a new epoch
-and restarts the count. The holdout window's bars no longer hashing to first_run.data.sha256 is warned once per
-hash, never refused; decisions that change because of it are DATA_REVISION. No report.html and no daily criteria
-1-2 recompute (spec 8): the go-live block is status_aeth / status_lines_aeth. Every step runs inside a named stage:
-any failure raises AethPaperError(stage); nothing is written before the write stage."""
+fingerprint and the A-ETH decision fingerprint (aeth/config.py, aeth/data.py) together
+(fingerprint.epoch_fingerprint): a change of either opens a new epoch and restarts the count; a fix to this runtime,
+sync.py or the CLI does not (spec 8, amended 2026-10-08). Like strategy A's paper/runner.py, this module is outside
+the epoch fingerprint, so during paper trading only its messages, retries, ledger IO and alerts change - not what it
+computes (the data path, the recompute, the count): a decision changed here shows up as a discrepancy, not as a new
+epoch. The holdout window's bars no longer hashing to first_run.data.sha256 is warned once per hash, never refused;
+decisions that change because of it are DATA_REVISION. No report.html and no daily criteria 1-2 recompute (spec 8):
+the go-live block is status_aeth / status_lines_aeth. Every step runs inside a named stage: any failure raises
+AethPaperError(stage); nothing is written before the write stage."""
 
 from __future__ import annotations
 
@@ -2505,9 +2634,10 @@ def holdout_summary_aeth(lock: dict[str, Any]) -> dict[str, Any]:
 
 
 def new_ledger_aeth(lock: dict[str, Any]) -> Ledger:
-    """Epoch 1 starts at the lock's last bar with the lock's epoch fingerprint (A's and A-ETH's at the lock)."""
+    """Epoch 1 starts at the lock's last bar with the lock's epoch fingerprint (A's and the A-ETH decision
+    fingerprint at the lock)."""
     hs = holdout_summary_aeth(lock)
-    fp = epoch_fingerprint(lock["a_fingerprint"], lock["aeth_sha256"])
+    fp = epoch_fingerprint(lock["a_fingerprint"], lock["aeth_decision_sha256"])
     start = hs["last_bar_ts"]
     epoch = {"id": 1, "fingerprint": fp, "started_ts": start, "reason": "baseline: holdout-aeth.lock",
              "through_ts": start}
@@ -2535,7 +2665,7 @@ def status_lines_aeth(st: dict[str, Any]) -> list[str]:
     count, c4 = st["count"], st["c4"]
     lines = ["A-ETH 실거래 검토 조건 (Plan 5a 명세 8.1)"]
     if not st["eligible"]:
-        lines.append(f"현재 구간 {st['epoch_id']}의 지문(A 지문 + A-ETH 지문)이 잠금 파일과 다름: 판정 대상 아님")
+        lines.append(f"현재 구간 {st['epoch_id']}의 지문(A 지문 + A-ETH 판단 지문)이 잠금 파일과 다름: 판정 대상 아님")
     lines.append(f"1. 단계 2 홀드아웃 합격 (A의 9.6절 1·2번): {_mark(st['holdout_passed'])}")
     lines.append(f"2. ETH 표본 외 거래 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 "
                  f"{count['paper']}): {_mark(st['count_met'])}")
@@ -2743,9 +2873,9 @@ def run_paper_aeth(env: AethPaperEnv) -> AethRunOutcome:
 uv run --group live pytest tests/aeth/test_paper.py tests/paper/test_static.py -q
 ```
 
-예상: `43 passed`
+예상: `44 passed`
 
-`tests/aeth/test_paper.py` 15개와 `tests/paper/test_static.py` 28개다.
+`tests/aeth/test_paper.py` 16개와 `tests/paper/test_static.py` 28개다.
 
 - [ ] **Step 5: 커밋**
 
@@ -2770,7 +2900,7 @@ A·B의 CLI와 같은 방식이다(해석 12). 처리 함수만 `ewbot.aeth`를 
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-파서(하위 명령, 조정 옵션 없음), `ewbot.cli`가 `ewbot.aeth`를 불러오지 않음(새 프로세스), 실제 배선, `fetch` 출력, 단계 1이 전체 기간으로만 돌고 1회임, 잠금에 커밋된 단계 1 기록이 필요함, 홀드아웃이 확인과 잠금 전에는 아무것도 받지 않음, 모의매매 실행과 상태, 실패 알림(접두어, 표시 파일), 장부 없는 상태를 확인한다.
+파서(하위 명령, 조정 옵션 없음), `ewbot.cli`가 `ewbot.aeth`를 불러오지 않음(새 프로세스), 실제 배선, `fetch` 출력, 단계 1이 전체 기간으로만 돌고 1회임, 잠금에 커밋된 단계 1 기록이 필요함, 잠금 없이 2024 봉이 든 캐시를 `fetch`·`stage1`·`holdout lock`이 traceback이 아니라 `refusing:`과 종료 코드 2로 거부함, 홀드아웃이 확인과 잠금 전에는 아무것도 받지 않음, 모의매매 실행과 상태, 실패 알림(접두어, 표시 파일), 장부 없는 상태를 확인한다.
 
 **파일 `tests/aeth/test_cli_aeth.py`** (새 파일, 전체 내용)
 
@@ -2884,6 +3014,16 @@ def test_the_lock_needs_the_committed_stage1_record(tmp_path, monkeypatch, capsy
     assert "must be committed unchanged" in capsys.readouterr().err and not ec.LOCK_PATH.exists()
 
 
+@pytest.mark.parametrize("argv", [["fetch"], ["stage1"], ["holdout", "lock"]])
+def test_a_cache_with_2024_bars_before_the_lock_is_refused_not_a_traceback(tmp_path, monkeypatch, capsys, argv):
+    _stage1_world(tmp_path, monkeypatch)
+    save_cache(tmp_path / "cache", eth_frame())  # reaches 2024 without a lock: not A-ETH's (A's `ewbot fetch`)
+    assert _code(["aeth", *argv, "--cache-dir", str(tmp_path / "cache")]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("refusing: ") and "did not come from A-ETH" in err
+    assert not ec.STAGE1_PATH.exists() and not ec.LOCK_PATH.exists()
+
+
 @pytest.mark.parametrize("argv, why", [
     (["--confirm"], "not a valid A-ETH lock"),
     ([], "runs once, after the user's approval"),
@@ -2961,7 +3101,7 @@ uv run --group live pytest tests/aeth/test_cli_aeth.py -q
 ```
 
 예상: `invalid choice: 'aeth'`
-예상: `9 failed, 1 passed, 2 errors`
+예상: `12 failed, 1 passed, 2 errors`
 
 `aeth` 하위 명령이 아직 없어 파서가 거부하고(`invalid choice: 'aeth'`), `cli._e_paper_env`가 없어 그것을 바꾸는 픽스처를 쓰는 테스트 2개는 준비 단계에서 오류가 난다. `ewbot.cli`가 `ewbot.aeth`를 불러오지 않는다는 테스트 1개는 지금도 통과한다.
 
@@ -3052,8 +3192,11 @@ def _e_fetch(args: argparse.Namespace) -> int:
     from ewbot.aeth.data import fetch_eth
     from ewbot.aeth.lockfile import lock_exists
 
-    path = fetch_eth(args.cache_dir, lock_path=ec.LOCK_PATH)
-    raw = _e_raw(args)
+    try:
+        path = fetch_eth(args.cache_dir, lock_path=ec.LOCK_PATH)
+        raw = _e_raw(args)
+    except ec.AethError as exc:
+        _refuse(str(exc))
     first = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(raw["ts"].iloc[0]))) if len(raw) else "-"
     last = time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(raw["ts"].iloc[-1]))) if len(raw) else "-"
     print(f"ETH cache: {path}\nETH bars before {WF_END}: {len(raw)} ({first} .. {last} UTC)")
@@ -3074,9 +3217,8 @@ def _e_stage1(args: argparse.Namespace) -> int:
     from ewbot.aeth import config as ec
     from ewbot.aeth.stage1 import write_stage1
 
-    raw = _e_raw(args)
     try:
-        rec = write_stage1(raw, out_path=ec.STAGE1_PATH, a_lock_path=ec.A_LOCK_PATH, workers=args.workers)
+        rec = write_stage1(_e_raw(args), out_path=ec.STAGE1_PATH, a_lock_path=ec.A_LOCK_PATH, workers=args.workers)
     except ec.AethError as exc:
         _refuse(str(exc))
     _e_head_lines(rec["headline"])
@@ -3243,7 +3385,7 @@ _COMMANDS = {
 uv run --group live pytest tests/aeth/test_cli_aeth.py -q
 ```
 
-예상: `12 passed`
+예상: `15 passed`
 
 - [ ] **Step 5: 커밋**
 
@@ -3801,11 +3943,12 @@ Three stages, one attempt each; a failure ends A-ETH:
 
 ## Isolation from strategy A (and B)
 
-- A-ETH's code is `src/ewbot/aeth/` (its own fingerprint: every `*.py` there). A's fingerprinted folders, `backtest/`, `data/coinbase_history.py`, `paper/`, `live/`, `stratb/`, `paperb/`, `holdout.lock`, `paper.yml`, `ci.yml`, `paper-b.yml`, `uv.lock` and `pyproject.toml` are never changed; A-ETH only imports A's modules.
+- A-ETH's code is `src/ewbot/aeth/` (its own fingerprint: every `*.py` there; the paper epoch uses only its decision part, `config.py` and `data.py` — see Paper trading). A's fingerprinted folders, `backtest/`, `data/coinbase_history.py`, `paper/`, `live/`, `stratb/`, `paperb/`, `holdout.lock`, `paper.yml`, `ci.yml`, `paper-b.yml`, `uv.lock` and `pyproject.toml` are never changed; A-ETH only imports A's modules.
 - `ewbot.aeth` is imported only inside the `ewbot aeth …` handlers of `cli.py`: `ewbot live …` and `ewbot paper …` load the same modules as before.
 - A-ETH's own artifacts: `data/cache/ETH-USD_1h.parquet`, `aeth-stage1.json`, `holdout-aeth.lock`, the `paper-aeth` branch, `.github/workflows/paper-aeth.yml`, the Actions cache key `eth-usd-1h-` and the Telegram prefix `[ewbot paper-A-ETH]`.
 - `tests/aeth/test_isolation.py` checks A's fingerprint, that `aeth/` is outside A's fingerprinted folders, that a branch touching A-ETH touches no strategy-A or strategy-B path, and that only the holdout and the paper runtime read 2024+ candles; `tests/paper/test_static.py` (run by `ci.yml`) carries the CI part.
 - **Never run strategy A's `ewbot fetch --product ETH-USD`**: it writes the same cache file up to now. Before the lock, A-ETH refuses a cache that holds 2024+ bars (delete the file and run `ewbot aeth fetch` again).
+- **Keep the pre-2024 ETH cache byte-identical from stage 1 until paper trading has reproduced the holdout.** The lock compares its bars with the stage-1 record and the holdout run with the lock; both are written once, so a lost cache re-downloaded with even one revised Coinbase candle would block A-ETH for good. Right after `ewbot aeth fetch`, copy `data/cache/ETH-USD_1h.parquet` outside `data/cache` and record its sha256 (Stage 1, step 2); restore the copy if the cache is lost.
 
 ## Commands
 
@@ -3821,20 +3964,43 @@ There is no option for params, product, costs, windows or the random-control siz
 
 ## Stage 1 (controller; network: ETH before 2024 only)
 
-1. On a clean working tree of `master` (`git status --porcelain --untracked-files=no` prints nothing): `uv run ewbot aeth fetch` (about 205 public Coinbase requests, a minute or two; an interrupted download resumes). Check the printed bar count (about 61,000) and `fetch window: stops at 2024-01-01 (no lock)`.
-2. `uv run ewbot aeth stage1` (a few minutes). It refuses when `aeth-stage1.json` exists (one attempt), when tracked files have uncommitted changes, when A's fingerprint is not `e0435223…`, and when the bars do not cover 2017-01-01 .. 2023-12-31. Commit `aeth-stage1.json` right away, whatever the result.
-3. If stage 1 failed, A-ETH ends here: no lock, no 2024 data, A stays BTC-only, no other asset is tried. Record the result in the spec's end record.
+1. On the record branch `chore/aeth-validation`, made from an up-to-date `master` after the A-ETH code is merged, with a clean working tree (`git status --porcelain --untracked-files=no` prints nothing): `uv run ewbot aeth fetch` (about 205 public Coinbase requests, a minute or two; an interrupted download resumes). Check the printed bar count (about 61,000) and `fetch window: stops at 2024-01-01 (no lock)`.
+2. Before stage 1, check the holes from the `ts` column only (no price is read). Stop if the longest gap is over 48 h or more than 300 hours are missing (strategy A's BTC cache: 43 missing hours, longest gap 15 h): a resumed download never refills a hole, and stage 1 would trade through flat filled bars in a run that cannot be repeated. Delete the cache and fetch again; if the holes remain, report them and stop (spec 2's exception: no result has been computed; a fix needs your approval and a spec amendment). When the check passes, copy the cache outside `data/cache` and record its sha256; keep both until paper trading has reproduced the holdout.
+
+   ```bash
+   uv run python - <<'PY'
+   import pandas as pd
+   ts = pd.read_parquet("data/cache/ETH-USD_1h.parquet", columns=["ts"])["ts"]
+   ts = ts[ts < 1704067200].drop_duplicates().sort_values().to_numpy()  # before 2024-01-01
+   holes = (ts[1:] - ts[:-1]) // 3600 - 1  # missing hours between consecutive bars
+   longest, missing = (int(holes.max()), int(holes.sum())) if len(holes) else (0, 0)
+   end = pd.to_datetime(int(ts[holes.argmax() + 1]), unit="s") if longest else "-"
+   print(f"bars {len(ts)} ({pd.to_datetime(int(ts[0]), unit='s')} .. {pd.to_datetime(int(ts[-1]), unit='s')}), "
+         f"missing hours {missing}, longest gap {longest} h (ends {end})")
+   print("gap check OK" if longest <= 48 and missing <= 300 else "STOP: do not run stage 1")
+   PY
+   ```
+
+   After `gap check OK`:
+
+   ```bash
+   mkdir -p "$HOME/ewbot-aeth-keep"
+   cp -p data/cache/ETH-USD_1h.parquet "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.parquet"
+   (cd data/cache && shasum -a 256 ETH-USD_1h.parquet) | tee "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.sha256"
+   ```
+3. `git status --porcelain src/` must print nothing (stage 1 refuses uncommitted tracked changes, but an untracked `*.py` under `src/ewbot` would be hashed into the record without being in git). Then `uv run ewbot aeth stage1` (a few minutes). It refuses when `aeth-stage1.json` exists (one attempt), when tracked files have uncommitted changes, when A's fingerprint is not `e0435223…`, and when the bars do not cover 2017-01-01 .. 2023-12-31. Commit `aeth-stage1.json` and push the branch right away, whatever the result: the committed, pushed record is what makes stage 1 a single attempt.
+4. If stage 1 failed, A-ETH ends here: no lock, no 2024 data, A stays BTC-only, no other asset is tried. Record the result in the spec's end record.
 
 ## Stage 2 (controller with your approval)
 
-1. On a clean tree: `uv run ewbot aeth holdout lock`, then commit `holdout-aeth.lock` right away. The lock is refused unless `aeth-stage1.json` is committed unchanged, passed, and was made with A's params (and `holdout.lock` sha256), this A-ETH code, A's frozen fingerprint and the same pre-2024 bars. The lock fixes the product and contract, params, config, holdout start, its last bar (the last complete hour now), the 100-run random control, A's fingerprint, the A-ETH fingerprint, `code_sha256` (every `src/ewbot` `*.py`, like A's lock), the pre-2024 bars and the stage-1 record's sha256.
+1. On a clean tree (`git status --porcelain src/` prints nothing too) with the kept cache (`(cd data/cache && shasum -a 256 -c "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.sha256")` prints `OK`; restore the copy otherwise): `uv run ewbot aeth holdout lock`, then commit `holdout-aeth.lock` and push right away. The lock is refused unless `aeth-stage1.json` is committed unchanged, passed, and was made with A's params (and `holdout.lock` sha256), this A-ETH code, A's frozen fingerprint and the same pre-2024 bars. The lock fixes the product and contract, params, config, holdout start, its last bar (the last complete hour now), the 100-run random control, A's fingerprint, the A-ETH fingerprint and its decision part (`config.py`, `data.py`: the paper epoch's baseline), `code_sha256` (every `src/ewbot` `*.py`, like A's lock), the pre-2024 bars and the stage-1 record's sha256.
 2. Approval: the user sees the lock and the pass rule and approves running the holdout once.
-3. Before the run: the tree is clean, `HEAD` is the lock commit, and the protection tests pass (`uv run --group live pytest tests/paper/test_fingerprint.py tests/paper/test_static.py tests/aeth/test_isolation.py -q`). Then `uv run ewbot aeth holdout run --confirm` (it first extends the cache to now: 2024+ bars are fetched only now) and commit `holdout-aeth.lock` **immediately** (it holds `first_run`). A second run, a changed A or A-ETH or `src/ewbot` file, a lock that is not this code's, other pre-2024 bars or uncommitted changes are refused. Keep `data/cache/ETH-USD_1h.parquet` until paper trading has reproduced the holdout (`holdout data ok` in `ewbot aeth paper status`).
+3. Before the run: the tree is clean (and `git status --porcelain src/` prints nothing), the cache's sha256 check still prints `OK`, `HEAD` is the lock commit, and the protection tests pass (`uv run --group live pytest tests/paper/test_fingerprint.py tests/paper/test_static.py tests/aeth/test_isolation.py -q`). Then `uv run ewbot aeth holdout run --confirm` (it first extends the cache to now: 2024+ bars are fetched only now) and commit and push `holdout-aeth.lock` **immediately** (it holds `first_run`). A second run, a changed A or A-ETH or `src/ewbot` file, a lock that is not this code's, other pre-2024 bars or uncommitted changes are refused. Keep `data/cache/ETH-USD_1h.parquet` and the kept copy until paper trading has reproduced the holdout (`holdout data ok` in `ewbot aeth paper status`).
 4. If `first_run.verdict.passed` is false, A-ETH ends: no paper trading.
 
 ## Paper trading (only after a passed ETH holdout; you)
 
-What runs: `.github/workflows/paper-aeth.yml` recomputes ETH from 2017 with the committed `holdout-aeth.lock`, trading from 2024-01-01, so it reproduces the holdout and continues it. Decisions go to `ledger.json` and `runs.log` on the orphan branch `paper-aeth` (only the workflow writes it). Paper trades are the trades entering after the lock's last bar. The ETH count is the holdout's A trades plus the paper trades, 50 needed, on this ledger only. A change of strategy A's fingerprint or of the A-ETH fingerprint opens a new epoch and restarts the count. There is no `report.html` and no daily criteria 1–2 recompute (Plan 5c judges them once on the whole ETH out-of-sample window).
+What runs: `.github/workflows/paper-aeth.yml` recomputes ETH from 2017 with the committed `holdout-aeth.lock`, trading from 2024-01-01, so it reproduces the holdout and continues it. Decisions go to `ledger.json` and `runs.log` on the orphan branch `paper-aeth` (only the workflow writes it). Paper trades are the trades entering after the lock's last bar. The ETH count is the holdout's A trades plus the paper trades, 50 needed, on this ledger only. A change of strategy A's fingerprint or of the A-ETH decision fingerprint (`src/ewbot/aeth/config.py` and `data.py`: the params, costs, product and the ETH bars) opens a new epoch and restarts the count. A fix to the runtime during paper trading — `aeth/paper.py`'s messages, retries, ledger and alerts, `aeth/sync.py`, `cli.py` — does not (spec 8, amended 2026-10-08; until the holdout has run, the A-ETH files are frozen from stage 1 on and every `src/ewbot` `*.py` from the lock on). Like strategy A's `paper/runner.py`, `aeth/paper.py` is outside the epoch fingerprint, so do not change what it computes (its data path, the recompute, the count) during paper trading either: a decision changed there shows up only as a discrepancy, not as a new epoch. There is no `report.html` and no daily criteria 1–2 recompute (Plan 5c judges them once on the whole ETH out-of-sample window).
 
 One-time setup:
 
@@ -3984,9 +4150,9 @@ git commit -m "feat(aeth): paper-aeth workflow (dormant) and git sync, CI guard 
 uv run --group live pytest -q
 ```
 
-예상: `1502 passed` 또는 `1501 passed, 1 skipped`
+예상: `1516 passed` 또는 `1515 passed, 1 skipped`
 
-`data/cache/BTC-USD_1h.parquet`가 없으면 `tests/backtest/test_e2e_real.py` 1개가 건너뛰어진다. 기준선보다 정확히 121개가 많아야 한다.
+`data/cache/BTC-USD_1h.parquet`가 없으면 `tests/backtest/test_e2e_real.py` 1개가 건너뛰어진다. 기준선보다 정확히 135개가 많아야 한다.
 
 - [ ] **Step 2: A 지문이 그대로인지 확인**
 
@@ -4079,7 +4245,7 @@ BODY
 
 `ci` 체크(A 지문·정적 검사)가 통과해야 사용자가 병합한다. `paper-aeth.yml`은 병합되어도 `PAPER_AETH_ENABLED`가 없어 돌지 않는다.
 
-- [ ] **Step 2: 기록 브랜치와 2024 이전 ETH 1시간봉 수집(네트워크)**
+- [ ] **Step 2: 기록 브랜치, 2024 이전 ETH 1시간봉 수집(네트워크), 누락 점검, 캐시 사본**
 
 ```bash
 git switch master && git pull --ff-only && git switch -c chore/aeth-validation
@@ -4089,20 +4255,74 @@ uv run ewbot aeth fetch
 
 약 205번의 공개 Coinbase 요청(1~2분; 중단되면 다시 실행해 이어 받는다). 출력에서 `ETH bars before 2024-01-01: …`(약 61,000개, `2017-01-01 00:00 .. 2023-12-31 23:00 UTC`에 가까워야 함)와 `fetch window: stops at 2024-01-01 (no lock)`을 확인하고, `[data]` 줄의 누락 봉 수를 기록한다. 이 단계는 성과를 계산하지 않는다.
 
+다음으로 `ts` 열만 읽어(가격은 읽지 않는다) 누락 시간과 가장 긴 공백을 잰다:
+
+```bash
+uv run python - <<'PY'
+import pandas as pd
+ts = pd.read_parquet("data/cache/ETH-USD_1h.parquet", columns=["ts"])["ts"]
+ts = ts[ts < 1704067200].drop_duplicates().sort_values().to_numpy()  # before 2024-01-01
+holes = (ts[1:] - ts[:-1]) // 3600 - 1  # missing hours between consecutive bars
+longest, missing = (int(holes.max()), int(holes.sum())) if len(holes) else (0, 0)
+end = pd.to_datetime(int(ts[holes.argmax() + 1]), unit="s") if longest else "-"
+print(f"bars {len(ts)} ({pd.to_datetime(int(ts[0]), unit='s')} .. {pd.to_datetime(int(ts[-1]), unit='s')}), "
+      f"missing hours {missing}, longest gap {longest} h (ends {end})")
+print("gap check OK" if longest <= 48 and missing <= 300 else "STOP: do not run stage 1")
+PY
+```
+
+가장 긴 공백이 48시간을 넘거나 누락이 300시간을 넘으면(A의 BTC 캐시: 누락 43시간, 최장 공백 15시간) 단계 1을 돌리지 않는다: 이어 받기는 캐시 안의 구멍을 다시 채우지 않고, 단계 1은 평평하게 채운 봉 위에서 다시 할 수 없는 1회 실행을 하게 된다. 캐시를 지우고(`rm data/cache/ETH-USD_1h.parquet`) `uv run ewbot aeth fetch`부터 다시 한 뒤 다시 잰다. 그래도 넘으면 숫자(누락 시간, 최장 공백과 그 위치)를 사용자에게 보고하고 멈춘다(명세 2절의 예외: 결과를 계산하기 전이므로 사용자 승인과 명세 개정 뒤에만 고친다).
+
+`gap check OK`이면 캐시를 `data/cache` 밖에 복사하고 sha256을 적는다:
+
+```bash
+mkdir -p "$HOME/ewbot-aeth-keep"
+cp -p data/cache/ETH-USD_1h.parquet "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.parquet"
+(cd data/cache && shasum -a 256 ETH-USD_1h.parquet) | tee "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.sha256"
+```
+
+잠금은 2024 이전 봉을 단계 1 기록과, 홀드아웃 실행은 잠금과 비교하고, 기록과 잠금은 한 번만 쓸 수 있다: 캐시를 잃고 다시 받았는데 Coinbase가 캔들 하나라도 고쳤으면 A-ETH는 명세 개정 없이는 잠그거나 홀드아웃을 돌릴 수 없다. 사본과 sha256은 모의매매가 홀드아웃을 재현할 때까지(Task 11 Step 2) 지우지 않고, sha256을 보고에 적는다.
+
 - [ ] **Step 3: 단계 1을 1회 실행하고 곧바로 커밋**
 
 ```bash
 git status --porcelain --untracked-files=no
+git status --porcelain src/
 uv run ewbot aeth stage1
 git add aeth-stage1.json
 git commit -m "chore(aeth): record stage 1" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git push -u origin chore/aeth-validation
 ```
 
-첫 줄의 출력이 비어 있어야 한다. 몇 분 걸린다(비교 두 번, 무작위 대조군 100회씩). 결과와 상관없이 기록을 **곧바로** 커밋한다(그 전에 파일을 지우거나 바꾸지 않는다: 1회 규칙). `stage1`이 실행 전에 거부하면(기간을 덮지 못함 등) 결과는 계산되지 않았으므로 이유를 사용자에게 보고하고 멈춘다(명세 2절의 예외: 사용자 승인과 명세 개정 뒤에만 고친다).
+처음 두 줄의 출력이 비어 있어야 한다. 둘째 줄은 `src/` 아래의 추적되지 않은 파일까지 본다: `stage1`의 작업 트리 검사는 추적 파일만 보지만 A-ETH 지문과 `code_sha256`은 `src/ewbot` 아래의 모든 `*.py`를 해시하므로, git에 없는 파일이 기록에 섞이면 안 된다. 몇 분 걸린다(비교 두 번, 무작위 대조군 100회씩). 결과와 상관없이 기록을 **곧바로** 커밋하고 푸시한다(그 전에 파일을 지우거나 바꾸지 않는다: 1회 규칙은 커밋·푸시된 기록이 지킨다). `stage1`이 실행 전에 거부하면(기간을 덮지 못함 등) 결과는 계산되지 않았으므로 이유를 사용자에게 보고하고 멈춘다(명세 2절의 예외: 사용자 승인과 명세 개정 뒤에만 고친다).
 
 - [ ] **Step 4: 사용자에게 보고**
 
-출력 그대로 보고한다: 전략별 표(A, HYBRID, C, BH, EMA), 무작위 대조군(100회, 평균 샤프·Calmar), 여섯 항목과 `passed`, 정보 실행(2019~2023의 A, 비용 2배의 A; 판정에 쓰지 않음을 밝힘), A의 연도별 거래 수(`aeth-stage1.json`의 `per_year_A`), 누락 봉 수, 기록 커밋. 명세 13절의 해석 한계(A는 BTC로 설계, BTC·ETH 상관, 같은 기간)를 함께 적는다.
+출력 그대로 보고한다: 전략별 표(A, HYBRID, C, BH, EMA), 무작위 대조군(100회, 평균 샤프·Calmar), 여섯 항목과 `passed`, 정보 실행(2019~2023의 A, 비용 2배의 A; 판정에 쓰지 않음을 밝힘), A의 연도별 거래 수(`aeth-stage1.json`의 `per_year_A`), 누락 봉 수와 최장 공백(Step 2), 캐시 sha256, 기록 커밋. 명세 13절의 해석 한계(A는 BTC로 설계, BTC·ETH 상관, 같은 기간)를 함께 적는다.
+
+2017-06-21(UTC)에는 GDAX(지금의 Coinbase Exchange) ETH-USD의 순간 폭락이 있었다(그날 가장 낮은 저가의 봉으로 확인한다). A의 엔진은 신호에는 꼬리를 잘라 쓰지만 체결은 원본 봉으로 하므로, 그 시간에 A의 거래가 열려 있었는지 확인한다(기록이 커밋된 뒤의 정보 확인이다: 기록·판정·코드는 바꾸지 않는다):
+
+```bash
+uv run python - <<'PY'
+from ewbot.aeth.config import DATA_START, aeth_config, frozen_a_params
+from ewbot.aeth.data import cache_path, load_eth
+from ewbot.backtest.runner import run_backtest
+from ewbot.backtest.walkforward import HOLDOUT_START
+from ewbot.data.candles import fill_gaps
+raw = load_eth(cache_path("data/cache"))
+day = raw[(raw["ts"] >= 1498003200) & (raw["ts"] < 1498089600)]  # 2017-06-21 UTC
+low = day.loc[day["low"].idxmin()]
+print(f"2017-06-21 lowest bar {int(low['ts'])}: open {low['open']}, low {low['low']}, close {low['close']}")
+res = run_backtest(aeth_config(frozen_a_params()[0]), fill_gaps(raw), DATA_START, HOLDOUT_START)
+hit = [t for t in res.trades if t.entry_ts <= int(low["ts"]) <= t.exit_ts]
+for t in hit:
+    print(f"A {t.setup} {'long' if t.direction > 0 else 'short'}: entry {t.entry_ts} at {t.entry_price}, exit "
+          f"{t.exit_ts} at {t.exit_price_avg} ({t.exit_reason}), R {t.r_multiple:.2f}")
+print(f"{len(hit)} A trade(s) open in that hour, of {len(res.trades)}")
+PY
+```
+
+거래가 있으면 그 거래(셋업, 방향, 진입·청산 시각과 가격, 청산 이유, R)와 그 봉의 시가·저가·종가를 보고에 적는다. 없으면 없다고 적는다.
 
 - [ ] **Step 5: 탈락이면 종료를 기록한다**
 
@@ -4124,30 +4344,36 @@ Task 9가 합격일 때만 한다. 되돌릴 수 없는 1회 실행이며 처음
 
 ```bash
 git status --porcelain --untracked-files=no
+git status --porcelain src/
+(cd data/cache && shasum -a 256 -c "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.sha256")
 uv run ewbot aeth holdout lock
 git add holdout-aeth.lock
 git commit -m "chore(aeth): lock the ETH holdout" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git push
 git rev-parse HEAD
 ```
 
-첫 줄의 출력이 비어 있어야 한다. 단계 1 기록이 커밋된 그대로가 아니거나, 합격이 아니거나, 다른 파라미터·코드·A 지문·봉으로 만든 것이면 거부된다. 잠금의 `last_bar_ts`(지금의 마지막 완성 시간)가 홀드아웃의 끝이다. 마지막 줄의 커밋(잠금 커밋)을 보고에 적는다.
+처음 두 줄의 출력이 비어 있고 셋째 줄이 `ETH-USD_1h.parquet: OK`를 출력해야 한다(캐시가 없거나 다르면 `cp -p "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.parquet" data/cache/ETH-USD_1h.parquet`로 Task 9의 사본을 되돌린 뒤 다시 확인한다). 단계 1 기록이 커밋된 그대로가 아니거나, 합격이 아니거나, 다른 파라미터·코드·A 지문·봉으로 만든 것이면 거부된다. 잠금의 `last_bar_ts`(지금의 마지막 완성 시간)가 홀드아웃의 끝이다. 마지막 줄의 커밋(잠금 커밋)을 보고에 적는다.
 
 - [ ] **Step 2: 사용자 승인(필수)**
 
-사용자에게 잠금 내용(파라미터 (2.0, 0.7, 0.5)와 `holdout.lock` sha256, ETP 0.1 비용, 기간 2024-01-01 ~ `last_bar_ts`, 무작위 대조군 100회, A 지문, A-ETH 지문, `code_sha256`, 2024 이전 봉 기록)과 합격 기준(명세 7.3: A의 `evaluate_criteria` 그대로, `winners`에 A와 A의 최대 낙폭 ≤ 15%)을 보여 주고, ETH 홀드아웃을 **1회** 실행해도 되는지 명시적 승인을 받는다. 승인이 없으면 멈춘다.
+사용자에게 잠금 내용(파라미터 (2.0, 0.7, 0.5)와 `holdout.lock` sha256, ETP 0.1 비용, 기간 2024-01-01 ~ `last_bar_ts`, 무작위 대조군 100회, A 지문, A-ETH 지문, A-ETH 판단 지문(`aeth_decision_sha256`: 모의매매 구간의 기준값), `code_sha256`, 2024 이전 봉 기록)과 합격 기준(명세 7.3: A의 `evaluate_criteria` 그대로, `winners`에 A와 A의 최대 낙폭 ≤ 15%)을 보여 주고, ETH 홀드아웃을 **1회** 실행해도 되는지 명시적 승인을 받는다. 승인이 없으면 멈춘다.
 
 - [ ] **Step 3: 실행 전 확인, 홀드아웃 1회, 즉시 커밋(네트워크)**
 
 ```bash
 git status --porcelain --untracked-files=no
+git status --porcelain src/
+(cd data/cache && shasum -a 256 -c "$HOME/ewbot-aeth-keep/ETH-USD_1h.pre2024.sha256")
 test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- holdout-aeth.lock)" && echo "HEAD is the lock commit"
 uv run --group live pytest tests/paper/test_fingerprint.py tests/paper/test_static.py tests/aeth/test_isolation.py -q
 uv run ewbot aeth holdout run --confirm
 git add holdout-aeth.lock
 git commit -m "chore(aeth): record the ETH holdout run" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git push
 ```
 
-실행 전: 첫 줄의 출력이 비어 있고, 둘째 줄이 `HEAD is the lock commit`을 출력하고, 보호 테스트가 모두 통과해야 한다(`54 passed`). 하나라도 어긋나면 실행하지 않고 보고한다. `holdout run`은 캐시를 지금까지 늘린 뒤(2024 이후 ETH 봉의 첫 다운로드) 1회 실행한다(몇 분). 끝나면 **바로** 커밋한다: 커밋 전에는 `holdout-aeth.lock`을 되돌리거나 지우지 않는다(두 번째 실행이 가능해진다). 같은 명령을 다시 실행하면 거부된다. `data/cache/ETH-USD_1h.parquet`은 모의매매가 홀드아웃을 재현할 때까지(`ewbot aeth paper status`에서 `holdout data ok`, `holdout trades recomputed`가 잠금과 같음) 지우지 않는다.
+실행 전: 처음 두 줄의 출력이 비어 있고, 셋째 줄이 `ETH-USD_1h.parquet: OK`, 넷째 줄이 `HEAD is the lock commit`을 출력하고, 보호 테스트가 모두 통과해야 한다(`54 passed`). 하나라도 어긋나면 실행하지 않고 보고한다. `holdout run`은 캐시를 지금까지 늘린 뒤(2024 이후 ETH 봉의 첫 다운로드) 1회 실행한다(몇 분). 끝나면 **바로** 커밋하고 푸시한다: 커밋 전에는 `holdout-aeth.lock`을 되돌리거나 지우지 않는다(두 번째 실행이 가능해진다). 같은 명령을 다시 실행하면 거부된다. `data/cache/ETH-USD_1h.parquet`과 Task 9의 사본은 모의매매가 홀드아웃을 재현할 때까지(`ewbot aeth paper status`에서 `holdout data ok`, `holdout trades recomputed`가 잠금과 같음) 지우지 않는다(홀드아웃 실행이 캐시에 2024 이후 봉을 더하므로 이 뒤로는 캐시의 sha256이 사본과 다르다).
 
 - [ ] **Step 4: 사용자에게 보고하고 병합**
 
@@ -4191,7 +4417,7 @@ uv run ewbot aeth paper status --ledger-dir "$TMPDIR/paper-aeth"
 git worktree remove "$TMPDIR/paper-aeth"
 ```
 
-텔레그램에 `[ewbot paper-A-ETH]` 메시지가 오는지, 상태에서 `holdout data ok`이고 `holdout trades recomputed`가 잠금의 거래 수와 같은지, `ETH 표본 외 거래 n/50`이 홀드아웃 거래 수에서 시작하는지 확인한다.
+텔레그램에 `[ewbot paper-A-ETH]` 메시지가 오는지, 상태에서 `holdout data ok`이고 `holdout trades recomputed`가 잠금의 거래 수와 같은지, `ETH 표본 외 거래 n/50`이 홀드아웃 거래 수에서 시작하는지 확인한다. 재현이 확인되면 Task 9의 캐시 사본(`$HOME/ewbot-aeth-keep`)은 더 보관하지 않아도 된다.
 
 - [ ] **Step 3: 첫 주 사용량과 4주 점검(사용자)**
 
@@ -4216,7 +4442,7 @@ git worktree remove "$TMPDIR/paper-aeth"
 | 7.1 잠금 | 커밋된 합격 기록에서만, 출처 확인, 묶는 필드(A 지문, 파라미터, 2024 이전 봉, 코드 상태 등), 깨끗한 트리, 즉시 커밋 | 4(해석 5·6), 10 |
 | 7.2 1회 실행 | 승인 뒤 1회, 거부 조건, 시도 기록, `compare(allow_holdout=True)`, 즉시 커밋 | 4(해석 7), 6, 10 |
 | 7.3 합격 | A의 `evaluate_criteria` 그대로, `winners`에 A + 낙폭 ≤ 15%, 거래 수 기록 | 4(해석 8) |
-| 8 모의매매 | A의 런타임을 상품·비용·잠금만 바꿔, 장부 `paper-aeth`, 구간 지문, ETH 카운트 50(합산 없음), 4번 기준, 휴면 워크플로·두 번째 트리거, 접두어, 재계산 없음, 사용량 | 5(해석 9), 7(해석 13), 11 |
+| 8 모의매매 | A의 런타임을 상품·비용·잠금만 바꿔, 장부 `paper-aeth`, 구간 지문(A 지문 + A-ETH 판단 지문; 2026-10-08 개정), ETH 카운트 50(합산 없음), 4번 기준, 휴면 워크플로·두 번째 트리거, 접두어, 재계산 없음, 사용량 | 5(해석 9), 7(해석 13), 11 |
 | 8.1 Plan 5c 조건 | 1~3 자동 표시, 4~6 수동 | 5(`status_lines_aeth`), 문서 |
 | 9 실거래 제약 | 단일 상품, 계좌 단위 한도·증거금, SHADOW 재시작 규칙, 배포하지 않음 | 문서(7), 6(지연 import) |
 | 10 오류 처리 | 수집 재시도·중단, 거부와 이유, 홀드아웃 데이터·거래 수 경고, 마지막 봉 누락, A·B와 충돌 없음 | 2, 4, 5, 6, 7 |
@@ -4224,9 +4450,10 @@ git worktree remove "$TMPDIR/paper-aeth"
 | 12 진행 절차 | 커밋 → 구현·PR → 단계 1 → 단계 2(승인) → 단계 3 | 9~11 |
 | 13 연구 정직성 | 보고에 해석 한계를 함께 적음 | 9(Step 4), 10(Step 4) |
 | 14 결과 기록 | 단계별 결과·종료 기록 | 9(Step 5), 10(Step 4) |
+| 15 개정 기록 | 2026-10-08: 모의매매 구간 지문을 A-ETH 판단 지문(`config.py`, `data.py`)으로, 잠금의 `aeth_decision_sha256`, 남는 한계(`paper.py`가 계산하는 것은 모의매매 중에도 고치지 않음), 10절 문구 정정 | 1, 2, 4, 5(해석 5·6·9), 7(문서) |
 
 **2. 자리 표시자 검사:** "TBD", "TODO", "나중에", "적절히 처리", "Task N과 같이" 같은 표현이 없다. 모든 코드 단계에 전체 코드(새 파일은 전체 내용, 기존 파일은 찾을 부분과 바꿀 내용)가 있고, 모든 명령에 예상 출력이 있다. 수동 작업(9~11)의 명령도 실제 명령이다.
 
-**3. 타입 일관성:** 파라미터는 어디서나 `Combo = tuple[float, ...]`이고 JSON에서는 리스트다(`lock["params"]`, `rec["params"]`; 설정은 `aeth_config(tuple(...))`). 잠금 경로는 `ewbot.aeth.config.LOCK_PATH`, 단계 1 기록은 `STAGE1_PATH`, A의 잠금은 `A_LOCK_PATH`(모두 CLI가 호출 때 읽음). `data_record`의 키(`first_ts, last_ts, n_bars, missing, sha256`)는 단계 1 기록의 `provenance.data`, 잠금의 `pre2024`, 홀드아웃 확인에서 같다. `first_run.verdict.n_trades`·`passed`와 `first_run.data.sha256`은 홀드아웃(Task 4), 합성 잠금(`records.aeth_lock`), 장부 요약(`holdout_summary_aeth`)에서 같다. 구간 지문은 기준값(`epoch_fingerprint(lock["a_fingerprint"], lock["aeth_sha256"])`)과 실행값(`current_epoch_fingerprint()`)이 같은 함수다. 오류는 연구 쪽이 `AethError`(가드는 그 하위 `HoldoutGuardError`), 모의매매가 `AethPaperError(stage, message)`다.
+**3. 타입 일관성:** 파라미터는 어디서나 `Combo = tuple[float, ...]`이고 JSON에서는 리스트다(`lock["params"]`, `rec["params"]`; 설정은 `aeth_config(tuple(...))`). 잠금 경로는 `ewbot.aeth.config.LOCK_PATH`, 단계 1 기록은 `STAGE1_PATH`, A의 잠금은 `A_LOCK_PATH`(모두 CLI가 호출 때 읽음). `data_record`의 키(`first_ts, last_ts, n_bars, missing, sha256`)는 단계 1 기록의 `provenance.data`, 잠금의 `pre2024`, 홀드아웃 확인에서 같다. `first_run.verdict.n_trades`·`passed`와 `first_run.data.sha256`은 홀드아웃(Task 4), 합성 잠금(`records.aeth_lock`), 장부 요약(`holdout_summary_aeth`)에서 같다. 구간 지문은 기준값(`epoch_fingerprint(lock["a_fingerprint"], lock["aeth_decision_sha256"])`)과 실행값(`current_epoch_fingerprint()`: A 지문과 `aeth_decision_fingerprint()`)이 같은 함수다. 오류는 연구 쪽이 `AethError`(가드는 그 하위 `HoldoutGuardError`), 모의매매가 `AethPaperError(stage, message)`다.
 
-**4. 검증:** 이 계획은 명세·계획 커밋 직후(2026-10-08) 저장소의 새 클론에서 그 커밋(`master` `cbf57ea` 위의 `feat/aeth` 첫 커밋, Task 1 코드 이전; Python 3.12.13, 네트워크 없음)부터 문서 그대로 적용해 확인했다: 모든 파일과 수정을 적힌 대로 쓰고 Task 1~8의 모든 명령을 실행했으며, 모든 `예상` 항목이 맞았다(각 Step 2는 적힌 대로 실패하고 각 Step 4는 적힌 수로 통과; 테스트 수는 앞에 다른 숫자가 붙지 않는지까지 확인). Task 8의 전체 테스트는 `1501 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문은 `e0435223…` 그대로, A 보호 검사는 `59 passed`(건너뜀 없음), 바뀐 파일 목록은 위와 같고, 작업 트리는 깨끗했다. 적용 결과의 27개 파일은 개발 사본과 바이트 단위로 같았다. Task 9~11은 네트워크와 사용자 승인이 필요한 수동 단계라 재생에서 제외했다(ETH 데이터는 받지 않았다).
+**4. 검증:** 이 계획은 2026-10-08 최종 검토 수정 뒤 다시 확인했다: 저장소의 새 클론에서 `master` `cbf57ea` 위에 이 명세·계획만 커밋한 상태(Task 1 코드 이전; Python 3.12.13, 네트워크 없음)부터 문서 그대로 적용해, 모든 파일과 수정을 적힌 대로 쓰고 Task 1~8의 모든 명령을 실행했으며, 모든 `예상` 항목이 맞았다(각 Step 2는 적힌 대로 실패하고 각 Step 4는 적힌 수로 통과; 테스트 수는 앞에 다른 숫자가 붙지 않는지까지 확인). Task 8의 전체 테스트는 `1515 passed, 1 skipped`(실제 데이터 캐시 없음), A 지문은 `e0435223…` 그대로, A 보호 검사는 `59 passed`(건너뜀 없음), 바뀐 파일 목록은 위와 같고, 작업 트리는 깨끗했다. 적용 결과의 27개 파일은 `feat/aeth`의 구현(최종 검토 수정 커밋 포함)과 바이트 단위로 같았다. Task 9~11은 네트워크와 사용자 승인이 필요한 수동 단계라 재생에서 제외했다(ETH 데이터는 받지 않았다).
