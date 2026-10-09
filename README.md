@@ -9,8 +9,9 @@ The project was built in three layers. Each layer has to prove itself before the
 | **Research** (Plan 1) | Backtest, walk-forward on 2017–2023, one-shot holdout from 2024-01-01 | Your laptop (`ewbot backtest / compare / walkforward / holdout`) | Done. The holdout was run once and is locked in `holdout.lock`. |
 | **Paper trading** (Plan 2) | Every hour, replays the frozen strategy on fresh Coinbase candles and records each decision. Builds the out-of-sample trade count. | GitHub Actions, hourly (Cloudflare cron at :37). Ledger on the orphan `paper` branch. | Running since 2026-10-02 |
 | **Live trading** (Plan 3) | Turns the same decisions into Coinbase CFM futures orders (`BIP-20DEC30-CDE`, nano BTC perp, 0.01 BTC per contract) with exchange-side stops | A US-East VPS, in Docker | **SHADOW** since 2026-10-05 (no real orders) |
-| **Strategy B** (Plan 4) | A separate 15m strategy on BTC and ETH (1h swing structure, Fibonacci zone with an earlier swing, 15m RSI divergence and breakout). Its own walk-forward, one-shot holdout (`holdout-b.lock`) and paper trading (`paper-b` branch). Never touches A. | Your laptop, then GitHub Actions (`paper-b.yml`) | Research ([`docs/strategy-b.md`](docs/strategy-b.md)) |
+| **Strategy B** (Plan 4) | A separate 15m strategy on BTC and ETH (1h swing structure, Fibonacci zone with an earlier swing, 15m RSI divergence and breakout). Its own walk-forward, one-shot holdout (`holdout-b.lock`) and paper trading (`paper-b` branch). Never touches A. | Your laptop, then GitHub Actions (`paper-b.yml`) | Ended at walk-forward ([`docs/strategy-b.md`](docs/strategy-b.md)) |
 | **A-ETH** (Plan 5a) | Strategy A, frozen (same params, code and costs except the 0.1 ETH contract), on ETH-USD: a pre-registered stage 1 on 2017–2023, a one-shot ETH holdout (`holdout-aeth.lock`) and paper trading (`paper-aeth` branch) with its own 50-trade count. Never touches A. | Your laptop, then GitHub Actions (`paper-aeth.yml`) | Ended (stage 2): stage 1 passed, the ETH holdout failed ([`docs/aeth.md`](docs/aeth.md)) |
+| **Strategy C** (Plan 5b) | Strategy B2's rules one timeframe up (4h structure and trend, 1h confirmation) on BTC and ETH. | - | Ended before walk-forward: 0.81 trades/month in 2017–2023, too few for a 50-trade holdout ([spec §11](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md)) |
 
 ## Live stages
 
@@ -64,6 +65,7 @@ uv run --group live pytest
   - [Plan 3: live trading](docs/superpowers/specs/2026-10-03-ewbot-plan3-live-trading-design.md)
   - [Plan 4: strategy B](docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md)
   - [Plan 5a: A-ETH](docs/superpowers/specs/2026-10-07-ewbot-plan5a-aeth-design.md)
+  - [Plan 5b: strategy C](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md) (ended)
 - Implementation plans: `docs/superpowers/plans/`.
 
 ## Layout
