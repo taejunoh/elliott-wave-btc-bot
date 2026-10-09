@@ -1,0 +1,89 @@
+{
+  "kind": "ewbot-aeth-holdout",
+  "version": 1,
+  "product": "ETH-USD",
+  "future": "ETP-20DEC30-CDE",
+  "params": [
+    2.0,
+    0.7,
+    0.5
+  ],
+  "a_lock_sha256": "d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45",
+  "config": {
+    "wave": {
+      "K4": 2.0,
+      "atr_len": 14,
+      "M": 12,
+      "sigma": 0.12,
+      "w0": 1.0,
+      "T": 0.05,
+      "h": 0.05,
+      "top_k": 5,
+      "wick_clip_atr1h": 6.0,
+      "warmup_4h": 200
+    },
+    "strategy": {
+      "mode": "A",
+      "setups_enabled": [
+        "W3",
+        "W5",
+        "W5_REV",
+        "C_END"
+      ],
+      "Q_MIN": 0.7,
+      "S_MIN": 0.5,
+      "r_gate": 1.5,
+      "tp1_frac": 0.5,
+      "time_stop_mult": 1.5,
+      "time_stop_min_4h": 12,
+      "time_stop_max_4h": 60,
+      "setup3_risk_mult": 0.5,
+      "buf_struct_atr": 0.25,
+      "buf_ext_atr": 0.5,
+      "choch_bars": 3
+    },
+    "risk": {
+      "name": "conservative",
+      "risk_pct": 0.01,
+      "max_leverage": 3.0
+    },
+    "breakers": {
+      "daily_loss": 0.03,
+      "total_dd": 0.15,
+      "max_consec_losses": 5,
+      "consec_pause_hours": 24,
+      "enabled": true
+    },
+    "costs": {
+      "fee_rate": 0.0005,
+      "fee_min_per_contract": 0.15,
+      "apply_min_fee": false,
+      "slippage": 0.0005,
+      "funding_apr_long": 0.1,
+      "contract_size": 0.1
+    },
+    "initial_equity": 10000.0,
+    "seed": 0
+  },
+  "holdout_start": 1704067200,
+  "last_bar_ts": 1791500400,
+  "random_runs": 100,
+  "a_fingerprint": "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1",
+  "aeth_sha256": "b8abd63cc757f384c57831409f11208f44d88d7067c508249d1558157af825f8",
+  "aeth_decision_sha256": "8d07cb90c1fd2384ac12a099e96b4355b7085ed11453139365c9d87a66e366c8",
+  "code_sha256": "d88755deadc31557bdcd9c1de7a14acb98995dc513979468142cd48c52693a64",
+  "pre2024": {
+    "first_ts": 1483228800,
+    "last_ts": 1704063600,
+    "n_bars": 61316,
+    "missing": 28,
+    "sha256": "98f4ee9c8b1ac67696c94c3944f30f98309336a98d4552360d054c3796afcbf2"
+  },
+  "stage1_sha256": "4b50c1cd9026d1852c8969596bca6050b785e468188f743aa6d42be0a0a0e998",
+  "sha256": "0fdd1a21d8b70f8db78fb6241832295dc40a350391ce0c550b87980f7d7322e5",
+  "locked_at": "2026-10-09T00:03:56+00:00",
+  "git_head": "812e86ebff5baff64c563a2dc378ac68cf3d0b05",
+  "git_dirty": false,
+  "attempts": [],
+  "first_run": null
+}
