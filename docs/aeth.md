@@ -1,5 +1,7 @@
 # A-ETH (Plan 5a) — strategy A, frozen, on ETH: stage 1, one-shot holdout, paper trading
 
+> **Status (2026-10-09): ENDED at stage 2.** Stage 1 (2017–2023) passed: A +10.0%, Sharpe 0.58, 66 trades. The one-shot ETH holdout (2024-01-01 .. 2026-10-08) failed: A +0.3%, Sharpe 0.06, Calmar 0.04, 38 trades, below buy-and-hold's Sharpe (0.37) and the random control's mean Calmar (0.09). Paper trading is never started (`PAPER_AETH_ENABLED` stays unset); A stays BTC-only. Records: `aeth-stage1.json`, `holdout-aeth.lock`; details in spec §14.
+
 Spec: `docs/superpowers/specs/2026-10-07-ewbot-plan5a-aeth-design.md`. Plan: `docs/superpowers/plans/2026-10-07-ewbot-plan5a-aeth.md`.
 
 A-ETH runs strategy A exactly as frozen — the params of the committed `holdout.lock` (K4 = 2.0, Q_MIN = 0.7, S_MIN = 0.5), the conservative profile, A's breakers, A's code — on Coinbase `ETH-USD` 1h candles, with A's costs and the contract size of `ETP-20DEC30-CDE` (0.1 ETH). Nothing is tuned and no other asset is tried. It is a separate research and paper track: strategy A's fingerprint (`e0435223…`), `holdout.lock`, BTC 50-trade count, `paper.yml` and live runtime are never touched, and ETH trades are never pooled into A-BTC's count.
