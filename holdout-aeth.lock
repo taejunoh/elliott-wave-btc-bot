@@ -1,0 +1,206 @@
+{
+  "kind": "ewbot-aeth-holdout",
+  "version": 1,
+  "product": "ETH-USD",
+  "future": "ETP-20DEC30-CDE",
+  "params": [
+    2.0,
+    0.7,
+    0.5
+  ],
+  "a_lock_sha256": "d1be04baa06c58dd483c88e053841d6eda56c1a560fd3196746bab311ece3c45",
+  "config": {
+    "wave": {
+      "K4": 2.0,
+      "atr_len": 14,
+      "M": 12,
+      "sigma": 0.12,
+      "w0": 1.0,
+      "T": 0.05,
+      "h": 0.05,
+      "top_k": 5,
+      "wick_clip_atr1h": 6.0,
+      "warmup_4h": 200
+    },
+    "strategy": {
+      "mode": "A",
+      "setups_enabled": [
+        "W3",
+        "W5",
+        "W5_REV",
+        "C_END"
+      ],
+      "Q_MIN": 0.7,
+      "S_MIN": 0.5,
+      "r_gate": 1.5,
+      "tp1_frac": 0.5,
+      "time_stop_mult": 1.5,
+      "time_stop_min_4h": 12,
+      "time_stop_max_4h": 60,
+      "setup3_risk_mult": 0.5,
+      "buf_struct_atr": 0.25,
+      "buf_ext_atr": 0.5,
+      "choch_bars": 3
+    },
+    "risk": {
+      "name": "conservative",
+      "risk_pct": 0.01,
+      "max_leverage": 3.0
+    },
+    "breakers": {
+      "daily_loss": 0.03,
+      "total_dd": 0.15,
+      "max_consec_losses": 5,
+      "consec_pause_hours": 24,
+      "enabled": true
+    },
+    "costs": {
+      "fee_rate": 0.0005,
+      "fee_min_per_contract": 0.15,
+      "apply_min_fee": false,
+      "slippage": 0.0005,
+      "funding_apr_long": 0.1,
+      "contract_size": 0.1
+    },
+    "initial_equity": 10000.0,
+    "seed": 0
+  },
+  "holdout_start": 1704067200,
+  "last_bar_ts": 1791500400,
+  "random_runs": 100,
+  "a_fingerprint": "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1",
+  "aeth_sha256": "b8abd63cc757f384c57831409f11208f44d88d7067c508249d1558157af825f8",
+  "aeth_decision_sha256": "8d07cb90c1fd2384ac12a099e96b4355b7085ed11453139365c9d87a66e366c8",
+  "code_sha256": "d88755deadc31557bdcd9c1de7a14acb98995dc513979468142cd48c52693a64",
+  "pre2024": {
+    "first_ts": 1483228800,
+    "last_ts": 1704063600,
+    "n_bars": 61316,
+    "missing": 28,
+    "sha256": "98f4ee9c8b1ac67696c94c3944f30f98309336a98d4552360d054c3796afcbf2"
+  },
+  "stage1_sha256": "4b50c1cd9026d1852c8969596bca6050b785e468188f743aa6d42be0a0a0e998",
+  "sha256": "0fdd1a21d8b70f8db78fb6241832295dc40a350391ce0c550b87980f7d7322e5",
+  "locked_at": "2026-10-09T00:03:56+00:00",
+  "git_head": "812e86ebff5baff64c563a2dc378ac68cf3d0b05",
+  "git_dirty": false,
+  "attempts": [
+    {
+      "started": "2026-10-09T00:04:30+00:00",
+      "data_sha256": "0fe2ce981ee48248141e322ae47b4594793b08275492095d6f86cdb802e6cf9e",
+      "git_head": "7f4912fe0d1380b1a11b9b66ed0c67d6f0aab887",
+      "git_dirty": false,
+      "completed": "2026-10-09T00:05:06+00:00"
+    }
+  ],
+  "first_run": {
+    "started": "2026-10-09T00:04:30+00:00",
+    "completed": "2026-10-09T00:05:06+00:00",
+    "start_ts": 1704067200,
+    "end_ts": 1791504000,
+    "last_bar_ts": 1791500400,
+    "data": {
+      "start_ts": 1704067200,
+      "last_bar_ts": 1791500400,
+      "n_bars": 24288,
+      "sha256": "0fe2ce981ee48248141e322ae47b4594793b08275492095d6f86cdb802e6cf9e"
+    },
+    "headline": {
+      "A": {
+        "total_return": 0.00337091485377905,
+        "cagr": 0.0012145367411106698,
+        "max_dd": 0.02783854952220899,
+        "sharpe": 0.061887885620059875,
+        "calmar": 0.04362787436686451,
+        "win_rate": 0.5,
+        "avg_r": -0.02370741560660977,
+        "n_trades": 38
+      },
+      "HYBRID": {
+        "total_return": 0.013879988878062965,
+        "cagr": 0.004984283307044627,
+        "max_dd": 0.027924190154568252,
+        "sharpe": 0.20296483913769575,
+        "calmar": 0.17849338797133293,
+        "win_rate": 0.5365853658536586,
+        "avg_r": 0.004837863361462665,
+        "n_trades": 41
+      },
+      "C": {
+        "total_return": -0.036721897252322555,
+        "cagr": -0.013403776914685656,
+        "max_dd": 0.07528848936998248,
+        "sharpe": -0.5214641346769578,
+        "calmar": -0.17803222015541917,
+        "win_rate": 0.36585365853658536,
+        "avg_r": -0.11049736287970693,
+        "n_trades": 41
+      },
+      "BH": {
+        "total_return": 0.07563094902987944,
+        "cagr": 0.02664555277198155,
+        "max_dd": 0.6914776079160391,
+        "sharpe": 0.3677294572252272,
+        "calmar": 0.038534223620465984,
+        "win_rate": 1.0,
+        "avg_r": 7.563094902987941,
+        "n_trades": 1
+      },
+      "EMA": {
+        "total_return": 0.31295704219273657,
+        "cagr": 0.10319274990374935,
+        "max_dd": 0.7291693647153428,
+        "sharpe": 0.45468445034240224,
+        "calmar": 0.14152096192910452,
+        "win_rate": 0.3333333333333333,
+        "avg_r": 2.36970150486167,
+        "n_trades": 33
+      },
+      "RANDOM": {
+        "runs": 100,
+        "n_signals": 38,
+        "sharpe": {
+          "mean": -0.04596491169806358,
+          "p05": -1.1714190386112873,
+          "p50": -0.035802425442123864,
+          "p95": 0.9825732305124151
+        },
+        "calmar": {
+          "mean": 0.09363848583178398,
+          "p05": -0.3280265239619424,
+          "p50": -0.022251255579985352,
+          "p95": 0.9061683315581396
+        },
+        "total_return": {
+          "mean": -0.0010936453368694664,
+          "p05": -0.0781670370841642,
+          "p50": -0.003401808558482544,
+          "p95": 0.08256360239582405
+        }
+      }
+    },
+    "criteria": {
+      "winners": [],
+      "max_dd_ok": false,
+      "n_trades_ok": false,
+      "n_trades": {
+        "A": 38,
+        "HYBRID": 41
+      },
+      "trade_count": [
+        "A: \ud45c\ubcf8 \uc678 \uac70\ub798 38/50 \u2014 paper \ubaa8\ub4dc\ub85c \ub204\uc801 \ud544\uc694; \uc2e4\uac70\ub798 \uc804\ud658 \uae30\uc900 \ubbf8\ucda9\uc871",
+        "HYBRID: \ud45c\ubcf8 \uc678 \uac70\ub798 41/50 \u2014 paper \ubaa8\ub4dc\ub85c \ub204\uc801 \ud544\uc694; \uc2e4\uac70\ub798 \uc804\ud658 \uae30\uc900 \ubbf8\ucda9\uc871"
+      ],
+      "random_control_evaluated": true,
+      "passing": [],
+      "paper_4_weeks": "manual check required",
+      "automatic_criteria_met": false
+    },
+    "verdict": {
+      "c1_a_beats_c_bh_random_mean": false,
+      "c2_max_dd_le_15pct": true,
+      "n_trades": 38,
+      "passed": false
+    }
+  }
+}
