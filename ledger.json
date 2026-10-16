@@ -24,7 +24,7 @@
    "fingerprint": "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1",
    "started_ts": 1790938800,
    "reason": "baseline: holdout commit 64e628a",
-   "through_ts": 1792148400
+   "through_ts": 1792152000
   }
  ],
  "trades": [],
@@ -11707,6 +11707,42 @@
     "pending": 0,
     "errors": []
    }
+  },
+  {
+   "id": "20261016T133804Z",
+   "ts": 1792157884,
+   "status": "ok",
+   "last_bar_ts": 1792152000,
+   "data_sha256": "1ebaa011504d2e088b2e184618489729fb633dad3d0ce921c50163e69c4350f9",
+   "holdout_data_ok": true,
+   "holdout_trades_recomputed": 36,
+   "epoch_id": 1,
+   "paper_trades": 0,
+   "count_total": 36,
+   "new_decisions": 0,
+   "new_discrepancies": 0,
+   "env": {
+    "python": "3.12.13",
+    "system": "Linux",
+    "machine": "x86_64",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "uv_lock_sha256": "47a0a99def92af3825ff16a625de457da5a4313e366dfc5db029c45bfbd0a5ab",
+    "image_os": "ubuntu24",
+    "image_version": "20261012.334.1"
+   },
+   "env_sha256": "849298152f9f8e77cf650c798564ca5d125d7c2272e86b615a0d88a07dd73f18",
+   "warnings": [],
+   "criteria_recompute": {
+    "ny_date": "2026-10-16",
+    "ok": true
+   },
+   "notify": {
+    "sent": 1,
+    "pending": 0,
+    "errors": []
+   }
   }
  ],
  "sent_event_ids": [
@@ -11724,16 +11760,17 @@
   "DAILY:1791810000:0",
   "DAILY:1791896400:0",
   "DAILY:1791982800:0",
-  "DAILY:1792069200:0"
+  "DAILY:1792069200:0",
+  "DAILY:1792155600:0"
  ],
  "pending_events": [],
- "daily_summary_date": "2026-10-15",
+ "daily_summary_date": "2026-10-16",
  "criteria": {
-  "computed_ts": 1792071481,
+  "computed_ts": 1792157884,
   "epoch_id": 1,
   "window": [
    1704067200,
-   1792069200
+   1792155600
   ],
   "winners": [
    "A",
@@ -11745,43 +11782,43 @@
    "A": {
     "total_return": 0.07347576714970105,
     "max_dd": 0.02901823651410427,
-    "sharpe": 0.9609100587996121,
-    "calmar": 0.8868436309480346,
+    "sharpe": 0.9604386474443751,
+    "calmar": 0.8859626627376405,
     "n_trades": 36
    },
    "HYBRID": {
     "total_return": 0.06837024471495634,
     "max_dd": 0.033375998621576156,
-    "sharpe": 0.8818519476411087,
-    "calmar": 0.7185902850770028,
+    "sharpe": 0.8814193284697821,
+    "calmar": 0.7178770619555703,
     "n_trades": 40
    },
    "C": {
-    "total_return": 0.010613899473614463,
+    "total_return": 0.00766118339471622,
     "max_dd": 0.041400512507171694,
-    "sharpe": 0.16122714681501582,
-    "calmar": 0.09156474780888327,
+    "sharpe": 0.11957934829820416,
+    "calmar": 0.0660892652665698,
     "n_trades": 48
    },
    "BH": {
-    "total_return": 0.89110617134596,
+    "total_return": 0.9263055470544765,
     "max_dd": 0.5385379861984871,
-    "sharpe": 0.7191473784196989,
-    "calmar": 0.47631224980569187,
+    "sharpe": 0.7326089076196695,
+    "calmar": 0.4912423367733474,
     "n_trades": 1
    },
    "EMA": {
-    "total_return": 0.8257103980982199,
+    "total_return": 0.8595034789806002,
     "max_dd": 0.38939518012585905,
-    "sharpe": 0.7206927702345238,
-    "calmar": 0.6183039452321311,
+    "sharpe": 0.7356120847667209,
+    "calmar": 0.6386165810812308,
     "n_trades": 35
    }
   },
   "random": {
    "runs": 100,
-   "sharpe_mean": -0.2326531690807108,
-   "calmar_mean": 0.030077274221414433
+   "sharpe_mean": -0.22357082193595004,
+   "calmar_mean": 0.03176165169495278
   }
  },
  "schema_version": 1
