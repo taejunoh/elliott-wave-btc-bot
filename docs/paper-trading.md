@@ -64,6 +64,7 @@ GitHub drops many scheduled runs when Actions is busy, so the hourly run is star
 2. In the Cloudflare dashboard open **Workers & Pages** → **Create** → **Create Worker**. Name it (for example `ewbot-paper-trigger`), **Deploy** the hello-world stub, then **Edit code**, replace everything with the contents of `ops/cloudflare-trigger/worker.js`, and **Deploy** again.
 3. Worker → **Settings** → **Variables and Secrets** → **Add** → type **Secret**, name `GITHUB_TOKEN`, value: the token from step 1 → **Deploy**.
 4. Worker → **Settings** → **Trigger Events** → **Cron Triggers** → **Add** → `37 * * * *` (Cloudflare cron runs in UTC).
+   - Optional catch-up (added 2026-10-17, after the :37 cron missed 3 hours in 12 days): add a second cron `47 * * * *` to the same worker. At :47 the worker dispatches only when this hour has no `paper.yml` run that succeeded or is still running, so a normal hour costs no extra Actions minutes. It needs the worker code from 2026-10-17 or later.
 5. Verify, either way:
    - In the Worker's **Settings** → **Trigger Events** (or the editor's **Schedule** test panel) run the cron trigger by hand, or just wait for the next :37.
    - Then check that a `workflow_dispatch` run was created:
