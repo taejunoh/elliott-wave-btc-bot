@@ -8,6 +8,7 @@ import pytest
 from ewbot.config import AGGRESSIVE, BotConfig
 from ewbot.live.pricing import (
     BASIS_BAND,
+    CANARY_MAX_RISK,
     BasisOutOfBand,
     basis_ratio,
     map_level,
@@ -73,28 +74,42 @@ def test_risk_per_contract_matches_the_sizing_distance():
     assert r == pytest.approx((1000.0 + 0.0005 * 119_000.0) * 0.01)
 
 
-def test_canary_and_shadow_trade_one_contract_unless_the_risk_exceeds_two_percent():
+def test_canary_and_shadow_trade_one_contract_unless_the_risk_exceeds_fifteen_percent():
     kw = dict(entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=CFG)
     assert stage_contracts("CANARY", equity=1_000.0, **kw) == (1, "canary: 1 contract")
     assert stage_contracts("SHADOW", equity=1_000.0, **kw) == (1, "shadow: 1 contract")
-    n, why = stage_contracts("CANARY", equity=500.0, **kw)  # risk 10.6 > 10.0
-    assert n == 0 and "2%" in why
+    assert stage_contracts("CANARY", equity=500.0, **kw) == (1, "canary: 1 contract")  # risk 10.6 <= 75.0 (15%)
+    n, why = stage_contracts("CANARY", equity=60.0, **kw)  # risk 10.6 > 9.0
+    assert n == 0 and "15%" in why and "equity 60.00" in why
     assert stage_contracts("CANARY", equity=1_000.0, entry=60_000.0, stop=61_000.0, direction=1,
                            risk_mult=1.0, cfg=CFG)[0] == 0
 
 
-def test_canary_short_side_and_the_exact_two_percent_boundary():
+def test_canary_short_side_and_the_exact_fifteen_percent_boundary():
     short = dict(entry=60_000.0, stop=61_000.0, direction=-1, risk_mult=1.0, cfg=CFG)
     assert stage_contracts("CANARY", equity=1_000.0, **short) == (1, "canary: 1 contract")
-    n, why = stage_contracts("CANARY", equity=500.0, **short)  # risk 10.605 > 10.0
-    assert n == 0 and "2%" in why
+    assert stage_contracts("CANARY", equity=500.0, **short) == (1, "canary: 1 contract")  # risk 10.605 <= 75.0
+    n, why = stage_contracts("CANARY", equity=60.0, **short)  # risk 10.605 > 9.0
+    assert n == 0 and "15%" in why
     assert stage_contracts("CANARY", equity=1_000.0, entry=60_000.0, stop=59_000.0, direction=-1,
                            risk_mult=1.0, cfg=CFG)[0] == 0  # stop on the wrong side for a short
     exact = dataclasses.replace(CFG, costs=dataclasses.replace(CFG.costs, slippage=0.0))
     kw = dict(entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=exact)
     assert risk_per_contract(60_000.0, 59_000.0, exact.costs) == 10.0
-    assert stage_contracts("CANARY", equity=500.0, **kw)[0] == 1  # exactly 2%: allowed (strictly greater skips)
-    assert stage_contracts("CANARY", equity=499.99, **kw)[0] == 0
+    assert stage_contracts("CANARY", equity=10.0 / CANARY_MAX_RISK, **kw)[0] == 1  # exactly 15%: allowed (strictly greater skips)
+    assert stage_contracts("CANARY", equity=10.0 / CANARY_MAX_RISK - 0.01, **kw)[0] == 0
+
+
+@pytest.mark.parametrize("stage", ["SHADOW", "CANARY"])
+def test_one_contract_risk_just_under_fifteen_percent_trades_and_just_over_is_skipped(stage):
+    """The user's 2026-10-19 decision: 2% -> 15% of equity (at about $500 the 2% cap skipped 34 of 36 signals)."""
+    assert CANARY_MAX_RISK == 0.15
+    exact = dataclasses.replace(CFG, costs=dataclasses.replace(CFG.costs, slippage=0.0))
+    kw = dict(entry=60_000.0, stop=59_000.0, direction=1, risk_mult=1.0, cfg=exact)  # 1-contract risk 10.0 USD
+    assert risk_per_contract(60_000.0, 59_000.0, exact.costs) == 10.0
+    assert stage_contracts(stage, equity=10.0 / 0.1499, **kw) == (1, f"{stage.lower()}: 1 contract")  # 14.99% of it
+    n, why = stage_contracts(stage, equity=10.0 / 0.1501, **kw)  # 15.01%
+    assert n == 0 and why == f"1-contract risk 10.00 USD > 15% of equity {10.0 / 0.1501:.2f}"
 
 
 def test_stage_contracts_fails_closed_on_bad_sizing_inputs():
