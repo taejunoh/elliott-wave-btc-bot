@@ -4,8 +4,9 @@
                  that limit and the position is still open 10 s later, the runtime closes at market.
   margin_status  overnight-margin projection of the open position: >= 80% warn, >= 90% reduce back to
                  the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
-  AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.97, or <= the peak
-                 x 0.85 -> flatten and pause (spec 4.5), on the second observation in a row that breaches.
+  AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.97 (x 0.80 in SHADOW and
+                 CANARY: LIVE_DAILY_LOSS, user decision 2026-10-19), or <= the peak x 0.85 -> flatten and pause
+                 (spec 4.5), on the second observation in a row that breaches.
                  State lives in the journal (survives restarts). A deliberate capital change (`ewbot live rebase`)
                  re-bases both references (`rebase`).
   SessionWatch   session state changes and the next scheduled maintenance (noticed 24 h ahead, or at once
@@ -17,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
@@ -41,6 +42,7 @@ WS_STALE_S = 60.0
 REST_POLL_S = 10.0
 MAINTENANCE_NOTICE_S = 24 * 3600
 BASING_READS = 3  # a reference (the day's, a re-based peak) is the median of its first three valid reads
+LIVE_DAILY_LOSS = 0.20  # SHADOW/CANARY real-account daily breaker; FULL keeps the strategy's (user decision 2026-10-19)
 CLOCK_SLACK_S = 1.0  # a price stamped up to this much after `now` (another thread's clock read) is still fresh
 
 
@@ -112,6 +114,12 @@ def _basing(reads: list[float], e: float) -> tuple[list[float] | None, float]:
     return None, sorted(reads)[len(reads) // 2]
 
 
+def live_breakers(base: BreakerParams, stage: str) -> BreakerParams:
+    """The real account's breaker thresholds for a stage: the daily one is LIVE_DAILY_LOSS in SHADOW and CANARY and
+    `base`'s in FULL; the total drawdown is `base`'s everywhere. The paper engine's breakers (cfg.breakers) are untouched."""
+    return replace(base, daily_loss=LIVE_DAILY_LOSS) if stage in ("SHADOW", "CANARY") else base
+
+
 class AccountGuard:
     """Real-account breakers (spec 4.5). Only a finite equity above 0 is an observation; anything else raises
     BadEquity and changes nothing (the runtime alerts it).
@@ -139,7 +147,7 @@ class AccountGuard:
 
     def __init__(self, journal: Journal, params: BreakerParams | None = None) -> None:
         self.journal = journal
-        self.params = BreakerParams() if params is None else params  # daily 3%, total 15% (spec 4.5)
+        self.params = BreakerParams() if params is None else params  # daily 3%, total 15% (spec 4.5; the runtime passes live_breakers(...))
 
     def state(self) -> dict[str, Any] | None:
         return self.journal.get(self.KEY)

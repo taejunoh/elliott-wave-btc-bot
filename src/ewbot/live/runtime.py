@@ -152,6 +152,7 @@ from ewbot.live.watchdog import (
     SessionWatch,
     StopGapWatch,
     fresh,
+    live_breakers,
     margin_status,
     ny_date,
 )
@@ -325,7 +326,7 @@ class LiveRuntime:
                                  close_conflicts=CLOSE_CONFLICTS | frozenset(deps.close_conflicts))
         self.prices = PriceSource(self.ex, deps.feed, clock=deps.clock)
         self.gap = StopGapWatch()
-        self.guard = AccountGuard(self.journal, self.cfg.breakers)
+        self.guard = AccountGuard(self.journal, live_breakers(self.cfg.breakers, self.stage))
         self.sessions = SessionWatch()
         self.target: Target | None = None
         self.frame: pd.DataFrame | None = None  # the candles of the last cycle (the audit's DATA_REVISION check)
@@ -555,6 +556,7 @@ class LiveRuntime:
         if self.journal.stage()[1] is None:
             self.journal.set_stage("SHADOW", "initial", now)
             self.stage, self.stage_since = self.journal.stage()
+            self.guard.params = live_breakers(self.cfg.breakers, self.stage)  # the guard's thresholds follow the stage
         self.product = self._startup_read("product", self.ex.product)
         self.session = self._startup_read("session", self.ex.session)
         now = self.clock()

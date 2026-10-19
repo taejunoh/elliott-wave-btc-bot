@@ -7,8 +7,8 @@ BASIS_BAND = 2% from 1 is a stale or one-sided book, not a basis: refused) and p
 the spec's rule (never triggered earlier than the engine's stop); for a take-profit it moves the
 level toward the entry, so the live limit is reached no later than the engine's strict-cross TP.
 
-Sizing: SHADOW and CANARY trade 1 contract and skip a signal whose 1-contract risk exceeds 2% of the
-account; FULL calls the frozen risk.sizing.size_contracts with the real equity and the conservative
+Sizing: SHADOW and CANARY trade 1 contract and skip a signal whose 1-contract risk exceeds 15% of the
+account (CANARY_MAX_RISK); FULL calls the frozen risk.sizing.size_contracts with the real equity and the conservative
 profile (no strategy file is changed), capped at 3 contracts until FULL has run 30 days without a CANARY
 failure (live/stage.full_cap). Margin is always projected at the OVERNIGHT rate (the stricter one; it applies
 from 16:00 New York)."""
@@ -22,7 +22,7 @@ from ewbot.config import CONSERVATIVE, BotConfig, CostParams
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, ProductSpec
 from ewbot.risk.sizing import size_contracts
 
-CANARY_MAX_RISK = 0.02  # spec 4.3
+CANARY_MAX_RISK = 0.15  # user decision 2026-10-19 (Plan 3 spec amendment; spec 4.3 had 2%)
 FULL_CAP_CONTRACTS = 3  # spec 4.3 / 6.2: until FULL has run FULL_CAP_DAYS without a CANARY failure (stage.full_cap)
 FULL_CAP_DAYS = 30
 MARGIN_ENTRY_MAX = 0.70  # spec 4.5: refuse an entry whose overnight projection exceeds 70%

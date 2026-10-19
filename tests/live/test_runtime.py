@@ -62,6 +62,16 @@ def h(tmp_path):
     hs.journal.close()
 
 
+@pytest.fixture
+def hf(tmp_path):
+    """FULL keeps the strategy's daily -3% real-account breaker (SHADOW and CANARY use LIVE_DAILY_LOSS, 20%)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    yield hs
+    hs.journal.close()
+
+
 def entered(h: Harness) -> None:
     h.at(ENTRY_BAR + 30)
     assert h.ex.position() is not None
@@ -235,7 +245,8 @@ def test_bracket_fills_are_recorded_for_the_cost_report(h):
     assert c["slippage_bps"] == pytest.approx((26_747.0 - 26_744.5) / 26_744.5 * 1e4)
 
 
-def test_the_account_breaker_flattens_and_pauses(h):
+def test_the_account_breaker_flattens_and_pauses(hf):
+    h = hf
     entered(h)  # the day's first balance read
     h.at(ENTRY_BAR + 90)
     h.at(ENTRY_BAR + 150)  # three reads: the day's reference (their median)
@@ -251,6 +262,43 @@ def test_the_account_breaker_flattens_and_pauses(h):
     assert h.rt.handle("/resume", ENTRY_BAR + 280).endswith("(지금과 다음 두 번 조회의 중앙값): DAILY_LOSS")
     g = h.rt.guard.state()
     assert not g["daily_tripped"] and g["day_ref"] == h.ex.balance().equity and g["peak"] == peak  # the peak stays
+
+
+@pytest.mark.parametrize(("stage", "daily"), [("SHADOW", 0.20), ("CANARY", 0.20), ("FULL", 0.03)])
+def test_the_real_account_guard_follows_the_stage(tmp_path, stage, daily):
+    """User decision 2026-10-19: daily 20% in SHADOW and CANARY, 3% in FULL, total 15% in all; the engine's own breakers
+    (cfg.breakers: paper equity, the target replay) keep 3%."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=10)
+    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (daily, 0.15)
+    assert (hs.rt.cfg.breakers.daily_loss, hs.rt.cfg.breakers.total_dd) == (0.03, 0.15)
+    hs.journal.close()
+
+
+def test_the_guard_params_follow_a_stage_that_is_read_again(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    assert hs.rt.guard.params.daily_loss == 0.03
+    hs.journal.set_stage("CANARY", "demotion", ENTRY_BAR)
+    hs.rt = hs.make_runtime()  # a restart reads the journal's stage again
+    assert hs.rt.stage == "CANARY" and hs.rt.guard.params.daily_loss == 0.20
+    hs.rt = hs.make_runtime(stage="FULL")  # a process kept on a stage other than the journal's
+    assert hs.rt.stage == "FULL" and hs.rt.guard.params.daily_loss == 0.03
+    hs.journal.close()
+    fresh = Harness(tmp_path / "fresh", ENTRY_BAR, stage=None)  # a journal without a stage: SHADOW is recorded at start
+    assert fresh.rt.guard.params.daily_loss == 0.20
+    fresh.price(26_700.0)
+    fresh.rt.startup()
+    assert fresh.rt.stage == "SHADOW" and fresh.rt.guard.params.daily_loss == 0.20
+    fresh.journal.close()
+
+
+def test_a_minus_five_percent_day_does_not_trip_the_canary_guard(h):
+    entered(h)
+    h.at(ENTRY_BAR + 90)
+    h.at(ENTRY_BAR + 150)  # three reads: the day's reference
+    h.ex.cash -= 500.0  # equity 10_000 -> ~9_500
+    for k in range(4):
+        h.at(ENTRY_BAR + 210 + 60 * k)
+    assert "BREAKER" not in h.alerts.kinds() and paused(h.journal) is None and h.ex.position() is not None
 
 
 def test_a_balance_that_is_not_a_finite_amount_never_trips_and_pauses_entries_after_three_reads(h):
@@ -1183,7 +1231,8 @@ def tripped(h: Harness, t0: float = ENTRY_BAR + 30) -> None:
     h.at(t0 + 180)
 
 
-def test_a_breaker_flatten_that_fails_is_sent_again_at_the_next_poll(h):
+def test_a_breaker_flatten_that_fails_is_sent_again_at_the_next_poll(hf):
+    h = hf
     entered(h)
     tripped(h)
     h.ex.fail_next("close_position", RateLimited("429"))  # the breaker's close is rate-limited (no order created)
@@ -1230,7 +1279,7 @@ def test_a_flatten_confirmed_while_the_venue_is_closed_closes_at_the_reopen(h):
 
 @pytest.mark.parametrize("crash", ["before the request", "before the close"])
 def test_a_crash_before_the_breaker_close_went_out_still_flattens_after_the_restart(tmp_path, crash):
-    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)

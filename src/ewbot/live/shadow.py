@@ -115,7 +115,7 @@ class ShadowExchange(SimExchange):
         return q
 
     def balance(self) -> Balance:
-        return self.real.balance()  # sizing and the 2% check use the real account
+        return self.real.balance()  # sizing and the CANARY risk-cap check use the real account
 
     def key_permissions(self) -> KeyPermissions:
         return self.real.key_permissions()
