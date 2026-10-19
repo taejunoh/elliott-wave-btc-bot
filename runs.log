@@ -455,3 +455,4 @@
 2026-10-19T17:37:50+00:00	ok	last_bar=2026-10-19T16:00+00:00	data=06de5f929486	trades=36/50	epoch=1	new_decisions=0
 2026-10-19T18:37:42+00:00	ok	last_bar=2026-10-19T17:00+00:00	data=58667f9aed27	trades=36/50	epoch=1	new_decisions=0
 2026-10-19T19:37:50+00:00	ok	last_bar=2026-10-19T18:00+00:00	data=48723f21ab2e	trades=36/50	epoch=1	new_decisions=0
+2026-10-19T20:37:47+00:00	ok	last_bar=2026-10-19T19:00+00:00	data=f91064c6addb	trades=36/50	epoch=1	new_decisions=0
