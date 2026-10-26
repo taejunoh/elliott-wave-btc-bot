@@ -24,7 +24,7 @@
    "fingerprint": "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1",
    "started_ts": 1790938800,
    "reason": "baseline: holdout commit 64e628a",
-   "through_ts": 1793012400
+   "through_ts": 1793016000
   }
  ],
  "trades": [],
@@ -20867,6 +20867,44 @@
     "pending": 0,
     "errors": []
    }
+  },
+  {
+   "id": "20261026T133758Z",
+   "ts": 1793021878,
+   "status": "ok",
+   "last_bar_ts": 1793016000,
+   "data_sha256": "baada27223db64ba717e8e688234fa52c44ad48b0590c31776adf8dbb3d2af0e",
+   "holdout_data_ok": true,
+   "holdout_trades_recomputed": 36,
+   "epoch_id": 1,
+   "paper_trades": 0,
+   "count_total": 36,
+   "new_decisions": 0,
+   "new_discrepancies": 0,
+   "env": {
+    "python": "3.12.13",
+    "system": "Linux",
+    "machine": "x86_64",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "uv_lock_sha256": "47a0a99def92af3825ff16a625de457da5a4313e366dfc5db029c45bfbd0a5ab",
+    "image_os": "ubuntu24",
+    "image_version": "20261023.334.3"
+   },
+   "env_sha256": "849298152f9f8e77cf650c798564ca5d125d7c2272e86b615a0d88a07dd73f18",
+   "warnings": [],
+   "criteria_recompute": {
+    "ny_date": "2026-10-26",
+    "ok": true
+   },
+   "notify": {
+    "sent": 0,
+    "pending": 1,
+    "errors": [
+     "send failed for DAILY:1793019600:0: telegram request failed: ReadTimeout"
+    ]
+   }
   }
  ],
  "sent_event_ids": [
@@ -20896,14 +20934,21 @@
   "DAILY:1792846800:0",
   "DAILY:1792933200:0"
  ],
- "pending_events": [],
- "daily_summary_date": "2026-10-25",
+ "pending_events": [
+  {
+   "id": "DAILY:1793019600:0",
+   "kind": "DAILY",
+   "text": "[ewbot paper] \uc77c\uc77c \uc694\uc57d 2026-10-26 (\ub274\uc695)\n\ud3ec\uc9c0\uc158: \uc5c6\uc74c\n\uc790\uc0b0 10,734.76 USD (\ud640\ub4dc\uc544\uc6c3 \uc774\ud6c4 +0.00%)\n\ud45c\ubcf8 \uc678 \ub204\uc801 36/50 (\ud640\ub4dc\uc544\uc6c3 36 + \ubaa8\uc758 0) \u00b7 \uad6c\uac04 1\n\uc2e4\uac70\ub798 \uc804\ud658 \ud310\uc815 (Plan 1 \uba85\uc138 \u00a79.6)\n1. \uc704\ud5d8 \ub300\ube44 \uc218\uc775 A > C\u00b7BH\u00b7RANDOM (\uc0e4\ud504\u00b7Calmar): \ucda9\uc871 [\uc6b0\uc704: A, HYBRID] (2026-10-26 \uacc4\uc0b0)\n2. \ucd5c\ub300 \ub099\ud3ed <= 15% (A): \ucda9\uc871 [A 2.9%]\n3. \ud45c\ubcf8 \uc678 \uac70\ub798 36/50 (\ud640\ub4dc\uc544\uc6c3 36 + \ubaa8\uc758 0): \ubbf8\ucda9\uc871\n4. \ubaa8\uc758\ub9e4\ub9e4 \uc7ac\ud604: \ubbf8\ucda9\uc871 (\uc6b4\uc601 23.8/28\uc77c, \ucee4\ubc84\ub9ac\uc9c0 97.2%, \uc6d0\uc778 \ubd88\uba85 \ubd88\uc77c\uce58 0\uac74)\n=> \uc2e4\uac70\ub798 \uc804\ud658 \uac80\ud1a0 \ubd88\uac00",
+   "attempts": 1
+  }
+ ],
+ "daily_summary_date": "2026-10-26",
  "criteria": {
-  "computed_ts": 1792935479,
+  "computed_ts": 1793021878,
   "epoch_id": 1,
   "window": [
    1704067200,
-   1792933200
+   1793019600
   ],
   "winners": [
    "A",
@@ -20915,43 +20960,43 @@
    "A": {
     "total_return": 0.07347576714970105,
     "max_dd": 0.02901823651410427,
-    "sharpe": 0.9562269335433141,
-    "calmar": 0.8781120087113509,
+    "sharpe": 0.9557623777889759,
+    "calmar": 0.8772482933056039,
     "n_trades": 36
    },
    "HYBRID": {
     "total_return": 0.06837024471495634,
     "max_dd": 0.033375998621576156,
-    "sharpe": 0.877554193744802,
-    "calmar": 0.7115211975681331,
+    "sharpe": 0.8771278659273924,
+    "calmar": 0.7108219305416625,
     "n_trades": 40
    },
    "C": {
     "total_return": 0.008838584555078466,
     "max_dd": 0.041400512507171694,
-    "sharpe": 0.13516913044645165,
-    "calmar": 0.07554950719824824,
+    "sharpe": 0.13510346906780854,
+    "calmar": 0.07547600800361622,
     "n_trades": 48
    },
    "BH": {
-    "total_return": 0.8888134421643104,
+    "total_return": 0.8854482808564745,
     "max_dd": 0.5385379861984871,
-    "sharpe": 0.714248192176529,
-    "calmar": 0.4701359879161422,
+    "sharpe": 0.7125296357502559,
+    "calmar": 0.46815550470645184,
     "n_trades": 1
    },
    "EMA": {
-    "total_return": 0.7862305224209258,
+    "total_return": 0.7898562172916217,
     "max_dd": 0.38939518012585905,
-    "sharpe": 0.6981054742504516,
-    "calmar": 0.5870535348436556,
+    "sharpe": 0.6994226218426121,
+    "calmar": 0.5886913068069117,
     "n_trades": 36
    }
   },
   "random": {
    "runs": 100,
-   "sharpe_mean": -0.2312212988181535,
-   "calmar_mean": -0.04268552448931352
+   "sharpe_mean": -0.10668598851168559,
+   "calmar_mean": 0.039083420655875604
   }
  },
  "schema_version": 1
