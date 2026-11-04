@@ -12,6 +12,7 @@ The project was built in three layers. Each layer has to prove itself before the
 | **Strategy B** (Plan 4) | A separate 15m strategy on BTC and ETH (1h swing structure, Fibonacci zone with an earlier swing, 15m RSI divergence and breakout). Its own walk-forward, one-shot holdout (`holdout-b.lock`) and paper trading (`paper-b` branch). Never touches A. | Your laptop, then GitHub Actions (`paper-b.yml`) | Ended at walk-forward ([`docs/strategy-b.md`](docs/strategy-b.md)) |
 | **A-ETH** (Plan 5a) | Strategy A, frozen (same params, code and costs except the 0.1 ETH contract), on ETH-USD: a pre-registered stage 1 on 2017–2023, a one-shot ETH holdout (`holdout-aeth.lock`) and paper trading (`paper-aeth` branch) with its own 50-trade count. Never touches A. | Your laptop, then GitHub Actions (`paper-aeth.yml`) | Ended (stage 2): stage 1 passed, the ETH holdout failed ([`docs/aeth.md`](docs/aeth.md)) |
 | **Strategy C** (Plan 5b) | Strategy B2's rules one timeframe up (4h structure and trend, 1h confirmation) on BTC and ETH. | - | Ended before walk-forward: 0.81 trades/month in 2017–2023, too few for a 50-trade holdout ([spec §11](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md)) |
+| **Strategy D** (Plan 6) | Strategy A's rules one timeframe down (1h waves, 15m breakout trigger) on BTC. | - | Ended at the pre-registered count check before walk-forward: median 3.18 trades/month in 2017–2023, fallback 3.44, bar 4.0; no performance computed ([spec §8](docs/superpowers/specs/2026-11-04-ewbot-plan6-strategy-d-design.md)). |
 
 ## Live stages
 
@@ -66,6 +67,7 @@ uv run --group live pytest
   - [Plan 4: strategy B](docs/superpowers/specs/2026-10-07-ewbot-plan4-strategy-b-design.md)
   - [Plan 5a: A-ETH](docs/superpowers/specs/2026-10-07-ewbot-plan5a-aeth-design.md)
   - [Plan 5b: strategy C](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md) (ended)
+  - [Plan 6: strategy D](docs/superpowers/specs/2026-11-04-ewbot-plan6-strategy-d-design.md) (ended)
 - Implementation plans: `docs/superpowers/plans/`.
 
 ## Layout
