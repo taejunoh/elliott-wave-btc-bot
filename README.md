@@ -13,6 +13,7 @@ The project was built in three layers. Each layer has to prove itself before the
 | **A-ETH** (Plan 5a) | Strategy A, frozen (same params, code and costs except the 0.1 ETH contract), on ETH-USD: a pre-registered stage 1 on 2017–2023, a one-shot ETH holdout (`holdout-aeth.lock`) and paper trading (`paper-aeth` branch) with its own 50-trade count. Never touches A. | Your laptop, then GitHub Actions (`paper-aeth.yml`) | Ended (stage 2): stage 1 passed, the ETH holdout failed ([`docs/aeth.md`](docs/aeth.md)) |
 | **Strategy C** (Plan 5b) | Strategy B2's rules one timeframe up (4h structure and trend, 1h confirmation) on BTC and ETH. | - | Ended before walk-forward: 0.81 trades/month in 2017–2023, too few for a 50-trade holdout ([spec §11](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md)) |
 | **Strategy D** (Plan 6) | Strategy A's rules one timeframe down (1h waves, 15m breakout trigger) on BTC. | - | Ended at the pre-registered count check before walk-forward: median 3.18 trades/month in 2017–2023, fallback 3.44, bar 4.0; no performance computed ([spec §8](docs/superpowers/specs/2026-11-04-ewbot-plan6-strategy-d-design.md)). |
+| **Strategy E** (Plan 7) | Daily channel-breakout trend following on BTC, without waves, with a −30% drawdown limit. | - | Ended at the pre-registered count check before walk-forward: median 0.435 trades/month in 2017–2023, bar 1.0; no performance computed ([spec §8](docs/superpowers/specs/2026-11-04-ewbot-plan7-strategy-e-design.md)). |
 
 ## Live stages
 
@@ -68,6 +69,7 @@ uv run --group live pytest
   - [Plan 5a: A-ETH](docs/superpowers/specs/2026-10-07-ewbot-plan5a-aeth-design.md)
   - [Plan 5b: strategy C](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md) (ended)
   - [Plan 6: strategy D](docs/superpowers/specs/2026-11-04-ewbot-plan6-strategy-d-design.md) (ended)
+  - [Plan 7: strategy E](docs/superpowers/specs/2026-11-04-ewbot-plan7-strategy-e-design.md) (ended)
 - Implementation plans: `docs/superpowers/plans/`.
 
 ## Layout
