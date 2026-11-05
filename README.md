@@ -22,7 +22,7 @@ The project was built in three layers. Each layer has to prove itself before the
 |---|---|---|
 | **SHADOW** | None. Decisions are checked against paper trading, and orders are only previewed. | ≥ 14 days, every gate met, then your explicit `ewbot live stage canary --confirm` |
 | **CANARY** | 1 contract | ≥ 3 trades or 90 days, with no incident |
-| **FULL** | Sized by the strategy, capped at 3 contracts until 30 clean days | **50 out-of-sample trades** (holdout + paper), plus your explicit approval |
+| **FULL** | Sized by the strategy, capped at 3 contracts until 30 clean days | CANARY passed and paper criteria 1, 2 and 4 met (no 50-trade requirement since 2026-11-05), plus your explicit approval |
 
 Any serious incident pauses trading or demotes the bot, and the Telegram commands `/status`, `/pause`, `/resume` and `/flatten` always work.
 

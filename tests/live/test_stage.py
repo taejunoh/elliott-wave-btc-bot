@@ -413,7 +413,9 @@ def test_canary_pass_and_full_entry(tmp_path):
     jr = canary_journal(tmp_path)
     now = S0 + 20 * DAY
     assert all(g.met for g in canary_gates(jr, now, good(now))), gate_lines(canary_gates(jr, now, good(now)))
-    assert not all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_OK, KEY))  # 37/50
+    # user decision 2026-11-05: criterion 3 (50 out-of-sample trades) is no longer a FULL gate: 37/50 and c3 False pass
+    assert all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_OK, KEY)), \
+        gate_lines(full_entry_gates(jr, now, good(now), PAPER_OK, KEY))
     assert all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_ALL, KEY))
     jr.add_event(now, "UNPROTECTED_60S", {"trade_id": 9})
     jr.add_event(now, "ADOPTED", {"trade_id": 9})
@@ -422,6 +424,31 @@ def test_canary_pass_and_full_entry(tmp_path):
     assert not met["② 손절 이동과 청산이 목표와 일치"] and not met["③ 보호되지 않은 상태 60초 초과 없음"]
     assert not met["④ 수동 개입 없음"]
     jr.close()
+
+
+def test_full_entry_needs_the_rest_but_not_the_trade_count(tmp_path):
+    jr = canary_journal(tmp_path)
+    now = S0 + 20 * DAY
+    few = {**PAPER_OK, "c3": False, "count": {"total": 0, "required": 50}}
+    gates = full_entry_gates(jr, now, good(now), few, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)  # no trade count gate of any kind
+    assert not any("표본 외" in g.name or "3번" in g.name for g in gates)
+    transition(jr, "FULL", now + 1, gates, confirm=True, flat=True)  # the promotion itself goes through
+    jr.close()
+    for key in ("c1", "c2"):
+        jr = canary_journal(tmp_path, name=f"{key}.sqlite")
+        assert not all(g.met for g in full_entry_gates(jr, now, good(now), {**PAPER_ALL, key: False}, KEY)), key
+        jr.close()
+    jr = canary_journal(tmp_path, name="c4.sqlite")
+    no_c4 = {**PAPER_ALL, "c4": {"met": False, "days": 12.0, "coverage": 0.99, "unexplained": 0}}
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), no_c4, KEY))
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), None, KEY))
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_ALL, KeyPermissions(True, True, True)))
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_ALL, None))
+    jr.close()
+    unmet = canary_journal(tmp_path, closed=1, name="few_trades.sqlite")  # the CANARY gates stay in force
+    assert not all(g.met for g in full_entry_gates(unmet, S0 + 20 * DAY, good(now), PAPER_ALL, KEY))
+    unmet.close()
 
 
 def test_every_canary_failure_pauses_canary_and_keeps_full_closed(tmp_path):

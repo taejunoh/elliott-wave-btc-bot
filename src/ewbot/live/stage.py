@@ -39,7 +39,8 @@ clock step moves every window with it.
                 manual intervention; (5) costs measured (a daily summary with fills); no other CANARY failure
                 (audit mismatch, breaker, transfer key); not paused; a current audit without an unexplained
                 mismatch of a decision known in the stint.
-  FULL start    CANARY pass + paper criteria 1-4 all met (incl. 50 out-of-sample trades)."""
+  FULL start    CANARY pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission (criterion 3,
+                the 50 out-of-sample trades, is no longer required: user decision 2026-11-05)."""
 
 from __future__ import annotations
 
@@ -103,12 +104,11 @@ G_AUDIT_NOW = "모의매매 대조 (최근 감사 통과)"
 G_C1 = "모의매매 1번 (위험 대비 수익)"
 G_C2 = "모의매매 2번 (최대 낙폭)"
 G_C4 = "모의매매 4번 (28일, 원인 불명 0건, 커버리지 95%)"
-G_C3 = "모의매매 3번 (표본 외 50건)"
 G_KEY = "거래 키 권한 (view+trade, 송금 불가)"
 SHADOW_PASS = (G_DAYS, G_SIGNAL, G_AUDIT, G_CYCLES, G_PREVIEW, G_RESTART)
 CANARY_PASS = (G_TRADES, G_PROTECT, G_ORDERS, G_UNPROTECTED, G_MANUAL, G_COSTS, G_MAJOR, G_RUNNING, G_AUDIT_NOW)
 REQUIRED_GATES = {("SHADOW", "CANARY"): SHADOW_PASS + (G_C1, G_C2, G_C4, G_KEY),
-                  ("CANARY", "FULL"): CANARY_PASS + (G_C1, G_C2, G_C4, G_C3, G_KEY)}
+                  ("CANARY", "FULL"): CANARY_PASS + (G_C1, G_C2, G_C4, G_KEY)}
 
 
 class StageError(RuntimeError):
@@ -313,21 +313,17 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     ]
 
 
-def _paper_gates(paper_status: dict[str, Any] | None, full: bool) -> list[Gate]:
+def _paper_gates(paper_status: dict[str, Any] | None) -> list[Gate]:
     if paper_status is None:
         return [Gate("모의매매 판정", False, "paper ledger를 읽지 못함")]
     c4 = paper_status.get("c4") or {}
-    gates = [
+    return [
         Gate(G_C1, bool(paper_status.get("c1")), str(paper_status.get("c1"))),
         Gate(G_C2, bool(paper_status.get("c2")), str(paper_status.get("c2"))),
         Gate(G_C4, bool(c4.get("met")),
              f"{float(c4.get('days', 0.0)):.1f}일, 커버리지 {float(c4.get('coverage', 0.0)) * 100:.1f}%, "
              f"원인 불명 {c4.get('unexplained')}건"),
     ]
-    if full:
-        count = paper_status.get("count") or {}
-        gates.append(Gate(G_C3, bool(paper_status.get("c3")), f"{count.get('total')}/{count.get('required')}"))
-    return gates
 
 
 def _key_gate(perms: KeyPermissions | None) -> Gate:
@@ -339,7 +335,7 @@ def _key_gate(perms: KeyPermissions | None) -> Gate:
 
 def canary_entry_gates(journal: Journal, now: float, audit_result: AuditResult | None,
                        paper_status: dict[str, Any] | None, perms: KeyPermissions | None) -> list[Gate]:
-    return shadow_gates(journal, now, audit_result) + _paper_gates(paper_status, full=False) + [_key_gate(perms)]
+    return shadow_gates(journal, now, audit_result) + _paper_gates(paper_status) + [_key_gate(perms)]
 
 
 def _counted(found: dict[str, tuple[int, float]], kinds: Sequence[str]) -> tuple[bool, str]:
@@ -381,7 +377,7 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
 
 def full_entry_gates(journal: Journal, now: float, audit_result: AuditResult | None,
                      paper_status: dict[str, Any] | None, perms: KeyPermissions | None) -> list[Gate]:
-    return canary_gates(journal, now, audit_result) + _paper_gates(paper_status, full=True) + [_key_gate(perms)]
+    return canary_gates(journal, now, audit_result) + _paper_gates(paper_status) + [_key_gate(perms)]
 
 
 def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, confirm: bool, flat: bool) -> None:
