@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ import ewbot.live.runtime as runtime_mod
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.live.audit import AuditError, audit
 from ewbot.live.control import Command
-from ewbot.live.executor import ENTRY_SHOW_MAX_S
+from ewbot.live.executor import ENTRY_CLAIM_MAX_S, ENTRY_SHOW_MAX_S
 from ewbot.live.exchange import (
     Balance,
     ExchangeError,
@@ -3106,6 +3107,216 @@ def test_a_flatten_stands_through_the_lag_and_closes_when_it_shows(tmp_path):
     assert hs.ex.pos is None and hs.journal.get(FLATTEN_KEY) is None
     assert hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "USER_FLATTEN"
     assert hs.journal.events(kind="ADOPTED") == []
+    hs.journal.close()
+
+
+def two_legs(tmp_path, refuse: bool = False) -> tuple[Harness, Lag]:
+    """FULL at 4 contracts: a 2-contract TP1 leg and a 2-contract TP2 leg, the position read lagging."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="FULL", stage_days=10, capped=4)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    lag = Lag(hs, 10_000, refuse=refuse)
+    hs.at(ENTRY_BAR + 30)
+    return hs, lag
+
+
+def test_one_filled_leg_with_another_resting_explains_nothing(tmp_path):
+    """Re-review M1: TP1 filled while the read lags, and the trade closed as BRACKET: the planner cancelled TP2 and the stop,
+    leaving 2 real contracts with no orders."""
+    hs, lag = two_legs(tmp_path)
+    t = hs.rt.executor.trade()
+    assert [(leg.name, leg.size) for leg in t.legs] == [("tp1", 2), ("tp2", 2)]
+    hs.ex.set_prices(next(leg for leg in t.legs if leg.name == "tp1").limit_price + 1.0)
+    assert hs.ex.pos.contracts == 2
+    hs.at(ENTRY_BAR + 31)
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    assert real_stops(hs) == 2 and hs.journal.events(kind="UNPROTECTED") == []  # what is left is covered
+    assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(ENTRY_BAR + 32)) is False  # the close's flat branch agrees
+    lag.left = 0
+    hs.at(ENTRY_BAR + 33)
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and t.tp1_filled and hs.ex.position().contracts == 2 and real_stops(hs) == 2
+    assert hs.journal.events(kind="ADOPTED") == [] and (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    hs.journal.close()
+
+
+def test_every_leg_gone_with_a_fill_is_a_bracket_exit(tmp_path):
+    hs, _ = two_legs(tmp_path)
+    t = hs.rt.executor.trade()
+    hs.ex.set_prices(t.stop_price - 1.0)  # both legs stopped out while the read lags
+    assert hs.ex.pos is None
+    hs.at(ENTRY_BAR + 31)
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET")
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage", ["CANARY", "FULL"])
+def test_no_stop_during_the_wait_counts_as_unprotected(tmp_path, stage):
+    """Re-review M2: the unprotected clock, the major incident and FULL's demotion stayed silent through a hold."""
+    hs, lag = lagged_entry(tmp_path, stage)
+    hs.at(ENTRY_BAR + 31)
+    assert hs.rt.executor.trade().unprotected_since is not None and hs.journal.events(kind="UNPROTECTED")
+    assert hs.rt._stop_waits() is True  # a stop request gives the passes that place it their time
+    now = float(ENTRY_BAR + 31)
+    while now < ENTRY_BAR + 31 + 65:
+        now += 10
+        hs.at(now)
+    assert hs.journal.events(kind="UNPROTECTED_60S") and paused(hs.journal) is not None
+    assert hs.journal.stage()[0] == "CANARY"  # FULL demoted: the next order at once, this position as it is
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and hs.ex.pos is not None and hs.rt._ctx(now).max_contracts == 1
+    lag.left = 0
+    hs.at(now + 10)
+    assert real_stops(hs) == t.contracts  # protected when it shows, at its real size
+    hs.journal.close()
+
+
+def test_stops_that_rest_through_the_wait_raise_no_alarm(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "FULL", refuse=False)
+    for k in range(1, 8):
+        hs.at(ENTRY_BAR + 30 + 10 * k)
+    assert hs.rt.executor.trade().unprotected_since is None and hs.journal.events(kind="UNPROTECTED") == []
+    assert hs.rt._stop_waits() is False and paused(hs.journal) is None and hs.journal.stage()[0] == "FULL"
+    hs.journal.close()
+
+
+def test_a_stop_during_the_wait_says_so_and_a_price_through_the_stop_sends_no_blind_close(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "CANARY")
+    hs.at(ENTRY_BAR + 31)
+    stop = hs.rt.executor.trade().stop_price
+    hs.rt.stop_requested = True
+    hs.rt.stop_since = hs.rt.mono() - STOP_GRACE_S - 1.0  # its grace is over
+    assert hs.rt.run_forever() == 0
+    said = [t for k, t in hs.alerts.items if k == "STOPPED"]
+    assert said and "거래소 손절 주문이 없음" in said[-1] and "보호 주문은 그대로" not in said[-1]
+    hs.journal.close()
+    hs, _ = lagged_entry(tmp_path / "price", "CANARY")
+    hs.at(ENTRY_BAR + 31)
+    calls = len(hs.ex.calls)
+    hs.ex.set_prices(stop - 50.0)
+    hs.at(ENTRY_BAR + 42)
+    assert hs.journal.events(kind="STOP_UNPROTECTED") and "close_position" not in hs.ex.calls[calls:]
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    said = [t for k, t in hs.alerts.items if k == "STOP_UNPROTECTED"]
+    assert said and "읽히지 않아" in said[-1]
+    hs.journal.close()
+
+
+def test_the_entrys_position_read_never_holds_back_its_first_stop(tmp_path):
+    """Re-review L1: three timeouts and their back-off on the read before the stop made a real PROTECT_SLOW."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    market, position, state = hs.ex.place_market, hs.ex.position, {"armed": False}
+
+    def m(*a):
+        out = market(*a)
+        state["armed"] = True
+        return out
+
+    def p():
+        if state["armed"]:
+            state["armed"] = False
+            hs.clock.now += 33.0
+        return position()
+
+    hs.ex.place_market, hs.ex.position = m, p
+    hs.at(ENTRY_BAR + 30)
+    assert [e["data"]["after_entry_s"] for e in hs.journal.events(kind="PROTECTED_FIRST")] == [0.0]
+    hs.at(hs.clock.now + 11)
+    assert "PROTECT_SLOW" not in canary_failures(hs.journal, hs.journal.stage()[1])
+    hs.journal.close()
+
+
+def test_a_failed_first_stop_still_marks_the_entry_not_shown(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    Lag(hs, 10_000)
+    real = hs.ex.open_orders
+
+    def fails_once_filled():
+        if hs.ex.pos is not None:
+            raise Unavailable("503")
+        return real()
+
+    hs.ex.open_orders = fails_once_filled
+    hs.at(ENTRY_BAR + 30)
+    assert hs.journal.events(kind="ENTRY") and hs.journal.events(kind="ACTION_ERROR")
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is True
+    hs.journal.close()
+
+
+def test_a_clock_behind_coinbase_is_no_expired_wait(tmp_path):
+    """Re-review L2: `created_time` ahead of this clock read as a negative age, which counted as expired: given up at once."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    real = hs.ex.get_order
+
+    def ahead(order_id):
+        o = real(order_id)
+        return dataclasses.replace(o, created_ts=hs.clock.now + 5.0) if o.client_order_id.startswith("ewb-e-") else o
+
+    hs.ex.get_order = ahead
+    lag = Lag(hs, 10_000)
+    hs.at(ENTRY_BAR + 30)
+    hs.at(hs.clock.now + 1)
+    assert hs.rt.executor.trade().status == "OPEN" and paused(hs.journal) is None
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) and lag.left > 0
+    hs.journal.close()
+
+
+def test_a_locked_journal_in_the_ticks_cadence_read_does_not_end_the_process(tmp_path):
+    """Re-review L4: this read sat outside the sections' guard, and `database is locked` would have ended the process."""
+    hs, _ = lagged_entry(tmp_path, "CANARY")
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    hs.rt.executor.trade = locked
+    hs.clock.now += 1
+    hs.rt.tick()  # survives: the failing sections are guarded, and the cadence falls back to the normal poll
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("with_target", [False, True])
+def test_a_position_that_shows_after_the_wait_is_claimed_and_protected(tmp_path, with_target):
+    """Re-review L5: with no target it got an alert only, no stop. Within ENTRY_CLAIM_MAX_S it is that entry's again."""
+    hs, lag = lagged_entry(tmp_path, "CANARY", refuse=False)
+    opened = hs.rt.executor.trade().opened_ts
+    hs.at(opened + ENTRY_SHOW_MAX_S + 1)
+    assert hs.rt.executor.trade().exit_reason == ENTRY_NOT_SEEN
+    hs.at(opened + ENTRY_SHOW_MAX_S + 12)  # what rested was cancelled: the book read flat
+    assert hs.ex.open_orders() == [] and hs.ex.pos is not None
+    if not with_target:
+        hs.rt.target = None
+    lag.left = 0
+    hs.at(opened + ENTRY_SHOW_MAX_S + 72)
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and t.exit_reason is None and real_stops(hs) == 1
+    assert any(text.startswith("[경고]") and "늦게 나타남" in text for _, text in hs.alerts.items)
+    assert hs.journal.events(kind="ADOPTED") == [] and (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    assert not {"UNKNOWN_POSITION", "ADOPTED"} & set(canary_failures(hs.journal, hs.journal.stage()[1]))
+    assert paused(hs.journal) is not None  # the pause stays the user's to lift
+    hs.journal.close()
+
+
+def test_a_position_that_shows_past_the_claim_is_a_foreign_one_as_before(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "CANARY", refuse=False)
+    opened = hs.rt.executor.trade().opened_ts
+    hs.at(opened + ENTRY_SHOW_MAX_S + 1)
+    hs.rt.target = None
+    lag.left = 0
+    hs.at(opened + ENTRY_CLAIM_MAX_S + 1)
+    assert hs.journal.events(kind="ENTRY_SHOWN_LATE") == []
+    # read as anything else the journal does not know: the hour's cycle in this tick adopts it, the engine holding that side
+    assert hs.journal.events(kind="ADOPTED") or (hs.journal.get(RAISED_KEY) or {}).get("items")
     hs.journal.close()
 
 

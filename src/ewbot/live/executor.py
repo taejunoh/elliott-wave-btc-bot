@@ -63,8 +63,9 @@ restart the trade's resting brackets are its legs again (no false UNPROTECTED).
 An entry can read FILLED before /cfm/positions shows it, and Coinbase then refuses a bracket for want of that position. So
 the entry's position is read once when it fills: not shown, the trade is marked unseen (`entry_unseen`, in the trade's
 scratch: a new LiveTrade field would crash a rolled-back release reading the journal), and until a read shows it a flat read
-closes nothing unless a leg reads back with a fill (`flat_held`, for `reconcile.observe` and `close`), for at most
-ENTRY_SHOW_MAX_S. An entry that ended with nothing filled after its wait is settled by the next read (`settle_unfilled`).
+closes nothing unless a leg reads back with a fill and no leg still rests (`flat_held`, for `reconcile.observe` and
+`close`), for at most ENTRY_SHOW_MAX_S; a position on its side for ENTRY_CLAIM_MAX_S after the entry is still that entry's
+(`reopen_late_entry`). An entry that ended with nothing filled after its wait is settled by the next read (`settle_unfilled`).
 
 The same code runs every stage: in SHADOW the exchange is a ShadowExchange (virtual fills, real
 previews)."""
@@ -102,6 +103,7 @@ from ewbot.live.reconcile import (
     entry_cid,
     expected_contracts,
     is_ours,
+    legs_left,
     reduce_cid,
 )
 from ewbot.live.target import TargetPosition
@@ -113,6 +115,7 @@ LOOKUP_WINDOW_S = 300.0  # find_order searches orders created up to 5 min before
 ABANDON_AFTER_S = 600.0  # a PENDING intent not found on the exchange after 10 min was never sent
 UNSETTLED_ENTRY_MAX_S = 7200.0  # an accepted entry no trade records stops counting as unsettled this long after it
 ENTRY_SHOW_MAX_S = 300.0  # a filled entry whose position no read shows is kept open this long, then given up (ENTRY_NOT_SEEN)
+ENTRY_CLAIM_MAX_S = 3600.0  # ... and a position on its side this long after the entry is still its own, then a foreign one
 CLEARING_MAX_S = 30.0  # a close waiting for the brackets it cancelled holds the planner's legs back at most this long
 LEG_SETTLE_S = 30.0  # a leg that left the book with fills is not placed again for this long (the position catches up)
 CLEAR_TIMEOUT_S = 5.0  # an entry after a close or a cancel waits this long for our brackets to leave the book
@@ -300,31 +303,47 @@ class Executor:
         scratch["unseen"] = self.clock() if unseen else None
         self.journal.put(SCRATCH_KEY, scratch)
 
-    def leg_filled(self, trade_id: int) -> bool:
-        """A bracket this trade placed reads back with a fill: only that explains a flat read right after its entry."""
+    def legs_filled(self, trade_id: int) -> int:
+        """Contracts the brackets this trade placed read back as filled (a failed read counts as nothing)."""
+        filled = 0
         for row in self.journal.intents(kind="BRACKET", trade_id=trade_id):
             if row["order_id"]:
                 try:
-                    if self.ex.get_order(str(row["order_id"])).filled > 0:
-                        return True
+                    filled += max(int(self.ex.get_order(str(row["order_id"])).filled), 0)
                 except ExchangeError:
                     pass
-        return False
+        return filled
 
-    def flat_held(self, trade: LiveTrade | None, position: Position | None, now: float) -> bool:
-        """Whether this read of an entry not shown yet closes nothing (`reconcile.observe`). A position ends the wait, and so
-        does a leg with a fill (the normal fold then closes it as that exit). No position by ENTRY_SHOW_MAX_S after the
-        entry: given up, and the trade's exit is named for that (ENTRY_NOT_SEEN), never a bracket's."""
+    def flat_held(self, trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float) -> int | None:
+        """Whether this read of an entry not shown yet closes nothing (`reconcile.observe`), and if so the contracts its legs
+        already sold (None: it is not held). A position ends the wait, and so do legs with a fill when none of them still
+        rests: one filled leg beside a resting one explains no flat read (the normal fold then closes it as that exit). No
+        position by ENTRY_SHOW_MAX_S after the entry: given up, and the trade's exit is named for that (ENTRY_NOT_SEEN),
+        never a bracket's."""
         if trade is None or not self.entry_unseen(trade):
-            return False
-        if position is not None or self.leg_filled(trade.trade_id):
+            return None
+        filled = 0 if position is not None else self.legs_filled(trade.trade_id)
+        if position is not None or (filled > 0 and legs_left(trade, orders) == 0):
             self._set_unseen(trade, False)
-            return False
-        if 0 <= now - trade.opened_ts <= ENTRY_SHOW_MAX_S:
-            return True
+            return None
+        if now - trade.opened_ts <= ENTRY_SHOW_MAX_S:  # a clock behind the venue's created_time reads as a wait, never as over
+            return filled
         self._set_unseen(trade, False)
         trade.exit_reason, trade.flat_seen = ENTRY_NOT_SEEN, now
-        return False
+        return None
+
+    def reopen_late_entry(self, trade: LiveTrade | None, position: Position | None, now: float) -> LiveTrade | None:
+        """A position on the side of the entry given up as not seen, within ENTRY_CLAIM_MAX_S of it, is that entry's: the trade
+        is open again and the planner protects it, with or without a target. Past that it is a foreign one, as for anything
+        else the journal does not know."""
+        if (trade is None or trade.status == "OPEN" or trade.exit_reason != ENTRY_NOT_SEEN or position is None
+                or position.side != trade.direction or now - trade.opened_ts > ENTRY_CLAIM_MAX_S):
+            return trade
+        trade.status, trade.exit_reason, trade.flat_seen = "OPEN", None, None
+        self.save(trade)
+        self.event("ENTRY_SHOWN_LATE", {"trade_id": trade.trade_id, "contracts": position.contracts},
+                   f"[경고] 거래 {trade.trade_id}: 포지션 {_side(position.side)} {position.contracts}계약이 늦게 나타남 - 이 거래로 보고 바로 보호")
+        return trade
 
     def _recorded(self, trade_id: int) -> bool:
         """A trade with this id was recorded once: it is the journal's trade, or it sent orders of its own."""
@@ -544,14 +563,16 @@ class Executor:
                              "order_id": order.order_id},
                    f"[진입] {e.setup} {_side(e.direction)} {trade.contracts}계약 @ {trade.entry_price:,.1f} · 손절 "
                    f"{trade.stop_price:,.0f} · TP1 {trade.tp1_price:,.0f} · TP2 {trade.tp2_price or 0:,.0f}")
-        try:  # one read, its brackets not held back for it: a read that fails shows nothing either
-            shown = self.ex.position()
-        except ExchangeError:
-            shown = None
-        if shown is None or shown.side != trade.direction:
-            self._set_unseen(trade, True)
         legs, stop = desired_legs(trade, trade.contracts, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
-        self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
+        try:
+            self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
+        finally:  # read after the stop, never holding it back; a read that fails shows nothing either
+            try:
+                shown = self.ex.position()
+            except ExchangeError:
+                shown = None
+            if shown is None or shown.side != trade.direction:
+                self._set_unseen(trade, True)
         return self.trade()
 
     def _trade_from(self, payload: dict[str, Any], order: Order) -> LiveTrade:
@@ -980,7 +1001,7 @@ class Executor:
         trade = self.trade()
         if self.ex.position() is None:
             if trade is not None and trade.status == "OPEN":
-                if (hold_flat or self.entry_unseen(trade)) and not trade.exit_reason and not self.leg_filled(trade.trade_id):
+                if (hold_flat or self.entry_unseen(trade)) and not trade.exit_reason and not self._flat_explained(trade):
                     self._set_unseen(trade, True)
                     return False
                 # flat before this close went out (after the pass's reads): what observe() would have found - a bracket
@@ -1050,6 +1071,15 @@ class Executor:
         if left:
             self._cancel_quietly(left, tid)
         return True
+
+    def _flat_explained(self, trade: LiveTrade) -> bool:
+        """Legs with a fill and none of them still resting: what a flat read needs (an unreadable book explains nothing)."""
+        if self.legs_filled(trade.trade_id) <= 0:
+            return False
+        try:
+            return legs_left(trade, self.ex.open_orders()) == 0
+        except ExchangeError:
+            return False
 
     def _send_close(self, open_trade: LiveTrade | None, reason: str) -> Sent:
         """close_position under a new client order id (the trade's next close number; `ewb-x-0-<n>` without one)."""

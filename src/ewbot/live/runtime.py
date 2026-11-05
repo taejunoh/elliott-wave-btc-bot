@@ -123,7 +123,16 @@ from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
 from ewbot.live.control import Command
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, Order, Position, ProductSpec, SessionInfo
-from ewbot.live.executor import CANCEL_QUEUED, CLOSE_CONFLICTS, ENTRY_SHOW_MAX_S, OVERLAP_REFUSALS, SCRATCH_KEY, SKIPS_KEY, Executor
+from ewbot.live.executor import (
+    CANCEL_QUEUED,
+    CLOSE_CONFLICTS,
+    ENTRY_CLAIM_MAX_S,
+    ENTRY_SHOW_MAX_S,
+    OVERLAP_REFUSALS,
+    SCRATCH_KEY,
+    SKIPS_KEY,
+    Executor,
+)
 from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
@@ -971,7 +980,7 @@ class LiveRuntime:
     def _observe(self, trade: LiveTrade | None, pos: Position | None, orders: list[Order], now: float
                  ) -> tuple[LiveTrade | None, list[tuple[str, dict[str, Any]]]]:
         """`observe`, told what it cannot read itself: whether this flat read closes nothing (`Executor.flat_held`)."""
-        return observe(trade, pos, orders, now, hold_flat=self.executor.flat_held(trade, pos, now))
+        return observe(trade, pos, orders, now, hold_flat=self.executor.flat_held(trade, pos, orders, now))
 
     def reconcile(self, now: float) -> None:
         self.active = self._fast()  # before the reads: a pass that fails still keeps the fast polls and the watchdog
@@ -998,8 +1007,8 @@ class LiveRuntime:
                     if paused(self.journal) is None:
                         pause(self.journal, "entry not seen", now)
                     self.alert(ENTRY_NOT_SEEN, f"[경고] 거래 {data['trade_id']}: 체결된 진입의 포지션이 {ENTRY_SHOW_MAX_S / 60:.0f}분 동안 "
-                                               "나타나지 않음 - 없는 것으로 보고 거래를 닫고 일시 정지. Coinbase 앱에서 확인한 뒤 /resume "
-                                               "(이후 나타나는 포지션은 수동 포지션으로 처리)")
+                                               f"나타나지 않음 - 거래를 닫고 일시 정지. Coinbase 앱에서 확인한 뒤 /resume (진입 뒤 "
+                                               f"{ENTRY_CLAIM_MAX_S / 3600:.0f}시간 안에 나타나면 이 거래로 보고 보호, 그 뒤에는 수동 포지션)")
             elif kind == "POSITION_NOT_SEEN":
                 self.alert(kind, f"[경고] 거래 {data['trade_id']}: 체결된 진입의 포지션이 아직 읽히지 않음 - 거래를 유지하고 계속 확인, "
                                  "손절 주문을 다시 시도 (읽히면 바로 보호)")
@@ -1024,6 +1033,7 @@ class LiveRuntime:
                 self._read_failed("session", exc)
         ctx = self._ctx(now)
         reduction = self._entry_reduction
+        seen = self.executor.reopen_late_entry(seen, pos, now)
         seen = self._test_entry_left(seen, pos, ctx, now)
         planned = plan(self.target, seen, pos, orders, ctx)
         req = self.journal.get(FLATTEN_KEY)
@@ -1354,6 +1364,12 @@ class LiveRuntime:
                                                         "error": self.d.redact(str(exc))[:200]})
         what = (f"[손절] 보호 주문 없이 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}을 지남" if kind == "STOP_UNPROTECTED" else
                 f"[손절 갭] 가격 {price:,.1f}이 손절 {t.stop_price:,.0f}의 {STOP_LIMIT_OFFSET:.0%} 지정가를 10초 넘게 지남")
+        if not done and self.executor.entry_unseen(self.executor.trade()):
+            held = self._limited(f"{kind}:{t.trade_id}")
+            if held is not None:  # no close goes out blind: nothing shows what Coinbase would do with one
+                self.alert(kind, f"{what}: 포지션이 읽히지 않아 청산을 보내지 못함 - 읽히면 바로 처리. Coinbase 앱에서 확인"
+                                 + (f" (같은 경보 {held}건 생략)" if held else ""))
+            return
         if done:
             self.gap.reset()
             self.watch_tried.pop(t.trade_id, None)
@@ -2467,6 +2483,17 @@ class LiveRuntime:
                 self.journal.add_event(now, "COMMAND_ERROR", {"cmd": cmd.word, "error": why[:200]})
                 self.alert("COMMAND", f"{cmd.word} 실패: {why[:200]} (다시 보내 주세요)")
 
+    def _entry_unseen_now(self, now: float) -> bool:
+        """For the tick's cadence: an entry not shown yet, in its first PROTECT_MAX_S. Outside the sections' guard: a journal
+        that cannot be read (`database is locked`) falls back to the normal poll, it never ends the process."""
+        if not self.active:
+            return False
+        try:
+            t = self.executor.trade()
+            return t is not None and self.executor.entry_unseen(t) and now - t.opened_ts < PROTECT_MAX_S
+        except Exception:  # noqa: BLE001 - the sections that follow are guarded and report it
+            return False
+
     @staticmethod
     def _due(last: float | None, interval: float, mono: float) -> bool:
         """`interval` has passed on the monotonic clock since `last` (a clock that went back counts as due)."""
@@ -2476,9 +2503,8 @@ class LiveRuntime:
         now, mono = self.clock(), self.mono()
         if self.d.feed is not None and self.d.feed.take_resync():  # a reconnect or a sequence gap: read everything
             self.resync_wanted = True
-        t = self.executor.trade() if self.active else None
-        unseen = t is not None and self.executor.entry_unseen(t) and 0 <= now - t.opened_ts < PROTECT_MAX_S
-        regular = self._due(self.last_poll, POLL_UNSEEN_S if unseen else POLL_ACTIVE_S if self.active else POLL_IDLE_S, mono)
+        regular = self._due(self.last_poll, POLL_UNSEEN_S if self._entry_unseen_now(now) else
+                            POLL_ACTIVE_S if self.active else POLL_IDLE_S, mono)
         resync = self.resync_wanted and self._due(self.last_poll, POLL_ACTIVE_S, mono)  # at most once per 10 s
         if resync and not regular:
             self.resync_polls += 1
