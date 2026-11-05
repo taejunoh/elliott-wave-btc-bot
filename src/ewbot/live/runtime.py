@@ -126,6 +126,7 @@ from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.pricing import (
+    EQUITY_READS_AGREE,
     EQUITY_SIZING_BAND,
     FULL_CAP_CONTRACTS,
     FULL_RISK,
@@ -202,6 +203,8 @@ DATA_DEADLINE_S = 120
 ENTRY_DEADLINE_S = 300
 POLL_ACTIVE_S = 10.0
 POLL_IDLE_S = 60.0
+EQUITY_REREADS = 2  # a FULL balance read outside the band is read again this many times at most ...
+EQUITY_REREAD_S = 1.0  # ... this far apart
 POLL_UNSEEN_S = 1.0  # an entry no read has shown yet, for its first PROTECT_MAX_S: the stop goes on as soon as it shows
 AUDIT_MINUTE = 50
 AUDIT_FETCH_MAX_S = 60.0  # the paper ledger fetch (a worker thread) is given up after this: a failed audit
@@ -564,12 +567,13 @@ class LiveRuntime:
         stage, cap = self._limits()
         if cap == 0 and self.stage != "SHADOW":
             return 0, "단계가 SHADOW로 바뀜: 실주문을 내지 않음 (포지션이 없으면 재시작)"
-        last = usable_price(g.get("equity"))  # the guard's last observation: FULL scales all of its limits from this one read
-        if stage == "FULL" and last is not None and abs(equity / last - 1.0) > EQUITY_SIZING_BAND:
-            return 0, (f"잔고 {equity:,.2f} USD가 직전 조회 {last:,.2f} USD와 {EQUITY_SIZING_BAND:.0%} 넘게 다름: "
-                       "한 번의 조회로 크기를 정하지 않음")
         t = self.executor.trade()
         if not (t is not None and t.trade_id == e.signal_ts) and e.signal_ts not in self.journal.get(SKIPS_KEY, []):
+            if stage == "FULL":
+                sizing, refused = self._sizing_equity(equity, e.signal_ts, now)
+                if sizing is None:
+                    return 0, refused
+                equity = sizing
             # The margin rates may change while the bot runs and FULL sizes to the 70% limit itself: they are read again right
             # before every entry is sized (a signal already traded or skipped is not sized again). A failed or unusable read
             # refuses the entry - sizing on stale rates is the risk - and the watchdog keeps the last good ones.
@@ -602,6 +606,44 @@ class LiveRuntime:
                                      "risk_per_contract": risk_per_contract(entry, stop, self.cfg.costs)}
             return fit, None
         return n, None
+
+    def _sizing_equity(self, first: float, signal_ts: int, now: float) -> tuple[float | None, str | None]:
+        """The equity a FULL entry is sized from (with no contract cap every limit scales from it), or why it is refused. A
+        read within EQUITY_SIZING_BAND of the breakers' last observation is used as it is. Outside it - one wrong read, a
+        stale reference after downtime, a real deposit or withdrawal - it is read again a few seconds, at most twice:
+        - the next read back in the band: that read, as trusted as any in the band (only the first one was off);
+        - three reads within EQUITY_READS_AGREE of each other: their median, even outside the band, and the alert says the
+          balance changed from the reference;
+        - reads that disagree, are not usable or fail: refused. A signal comes about once a month: only this skips it."""
+        last = usable_price((self.guard.state() or {}).get("equity"))
+        if last is None or abs(first / last - 1.0) <= EQUITY_SIZING_BAND:
+            return first, None
+        head = f"잔고 {first:,.2f} USD가 기준 {last:,.2f} USD와 {EQUITY_SIZING_BAND:.0%} 넘게 다름"
+        reads = [float(first)]
+        for _ in range(EQUITY_REREADS):
+            self.d.sleep(EQUITY_REREAD_S)
+            try:
+                reads.append(float(self.ex.balance().equity))
+            except ExchangeError as exc:
+                return None, self.d.redact(f"{head}: 다시 읽지 못함 ({exc})")[:200]
+            if len(reads) == 2 and usable_price(reads[1]) is not None and abs(reads[1] / last - 1.0) <= EQUITY_SIZING_BAND:
+                if self._once(f"equity_read_off:{signal_ts}"):
+                    self.journal.add_event(now, "EQUITY_READ_OFF", {"signal_ts": signal_ts, "read": first, "again": reads[1],
+                                                                    "reference": last})
+                    self.alert("EQUITY_READ_OFF", f"[잔고 조회 이상] {head}: 다시 읽은 값 {reads[1]:,.2f} USD로 크기를 정함")
+                return reads[1], None
+        shown = ", ".join(f"{x:,.2f}" for x in reads)
+        if not all(usable_price(x) is not None for x in reads):
+            return None, f"{head}: 세 번 읽은 값이 서로 다름 ({shown})"
+        median = sorted(reads)[1]
+        if max(reads) - min(reads) > EQUITY_READS_AGREE * median:
+            return None, f"{head}: 세 번 읽은 값이 서로 다름 ({shown})"
+        if self._once(f"equity_changed:{signal_ts}"):
+            self.journal.add_event(now, "EQUITY_CHANGED", {"signal_ts": signal_ts, "reads": reads, "median": median,
+                                                           "reference": last})
+            self.alert("EQUITY_CHANGED", f"[잔고 변경] 손실 한도의 기준 {last:,.2f} USD와 달리 세 번 읽은 잔고가 {median:,.2f} USD: 이 값으로 "
+                                         "크기를 정함 (입출금이면 ewbot live rebase 확인)")
+        return median, None
 
     def _record_entry_reduction(self, r: dict[str, Any], now: float) -> None:
         """A FULL entry that entered with the margin maximum instead of the risk size: once per signal, after the entry

@@ -2292,36 +2292,100 @@ def guarded(hs: Harness, equity: float | None) -> None:
                                       "daily_tripped": False, "total_tripped": False})
 
 
-@pytest.mark.parametrize("read,agrees", [(10_000.0, True), (11_900.0, True), (8_100.0, True), (12_100.0, False),
-                                         (7_900.0, False), (100_000.0, False)])
-def test_full_refuses_to_size_on_a_balance_read_far_from_the_last_good_one(tmp_path, read, agrees):
-    """Review finding: with no contract cap every FULL limit scales from one balance read, while the breakers need two reads
-    or a median of three. A read more than 20% from the guard's last observation (a minute old, in the journal) sizes
-    nothing: the signal is skipped and says why. Both ways: a wrong read is no reason to trust either side of it."""
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0, equity=read)
+def sizing(tmp_path, *reads, stage: str = "FULL", reference: float | None = 10_000.0) -> tuple[Harness, list]:
+    """A FULL entry at 26,740 with its stop 240 away (one contract's overnight margin: 56.22 USD), the guard's last observation
+    at `reference`, and balance() answering `reads` in turn (an exception raises), the last one from then on."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=60.0)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
-    guarded(hs, 10_000.0)
+    if reference is not None:
+        guarded(hs, reference)
     ent = TargetEntry(SIGNAL, "W3", 1, 26_740.0, 26_500.0, 27_500.0, None, 1.0, 5, "test signal")
     hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
-    n, block = hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True)
-    if agrees:
-        assert n > 0 and block is None
-    else:
-        assert n == 0 and "다름" in block
+    calls: list[float] = []
+
+    def balance() -> Balance:
+        x = reads[min(len(calls), len(reads) - 1)]
+        calls.append(x)
+        if isinstance(x, Exception):
+            raise x
+        return Balance(float(x), None)
+
+    hs.ex.balance = balance
+    return hs, calls
+
+
+def size_now(hs: Harness) -> tuple[int, str | None]:
+    return hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True)
+
+
+@pytest.mark.parametrize("read", [10_000.0, 11_900.0, 8_100.0])
+def test_a_balance_read_in_the_band_is_read_once(tmp_path, read):
+    hs, calls = sizing(tmp_path, read)
+    assert size_now(hs)[0] > 0 and calls == [read] and hs.journal.events(kind="EQUITY_CHANGED") == []
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("reads,median,contracts", [
+    ((30_000.0, 30_100.0, 29_950.0), 30_000.0, 373),  # a deposit: floor(0.70 * 30,000 / 56.22)
+    ((5_000.0, 5_010.0, 4_990.0), 5_000.0, 62),  # a withdrawal, or a stale reference after downtime
+])
+def test_three_reads_that_agree_size_the_entry_even_outside_the_band_and_it_says_so(tmp_path, reads, median, contracts):
+    """User decision 2026-11-05: signals come about once a month. A real change of the balance, or a reference gone stale, is
+    no reason to skip one: the median of three reads that agree within 1% sizes it."""
+    hs, calls = sizing(tmp_path, *reads)
+    start = hs.clock.now
+    assert size_now(hs) == (contracts, None) and calls == list(reads)
+    assert hs.rt._entry_reduction["equity"] == median
+    assert 0 < hs.clock.now - start <= 5  # within a few seconds
+    assert hs.journal.events(kind="EQUITY_CHANGED")[-1]["data"]["median"] == median
+    said = [t for k, t in hs.alerts.items if k == "EQUITY_CHANGED"]
+    assert len(said) == 1 and said[0].startswith("[잔고 변경]") and "10,000.00" in said[0] and f"{median:,.2f}" in said[0]
+    assert size_now(hs)[0] > 0 and len([k for k in hs.alerts.kinds() if k == "EQUITY_CHANGED"]) == 1  # once a signal
+    hs.journal.close()
+
+
+def test_one_wild_read_followed_by_a_normal_one_loses_no_signal(tmp_path):
+    """The case that asked for this: the next read is back in the band, as trusted as any read in the band. No third read is
+    needed, the size is that read's, and the balance did not change, so nothing says it did."""
+    hs, calls = sizing(tmp_path, 100_000.0, 10_000.0)
+    assert size_now(hs) == (124, None) and calls == [100_000.0, 10_000.0]
+    assert hs.journal.events(kind="EQUITY_CHANGED") == []
+    assert hs.journal.events(kind="EQUITY_READ_OFF")[-1]["data"]["read"] == 100_000.0
+    assert any(t.startswith("[잔고 조회 이상]") for _, t in hs.alerts.items)
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("reads,why", [
+    ((30_000.0, 30_000.0, 40_000.0), "서로 다름"),  # within 1% is not met
+    ((30_000.0, 20_000.0, 10_000.0), "서로 다름"),  # the last one in the band does not make two wild reads right
+    ((30_000.0, 30_000.0, float("nan")), "서로 다름"),
+    ((float("inf"), float("inf"), float("inf")), "서로 다름"),
+    ((30_000.0, Unavailable("HTTP 503")), "다시 읽지 못함"),
+    ((30_000.0, 30_000.0, RateLimited("429")), "다시 읽지 못함"),
+])
+def test_reads_that_disagree_or_fail_refuse_the_entry_and_say_why(tmp_path, reads, why):
+    hs, _ = sizing(tmp_path, *reads)
+    hs.rt.poll(ENTRY_BAR + 31)  # a whole pass: skipped, and the skip is alerted
+    assert hs.ex.position() is None and hs.journal.events(kind="EQUITY_CHANGED") == []
+    said = [t for k, t in hs.alerts.items if k == "SKIP"]
+    assert len(said) == 1 and why in said[0] and hs.journal.events(kind="SKIP")[-1]["data"]["signal_ts"] == SIGNAL
+    hs.journal.close()
+
+
+def test_a_signal_already_traded_or_skipped_is_not_read_again(tmp_path):
+    hs, calls = sizing(tmp_path, 30_000.0)
+    hs.journal.put("skipped_signals", [SIGNAL])
+    size_now(hs)
+    assert calls == [30_000.0]
     hs.journal.close()
 
 
 def test_the_balance_check_is_for_full_only_and_needs_a_reference(tmp_path):
-    for name, stage, ref, wanted in (("canary", "CANARY", 10_000.0, 1), ("first", "FULL", None, 124)):
-        hs = Harness(tmp_path / name, ENTRY_BAR + 30, stage=stage, stage_days=60.0, equity=10_000.0)
-        hs.price(float(hs.bar(ENTRY_BAR)["open"]))
-        hs.rt.startup()
-        if ref is not None:
-            guarded(hs, ref * 0.5)  # far from the read: CANARY's one contract has its own risk and margin checks
-        ent = TargetEntry(SIGNAL, "W3", 1, 26_740.0, 26_500.0, 27_500.0, None, 1.0, 5, "test signal")
-        hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
-        assert hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True) == (wanted, None)
+    for name, stage, ref, wanted in (("canary", "CANARY", 5_000.0, 1), ("first", "FULL", None, 124)):
+        # far from the read: CANARY's one contract has its own risk and margin checks
+        hs, calls = sizing(tmp_path / name, 10_000.0, stage=stage, reference=ref)
+        assert size_now(hs) == (wanted, None) and calls == [10_000.0]
         hs.journal.close()
 
 
