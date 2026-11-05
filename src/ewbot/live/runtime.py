@@ -264,6 +264,7 @@ TEST_BRACKET_REFUSALS = 2  # ... at once after this many refusals: the same term
 TEST_RETRY_S = 1.0
 TEST_UNSEEN_MAX_S = OBSERVED_CLOSE_FAST_S  # a position not read yet is looked for this long at the fast polls, then taken as gone
 TEST_FLAT_READS = 5  # reads (a TEST_RETRY_S apart) after the close until flat and no bracket of ours rests
+TEST_FILL_READS = 5  # reads (a TEST_RETRY_S apart) of a would-be pass's fill price or fee the first read did not have
 TEST_MARGIN_WAIT_S = 2.0  # the margin read is waited for at most this: a hung one never holds back the close
 TEST_MARGIN_FIELDS = ("liquidation_threshold", "liquidation_buffer_amount", "liquidation_buffer_percentage",
                       "initial_margin", "available_margin", "intraday_margin_window_measure",
@@ -2250,46 +2251,77 @@ class LiveRuntime:
                                "Coinbase 앱에서 바로 청산")
 
     def _test_fills(self, r: dict[str, Any], tid: int) -> None:
-        """The fills as the journal has them (the same ENTRY and CLOSED events as a strategy trade's); a fee not there yet is
-        read once more, with nothing left to protect."""
+        """The fills as the journal has them (the same ENTRY and CLOSED events as a strategy trade's). A price it does not
+        have, or a fee (0: not settled yet, and shown as it is if it stays so), is read again: for a would-be pass up to
+        TEST_FILL_READS times with nothing left to protect, otherwise once. A would-be pass with a fill price never read
+        fails here: nothing else says the entry or the close was at a known price."""
         def event(kind: str) -> dict[str, Any]:
             found = [e["data"] for e in self.journal.events(kind=kind, since=float(r["started"]))
                      if e["data"].get("trade_id") == tid]
             return found[-1] if found else {}
 
-        def fee(data: dict[str, Any]) -> float | None:
-            if data.get("fee") is not None or not data.get("order_id"):
-                return data.get("fee")
-            try:
-                got = self.ex.get_order(str(data["order_id"])).fee
-            except ExchangeError:
-                return None
-            return float(got) if got is not None and math.isfinite(float(got)) else None
-
         e, c = event("ENTRY"), event("CLOSED")
-        entry_fee, close_fee = fee(e), fee(c)
+        fills = [{"order": d.get("order_id"), "price": d.get("price"), "fee": d.get("fee")} for d in (e, c)]
+        for k in range(TEST_FILL_READS if r["ok"] else 1):
+            short = [f for f in fills if f["order"] and (f["price"] is None or not f["fee"])]
+            if not short:
+                break
+            if k:
+                self.d.sleep(TEST_RETRY_S)
+            for f in short:
+                try:
+                    o = self.ex.get_order(str(f["order"]))
+                except ExchangeError:
+                    continue
+                if f["price"] is None:
+                    f["price"] = usable_price(o.avg_fill_price)
+                if not f["fee"] and o.fee is not None and math.isfinite(float(o.fee)):
+                    f["fee"] = float(o.fee)
+        (entry_price, entry_fee), (close_price, close_fee) = ((f["price"], f["fee"]) for f in fills)
         t = self.executor.trade()
-        r.update(entry_price=e.get("price"), entry_order=e.get("order_id"), entry_fee=entry_fee, close_price=c.get("price"),
+        r.update(entry_price=entry_price, entry_order=e.get("order_id"), entry_fee=entry_fee, close_price=close_price,
                  close_order=c.get("order_id"), close_fee=close_fee, close_reason=c.get("reason"),
                  fees=None if entry_fee is None or close_fee is None else entry_fee + close_fee,
                  protect_s=None if t is None or t.trade_id != tid or t.protected_ts is None
                  else round(t.protected_ts - t.opened_ts, 3))
+        if r["ok"] and (entry_price is None or close_price is None):
+            r["ok"], r["why"] = False, f"{'진입' if entry_price is None else '청산'} 체결가를 읽지 못함: 왕복은 끝났지만 통과로 보지 않음"
+
+    def _test_words(self, r: dict[str, Any], state: str) -> tuple[str, str]:
+        """The command's message and the alert."""
+        step = TEST_STEP[r["step"]]
+        if not r["ok"]:
+            detail = f"{r['why']} · {state}"
+            return f"시험 거래 실패 ({step}): {detail}", f"[시험 거래 실패] {step}: {detail}"
+        fees = "-" if r["fees"] is None else f"{r['fees']:.2f} USD"
+        detail = (f"{_side(r['side'])} {r['contracts']}계약 · 진입 {r['entry_price']:,.1f} · 손절 {r['stop']:,.0f} 확인 "
+                  f"(보호까지 {r['protect_s']:.1f}초) · 청산 {r['close_price']:,.1f} · 수수료 {fees} · {state}")
+        return f"시험 거래 성공: {detail}", f"[시험 거래 성공] {detail}"
 
     def _test_trade_end(self, r: dict[str, Any], tid: int) -> None:
-        """The result: journaled with what the gates need (TEST_TRADE), alerted, and read back by the command."""
-        self._test_fills(r, tid)
-        r["position"], state = self._test_end_state()
-        if r["ok"]:
-            fees = "-" if r["fees"] is None else f"{r['fees']:.2f} USD"
-            detail = (f"{_side(r['side'])} {r['contracts']}계약 · 진입 {r['entry_price']:,.1f} · 손절 {r['stop']:,.0f} 확인 "
-                      f"(보호까지 {r['protect_s']:.1f}초) · 청산 {r['close_price']:,.1f} · 수수료 {fees} · {state}")
-            r["message"], alert = f"시험 거래 성공: {detail}", f"[시험 거래 성공] {detail}"
-        else:
-            detail = f"{r['why']} · {state}"
-            r["message"] = f"시험 거래 실패 ({TEST_STEP[r['step']]}): {detail}"
-            alert = f"[시험 거래 실패] {TEST_STEP[r['step']]}: {detail}"
-        self.journal.add_event(self.clock(), TEST_TRADE, r)
-        self.journal.put(TEST_ACTIVE_KEY, None)
+        """The result: journaled with what the gates need (TEST_TRADE), alerted, and read back by the command. Whatever
+        happens while it is put together, the event is written and TEST_ACTIVE_KEY cleared, so a rerun is never refused and
+        the command gets an answer. A pass needs the last read of the account to be flat."""
+        alert = ""
+        try:
+            self._test_fills(r, tid)
+            r["position"], state = self._test_end_state()
+            if r["ok"] and r["position"] != "flat":
+                r["ok"] = False
+                self._test_unseen(r, "끝 확인에서 포지션이 없음을 확인하지 못함")
+                r["position"], state = self._test_end_state()
+            r["message"], alert = self._test_words(r, state)
+        except Exception as exc:  # noqa: BLE001 - the result goes out in any case
+            why = self.d.redact(f"결과를 정리하다 오류 {type(exc).__name__}: {exc}")[:200]
+            self._loop_error("test trade", exc, self.clock())
+            r["ok"], r["why"] = False, r.get("why") or why
+            r["message"] = f"시험 거래 실패: {r['why']} · ewbot live status --exchange 와 Coinbase 앱에서 확인"
+            alert = f"[시험 거래 실패] {r['why']} · ewbot live status --exchange 와 Coinbase 앱에서 확인"
+        finally:
+            try:
+                self.journal.add_event(self.clock(), TEST_TRADE, r)
+            finally:
+                self.journal.put(TEST_ACTIVE_KEY, None)
         self.alert(TEST_TRADE, alert)
         self.active = self._fast()
 

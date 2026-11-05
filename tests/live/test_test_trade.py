@@ -4,6 +4,7 @@ here proves what Coinbase itself does (docs/live-trading.md lists what only the 
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
 
@@ -340,6 +341,102 @@ def test_protection_slower_than_30_s_is_no_pass_and_the_real_canary_failure(h):
     assert r["ok"] is False and r["protect_s"] == pytest.approx(40.0) and h.ex.position() is None
     h.at(h.clock.now + 61)
     assert "PROTECT_SLOW" in canary_failures(h.journal, h.journal.stage()[1])
+
+
+# ---------------------------------------------------------------------------- the result is always written
+def order_view(hs: Harness, prefix: str, reads_until_ok: int = 10_000, **change):
+    """get_order answers `change` for the orders of `prefix` for `reads_until_ok` reads, the truth after that."""
+    real, left = hs.ex.get_order, {"n": reads_until_ok}
+
+    def view(order_id):
+        o = real(order_id)
+        if o.client_order_id.startswith(prefix) and left["n"] > 0:
+            left["n"] -= 1
+            return dataclasses.replace(o, **change)
+        return o
+
+    hs.ex.get_order = view
+    return left
+
+
+@pytest.mark.parametrize("prefix,what", [("ewb-e-", "진입"), ("ewb-x-", "청산")])
+def test_a_fill_price_never_read_is_an_explicit_failure_with_a_result(h, prefix, what):
+    """Review finding: `f"{None:,.1f}"` raised after a good round trip: no TEST_TRADE, TEST_ACTIVE_KEY stuck, every rerun
+    refused, the command's exit 3. The runbook says it passes only if its fill was read."""
+    order_view(h, prefix, avg_fill_price=None)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and what in r["why"] and "체결가" in r["why"] and r["position"] == "flat"
+    assert h.journal.get(TEST_ACTIVE_KEY) is None and h.journal.events(kind="LOOP_ERROR") == []
+    assert any(t.startswith("[시험 거래 실패]") for _, t in h.alerts.items)
+    assert rt_mod.refusal_of_test_trade(h.journal, h.ex, h.clock.now) is None  # it can be run again
+
+
+@pytest.mark.parametrize("prefix", ["ewb-e-", "ewb-x-"])
+def test_a_fill_price_read_a_few_seconds_late_is_a_pass(h, prefix):
+    order_view(h, prefix, reads_until_ok=2, avg_fill_price=None)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is True and r["entry_price"] and r["close_price"] and r["fees"] == pytest.approx(0.30)
+
+
+def test_a_fee_of_zero_on_the_first_read_is_read_again(h):
+    """Review finding: a fee not settled yet reads 0 and would count as measured."""
+    order_view(h, "ewb-x-", reads_until_ok=1, fee=0.0)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is True and r["close_fee"] == pytest.approx(0.15) and r["fees"] == pytest.approx(0.30)
+
+
+def test_a_fee_still_zero_is_shown_as_it_is(h):
+    order_view(h, "ewb-x-", fee=0.0)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is True and r["close_fee"] == 0.0 and r["fees"] == pytest.approx(0.15)
+    assert "0.15" in {g.name: g for g in canary_gates(h.journal, h.clock.now, None)}["⑤ 비용 실측치 비교"].detail
+
+
+def test_ok_needs_the_end_state_to_be_flat(h, monkeypatch):
+    """Review finding: `ok` was set before the last read. A position in that read is no pass, and it is taken back."""
+    real, end_state = h.ex.position, h.rt._test_end_state
+
+    def a_position_shows():
+        h.ex.position = lambda: rt_mod.Position(1, 1, 22_000.0)
+        return end_state()
+
+    monkeypatch.setattr(h.rt, "_test_end_state", a_position_shows)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and r["position"] == "unseen" and "끝" in r["why"] and "포지션 없음" not in r["message"]
+    assert h.journal.get(TEST_UNSEEN_KEY) is not None and h.journal.get(TEST_ACTIVE_KEY) is None
+    h.ex.position = real
+    assert_no_false_manual(h)
+
+
+def test_an_end_state_that_cannot_be_read_is_no_pass(h, monkeypatch):
+    end_state = h.rt._test_end_state
+
+    def down():
+        h.ex.fail_next("position", Unavailable("down"), times=1000)
+        return end_state()
+
+    monkeypatch.setattr(h.rt, "_test_end_state", down)
+    ask(h)
+    h.ex.clear_faults()
+    r = result(h)
+    assert r["ok"] is False and r["position"] == "unread" and "읽지 못함" in r["message"]
+
+
+def test_a_bug_while_writing_the_result_still_writes_it_and_clears_the_active_key(h, monkeypatch):
+    def broken(r, tid):
+        raise KeyError("a bug")
+
+    monkeypatch.setattr(h.rt, "_test_fills", broken)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and "KeyError" in r["why"] and "시험 거래 실패" in r["message"]
+    assert h.journal.get(TEST_ACTIVE_KEY) is None
+    assert any(t.startswith("[시험 거래 실패]") for _, t in h.alerts.items)
 
 
 # ---------------------------------------------------------------------------- a position read that lags the fill
