@@ -22,6 +22,7 @@ import argparse
 import dataclasses
 import json
 import os
+import signal
 import sys
 import time
 import traceback
@@ -867,8 +868,8 @@ def _live_test_trade(s: LiveSettings, args: argparse.Namespace) -> int:
     """`ewbot live test-trade --confirm [--side long|short]`: asks the running runtime for one real round trip and prints its
     result (live/runtime.py, "the test trade"). This process sends no order: a position or a bracket of a second process
     would be closed or cancelled by the runtime's next pass and read as a manual intervention, and no lock exists between
-    the two. Exit 0: passed; 1: it ran and failed; 2: refused, nothing was sent; 3: no result (in time, or Ctrl-C: a request
-    the runtime has not taken is withdrawn; see `live status`)."""
+    the two. Exit 0: passed; 1: it ran and failed; 2: refused, nothing was sent; 3: no result (in time, or Ctrl-C, SIGTERM or
+    SIGHUP: a request the runtime has not taken is withdrawn; see `live status`)."""
     if not s.journal_path.exists():
         print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
         return 2
@@ -908,9 +909,20 @@ def _live_test_trade(s: LiveSettings, args: argparse.Namespace) -> int:
 
 def _test_trade_wait(journal: Journal, rid: str) -> int:
     """The runtime's answer to request `rid`: its result (TEST_TRADE) or refusal, with the raw margin values it journaled.
-    No answer in time, or Ctrl-C: a request it has not taken is withdrawn, so it never runs later; one it took may still run."""
+    No answer in time, Ctrl-C, SIGTERM or SIGHUP (`docker compose exec` ended, a closed terminal): a request it has not taken is
+    withdrawn, so it never runs later; one it took may still run."""
     start = time.monotonic()
     why = f"런타임이 {TEST_TRADE_WAIT_S:.0f}초 안에 답하지 않음"
+
+    def stopped(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            previous[sig] = signal.signal(sig, stopped)
+        except ValueError:  # not the main thread: only Ctrl-C's own handling there
+            pass
     try:
         while True:
             for kind in (live_runtime.TEST_TRADE_REFUSED, live_runtime.TEST_TRADE):
@@ -927,7 +939,10 @@ def _test_trade_wait(journal: Journal, rid: str) -> int:
                 break
             time.sleep(1.0)
     except KeyboardInterrupt:
-        why = "중단됨 (Ctrl-C)"
+        why = "중단됨 (Ctrl-C 또는 종료 신호)"
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     cur = journal.get(live_runtime.TEST_REQUEST_KEY)
     if cur is not None and cur.get("id") == rid:
         journal.put(live_runtime.TEST_REQUEST_KEY, None)

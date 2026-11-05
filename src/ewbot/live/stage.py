@@ -389,6 +389,8 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     protected = [p for p in every if int(p["data"].get("trade_id") or 0) not in tests - shown]
     fast = [p for p in protected if p["data"]["after_entry_s"] <= PROTECT_MAX_S]
     fees = [float(e["data"]["fees"]) for e in passed if e["data"].get("fees") is not None]
+    # a fee that stayed 0 may be unsettled, or truly free: it passes - it must not lock FULL for ever - in plain sight
+    free = any(e["data"].get(k) == 0 for e in passed for k in ("fees", "entry_fee", "close_fee"))
     found = canary_failures(journal, since)
     costs = journal.events(kind="COSTS", since=since)
     p = paused(journal)
@@ -411,7 +413,8 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
         Gate(G_UNPROTECTED, unprotected_ok, unprotected),
         Gate(G_MANUAL, manual_ok, manual),
         Gate(G_COSTS, bool(costs) or bool(fees),
-             f"비용 보고 {len(costs)}회" + (f", 시험 거래 수수료 실측 {fees[-1]:.2f} USD" if fees else "")),
+             f"비용 보고 {len(costs)}회" + (f", 시험 거래 수수료 실측 {fees[-1]:.2f} USD" if fees else "")
+             + (", 수수료 0 (확인 필요)" if free else "")),
         Gate(G_MAJOR, major_ok, major),
         Gate(G_RUNNING, p is None, "운영 중" if p is None else f"일시 정지: {p['reason']}"),
         audit_gate(G_AUDIT_NOW, audit_result, since, now, after=since),

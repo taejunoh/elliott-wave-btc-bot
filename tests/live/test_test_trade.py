@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import signal
 import threading
 
 import pytest
@@ -311,6 +312,16 @@ def test_a_close_whose_answer_is_lost_is_looked_up_never_doubled(h):
     assert len([f for f in h.ex.fills if f["kind"] == "MARKET"]) == 2
 
 
+def test_a_bug_in_the_plan_is_a_refusal_and_leaves_no_mark(h, monkeypatch):
+    def broken(req, side, now):
+        raise KeyError("a bug")
+
+    monkeypatch.setattr(h.rt, "_test_trade_plan", broken)
+    ask(h)
+    assert "KeyError" in h.journal.events(kind=TEST_TRADE_REFUSED)[-1]["data"]["why"]
+    assert h.journal.get(TEST_ACTIVE_KEY) is None and not h.ex.fills
+
+
 def test_a_position_that_is_gone_before_the_close_is_no_pass(h):
     """The stop or the take-profit filled first (a fast market): flat, nothing to do, but the close path was not shown."""
     real = h.ex.place_bracket
@@ -393,6 +404,34 @@ def test_a_fee_still_zero_is_shown_as_it_is(h):
     r = result(h)
     assert r["ok"] is True and r["close_fee"] == 0.0 and r["fees"] == pytest.approx(0.15)
     assert "0.15" in {g.name: g for g in canary_gates(h.journal, h.clock.now, None)}["⑤ 비용 실측치 비교"].detail
+
+
+def test_a_fee_that_stays_zero_passes_the_cost_gate_and_says_to_check_it(tmp_path):
+    """Re-review L6: 0.00 read as measured. A truly free fill must not lock FULL for ever, so it passes, in plain sight."""
+    hs = Harness(tmp_path, QUIET + 30, stage="CANARY", stage_days=1.0)  # no fee on the venue at all
+    hs.price(float(hs.bar(QUIET)["open"]))
+    hs.ex.summary = {}
+    hs.rt.startup()
+    hs.at(QUIET + 30)
+    hs.clock.now = float(QUIET + 600)
+    ask(hs)
+    assert result(hs)["ok"] is True and result(hs)["fees"] == 0.0
+    gate = {g.name: g for g in canary_gates(hs.journal, hs.clock.now, None)}["⑤ 비용 실측치 비교"]
+    assert gate.met and "수수료 0 (확인 필요)" in gate.detail
+    hs.journal.close()
+
+
+def test_a_fee_of_zero_on_one_fill_is_shown_too(h):
+    order_view(h, "ewb-x-", fee=0.0)
+    ask(h)
+    gate = {g.name: g for g in canary_gates(h.journal, h.clock.now, None)}["⑤ 비용 실측치 비교"]
+    assert gate.met and "수수료 0 (확인 필요)" in gate.detail and "0.15" in gate.detail
+
+
+def test_a_positive_fee_is_not_flagged(h):
+    ask(h)
+    gate = {g.name: g for g in canary_gates(h.journal, h.clock.now, None)}["⑤ 비용 실측치 비교"]
+    assert "확인 필요" not in gate.detail and "0.30" in gate.detail
 
 
 def test_ok_needs_the_end_state_to_be_flat(h, monkeypatch):
@@ -491,6 +530,7 @@ def test_a_position_not_seen_within_the_limit_and_shown_later_with_no_target_is_
     h.rt.target = None
     lag, r = unseen_lag(h)
     assert_unseen(h, r)
+    assert "보호한 뒤" not in r["message"] and "바로 청산" in r["message"]  # what this path does: the close comes first
     assert h.ex.pos is not None  # the real one, on the venue
     lag.left = 0
     h.at(h.clock.now + 11)
@@ -806,6 +846,42 @@ def test_an_entry_that_ends_unfilled_after_its_wait_is_settled(h):
     assert h.journal.events(kind="ENTRY_UNFILLED")[-1]["data"]["terminal"] is True
     ask(h)
     assert len(h.journal.events(kind=TEST_TRADE)) == 2  # not refused
+
+
+def test_a_demotion_during_the_plans_reads_sends_nothing_and_the_book_shows_it_held(h):
+    """Re-review L3: a demotion to SHADOW during the plan's reads still sent two real fills, and `_held` saw nothing."""
+    real, seen = h.ex.balance, {}
+
+    def demoted_here():
+        if not seen:
+            seen["held"] = cli._test_trade_held(h.journal)
+            h.journal.set_stage("SHADOW", "demotion", h.clock.now)
+        return real()
+
+    at = h.clock.now + 1
+    h.clock.now = at
+    h.journal.put(TEST_REQUEST_KEY, {"id": "r", "side": 1, "ts": at})
+    h.ex.balance = demoted_here
+    h.rt._test_trade_due(at)
+    assert seen["held"] is True and h.ex.fills == [] and h.ex.position() is None
+    assert "CANARY" in h.journal.events(kind=TEST_TRADE_REFUSED)[-1]["data"]["why"]
+    assert h.journal.get(TEST_ACTIVE_KEY) is None and h.journal.get(TEST_REQUEST_KEY) is None
+
+
+def test_a_crash_in_the_plan_is_a_refusal_not_a_failed_test_trade(h):
+    """Nothing was sent: no failed last test trade for the gates, no pause, no standing close."""
+    h.journal.put(TEST_ACTIVE_KEY, {"request": "r", "side": 1, "ts": h.clock.now})
+    h.clock.now += 20
+    h.rt = h.make_runtime()
+    h.rt.startup()
+    assert h.journal.get(TEST_ACTIVE_KEY) is None and h.journal.events(kind=TEST_TRADE) == []
+    assert h.journal.events(kind=TEST_TRADE_REFUSED)[-1]["data"]["request"] == "r" and paused(h.journal) is None
+
+
+def test_every_refusal_clears_the_mark_the_book_is_held_by(h):
+    h.journal.put("paused", {"reason": "user /pause", "ts": h.clock.now})
+    ask(h)
+    assert h.journal.events(kind=TEST_TRADE_REFUSED) and h.journal.get(TEST_ACTIVE_KEY) is None
 
 
 def test_refused_without_quotes_or_fresh_margin_rates(h):
@@ -1127,6 +1203,18 @@ def test_ctrl_c_withdraws_a_request_not_taken_yet(env, capsys, monkeypatch):
     assert "거둠" in err and env.journal.get(TEST_REQUEST_KEY) is None
     env.at(env.clock.now + 1)
     assert env.journal.events(kind=TEST_TRADE) == [] and not env.ex.fills  # never runs later
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_sigterm_and_sighup_withdraw_a_request_not_taken_yet(env, capsys, monkeypatch, sig):
+    """Re-review: `docker compose exec` ended, a closed terminal: the request would have stood for up to 2 minutes."""
+    before = signal.getsignal(sig)
+    monkeypatch.setattr("ewbot.cli.time.sleep", lambda s: signal.raise_signal(sig))
+    assert main(["live", "test-trade", "--confirm"]) == 3
+    assert "거둠" in capsys.readouterr().err and env.journal.get(TEST_REQUEST_KEY) is None
+    assert signal.getsignal(sig) is before  # the process's handlers are back
+    env.at(env.clock.now + 1)
+    assert env.journal.events(kind=TEST_TRADE) == [] and not env.ex.fills
 
 
 def test_ctrl_c_after_the_runtime_took_it_says_it_may_be_running(env, capsys, monkeypatch):

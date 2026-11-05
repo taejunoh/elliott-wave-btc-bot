@@ -2019,9 +2019,15 @@ class LiveRuntime:
         self.journal.put(TEST_REQUEST_KEY, None)
         now = self.clock()  # not the tick's: a request may have been written while the tick ran
         rid, side = str(req.get("id")), int(req.get("side") or 0)
-        planned = self._test_trade_plan(req, side, now)
+        self.journal.put(TEST_ACTIVE_KEY, {"request": rid, "side": side, "ts": now})  # from here on the book shows it held
+        try:
+            planned = self._test_trade_plan(req, side, now)
+        except Exception as exc:  # noqa: BLE001 - nothing was sent: a refusal, never a mark left behind
+            self._loop_error("test trade", exc, self.clock())
+            planned = self.d.redact(f"예기치 못한 오류 {type(exc).__name__}: {exc}")[:200]
         if isinstance(planned, str):
             self.journal.add_event(now, TEST_TRADE_REFUSED, {"request": rid, "side": side, "why": planned})
+            self.journal.put(TEST_ACTIVE_KEY, None)
             self.alert(TEST_TRADE, f"[시험 거래 거부] {planned}")
             return
         self._test_trade(rid, *planned, now)
@@ -2067,6 +2073,9 @@ class LiveRuntime:
         projected = margin_ratio(1, ctx.price, side, self.product, equity)
         if projected > MARGIN_ENTRY_MAX:
             return f"오버나이트 증거금 예상 {projected:.0%} > {MARGIN_ENTRY_MAX:.0%}"
+        stage = self.journal.stage()[0]  # read again: `ewbot live stage` writes from outside, during the reads above
+        if stage != "CANARY":
+            return f"CANARY 단계에서만 실행할 수 있음 (점검 중 {stage}로 바뀜)"
         return entry, ctx
 
     def _test_trade(self, rid: str, entry: TargetEntry, ctx: PlanContext, now: float) -> None:
@@ -2289,11 +2298,11 @@ class LiveRuntime:
         try:
             pos = self.ex.position()
             if pos is None and waiting:
-                return "unseen", "지금은 포지션이 읽히지 않음: 나타나면 보호한 뒤 바로 청산 (재개는 /resume)"
+                return "unseen", "지금은 포지션이 읽히지 않음: 나타나면 바로 청산 (재개는 /resume)"
             if pos is None:
                 return "flat", "포지션 없음"
             if waiting:
-                return "unseen", f"포지션 {_side(pos.side)} {pos.contracts}계약이 읽힘: 다음 확인에서 보호한 뒤 바로 청산"
+                return "unseen", f"포지션 {_side(pos.side)} {pos.contracts}계약이 읽힘: 다음 확인에서 바로 청산"
             covered = sum(o.size - o.filled for o in self.ex.open_orders()
                           if is_ours(o) and o.kind == "BRACKET" and o.stop_price is not None and o.side == -pos.side)
         except ExchangeError as exc:
@@ -2385,6 +2394,11 @@ class LiveRuntime:
         failed and never run again."""
         active = self.journal.get(TEST_ACTIVE_KEY)
         if active is None:
+            return
+        if active.get("trade_id") is None:  # it died in the plan's reads: nothing was sent, nothing failed
+            self.journal.add_event(now, TEST_TRADE_REFUSED, {"request": active.get("request"), "side": active.get("side"),
+                                                             "why": "점검 중에 프로세스가 끝남: 주문을 내지 않음, 다시 실행"})
+            self.journal.put(TEST_ACTIVE_KEY, None)
             return
         message = "시험 거래 실패 (중단): 도중에 프로세스가 끝남 - 남은 포지션은 바로 청산, 재개는 /resume"
         self.journal.add_event(now, TEST_TRADE, {"request": active.get("request"), "ok": False, "step": "interrupted",
