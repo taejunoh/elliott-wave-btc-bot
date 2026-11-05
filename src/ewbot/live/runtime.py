@@ -22,7 +22,9 @@ is taken before its alert.
             taken for a close conflict (executor `any_refusal`) only where the brackets protect nothing - a gapped
             stop, or no leg resting at all: a leg that still covers contracts is never cancelled for it
   poll      every 10 s while a trade is open, an intent is pending, our latest entry is unsettled (accepted, no trade
-            records it: Executor.unsettled_entry) or a flatten stands, and for 5 minutes after a close only the reads
+            records it: Executor.unsettled_entry; one that ended with nothing is settled at the next read) or a flatten
+            stands - every second for the first 30 s of an entry no read has shown yet (Executor.entry_unseen: kept open,
+            its stop tried, a flat read closing nothing unless a leg filled) -, and for 5 minutes after a close only the reads
             showed (60 s otherwise; after a WebSocket resync at once, but a resync poll at most once per 10 s; the
             loop's cadence runs on a monotonic clock): a reduce
             with an unknown outcome is resolved by its client order id first; then position and open
