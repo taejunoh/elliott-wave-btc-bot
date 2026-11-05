@@ -626,6 +626,19 @@ class Executor:
         legs, stop = desired_legs(trade, n, trade.stop_spot, ctx.ratio, ctx.tick, ctx.price)
         self.protect(Protect(tuple(legs), trade.stop_spot, stop), ctx)
 
+    def take_test_entry(self, own: dict[str, Any], pos: Position, ctx: PlanContext) -> None:
+        """The test trade's entry (`own`, its intent) whose answer or fill was lost, and a position on its side. The book was
+        read flat right before that entry was sent and the account is the bot's alone, so the position is that entry's: the
+        intent is marked accepted - `_settle` then never reads it as foreign - and the position protected from it at once
+        (`_provisional`), never left for the planner to take for a manual one (UNKNOWN_POSITION, ADOPTED)."""
+        cid = str(own["client_order_id"])
+        lost = own["status"] == "PENDING"
+        if lost:
+            self.journal.update_intent(cid, "ACCEPTED", self.clock(), note="test trade: a position on its side")
+        row = self.journal.intent(cid)
+        assert row is not None
+        self._provisional(row, pos, pos.contracts, ctx, fill_unread=not lost)
+
     def _entry_outcome(self, cid: str) -> bool | None:
         """Our entry `cid` reached the venue (True), never did (False), or is still unknown (None)."""
         row = self.journal.intent(cid)

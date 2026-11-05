@@ -6,7 +6,7 @@ report candle sees it, and an explicit --start at/after HOLDOUT_START or --end a
 (exit 2). runner.run_backtest and runner.compare refuse the holdout on their own as well (defence in
 depth). `holdout` is the one-shot evaluation. `paper run` (Plan 2) works on the period AFTER the
 holdout: it reads the params from the committed holdout.lock only and has no strategy or config
-options (ewbot.paper.runner). `live run | preflight | status | stage | rebase | backup` (Plan 3) runs and
+options (ewbot.paper.runner). `live run | preflight | status | stage | test-trade | rebase | backup` (Plan 3) runs and
 inspects the live-trading runtime (ewbot.live); like `paper` it has no strategy or config options.
 `stratb fetch | backtest | walkforward | holdout lock | holdout run | paper run | paper status` (Plan 4) is
 strategy B (ewbot.stratb, ewbot.paperb) on BTC and ETH with its own 15m caches, lock (holdout-b.lock) and
@@ -131,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_stage.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
     p_stage.add_argument("--restart", action="store_true",
                          help="shadow or canary, the current stage: start a new stint of it (flat book)")
+    p_tt = live_sub.add_parser("test-trade", help="CANARY only: one real 1-contract round trip run by the running runtime "
+                               "(market entry, stop checked on the exchange, market close)")
+    p_tt.add_argument("--confirm", action="store_true", help="required: it sends real orders")
+    p_tt.add_argument("--side", choices=("long", "short"), default="long", help="side of the entry (default: long)")
     p_rb = live_sub.add_parser("rebase", help="after a deliberate deposit or withdrawal: re-base the account loss "
                                "breakers (the running runtime applies it at its next minute)")
     p_rb.add_argument("--confirm", action="store_true", help="required: the user's explicit approval")
@@ -550,6 +554,8 @@ LIVE_REFUSAL_WAIT_S = 600.0  # a refused start waits before exiting: Docker rest
 # (a start refused because Coinbase could not be read - an outage - waits live_app.OUTAGE_WAIT_S instead)
 ALERTS_GATE = "알림 설정 (Telegram 알림·명령, 헬스체크)"  # a promotion to CANARY or FULL needs them (preflight `alerts`)
 CYCLE_WINDOW = (59, 6)  # promotions and stint restarts are refused from hh:59 to hh:06 UTC (the hour's cycle, entries)
+TEST_TRADE_WAIT_S = 300.0  # `live test-trade` waits this long for the runtime's result (its worst case is about a minute)
+TEST_TRADE_HEARTBEAT_S = 180.0  # ... and refuses when the loop's heartbeat is older (the Docker health check's limit)
 
 
 def _in_cycle_window(now: float) -> bool:
@@ -848,6 +854,90 @@ def _live_stage(s: LiveSettings, args: argparse.Namespace) -> int:
         journal.close()
 
 
+def _live_test_trade(s: LiveSettings, args: argparse.Namespace) -> int:
+    """`ewbot live test-trade --confirm [--side long|short]`: asks the running runtime for one real round trip and prints its
+    result (live/runtime.py, "the test trade"). This process sends no order: a position or a bracket of a second process
+    would be closed or cancelled by the runtime's next pass and read as a manual intervention, and no lock exists between
+    the two. Exit 0: passed; 1: it ran and failed; 2: refused, nothing was sent; 3: no result in time (see `live status`)."""
+    if not s.journal_path.exists():
+        print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
+        return 1
+    journal = Journal(s.journal_path)
+    try:
+        now = time.time()
+
+        def refuse(why: str) -> int:
+            print(f"거부: {why}", file=sys.stderr)
+            return 2
+
+        if not args.confirm:
+            return refuse("시험 거래는 실제 주문을 냅니다 (1계약 시장가 진입, 손절 확인, 시장가 청산): --confirm 이 필요합니다")
+        if journal.stage()[0] != "CANARY":
+            return refuse(f"CANARY 단계에서만 실행할 수 있음 (현재 {journal.stage()[0]})")
+        hb = journal.get(live_runtime.HEARTBEAT_KEY)
+        if hb is None or not 0 <= now - float(hb) <= TEST_TRADE_HEARTBEAT_S:
+            return refuse("런타임이 돌고 있지 않음: 시험 거래는 돌고 있는 런타임이 실행함 (docker compose ... ps, logs)")
+        waiting = journal.get(live_runtime.TEST_REQUEST_KEY)
+        if waiting is not None or journal.get(live_runtime.TEST_ACTIVE_KEY) is not None:
+            return refuse("이미 요청된 시험 거래가 있음: 끝난 뒤 다시 실행")
+        try:
+            why = live_runtime.refusal_of_test_trade(journal, _exchange(s), now)
+        except SettingsError as exc:
+            return refuse(f"거래 키를 읽지 못함: {exc}")
+        if why is not None:
+            return refuse(why)
+        rid = f"{int(now * 1000)}"
+        side = 1 if args.side == "long" else -1
+        journal.put(live_runtime.TEST_REQUEST_KEY, {"id": rid, "side": side, "ts": now})
+        journal.add_event(now, "TEST_TRADE_REQUESTED", {"request": rid, "side": side})
+        print(f"요청함: {args.side} 1계약 - 돌고 있는 런타임이 실행합니다")
+        return _test_trade_wait(journal, rid)
+    finally:
+        journal.close()
+
+
+def _test_trade_wait(journal: Journal, rid: str) -> int:
+    """The runtime's answer to request `rid`: its result (TEST_TRADE) or refusal, with the raw margin values it journaled."""
+    start = time.monotonic()
+    while True:
+        for kind in (live_runtime.TEST_TRADE_REFUSED, live_runtime.TEST_TRADE):
+            hit = next((e["data"] for e in journal.events(kind=kind) if e["data"].get("request") == rid), None)
+            if hit is None:
+                continue
+            if kind == live_runtime.TEST_TRADE_REFUSED:
+                print(f"거부: {hit['why']}", file=sys.stderr)
+                return 2
+            _print_test_margin(hit.get("margin") or {})
+            print(hit["message"], file=sys.stdout if hit.get("ok") else sys.stderr)
+            return 0 if hit.get("ok") else 1
+        if not 0 <= time.monotonic() - start < TEST_TRADE_WAIT_S:
+            break
+        time.sleep(1.0)
+    cur = journal.get(live_runtime.TEST_REQUEST_KEY)
+    if cur is not None and cur.get("id") == rid:
+        journal.put(live_runtime.TEST_REQUEST_KEY, None)
+        print(f"런타임이 {TEST_TRADE_WAIT_S:.0f}초 안에 응답하지 않아 요청을 거둠: ewbot live status --exchange 로 확인", file=sys.stderr)
+    else:
+        print(f"런타임이 {TEST_TRADE_WAIT_S:.0f}초 안에 결과를 내지 않음 (아직 실행 중일 수 있음): ewbot live status --exchange 로 확인",
+              file=sys.stderr)
+    return 3
+
+
+def _print_test_margin(margin: dict[str, Any]) -> None:
+    """The margin values as Coinbase sent them (no conversion, no unit added), or the warning when they could not be read."""
+    if "fields" not in margin:
+        if margin.get("error"):
+            print(f"경고: 증거금 값을 읽지 못함 ({margin['error']}) - 청산에는 영향 없음", file=sys.stderr)
+        return
+    print("증거금 원본 값 (GET /api/v3/brokerage/cfm/balance_summary, 포지션 보유 중, 변환 없음):")
+    print(f"  position: {json.dumps(margin.get('position'), sort_keys=True)}")
+    print(f"  futures_mid: {json.dumps(margin.get('futures_mid'))}")
+    for name, value in margin["fields"].items():
+        print(f"  {name}: {json.dumps(value, ensure_ascii=False, sort_keys=True)}")
+    if margin.get("missing"):
+        print(f"경고: Coinbase가 보내지 않은 필드: {', '.join(margin['missing'])}", file=sys.stderr)
+
+
 def _usd(x: Any) -> str:
     return "-" if x is None else f"{float(x):,.2f}"
 
@@ -918,8 +1008,8 @@ def cmd_live(args: argparse.Namespace) -> int:
         return 2
     if args.live_cmd == "run":
         return _live_run(s)
-    handlers = {"preflight": _live_preflight, "status": _live_status, "stage": _live_stage, "rebase": _live_rebase,
-                "backup": _live_backup}
+    handlers = {"preflight": _live_preflight, "status": _live_status, "stage": _live_stage, "test-trade": _live_test_trade,
+                "rebase": _live_rebase, "backup": _live_backup}
     return handlers[args.live_cmd](s, args)
 
 

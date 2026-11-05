@@ -37,11 +37,16 @@ clock step moves every window with it.
                 and the signal. No code restarts a stint on a deploy - that was an operating rule, also dropped on
                 2026-11-05 -: a deploy is one more start of the same stint.
   CANARY start  SHADOW pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission.
-  CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
-                closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
-                manual intervention; (5) costs measured (a daily summary with fills); no other CANARY failure
-                (audit mismatch, breaker, transfer key); not paused; a current audit without an unexplained
-                mismatch of a decision known in the stint.
+  CANARY pass   >= 3 closed strategy trades or 90 days, or one passed test trade (`ewbot live test-trade`, user decision
+                2026-11-05); (1) protection within 30 s of every fill, with at least one protected entry - a strategy
+                trade's or the passed test trade's -; (2) stop moves and closes executed as targeted (no unresolved order
+                failure); (3) never unprotected > 60 s; (4) no manual intervention; (5) costs measured (a daily summary
+                with fills, or the fees the passed test trade measured); no other CANARY failure (audit mismatch, breaker,
+                transfer key); not paused; a current audit without an unexplained mismatch of a decision known in the
+                stint (nothing to compare is no failure).
+                A test trade is no strategy trade: its id is in TEST_IDS_KEY before its first order, and nothing counts it
+                as one (the closed trades here, the cost report in live/runtime.py); its decisions do not exist, so the
+                paper comparison never sees it.
   FULL start    CANARY pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission (criterion 3,
                 the 50 out-of-sample trades, is no longer required: user decision 2026-11-05)."""
 
@@ -86,6 +91,13 @@ CANARY_FAIL = MAJOR + ("PROTECT_SLOW",) + MANUAL + (ORDER_UNRESOLVED,)
 # on a venue that refuses overlapping brackets the executor cancels the old leg first by design (a replacement that
 # then fails is BRACKET_FAILED). Each one is resolved or becomes ORDER_UNRESOLVED.
 ORDER_FAILURES = ("BRACKET_FAILED", "CLOSE_FAILED", "CLOSE_UNCONFIRMED", "REDUCE_FAILED")
+# the test trade (`ewbot live test-trade`, live/runtime.py): its result, a refusal, the margin values read during it
+TEST_TRADE = "TEST_TRADE"
+TEST_TRADE_REFUSED = "TEST_TRADE_REFUSED"
+TEST_TRADE_MARGIN = "TEST_TRADE_MARGIN"
+TEST_REQUEST_KEY = "test_trade_request"  # the command's request: {"id", "side", "ts"}; the runtime takes it once
+TEST_ACTIVE_KEY = "test_trade_active"  # one is under way: {"request", "trade_id", "side", "ts"} (a crash leaves it)
+TEST_IDS_KEY = "test_trade_ids"  # the ids of every test trade, written before its first order
 
 # gate names: transition() checks that a promotion got every one of its gates, met
 G_DAYS = "기간 14일 이상"
@@ -145,6 +157,14 @@ def pause(journal: Journal, reason: str, now: float) -> None:
 def resume(journal: Journal, now: float) -> None:
     journal.put(PAUSE_KEY, None)
     journal.add_event(now, "RESUMED", {})
+
+
+def ids_of_test_trades(journal: Journal) -> set[int]:
+    return {int(x) for x in journal.get(TEST_IDS_KEY) or []}
+
+
+def passed_test_trades(journal: Journal, since: float) -> list[dict[str, Any]]:
+    return [e for e in journal.events(kind=TEST_TRADE, since=since) if e["data"].get("ok")]
 
 
 def canary_failures(journal: Journal, since: float) -> dict[str, tuple[int, float]]:
@@ -350,9 +370,15 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     if since is None:
         return [Gate("CANARY 단계", False, "현재 단계가 CANARY가 아님")]
     days = (now - since) / DAY
-    n_closed = len({e["data"]["trade_id"] for e in journal.events(kind="CLOSED", since=since) if e["data"].get("trade_id")})
-    protected = journal.events(kind="PROTECTED_FIRST", since=since)
-    slow = [p for p in protected if p["data"]["after_entry_s"] > PROTECT_MAX_S]
+    tests, passed = ids_of_test_trades(journal), passed_test_trades(journal, since)
+    n_closed = len({e["data"]["trade_id"] for e in journal.events(kind="CLOSED", since=since)
+                    if e["data"].get("trade_id") and int(e["data"]["trade_id"]) not in tests})
+    every = journal.events(kind="PROTECTED_FIRST", since=since)
+    slow = [p for p in every if p["data"]["after_entry_s"] > PROTECT_MAX_S]  # a test trade's as well: it is the same path
+    shown = {int(e["data"]["trade_id"]) for e in passed}  # of the test trades, only a passed one shows protection
+    protected = [p for p in every if int(p["data"].get("trade_id") or 0) not in tests - shown]
+    fast = [p for p in protected if p["data"]["after_entry_s"] <= PROTECT_MAX_S]
+    fees = [float(e["data"]["fees"]) for e in passed if e["data"].get("fees") is not None]
     found = canary_failures(journal, since)
     costs = journal.events(kind="COSTS", since=since)
     p = paused(journal)
@@ -365,12 +391,15 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
         major += f" · 손실 한도 기준 재설정 {rebased}회"
     slow_ok = not slow and "PROTECT_SLOW" not in found
     return [
-        Gate(G_TRADES, n_closed >= CANARY_MIN_TRADES or days >= CANARY_MAX_DAYS, f"{n_closed}건, {days:.1f}일"),
-        Gate(G_PROTECT, bool(protected) and slow_ok, f"{len(protected) - len(slow)}/{len(protected)}"),
+        Gate(G_TRADES, n_closed >= CANARY_MIN_TRADES or days >= CANARY_MAX_DAYS or bool(passed),
+             f"{n_closed}건, {days:.1f}일, 시험 거래 성공 {len(passed)}건"),
+        Gate(G_PROTECT, bool(protected) and slow_ok,
+             f"{len(fast)}/{len(protected)}" + (" (성공한 시험 거래 포함)" if shown else "")),
         Gate(G_ORDERS, orders_ok, f"해결되지 않은 주문 실패: {orders}"),
         Gate(G_UNPROTECTED, unprotected_ok, unprotected),
         Gate(G_MANUAL, manual_ok, manual),
-        Gate(G_COSTS, bool(costs), f"비용 보고 {len(costs)}회"),
+        Gate(G_COSTS, bool(costs) or bool(fees),
+             f"비용 보고 {len(costs)}회" + (f", 시험 거래 수수료 실측 {fees[-1]:.2f} USD" if fees else "")),
         Gate(G_MAJOR, major_ok, major),
         Gate(G_RUNNING, p is None, "운영 중" if p is None else f"일시 정지: {p['reason']}"),
         audit_gate(G_AUDIT_NOW, audit_result, since, now, after=since),

@@ -86,7 +86,17 @@ runs the stage `ewbot live run` gives it (`LiveDeps.stage`, live.app.process_sta
 something real left it stays on the real account in the last real stage - entries blocked by the journal's SHADOW cap -
 until flat. A stop request (`stop_requested`: SIGTERM, Ctrl-C) ends the start's read retries, or the loop after the
 current tick - while the open trade has no resting stop, after up to STOP_GRACE_S more of passes that place it
-(`STOPPED`, alerted)."""
+(`STOPPED`, alerted).
+
+The test trade (`ewbot live test-trade`, user decision 2026-11-05: CANARY's one real round trip, instead of waiting for
+signals). No lock exists between processes, and a position or a bracket of another process would be closed or cancelled by
+the next pass (UNKNOWN_POSITION, FLAT, ENGINE_FLAT) and read as a manual intervention. So the command only asks, through the
+journal as `ewbot live rebase` does, and this process runs it on its one loop, whole, within a tick (seconds; about a minute
+at worst): nothing else of the loop runs meanwhile, and from hh:55 to hh:06 it is refused. It goes through Executor.execute,
+protect and close, and the check that the stop rests is observe's. Its id is recorded first: it never counts as a strategy
+trade, it has no engine decision, so the paper comparison never sees it, and a position of its unknown entry is never a
+manual one. A step that fails after the entry leaves a standing close (the flatten request); a crash does the same at the
+next start."""
 
 from __future__ import annotations
 
@@ -134,8 +144,12 @@ from ewbot.live.reconcile import (
     PlanContext,
     Protect,
     Skip,
+    desired_legs,
+    entry_cid,
     entry_position,
+    expected_contracts,
     is_ours,
+    legs_match,
     observe,
     plan,
 )
@@ -148,7 +162,14 @@ from ewbot.live.stage import (
     PROTECT_MAX_S,
     RAISED_KEY,
     STAGES,
+    TEST_ACTIVE_KEY,
+    TEST_IDS_KEY,
+    TEST_REQUEST_KEY,
+    TEST_TRADE,
+    TEST_TRADE_MARGIN,
+    TEST_TRADE_REFUSED,
     full_cap,
+    ids_of_test_trades,
     on_incident,
     pause,
     paused,
@@ -228,6 +249,23 @@ UNREADABLE_IDLE_ALERT_S = 900.0  # ... this long otherwise
 UNREADABLE_FAIL_S = 1800.0  # ... and with something to manage this long healthchecks.io gets a /fail as well
 READS = {"positions": "포지션·주문", "session": "장 상태", "balance": "잔고"}  # the account reads that are watched
 OBSERVED_CLOSE_FAST_S = 300.0  # after a close only the reads showed, the 10 s polls go on this long (a wrong read)
+# the test trade (`ewbot live test-trade`, section "the test trade" below)
+TEST_SETUP = "TEST"  # its trade's setup: shown in the entry's alert and the status
+TEST_CLOSE = "TEST_TRADE"  # its close's reason
+TEST_FAILED = "TEST_TRADE_FAILED"  # the reason of the standing close after a step that failed or a crash
+TEST_STOP_FRAC = 0.02  # its stop and take-profit this far from the mid: far from a round trip of seconds, about 20 USD at 100k
+TEST_REQUEST_MAX_S = 120.0  # a request older than this when the loop reaches it is refused (a runtime that was down)
+TEST_SETTLE_S = 30.0  # an entry whose answer or fill was lost: the position and the lookups are read this long
+TEST_PROTECT_S = 10.0  # the stop must show on the exchange within this, or the position is closed
+TEST_BRACKET_REFUSALS = 2  # ... at once after this many refusals: the same terms get the same answer, and it has no stop
+TEST_RETRY_S = 1.0
+TEST_FLAT_READS = 5  # reads (a TEST_RETRY_S apart) after the close until flat and no bracket of ours rests
+TEST_MARGIN_WAIT_S = 2.0  # the margin read is waited for at most this: a hung one never holds back the close
+TEST_MARGIN_FIELDS = ("liquidation_threshold", "liquidation_buffer_amount", "liquidation_buffer_percentage",
+                      "initial_margin", "available_margin", "intraday_margin_window_measure",
+                      "overnight_margin_window_measure")  # GET /cfm/balance_summary, journaled as Coinbase sent them
+TEST_WINDOW = (55, 6)  # refused from hh:55 to hh:06: its seconds on the loop never meet the hour's cycle and entries
+TEST_STEP = {"entry": "진입", "protect": "손절 주문", "close": "청산", "interrupted": "중단"}
 # what a flatten did by the end of its first pass: the /flatten_confirm reply and the breaker alert say it
 FLATTEN_OUTCOME = {
     "done": "전량 청산 완료",
@@ -659,6 +697,7 @@ class LiveRuntime:
         if isinstance(self.ex, ShadowExchange):
             self.ex.restore(self.executor.trade())
         out = self.executor.recover()
+        self._test_trade_interrupted(now)
         self.journal.add_event(now, "STARTUP", {"stage": self.stage})
         # the session state seen at start (a change is journaled by minute(); a reopen while down never is)
         self.journal.add_event(now, "SESSION", {"text": f"시작 시 장 운영 상태 {self.session.state}",
@@ -910,6 +949,7 @@ class LiveRuntime:
                 self._read_failed("session", exc)
         ctx = self._ctx(now)
         reduction = self._entry_reduction
+        seen = self._test_entry_left(seen, pos, ctx, now)
         planned = plan(self.target, seen, pos, orders, ctx)
         req = self.journal.get(FLATTEN_KEY)
         actions = planned if req is None else self._flatten_actions(req, planned, pos, ctx, now)
@@ -1781,9 +1821,10 @@ class LiveRuntime:
         """Measured costs since `since`: fills, entry slippage vs. the engine reference, stop slippage vs. the
         stop (positive = worse), fees vs. the paper cost model. Funding is in the balance, not measured here."""
         kinds = ("ENTRY", "CLOSED", "REDUCED", "BRACKET_FILL")
+        tests = ids_of_test_trades(self.journal)  # the test trade is no strategy trade: its fees are in its own event
         # only fills with a usable price (finite, above 0: an unread fill price is no fill), only finite fees
         fills = [e["data"] for k in kinds for e in self.journal.events(kind=k, since=since)
-                 if usable_price(e["data"].get("price")) is not None]
+                 if usable_price(e["data"].get("price")) is not None and e["data"].get("trade_id") not in tests]
         entries = [d for d in fills if "ref" in d and usable_price(d.get("ref")) is not None]
         entry_bps = [d["side"] * (d["price"] - d["ref"]) / d["ref"] * 1e4 for d in entries]
         stops = [d for d in fills if "stop" in d and usable_price(d.get("stop")) is not None
@@ -1880,6 +1921,353 @@ class LiveRuntime:
             self.alert("TRANSFER_KEY", "[중대 사건] API 키에 송금 권한이 있음: 즉시 키를 교체")
         return True
 
+    # ------------------------------------------------------------------ the test trade
+    def _test_trade_due(self, now: float) -> None:
+        """`ewbot live test-trade --confirm` only asks (TEST_REQUEST_KEY): this process is the one that sends orders. The
+        request is taken once - a crash never runs it twice - and run here, whole, within this tick: no poll, watchdog or
+        cycle of this loop can meet the position half way."""
+        req = self.journal.get(TEST_REQUEST_KEY)
+        if req is None:
+            return
+        self.journal.put(TEST_REQUEST_KEY, None)
+        rid, side = str(req.get("id")), int(req.get("side") or 0)
+        planned = self._test_trade_plan(req, side, now)
+        if isinstance(planned, str):
+            self.journal.add_event(now, TEST_TRADE_REFUSED, {"request": rid, "side": side, "why": planned})
+            self.alert(TEST_TRADE, f"[시험 거래 거부] {planned}")
+            return
+        self._test_trade(rid, *planned, now)
+
+    def _test_trade_plan(self, req: dict[str, Any], side: int, now: float) -> tuple[TargetEntry, PlanContext] | str:
+        """The checks of the running process, the ones that count (the command's are only there to answer at once), then
+        the entry: its levels on the mid, sized and margin-checked as a CANARY entry. Returns why it is refused instead."""
+        if side not in (1, -1):
+            return f"방향 {side}: 롱(1) 또는 숏(-1)만 가능"
+        if not 0 <= now - float(req.get("ts") or 0.0) <= TEST_REQUEST_MAX_S:
+            return "요청이 오래됨: 다시 실행해 주세요"
+        if self.stage != "CANARY":
+            return f"CANARY 단계에서만 실행할 수 있음 (이 프로세스 {self.stage})"
+        why = refusal_of_test_trade(self.journal, self.ex, now)
+        if why is not None:
+            return why
+        if self._busy():
+            return "관리 중인 거래나 결과 미확인 주문이 있음"
+        if self.target is not None and self.target.entry is not None:
+            return "이번 봉에 전략 신호가 있음: 다음 시간에 다시 실행"
+        try:
+            self._read_session(now)
+            equity = self.ex.balance().equity
+        except ExchangeError as exc:
+            return self.d.redact(f"거래소를 읽지 못함: {exc}")[:200]
+        why = self._read_product(now)
+        if why is not None:
+            return f"증거금률을 새로 읽지 못함 ({why})"
+        ctx = self._ctx(now)
+        if ctx.ratio is None or ctx.price is None:
+            return "호가를 읽지 못함"
+        if not ctx.session_open:
+            return "장이 열려 있지 않음"
+        assert self.product is not None
+        spot, f = ctx.price / ctx.ratio, TEST_STOP_FRAC
+        entry = TargetEntry(int(now), TEST_SETUP, side, spot, spot * (1 - side * f), spot * (1 + side * f),
+                            spot * (1 + 2 * side * f), 1.0, 1, "test trade")
+        stop = map_level(entry.stop, ctx.ratio, ctx.tick, side)
+        n, why = stage_contracts("CANARY", equity=equity, entry=ctx.price, stop=stop, direction=side, risk_mult=1.0,
+                                 cfg=self.cfg)
+        if n != 1:
+            return why
+        projected = margin_ratio(1, ctx.price, side, self.product, equity)
+        if projected > MARGIN_ENTRY_MAX:
+            return f"오버나이트 증거금 예상 {projected:.0%} > {MARGIN_ENTRY_MAX:.0%}"
+        return entry, ctx
+
+    def _test_trade(self, rid: str, entry: TargetEntry, ctx: PlanContext, now: float) -> None:
+        """One contract at market, the same stop, the same check that it rests, the same close, each through the path of a
+        strategy trade (`Executor`). Its id is on record before its first order: nothing ever counts it as a strategy trade.
+        Whatever fails after the entry, the position ends closed or protected with its close standing (`_test_abort`)."""
+        tid = entry.signal_ts
+        self.journal.put(TEST_IDS_KEY, sorted(ids_of_test_trades(self.journal) | {tid}))
+        self.journal.put(TEST_ACTIVE_KEY, {"request": rid, "trade_id": tid, "side": entry.direction, "ts": now})
+        r: dict[str, Any] = {"request": rid, "ok": False, "step": "entry", "trade_id": tid, "side": entry.direction,
+                             "contracts": 0, "why": None, "margin": {}, "started": now}
+        try:
+            self._test_trade_steps(entry, ctx, r)
+        except Exception as exc:  # noqa: BLE001 - a bug or a read: whatever it was, the position does not stay as it is
+            why = self.d.redact(f"예기치 못한 오류 {type(exc).__name__}: {exc}")[:200]
+            self._loop_error("test trade", exc, self.clock())
+            r["why"] = why
+            try:
+                self._test_abort(r, why)
+            except Exception as again:  # noqa: BLE001 - its close was journaled first: every later pass sends it
+                self._loop_error("test trade", again, self.clock())
+        self._test_trade_end(r, tid)
+
+    def _test_trade_steps(self, entry: TargetEntry, ctx: PlanContext, r: dict[str, Any]) -> None:
+        tid = entry.signal_ts
+        self.executor.execute([Enter(entry, 1)], ctx)  # the entry and its bracket (executor.enter)
+        t = self.executor.trade()
+        confirmed = t is not None and t.trade_id == tid and t.status == "OPEN"  # its fill was read
+        if not confirmed:
+            t = self._test_settle_entry(entry, ctx, r)
+            if t is None:
+                return  # `why` says it: refused, not filled, or unknown with no position seen
+        assert t is not None
+        r.update(step="protect", contracts=t.contracts, stop=t.stop_price, take_profit=t.tp1_price)
+        state, pos = self._test_verify_stop(tid, ctx)
+        if state == "failed":
+            self._test_abort(r, f"손절 주문을 {TEST_PROTECT_S:.0f}초 안에 거래소에서 확인하지 못함")
+            return
+        r["step"] = "close"
+        if state == "flat":
+            r["why"] = "손절·익절 주문이 청산보다 먼저 체결됨: 청산 경로는 확인되지 않음"
+            return
+        assert pos is not None
+        r["margin"] = self._test_margin_read(tid, pos, ctx)
+        closed = False
+        try:
+            closed = self.executor.close(TEST_CLOSE, ctx)
+        except ExchangeError as exc:
+            self.executor.event("ACTION_ERROR", {"action": "Close", "error": str(exc)[:200]},
+                                f"[주문 오류] Close: {str(exc)[:200]}")
+        if not closed:
+            self._test_abort(r, "청산이 확인되지 않음")
+            return
+        flat = self._test_flat_reads(r)
+        done = self.executor.trade()
+        protect_s = None
+        if done is not None and done.protected_ts is not None:
+            protect_s = done.protected_ts - done.opened_ts
+        if flat is False:
+            self._test_abort(r, "청산 뒤에도 포지션이 읽힘")
+        elif flat is None:
+            r["why"] = "청산 뒤 포지션을 읽지 못함"
+        elif not confirmed:
+            r["why"] = "진입 응답을 받지 못해 체결가를 모름: 포지션은 보호한 뒤 청산함"
+        elif protect_s is None or protect_s > PROTECT_MAX_S:
+            r["why"] = f"보호까지 {protect_s if protect_s is not None else 0.0:.0f}초: {PROTECT_MAX_S:.0f}초 초과"
+        elif done is None or done.exit_reason != TEST_CLOSE:
+            r["why"] = "손절·익절 주문이 청산보다 먼저 체결됨: 청산 경로는 확인되지 않음"
+        else:
+            r["ok"] = True
+
+    def _test_settle_entry(self, entry: TargetEntry, ctx: PlanContext, r: dict[str, Any]) -> LiveTrade | None:
+        """`Executor.enter` recorded no trade: refused, nothing filled, or its answer or fill is unknown - for at most
+        TEST_SETTLE_S the position and the lookups are read. A position on its side is this entry's (`take_test_entry`).
+        Returns the trade, or None with `why` set. Never sent again: this is a test, a lost one is simply run again."""
+        tid, cid = entry.signal_ts, entry_cid(entry.signal_ts, entry.direction)
+        start = self.mono()
+        while True:
+            t = self.executor.trade()
+            if t is not None and t.trade_id == tid and t.status == "OPEN":
+                return t
+            row = self.journal.intent(cid)
+            if row is None or row["status"] in ("REJECTED", "ABANDONED"):
+                r["why"] = f"거래소가 진입을 거부함: {row['note'] if row else '주문 기록 없음'}"[:200]
+                return None
+            try:
+                pos = self.ex.position()
+                if pos is not None and pos.side == entry.direction:
+                    self.executor.take_test_entry(row, pos, ctx)
+                    continue
+                if row["status"] == "PENDING":
+                    self.executor.resolve_pending()
+                elif row["order_id"]:
+                    o = self.ex.get_order(str(row["order_id"]))
+                    if o.is_terminal and o.filled == 0:
+                        r["why"] = "진입 주문이 체결 없이 끝남"
+                        return None
+            except ExchangeError:
+                pass
+            if not 0 <= self.mono() - start < TEST_SETTLE_S:
+                r["why"] = f"진입 결과를 {TEST_SETTLE_S:.0f}초 안에 확인하지 못함 (포지션이 나타나면 보호한 뒤 바로 청산)"
+                return None
+            self.d.sleep(TEST_RETRY_S)
+
+    def _test_verify_stop(self, tid: int, ctx: PlanContext) -> tuple[str, Position | None]:
+        """The stop is on the exchange by the check of every reconcile pass: position and open orders read as one state
+        (`_snapshot`), `observe` finds resting stop legs covering the position, and they are the wanted legs. A leg missing
+        is placed again the way a pass would, until TEST_PROTECT_S has gone by or the venue refused it
+        TEST_BRACKET_REFUSALS times. ("ok", the position) | ("flat", None): it left by a bracket | ("failed", None)."""
+        start, since = self.mono(), self.clock() - 60.0
+
+        def refused() -> int:
+            return sum(1 for e in self.journal.events(kind="BRACKET_FAILED", since=since)
+                       if e["data"].get("trade_id") == tid and e["data"].get("status") == "REJECTED")
+
+        while True:
+            now = self.clock()
+            try:
+                pos, orders = self._snapshot()
+                t = self.executor.trade()
+                seen, events = observe(t, pos, orders, now)
+                if seen != t:
+                    self.executor.save(seen)
+                for kind, data in events:
+                    self.journal.add_event(now, kind, data)
+                if seen is None or seen.trade_id != tid or seen.status != "OPEN":
+                    return "flat", None
+                if pos is not None:
+                    legs, stop = desired_legs(seen, expected_contracts(seen), seen.stop_spot, ctx.ratio, ctx.tick, ctx.price)
+                    if seen.unprotected_since is None and pos.side == seen.direction and legs_match(seen, orders, legs):
+                        return "ok", pos
+                    self.executor.protect(Protect(tuple(legs), seen.stop_spot, stop), ctx)
+            except ExchangeError as exc:
+                self.journal.add_event(now, "POLL_ERROR", {"error": self.d.redact(str(exc))[:200]})
+            if not 0 <= self.mono() - start < TEST_PROTECT_S or refused() >= TEST_BRACKET_REFUSALS:
+                return "failed", None
+            self.d.sleep(TEST_RETRY_S)
+
+    def _test_margin_read(self, tid: int, pos: Position, ctx: PlanContext) -> dict[str, Any]:
+        """With the position open and its stop resting: the margin fields of GET /cfm/balance_summary, journaled exactly as
+        Coinbase sent them (no unit is documented for most, none is assumed): Coinbase publishes no maintenance rate for
+        BIP, and this is how it gets measured. It only ever warns. The read runs on its own thread and is waited for at
+        most TEST_MARGIN_WAIT_S - the client's own retries can take many seconds -, an answer later than that describes no
+        open position and is dropped, and nothing raised here reaches the close."""
+        out: dict[str, Any]
+        try:
+            job = _Fetch(self.ex.balance_summary, self.mono(), "ewbot-test-margin", "balance summary read")
+            job.thread.join(TEST_MARGIN_WAIT_S)
+            if not job.done():
+                raise TimeoutError(f"{TEST_MARGIN_WAIT_S:.0f}초 안에 답이 없음")
+            raw = job.result()
+            out = {"fields": {k: raw.get(k) for k in TEST_MARGIN_FIELDS},
+                   "missing": [k for k in TEST_MARGIN_FIELDS if k not in raw]}
+        except Exception as exc:  # noqa: BLE001 - never at the cost of the close
+            out = {"error": self.d.redact(f"{type(exc).__name__}: {exc}")[:200]}
+        out["position"] = {"side": pos.side, "contracts": pos.contracts, "avg_entry": pos.avg_entry}
+        out["futures_mid"] = ctx.price
+        try:
+            self.journal.add_event(self.clock(), TEST_TRADE_MARGIN, {"trade_id": tid, **out})
+        except Exception as exc:  # noqa: BLE001 - e.g. a value the journal refuses (NaN): never at the cost of the close
+            out = {"error": f"journal: {type(exc).__name__}: {exc}"[:200]}
+            self.journal.add_event(self.clock(), TEST_TRADE_MARGIN, {"trade_id": tid, **out})
+        if "error" in out:
+            self.alert(TEST_TRADE, f"[시험 거래 경고] 증거금 값을 읽지 못함 ({out['error']}): 청산은 그대로 진행")
+        return out
+
+    def _test_flat_reads(self, r: dict[str, Any]) -> bool | None:
+        """After the close: flat (True), a position (False) or unreadable (None); how many brackets of ours still rest goes
+        into the result (they only reduce, and the next pass cancels what is left)."""
+        flat: bool | None = None
+        r["resting"] = 0
+        for k in range(TEST_FLAT_READS):
+            if k:
+                self.d.sleep(TEST_RETRY_S)
+            try:
+                pos, orders = self._snapshot()
+            except ExchangeError:
+                continue
+            flat = pos is None
+            r["resting"] = len([o for o in orders if is_ours(o) and o.kind == "BRACKET"])
+            if not flat or r["resting"] == 0:
+                break
+        return flat
+
+    def _test_abort(self, r: dict[str, Any], why: str) -> None:
+        """A step after the entry failed. The close stands in the journal, entries pause - a real entry would meet the same
+        failure -, and a pass sends it now and every pass after it until the account is flat, whatever the session or a
+        restart does (`_flatten`); the brackets rest until the venue took it, and a failed close puts them back."""
+        r["why"] = why
+        r["flatten"] = self._flatten(TEST_FAILED, "TEST_TRADE", f"test trade failed: {why}"[:160], self.clock())
+
+    def _test_end_state(self) -> tuple[str, str]:
+        """How the position stands now, read again: ("flat" | "protected" | "unprotected" | "unread", in words)."""
+        try:
+            pos = self.ex.position()
+            if pos is None:
+                return "flat", "포지션 없음"
+            covered = sum(o.size - o.filled for o in self.ex.open_orders()
+                          if is_ours(o) and o.kind == "BRACKET" and o.stop_price is not None and o.side == -pos.side)
+        except ExchangeError as exc:
+            return "unread", self.d.redact(f"포지션을 읽지 못함 ({exc}): Coinbase 앱에서 바로 확인")[:200]
+        if covered >= pos.contracts:
+            return "protected", f"포지션 {_side(pos.side)} {pos.contracts}계약은 손절 주문으로 보호 중, 청산을 매 확인마다 다시 보냄"
+        return "unprotected", (f"경고: 포지션 {_side(pos.side)} {pos.contracts}계약에 손절 주문이 없음 - 매 확인마다 다시 시도 중, "
+                               "Coinbase 앱에서 바로 청산")
+
+    def _test_fills(self, r: dict[str, Any], tid: int) -> None:
+        """The fills as the journal has them (the same ENTRY and CLOSED events as a strategy trade's); a fee not there yet is
+        read once more, with nothing left to protect."""
+        def event(kind: str) -> dict[str, Any]:
+            found = [e["data"] for e in self.journal.events(kind=kind, since=float(r["started"]))
+                     if e["data"].get("trade_id") == tid]
+            return found[-1] if found else {}
+
+        def fee(data: dict[str, Any]) -> float | None:
+            if data.get("fee") is not None or not data.get("order_id"):
+                return data.get("fee")
+            try:
+                got = self.ex.get_order(str(data["order_id"])).fee
+            except ExchangeError:
+                return None
+            return float(got) if got is not None and math.isfinite(float(got)) else None
+
+        e, c = event("ENTRY"), event("CLOSED")
+        entry_fee, close_fee = fee(e), fee(c)
+        t = self.executor.trade()
+        r.update(entry_price=e.get("price"), entry_order=e.get("order_id"), entry_fee=entry_fee, close_price=c.get("price"),
+                 close_order=c.get("order_id"), close_fee=close_fee, close_reason=c.get("reason"),
+                 fees=None if entry_fee is None or close_fee is None else entry_fee + close_fee,
+                 protect_s=None if t is None or t.trade_id != tid or t.protected_ts is None
+                 else round(t.protected_ts - t.opened_ts, 3))
+
+    def _test_trade_end(self, r: dict[str, Any], tid: int) -> None:
+        """The result: journaled with what the gates need (TEST_TRADE), alerted, and read back by the command."""
+        self._test_fills(r, tid)
+        r["position"], state = self._test_end_state()
+        if r["ok"]:
+            fees = "-" if r["fees"] is None else f"{r['fees']:.2f} USD"
+            detail = (f"{_side(r['side'])} {r['contracts']}계약 · 진입 {r['entry_price']:,.1f} · 손절 {r['stop']:,.0f} 확인 "
+                      f"(보호까지 {r['protect_s']:.1f}초) · 청산 {r['close_price']:,.1f} · 수수료 {fees} · {state}")
+            r["message"], alert = f"시험 거래 성공: {detail}", f"[시험 거래 성공] {detail}"
+        else:
+            detail = f"{r['why']} · {state}"
+            r["message"] = f"시험 거래 실패 ({TEST_STEP[r['step']]}): {detail}"
+            alert = f"[시험 거래 실패] {TEST_STEP[r['step']]}: {detail}"
+        self.journal.add_event(self.clock(), TEST_TRADE, r)
+        self.journal.put(TEST_ACTIVE_KEY, None)
+        self.alert(TEST_TRADE, alert)
+        self.active = self._fast()
+
+    def _test_trade_interrupted(self, now: float) -> None:
+        """At start: the process died in the middle of a test trade. The recovery has rebuilt what the exchange shows; the
+        close stands from here on (`_flatten_actions`, in the start's first pass) and entries pause. It is recorded as
+        failed and never run again."""
+        active = self.journal.get(TEST_ACTIVE_KEY)
+        if active is None:
+            return
+        message = "시험 거래 실패 (중단): 도중에 프로세스가 끝남 - 남은 포지션은 바로 청산, 재개는 /resume"
+        self.journal.add_event(now, TEST_TRADE, {"request": active.get("request"), "ok": False, "step": "interrupted",
+                                                 "trade_id": active.get("trade_id"), "side": active.get("side"),
+                                                 "contracts": 0, "why": "도중에 프로세스가 끝남", "margin": {},
+                                                 "started": active.get("ts"), "message": message})
+        self.journal.put(TEST_ACTIVE_KEY, None)
+        self._request_flatten(TEST_FAILED, "TEST_TRADE", now, restored=True)
+        if paused(self.journal) is None:
+            pause(self.journal, "test trade interrupted", now)
+        self.alert(TEST_TRADE, "[시험 거래 중단] 도중에 프로세스가 끝남: 남은 포지션은 바로 청산, 재개는 /resume")
+
+    def _test_entry_left(self, seen: LiveTrade | None, pos: Position | None, ctx: PlanContext, now: float) -> LiveTrade | None:
+        """In every pass, before the planner: a position no open trade records while our latest entry is a test trade's with
+        its outcome still unknown (the test gave up on it, or a restart found the lookup failing). It is that entry's, never
+        a manual one: protected from it at once, and its close stands. Anything else is the planner's."""
+        if pos is None or (seen is not None and seen.status == "OPEN"):
+            return seen
+        own = self.executor.unsettled_entry(now)
+        if (own is None or int(own["payload"]["signal_ts"]) not in ids_of_test_trades(self.journal)
+                or int(own["payload"]["direction"]) != pos.side):
+            return seen
+        try:
+            self.executor.take_test_entry(own, pos, ctx)
+        except ExchangeError as exc:  # recorded before its protection: the next pass places what is missing
+            self.executor.event("ACTION_ERROR", {"action": "Protect", "error": str(exc)[:200]},
+                                f"[주문 오류] Protect: {str(exc)[:200]}")
+        self._request_flatten(TEST_FAILED, "TEST_TRADE", now)
+        if paused(self.journal) is None:
+            pause(self.journal, "test trade: its entry showed late", now)
+        self.alert(TEST_TRADE, "[시험 거래 경고] 결과를 모르던 진입의 포지션이 나타남: 보호한 뒤 바로 청산, 재개는 /resume")
+        return self.executor.trade()
+
     # ------------------------------------------------------------------ Telegram commands
     def handle(self, cmd: str, now: float, sent: float | None = None) -> str:
         """One Telegram command. `sent` is the message's Telegram date (`now` when not given): /flatten_confirm
@@ -1960,6 +2348,7 @@ class LiveRuntime:
             ("poll", self.poll, regular or resync),
             ("audit", self._audit_poll, self.audit_job is not None),
             ("minute", self.minute, self._due(self.last_minute, 60.0, mono)),
+            ("test trade", self._test_trade_due, True),
             ("cycle", self._cycle_due, True),
         ]
         for name, fn, due in sections:
@@ -2014,6 +2403,46 @@ class LiveRuntime:
                 f"- 경고: 거래 {t.trade_id}에 거래소 손절 주문이 없음 (Coinbase 앱에서 확인)" if bare and t is not None
                 else "(거래소의 보호 주문은 그대로)"))
         return 0 if self.exit_code is None else self.exit_code
+
+
+def refusal_of_test_trade(journal: Journal, ex: Exchange, now: float) -> str | None:
+    """Why no test trade may start now, or None: only in CANARY, not paused, outside the hour's cycle and its entries, with a
+    book flat as the running runtime sees it, no tripped breaker, a key that can trade and not transfer, the session OPEN.
+    The command asks this to answer at once; the runtime asks it again before it sends anything."""
+    stage = journal.stage()[0]
+    if stage != "CANARY":
+        return f"CANARY 단계에서만 실행할 수 있음 (현재 {stage})"
+    p = paused(journal)
+    if p is not None:
+        return f"일시 정지 중 ({p['reason']}): /resume 뒤에 실행"
+    minute = int(now) // 60 % 60
+    if minute >= TEST_WINDOW[0] or minute < TEST_WINDOW[1]:
+        return f"매시 {TEST_WINDOW[0]}분부터 {TEST_WINDOW[1]:02d}분까지는 실행하지 않음 (그 시간의 사이클과 진입): {TEST_WINDOW[1]:02d}분 뒤에 다시"
+    t = journal.get("trade")
+    if t and t.get("status") == "OPEN":
+        return f"포지션이 열려 있음 (거래 {t.get('trade_id')})"
+    pending = len(journal.intents(status="PENDING"))
+    if pending:
+        return f"결과 미확인 주문 {pending}건이 있음"
+    if journal.get(FLATTEN_KEY) is not None:
+        return "전량 청산 진행 중"
+    g = journal.get(AccountGuard.KEY) or {}
+    if g.get("total_tripped") or (g.get("daily_tripped") and g.get("day") == ny_date(now)):
+        return "실계좌 손실 한도 발동 중"
+    try:
+        perms = ex.key_permissions()
+        if not perms.can_view or not perms.can_trade or perms.can_transfer:
+            return f"거래 키가 아님 (view+trade, 송금 불가 필요): view={perms.can_view} trade={perms.can_trade} transfer={perms.can_transfer}"
+        session = ex.session()
+        if not session.is_open:
+            return f"장이 열려 있지 않음 ({session.state})"
+        pos = ex.position()
+        if pos is not None:
+            return f"포지션이 열려 있음 ({_side(pos.side)} {pos.contracts}계약)"
+        orders = ex.open_orders()
+    except ExchangeError as exc:
+        return f"거래소를 읽지 못함: {exc}"[:200]
+    return f"대기 주문 {len(orders)}건이 있음" if orders else None
 
 
 def status_lines(journal: Journal, now: float) -> list[str]:
