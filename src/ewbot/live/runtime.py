@@ -621,11 +621,11 @@ class LiveRuntime:
     def _sizing_equity(self, first: float, signal_ts: int, now: float) -> tuple[float | None, str | None]:
         """The equity a FULL entry is sized from (with no contract cap every limit scales from it), or why it is refused. A
         read within EQUITY_SIZING_BAND of the breakers' last observation is used as it is. Outside it - one wrong read, a
-        stale reference after downtime, a real deposit or withdrawal - it is read again a few seconds, at most twice:
-        - the next read back in the band: that read, as trusted as any in the band (only the first one was off);
-        - three reads within EQUITY_READS_AGREE of each other: their median, even outside the band, and the alert says the
-          balance changed from the reference;
-        - reads that disagree, are not usable or fail: refused. A signal comes about once a month: only this skips it."""
+        wrong or stale reference, a real deposit or withdrawal - it is always read twice more, a second apart, and the
+        median of the three sizes the entry when at least two of them agree within EQUITY_READS_AGREE: a wild read is
+        discarded and a wrong reference outvoted, whichever read looked in the band. A median still outside the band is said
+        as a change of the balance. Reads that fail, are not usable or have no two agreeing refuse it; a signal comes about
+        once a month, and only this skips it."""
         last = usable_price((self.guard.state() or {}).get("equity"))
         if last is None or abs(first / last - 1.0) <= EQUITY_SIZING_BAND:
             return first, None
@@ -637,23 +637,19 @@ class LiveRuntime:
                 reads.append(float(self.ex.balance().equity))
             except ExchangeError as exc:
                 return None, self.d.redact(f"{head}: 다시 읽지 못함 ({exc})")[:200]
-            if len(reads) == 2 and usable_price(reads[1]) is not None and abs(reads[1] / last - 1.0) <= EQUITY_SIZING_BAND:
-                if self._once(f"equity_read_off:{signal_ts}"):
-                    self.journal.add_event(now, "EQUITY_READ_OFF", {"signal_ts": signal_ts, "read": first, "again": reads[1],
-                                                                    "reference": last})
-                    self.alert("EQUITY_READ_OFF", f"[잔고 조회 이상] {head}: 다시 읽은 값 {reads[1]:,.2f} USD로 크기를 정함")
-                return reads[1], None
         shown = ", ".join(f"{x:,.2f}" for x in reads)
         if not all(usable_price(x) is not None for x in reads):
+            return None, f"{head}: 잔고를 읽지 못함 ({shown})"
+        low, median, high = sorted(reads)
+        if min(median - low, high - median) > EQUITY_READS_AGREE * median:
             return None, f"{head}: 세 번 읽은 값이 서로 다름 ({shown})"
-        median = sorted(reads)[1]
-        if max(reads) - min(reads) > EQUITY_READS_AGREE * median:
-            return None, f"{head}: 세 번 읽은 값이 서로 다름 ({shown})"
-        if self._once(f"equity_changed:{signal_ts}"):
-            self.journal.add_event(now, "EQUITY_CHANGED", {"signal_ts": signal_ts, "reads": reads, "median": median,
-                                                           "reference": last})
-            self.alert("EQUITY_CHANGED", f"[잔고 변경] 손실 한도의 기준 {last:,.2f} USD와 달리 세 번 읽은 잔고가 {median:,.2f} USD: 이 값으로 "
-                                         "크기를 정함 (입출금이면 ewbot live rebase 확인)")
+        changed = abs(median / last - 1.0) > EQUITY_SIZING_BAND
+        kind = "EQUITY_CHANGED" if changed else "EQUITY_READ_OFF"
+        if self._once(f"{kind.lower()}:{signal_ts}"):
+            self.journal.add_event(now, kind, {"signal_ts": signal_ts, "reads": reads, "median": median, "reference": last})
+            self.alert(kind, f"[잔고 변경] 손실 한도의 기준 {last:,.2f} USD와 달리 세 번 읽은 잔고의 중앙값이 {median:,.2f} USD ({shown}): 이 값으로 "
+                             "크기를 정함 (입출금이면 ewbot live rebase 확인)" if changed else
+                             f"[잔고 조회 이상] {head}: 세 번 읽은 값 ({shown})의 중앙값 {median:,.2f} USD로 크기를 정함")
         return median, None
 
     def _record_entry_reduction(self, r: dict[str, Any], now: float) -> None:

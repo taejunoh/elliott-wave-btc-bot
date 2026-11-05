@@ -2346,24 +2346,39 @@ def test_three_reads_that_agree_size_the_entry_even_outside_the_band_and_it_says
     hs.journal.close()
 
 
-def test_one_wild_read_followed_by_a_normal_one_loses_no_signal(tmp_path):
-    """The case that asked for this: the next read is back in the band, as trusted as any read in the band. No third read is
-    needed, the size is that read's, and the balance did not change, so nothing says it did."""
-    hs, calls = sizing(tmp_path, 100_000.0, 10_000.0)
-    assert size_now(hs) == (124, None) and calls == [100_000.0, 10_000.0]
+def test_one_wild_read_followed_by_normal_ones_loses_no_signal(tmp_path):
+    """Three reads always, once one is out of the band: the median discards the wild one, and nothing says the balance
+    changed, because the median is in the band."""
+    hs, calls = sizing(tmp_path, 100_000.0, 10_000.0, 10_000.0)
+    assert size_now(hs) == (124, None) and calls == [100_000.0, 10_000.0, 10_000.0]
     assert hs.journal.events(kind="EQUITY_CHANGED") == []
-    assert hs.journal.events(kind="EQUITY_READ_OFF")[-1]["data"]["read"] == 100_000.0
+    assert hs.journal.events(kind="EQUITY_READ_OFF")[-1]["data"]["reads"] == calls
     assert any(t.startswith("[잔고 조회 이상]") for _, t in hs.alerts.items)
     hs.journal.close()
 
 
+def test_flapping_reads_with_a_poisoned_reference_size_on_the_truth(tmp_path):
+    """Re-review M3: the true read looked out of the band, a wrong second read looked back in it, and the entry doubled
+    (248 for 124). The reference is 20,000 from a wrong minute; the truth is 10,000."""
+    hs, calls = sizing(tmp_path, 10_000.0, 20_000.0, 10_000.0, reference=20_000.0)
+    assert size_now(hs) == (124, None) and len(calls) == 3
+    hs.journal.close()
+
+
+def test_two_of_three_agreeing_above_the_band_are_used_and_said(tmp_path):
+    hs, calls = sizing(tmp_path, 30_000.0, 30_000.0, 10_000.0)
+    assert size_now(hs) == (373, None) and len(calls) == 3
+    assert hs.journal.events(kind="EQUITY_CHANGED")[-1]["data"]["median"] == 30_000.0
+    hs.journal.close()
+
+
 @pytest.mark.parametrize("reads,why", [
-    ((30_000.0, 30_000.0, 40_000.0), "서로 다름"),  # within 1% is not met
-    ((30_000.0, 20_000.0, 10_000.0), "서로 다름"),  # the last one in the band does not make two wild reads right
-    ((30_000.0, 30_000.0, float("nan")), "서로 다름"),
-    ((float("inf"), float("inf"), float("inf")), "서로 다름"),
-    ((30_000.0, Unavailable("HTTP 503")), "다시 읽지 못함"),
-    ((30_000.0, 30_000.0, RateLimited("429")), "다시 읽지 못함"),
+    ((30_000.0, 20_000.0, 10_000.0), "서로 다름"),  # no two within 1%
+    ((5_000.0, 5_200.0, 5_400.0), "서로 다름"),  # a real move between the reads: nothing to size on
+    ((30_000.0, 30_000.0, float("nan")), "읽지 못함"),
+    ((float("inf"), float("inf"), float("inf")), "읽지 못함"),
+    ((30_000.0, Unavailable("HTTP 503")), "읽지 못함"),
+    ((30_000.0, 30_000.0, RateLimited("429")), "읽지 못함"),
 ])
 def test_reads_that_disagree_or_fail_refuse_the_entry_and_say_why(tmp_path, reads, why):
     hs, _ = sizing(tmp_path, *reads)
