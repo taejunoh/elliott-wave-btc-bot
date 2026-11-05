@@ -113,12 +113,22 @@ from ewbot.live.executor import CANCEL_QUEUED, CLOSE_CONFLICTS, OVERLAP_REFUSALS
 from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
-from ewbot.live.pricing import MARGIN_ENTRY_MAX, BasisOutOfBand, basis_ratio, map_level, margin_ratio, stage_contracts
+from ewbot.live.pricing import (
+    FULL_RISK,
+    MARGIN_ENTRY_MAX,
+    BasisOutOfBand,
+    basis_ratio,
+    map_level,
+    margin_ratio,
+    max_contracts_for_margin,
+    stage_contracts,
+)
 from ewbot.live.reconcile import (
     Action,
     Adopt,
     Alert,
     Close,
+    Enter,
     LiveTrade,
     PlanContext,
     Protect,
@@ -329,6 +339,7 @@ class LiveRuntime:
         self.guard = AccountGuard(self.journal, live_breakers(self.cfg.breakers, self.stage))
         self.sessions = SessionWatch()
         self.target: Target | None = None
+        self._entry_reduction: dict[str, Any] | None = None  # the last _entry_size's FULL margin reduction, if any
         self.frame: pd.DataFrame | None = None  # the candles of the last cycle (the audit's DATA_REVISION check)
         self.product: ProductSpec | None = None
         self.session: SessionInfo | None = None
@@ -476,6 +487,7 @@ class LiveRuntime:
                            own_entry=None if own is None else entry_position(own["payload"]))
 
     def _entry_size(self, now: float, ratio: float | None, session_open: bool) -> tuple[int, str | None]:
+        self._entry_reduction = None  # set below only when this call reduces a FULL entry to the margin maximum
         t = self.target
         if t is None or t.entry is None:
             return 0, None
@@ -511,8 +523,34 @@ class LiveRuntime:
             return 0, why
         projected = margin_ratio(n, entry, e.direction, self.product, equity)
         if projected > MARGIN_ENTRY_MAX:
-            return 0, f"오버나이트 증거금 예상 {projected:.0%} > {MARGIN_ENTRY_MAX:.0%}"
+            # FULL (user decision 2026-11-05) enters with the most contracts the limit holds - below both the risk size
+            # and the stage cap, so the result is min(risk size, cap, margin maximum); SHADOW and CANARY trade 1 contract
+            # and refuse. Nothing fits (0): refused, as it always was.
+            fit = max_contracts_for_margin(entry, e.direction, self.product, equity, MARGIN_ENTRY_MAX) if stage == "FULL" else 0
+            if fit <= 0:
+                return 0, f"오버나이트 증거금 예상 {projected:.0%} > {MARGIN_ENTRY_MAX:.0%}"
+            wanted, _ = stage_contracts(stage, equity=equity, entry=entry, stop=stop, direction=e.direction,
+                                        risk_mult=e.risk_mult, cfg=self.cfg, full_cap=None)
+            self._entry_reduction = {"signal_ts": e.signal_ts, "stage": stage, "direction": e.direction, "needed": wanted,
+                                     "cap": cap, "margin_max": fit, "entered": fit, "projected": projected,
+                                     "risk": FULL_RISK.risk_pct}
+            return fit, None
         return n, None
+
+    def _record_entry_reduction(self, r: dict[str, Any], now: float) -> None:
+        """A FULL entry that entered with the margin maximum instead of the risk size: once per signal, after the entry
+        exists (a failed send is recorded when a later pass enters). Shows the needed and the entered contracts, so the
+        reduced risk (about the risk fraction times entered / needed) is visible."""
+        t = self.executor.trade()
+        if t is None or t.trade_id != r["signal_ts"] or not self._once(f"entry_reduced:{r['signal_ts']}"):
+            return
+        self.journal.add_event(now, "ENTRY_REDUCED", r)
+        needed, entered = int(r["needed"]), t.contracts
+        real = float(r["risk"]) * entered / needed if needed > 0 else 0.0
+        self.alert("ENTRY_REDUCED", f"[진입 축소] 위험 {float(r['risk']):.0%} 기준 {needed}계약이 필요하나 오버나이트 증거금 "
+                                    f"{MARGIN_ENTRY_MAX:.0%} 한도(최대 {r['margin_max']}계약"
+                                    + (f", 단계 상한 {r['cap']}계약" if r["cap"] is not None else "")
+                                    + f")로 {entered}계약 진입 - 실제 위험은 약 {real:.1%}")
 
     def flat(self) -> bool:
         """Nothing left to manage: no open trade, no order of unknown outcome (PENDING), no standing flatten (the
@@ -814,11 +852,14 @@ class LiveRuntime:
                 self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
                 self._read_failed("session", exc)
         ctx = self._ctx(now)
+        reduction = self._entry_reduction
         planned = plan(self.target, seen, pos, orders, ctx)
         req = self.journal.get(FLATTEN_KEY)
         actions = planned if req is None else self._flatten_actions(req, planned, pos, ctx, now)
         closes = [e["id"] for e in self.journal.events(kind="CLOSED")][-1:] if req is not None else []
         self.executor.execute(actions, ctx)
+        if reduction is not None and any(isinstance(a, Enter) for a in actions):
+            self._record_entry_reduction(reduction, now)
         if req is not None and pos is not None and ctx.session_open:
             self._flatten_sent(req, closes[0] if closes else 0, now)
         for kind, note in self._after_pass:  # the pass's actions first, then the flatten's alerts

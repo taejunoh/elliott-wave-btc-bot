@@ -168,7 +168,7 @@ def test_full_leverage_cap_binds_at_five_x_on_a_narrow_stop():
 
 def test_full_margin_check_binds_before_the_leverage_cap():
     """59 contracts at 80,000 are 4.72x notional; the overnight margin (0.21025 long) projects
-    59 * 800 * 0.21025 / 10,000 = 99.2% of equity, above MARGIN_ENTRY_MAX 70%: the runtime refuses the entry.
+    59 * 800 * 0.21025 / 10,000 = 99.2% of equity, above MARGIN_ENTRY_MAX 70%: the runtime reduces a FULL entry to the margin maximum (SHADOW/CANARY refuse).
     The most that passes is floor(0.70 * 10,000 / (800 * 0.21025)) = floor(41.6) = 41 contracts."""
     n, _ = stage_contracts("FULL", equity=10_000.0, entry=80_000.0, stop=78_400.0, direction=1, risk_mult=1.0, cfg=CFG)
     assert n == 59

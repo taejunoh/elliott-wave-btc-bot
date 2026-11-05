@@ -13,7 +13,9 @@ account (CANARY_MAX_RISK); FULL calls the frozen risk.sizing.size_contracts with
 stays conservative), capped at 3 contracts until FULL has run 30 days without a CANARY failure
 (live/stage.full_cap). Margin is always projected at the OVERNIGHT rate (the stricter one; it applies from 16:00
 New York); the exchange's overnight rates (about 4.8x long, 3.9x short) are below FULL_RISK's 5x, so the 70% entry
-limit (MARGIN_ENTRY_MAX) binds first, on purpose: an entry above it is refused, not reduced."""
+limit (MARGIN_ENTRY_MAX) binds first, on purpose. In FULL an entry above it is reduced to the most contracts the limit holds
+(runtime._entry_size, max_contracts_for_margin; user decision 2026-11-05: the real risk is then under 10%), refused only
+when not even one fits; SHADOW and CANARY (1 contract) refuse."""
 
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ CANARY_MAX_RISK = 0.15  # user decision 2026-10-19 (Plan 3 spec amendment; spec 
 FULL_RISK = RiskProfile("full", 0.10, 5.0)  # user decision 2026-11-05 (Plan 3 spec amendment; it was CONSERVATIVE 1% / 3x)
 FULL_CAP_CONTRACTS = 3  # spec 4.3 / 6.2: until FULL has run FULL_CAP_DAYS without a CANARY failure (stage.full_cap)
 FULL_CAP_DAYS = 30
-MARGIN_ENTRY_MAX = 0.70  # spec 4.5: refuse an entry whose overnight projection exceeds 70%
+MARGIN_ENTRY_MAX = 0.70  # spec 4.5: an entry whose overnight projection exceeds 70% is refused (FULL: reduced to fit, 2026-11-05)
 MARGIN_WARN = 0.80
 MARGIN_REDUCE = 0.90
 BASIS_BAND = 0.02  # a futures mid this far from the spot mid (either way) is no basis: a stale or one-sided book

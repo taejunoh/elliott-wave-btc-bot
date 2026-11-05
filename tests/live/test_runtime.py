@@ -29,6 +29,7 @@ from ewbot.live.feed import Tick, TickerFeed
 from ewbot.live.health import Heartbeat
 from ewbot.live.notify import RESENT, UNANSWERED, LiveNotifier, TelegramError
 from ewbot.live.preflight import BASELINE_FINGERPRINT
+from ewbot.live.pricing import MARGIN_ENTRY_MAX, margin_ratio
 from ewbot.live.journal import Journal
 from ewbot.live.reconcile import PlanContext, pending_position
 from ewbot.live.runtime import (
@@ -42,7 +43,7 @@ from ewbot.live.runtime import (
 from ewbot.live.shadow import CALLS_KEPT, FILLS_KEPT, PREVIEW_RETRY_LIMIT, ShadowExchange
 from ewbot.live.sim import SimCrash, SimExchange
 from ewbot.live.stage import canary_gates, full_cap, on_incident, paused, restart_stint, resume, shadow_gates
-from ewbot.live.target import compute_target
+from ewbot.live.target import Target, TargetEntry, compute_target
 from ewbot.paper.decisions import known_at
 from ewbot.paper.notify import SendError
 from tests.live.harness import Harness
@@ -842,7 +843,7 @@ def test_a_demotion_applies_to_the_next_entry_while_the_process_still_runs(tmp_p
     sizes = {}
     for demoted in (False, True):
         hs = Harness(tmp_path / str(demoted), ENTRY_BAR, stage="FULL", stage_days=10)  # the 3-contract cap applies (uncapped,
-        # this fixture's 0.6% stop sizes 186 contracts at FULL_RISK: 105% overnight margin, refused by the 70% entry limit)
+        # this fixture's 0.6% stop sizes 186 contracts at FULL_RISK: 105% overnight margin, reduced to the 124 the 70% entry limit holds)
         hs.price(float(hs.bar(ENTRY_BAR)["open"]))
         hs.rt.startup()
         hs.at(ENTRY_BAR + 1)  # this minute's stage check is done: the next one would restart the flat runtime
@@ -2195,6 +2196,103 @@ def test_an_entry_is_never_sized_without_a_margin_rate(tmp_path):
     hs.rt.product = dataclasses.replace(hs.rt.product, overnight_margin=(0.0, 0.0))
     hs.at(ENTRY_BAR + 30)
     assert hs.ex.position() is None and "증거금률" in hs.journal.events(kind="SKIP")[0]["data"]["reason"]
+    hs.journal.close()
+
+
+def sized(tmp_path, stage: str, equity: float, *, direction: int = 1, stop_dist: float = 240.0,
+          stage_days: float = 60.0) -> tuple[int, str | None, Harness]:
+    """`_entry_size` for a hand-made entry at 26,740 (ratio 1.0, so entry == entry_ref) with the stop `stop_dist` away,
+    on a `stage` harness (stage_days 60: FULL is uncapped; 10: the 3-contract cap applies)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=stage_days, equity=equity)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    ent = TargetEntry(SIGNAL, "W3", direction, 26_740.0, 26_740.0 - direction * stop_dist,
+                      26_740.0 + direction * 760.0, None, 1.0, 5, "test signal")
+    hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
+    n, block = hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True)
+    return n, block, hs
+
+
+def test_full_enters_at_the_margin_maximum_when_the_risk_size_would_exceed_the_limit(tmp_path):
+    """User decision 2026-11-05: FULL reduces an entry the 70% overnight-margin limit cannot hold instead of refusing it.
+    Long, equity 10,000, entry 26,740, stop 26,500: the 5x leverage cap sizes 186 contracts (the 10% risk would allow 375);
+    186 contracts are 186 * 0.01 * 26,740 * 0.21025 / 10,000 = 105% of the account, above 70%. One contract needs
+    0.01 * 26,740 * 0.21025 = 56.22 USD, so the most that fits is floor(0.70 * 10,000 / 56.22) = floor(124.5) = 124."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0)
+    assert (n, block) == (124, None)
+    assert margin_ratio(124, 26_740.0, 1, hs.rt.product, 10_000.0) <= MARGIN_ENTRY_MAX
+    assert margin_ratio(125, 26_740.0, 1, hs.rt.product, 10_000.0) > MARGIN_ENTRY_MAX
+    hs.journal.close()
+
+
+def test_the_3_contract_cap_wins_when_it_is_smaller_than_the_margin_maximum(tmp_path):
+    """The minimum of the risk size (186), the cap (3) and the margin maximum (124) is the cap: nothing is reduced."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, stage_days=10)
+    assert (n, block) == (3, None) and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+def test_the_margin_maximum_wins_when_it_is_smaller_than_the_cap(tmp_path):
+    """Equity 200 (the 3-contract cap applies): the risk size is 3 (the 5x cap: floor(5 * 200 / 267.4) = 3), 3 contracts are
+    3 * 56.22 / 200 = 84% > 70%; the most that fits is floor(0.70 * 200 / 56.22) = floor(2.49) = 2."""
+    n, block, hs = sized(tmp_path, "FULL", 200.0, stage_days=10)
+    assert (n, block) == (2, None)
+    hs.journal.close()
+
+
+def test_full_at_or_under_the_margin_limit_is_unchanged(tmp_path):
+    """A wide stop (26,740 to 24,740: 2,000 + 0.0005 * 51,480 = 2,025.7 per BTC, 20.26 USD per contract) sizes
+    floor(1,000 / 20.26) = 49 contracts at 10% risk: 49 * 56.22 / 10,000 = 27.5%, under 70%: entered whole, no reduction."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, stop_dist=2_000.0)
+    assert (n, block) == (49, None) and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+def test_full_refuses_when_not_even_one_contract_fits(tmp_path):
+    """Equity 54: 1 contract is 56.22 / 54 = 104% > 70% and floor(0.70 * 54 / 56.22) = floor(0.67) = 0: refused,
+    with the message the refusal always had."""
+    n, block, hs = sized(tmp_path, "FULL", 54.0)
+    assert (n, block) == (0, "오버나이트 증거금 예상 104% > 70%") and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage", ["CANARY", "SHADOW"])
+def test_canary_and_shadow_above_the_limit_still_refuse(tmp_path, stage):
+    """They trade 1 contract, never a reduced FULL size: equity 54 projects 104% for it."""
+    n, block, hs = sized(tmp_path, stage, 54.0)
+    assert (n, block) == (0, "오버나이트 증거금 예상 104% > 70%") and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+def test_a_short_is_reduced_with_the_higher_short_margin_rate(tmp_path):
+    """Short, equity 10,000, entry 26,740: 186 contracts again, at the short overnight rate 0.256625 one contract needs
+    0.01 * 26,740 * 0.256625 = 68.62 USD, so floor(0.70 * 10,000 / 68.62) = floor(102.0) = 102 (a long fits 124)."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, direction=-1)
+    assert (n, block) == (102, None)
+    assert margin_ratio(102, 26_740.0, -1, hs.rt.product, 10_000.0) <= MARGIN_ENTRY_MAX
+    assert margin_ratio(103, 26_740.0, -1, hs.rt.product, 10_000.0) > MARGIN_ENTRY_MAX
+    hs.journal.close()
+
+
+def test_a_reduced_full_entry_is_sent_recorded_once_and_left_alone_by_the_margin_watchdog(tmp_path):
+    """The cycle enters the reduced size (the fixture's long: the margin maximum floor(0.70 * 10,000 / 56.23) = 124),
+    journals and alerts the needed and the entered contracts once, and the minute checks (warn 80%, reduce 90% of the
+    overnight projection) leave a position entered just under 70% alone."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position().contracts == 124
+    rows = hs.journal.events(kind="ENTRY_REDUCED")
+    assert len(rows) == 1
+    d = rows[0]["data"]
+    assert (d["entered"], d["margin_max"], d["cap"], d["stage"]) == (124, 124, None, "FULL") and d["needed"] > 124
+    texts = [t for k, t in hs.alerts.items if k == "ENTRY_REDUCED"]
+    assert len(texts) == 1 and texts[0].startswith("[진입 축소]") and f"{d['needed']}계약" in texts[0] and "124계약" in texts[0]
+    for k in range(1, 8):
+        hs.at(ENTRY_BAR + 30 + 60 * k)
+    assert len(hs.journal.events(kind="ENTRY_REDUCED")) == 1 and hs.ex.position().contracts == 124
+    assert "MARGIN" not in hs.alerts.kinds() and not hs.journal.events(kind="REDUCED")
     hs.journal.close()
 
 

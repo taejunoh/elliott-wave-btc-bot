@@ -3,7 +3,7 @@
   StopGapWatch   a bracket stop fills as a limit 5% beyond the stop; when the futures price has passed
                  that limit and the position is still open 10 s later, the runtime closes at market.
   margin_status  overnight-margin projection of the open position: >= 80% warn, >= 90% reduce back to
-                 the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
+                 the 70% entry limit (an entry above 70% is refused before sending - FULL: reduced to fit - live/pricing.py).
   AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.80 (LIVE_DAILY_LOSS, every
                  stage: user decisions 2026-10-19 for SHADOW and CANARY, 2026-11-05 for FULL), or <= the peak x 0.85
                  (x 0.70 in FULL: FULL_TOTAL_DD, user decision 2026-11-05) -> flatten and pause (spec 4.5), on the
