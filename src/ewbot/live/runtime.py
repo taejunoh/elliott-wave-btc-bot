@@ -91,8 +91,10 @@ current tick - while the open trade has no resting stop, after up to STOP_GRACE_
 The test trade (`ewbot live test-trade`, user decision 2026-11-05: CANARY's one real round trip, instead of waiting for
 signals). No lock exists between processes, and a position or a bracket of another process would be closed or cancelled by
 the next pass (UNKNOWN_POSITION, FLAT, ENGINE_FLAT) and read as a manual intervention. So the command only asks, through the
-journal as `ewbot live rebase` does, and this process runs it on its one loop, whole, within a tick (seconds; about a minute
-at worst): nothing else of the loop runs meanwhile, and from hh:55 to hh:06 it is refused. It goes through Executor.execute,
+journal as `ewbot live rebase` does, and this process runs it on its one loop, whole, within a tick (seconds; minutes when
+Coinbase's requests time out): nothing else of the loop runs meanwhile - a command older than COMMAND_MAX_AGE_S when it is
+reached is dropped with a reply, /flatten_confirm too -, a stop request waits for the tick up to Docker's grace, and from
+hh:55 to hh:06 it is refused. It goes through Executor.execute,
 protect and close, and the check that the stop rests is observe's. Its id is recorded first: it never counts as a strategy
 trade, it has no engine decision, so the paper comparison never sees it, and a position of its unknown entry is never a
 manual one. A step that fails after the entry leaves a standing close (the flatten request); a crash does the same at the
@@ -1937,6 +1939,7 @@ class LiveRuntime:
         if req is None:
             return
         self.journal.put(TEST_REQUEST_KEY, None)
+        now = self.clock()  # not the tick's: a request may have been written while the tick ran
         rid, side = str(req.get("id")), int(req.get("side") or 0)
         planned = self._test_trade_plan(req, side, now)
         if isinstance(planned, str):
@@ -2036,8 +2039,8 @@ class LiveRuntime:
         closed = False
         try:
             closed = self.executor.close(TEST_CLOSE, ctx)
-        except ExchangeError as exc:
-            self.executor.event("ACTION_ERROR", {"action": "Close", "error": str(exc)[:200]},
+        except ExchangeError as exc:  # named by its trade: the standing close's CLOSED below resolves it, whenever it comes
+            self.executor.event("ACTION_ERROR", {"action": "Close", "trade_id": tid, "error": str(exc)[:200]},
                                 f"[주문 오류] Close: {str(exc)[:200]}")
         if not closed:
             self._test_abort(r, "청산이 확인되지 않음")
@@ -2087,7 +2090,9 @@ class LiveRuntime:
                     self.executor.resolve_pending()
                 elif row["order_id"]:
                     o = self.ex.get_order(str(row["order_id"]))
-                    if o.is_terminal and o.filled == 0:
+                    if o.is_terminal and o.filled == 0:  # settled on the record: no unsettled entry for 2 hours
+                        self.journal.add_event(self.clock(), "ENTRY_UNFILLED", {"signal_ts": tid, "order_id": o.order_id,
+                                                                                "terminal": True})
                         r["why"] = "진입 주문이 체결 없이 끝남"
                         return None
             except ExchangeError:

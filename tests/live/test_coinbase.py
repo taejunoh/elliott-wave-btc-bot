@@ -169,6 +169,34 @@ def test_balance_summary_without_its_object_is_an_exchange_error(reply):
         ex.balance()
 
 
+def test_the_margin_read_leaves_no_mark_on_the_calls_that_protect():
+    """Review finding: a 429 on this one read made the close's next private call raise at once, nothing sent. It is one
+    try with no retry, and its 429 window and pacing are its own; `balance()`, which the breakers read, keeps the rule."""
+    route = ("GET", "/cfm/balance_summary")
+    positions = ("GET", "/cfm/positions")
+    limited = http_error(429, "slow", {"Retry-After": "5"})
+    ex, client, slept = make({route: [limited, limited], positions: "positions_flat"})
+    with pytest.raises(RateLimited):
+        ex.balance_summary()
+    assert ex.position() is None and slept == []  # sent at once
+    # its pacing headers hold nothing back
+    ex, _, slept = make({route: {**DOCUMENTED_SUMMARY, "x-ratelimit-remaining": "0", "x-ratelimit-reset": "9"},
+                         positions: "positions_flat"})
+    assert ex.balance_summary()["liquidation_buffer_percentage"] == "1438"
+    assert ex.position() is None and slept == []
+    # a 429 window the loop already honours applies to it too: nothing sent, and the window stays as it was
+    ex._limited_until[False] = ex.clock() + 5.0
+    with pytest.raises(RateLimited, match="nothing sent"):
+        ex.balance_summary()
+    assert ex._limited_until[False] == ex.clock() + 5.0
+    # the same endpoint read as `balance()` keeps the venue's rule for every other call
+    ex, _, _ = make({route: [limited, limited, limited], positions: "positions_flat"}, attempts=1)
+    with pytest.raises(RateLimited):
+        ex.balance()
+    with pytest.raises(RateLimited, match="nothing sent"):
+        ex.position()
+
+
 def by_status(pages: dict[str, list]):
     """A List Orders route: each status answered from its own pages (consumed in order), no orders otherwise."""
     def answer(params):

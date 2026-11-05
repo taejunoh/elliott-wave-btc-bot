@@ -785,6 +785,39 @@ def test_refused_when_the_account_cannot_carry_one_contract(tmp_path):
     hs.journal.close()
 
 
+def test_a_request_written_after_the_tick_began_is_not_refused_as_old(h):
+    """Review finding: the tick's `now` predates a request written while the tick ran: a negative age, refused as old."""
+    at = h.clock.now + 1
+    h.clock.now = at + 1.0  # the tick took its `now` a second ago
+    h.journal.put(TEST_REQUEST_KEY, {"id": "r", "side": 1, "ts": at + 0.4})
+    h.rt._test_trade_due(at)
+    assert h.journal.events(kind=TEST_TRADE_REFUSED) == [] and result(h)["ok"] is True
+
+
+def test_an_entry_that_ends_unfilled_after_its_wait_is_settled(h):
+    """Review finding: the IOC read open past the 10 s wait, then ended unfilled, and stayed "unsettled" for up to 2 hours:
+    fast polls, no flat book, every rerun refused."""
+    h.ex.market_fill_ratio = 0.0
+    real, start = h.ex.get_order, {"t": None}
+
+    def late(order_id):
+        o = real(order_id)
+        if o.client_order_id.startswith("ewb-e-"):
+            start["t"] = h.clock.now if start["t"] is None else start["t"]
+            if h.clock.now - start["t"] <= h.rt.executor.fill_timeout:
+                return dataclasses.replace(o, status="OPEN")
+        return o
+
+    h.ex.get_order = late
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and r["position"] == "flat" and "포지션 없음" in r["message"]
+    assert h.rt.executor.unsettled_entry(h.clock.now) is None and h.rt._busy() is False and h.rt.flat() is True
+    assert h.journal.events(kind="ENTRY_UNFILLED")[-1]["data"]["terminal"] is True
+    ask(h)
+    assert len(h.journal.events(kind=TEST_TRADE)) == 2  # not refused
+
+
 def test_refused_without_quotes_or_fresh_margin_rates(h):
     h.ex.fail_next("quote", Unavailable("down"), times=2)
     ask(h)
@@ -827,6 +860,28 @@ def test_a_failed_margin_read_only_warns(h, fault):
     assert h.journal.events(kind=TEST_TRADE_MARGIN)[-1]["data"]["error"] == r["margin"]["error"]
     assert any(t.startswith("[시험 거래 경고]") for _, t in h.alerts.items)
     assert_nothing_false(h)
+
+
+def test_one_failed_read_at_the_close_is_no_canary_failure(h):
+    """Review finding: the close's first position read failed once, its ACTION_ERROR named no trade, and so the CLOSED of the
+    standing close never matched it: ORDER_UNRESOLVED, a pause, a failed stint, for a position that was closed in seconds."""
+    real = h.ex.balance_summary
+
+    def arm():
+        h.ex.fail_next("position", Unavailable("HTTP 503"), times=1)
+        return real()
+
+    h.ex.balance_summary = arm
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and r["position"] == "flat" and h.ex.position() is None
+    action = h.journal.events(kind="ACTION_ERROR")[-1]["data"]
+    assert action["trade_id"] == r["trade_id"]
+    resume(h.journal, h.clock.now)
+    ticks(h, 3, 61.0)
+    assert h.journal.events(kind="ORDER_UNRESOLVED") == [] and paused(h.journal) is None
+    assert "ORDER_UNRESOLVED" not in canary_failures(h.journal, h.journal.stage()[1])
+    assert [e["data"]["kind"] for e in h.journal.events(kind="ORDER_RESOLVED")] == ["ACTION_ERROR"]
 
 
 def test_an_unexpected_error_in_the_margin_read_only_warns(h):
@@ -1004,7 +1059,7 @@ def test_the_command_sends_no_order_itself(env, capsys, monkeypatch):
     calls = list(env.ex.calls)
     assert main(["live", "test-trade", "--confirm"]) == 3
     err = capsys.readouterr().err
-    assert "응답" in err
+    assert "답하지 않음" in err and "거둠" in err
     new = env.ex.calls[len(calls):]
     assert not {"place_market", "place_bracket", "close_position", "cancel"} & set(new)
     assert env.journal.get(TEST_REQUEST_KEY) is None and not env.ex.fills
@@ -1066,9 +1121,50 @@ def test_the_command_refuses_with_the_trade_key_missing(env, capsys, monkeypatch
 
 
 def test_the_command_refuses_without_a_journal(tmp_path, monkeypatch, capsys):
+    """Refused, nothing sent: not exit 1, which says a test trade ran and failed."""
     monkeypatch.setattr(cli, "_live_settings", lambda: LiveSettings(data_dir=tmp_path / "none"))
-    assert main(["live", "test-trade", "--confirm"]) == 1
+    assert main(["live", "test-trade", "--confirm"]) == 2
     assert "no journal" in capsys.readouterr().err
+
+
+def test_ctrl_c_withdraws_a_request_not_taken_yet(env, capsys, monkeypatch):
+    def interrupted(s):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ewbot.cli.time.sleep", interrupted)
+    assert main(["live", "test-trade", "--confirm"]) == 3
+    err = capsys.readouterr().err
+    assert "거둠" in err and env.journal.get(TEST_REQUEST_KEY) is None
+    env.at(env.clock.now + 1)
+    assert env.journal.events(kind=TEST_TRADE) == [] and not env.ex.fills  # never runs later
+
+
+def test_ctrl_c_after_the_runtime_took_it_says_it_may_be_running(env, capsys, monkeypatch):
+    def taken_then_interrupted(s):
+        env.journal.put(TEST_REQUEST_KEY, None)
+        env.journal.put(TEST_ACTIVE_KEY, {"request": "x", "trade_id": 1, "side": 1, "ts": env.clock.now})
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ewbot.cli.time.sleep", taken_then_interrupted)
+    assert main(["live", "test-trade", "--confirm"]) == 3
+    assert "실행 중" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key,value", [(TEST_REQUEST_KEY, {"id": "r", "side": 1, "ts": 1.0}),
+                                       (TEST_ACTIVE_KEY, {"request": "r", "trade_id": 1, "side": 1, "ts": 1.0}),
+                                       (TEST_UNSEEN_KEY, {"trade_id": 1, "side": 1, "until": 1.0})])
+def test_a_test_trade_under_way_holds_the_book_for_deploy_rebase_and_promotions(env, capsys, key, value):
+    """Review finding: `live status --require-flat`, `rebase` and the promotions did not see a test trade asked for, under
+    way, or waiting for its position, each of which can be an order of the next seconds or a position nobody reads yet."""
+    env.journal.put(key, value)
+    assert main(["live", "status", "--json", "--require-flat", "--exchange"]) == 3
+    captured = capsys.readouterr()
+    assert "test trade" in captured.err and json.loads(captured.out)["test_trade"] is True
+    assert main(["live", "rebase", "--confirm"]) == 2 and "test trade" in capsys.readouterr().err
+    assert main(["live", "stage", "canary", "--restart", "--confirm"]) == 2 and "test trade" in capsys.readouterr().err
+    env.journal.put(key, None)
+    assert main(["live", "status", "--json", "--require-flat", "--exchange"]) == 0
+    assert json.loads(capsys.readouterr().out)["test_trade"] is False
 
 
 def test_the_command_reports_the_runtimes_own_refusal(env, capsys):

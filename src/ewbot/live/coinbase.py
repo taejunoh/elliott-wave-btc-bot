@@ -353,8 +353,10 @@ class CoinbaseExchange:
 
     def _call(self, method: str, path: str, *, params: dict[str, Any] | None = None,
               data: dict[str, Any] | None = None, public: bool = False, retry: bool = True,
-              waits: _Waits | None = None) -> dict[str, Any]:
-        """One request; `waits` is the budget of the call it belongs to (a call of several requests passes its own)."""
+              waits: _Waits | None = None, quiet: bool = False) -> dict[str, Any]:
+        """One request; `waits` is the budget of the call it belongs to (a call of several requests passes its own).
+        `quiet`: a read beside the loop that must never hold it back (`balance_summary`): it honours a running 429 window, but
+        its own 429 and its pacing headers leave no mark on the calls that protect a position."""
         tries = self.attempts if retry else 1
         left = self._limited_until[public] - self.clock()
         if 0 < left <= RETRY_AFTER_MAX_S:  # a 429's Retry-After still runs: nothing sent (a clock step back ignores it)
@@ -378,7 +380,7 @@ class CoinbaseExchange:
                     raise Unavailable(f"reply is not a JSON object ({type(resp).__name__})")
             except Exception as exc:  # noqa: BLE001 - mapped below
                 err = map_error(exc)
-                if isinstance(err, RateLimited):
+                if isinstance(err, RateLimited) and not quiet:
                     self._limited_until[public] = self.clock() + min(err.retry_after, RETRY_AFTER_MAX_S)
                 if not err.retryable or attempt == tries - 1:
                     raise err from None
@@ -388,6 +390,8 @@ class CoinbaseExchange:
                 self.sleep(wait)
                 waits.slept += wait
                 continue
+            if quiet:
+                return dict(resp)
             self._limited_until[public] = 0.0  # answered: no 429 runs any more
             resp = dict(resp)
             self._pace(resp, public)
@@ -516,19 +520,24 @@ class CoinbaseExchange:
                 return o
         return None
 
-    def balance_summary(self) -> dict[str, Any]:
-        """The `balance_summary` object of GET /cfm/balance_summary exactly as Coinbase sent it: nothing is converted and
-        no unit assumed. Coinbase documents amounts as {value, currency}, one field as "expressed as a percentage", and no
-        unit for the margin window measures' strings."""
-        bs = self._call("GET", "/cfm/balance_summary").get("balance_summary")
+    @staticmethod
+    def _summary_of(reply: dict[str, Any]) -> dict[str, Any]:
+        bs = reply.get("balance_summary")
         if not isinstance(bs, dict):
             raise ExchangeError("balance_summary: a reply without its object")
         return bs
 
+    def balance_summary(self) -> dict[str, Any]:
+        """The `balance_summary` object of GET /cfm/balance_summary exactly as Coinbase sent it: nothing is converted and
+        no unit assumed. Coinbase documents amounts as {value, currency}, one field as "expressed as a percentage", and no
+        unit for the margin window measures' strings. For the test trade's measurement, read on its own thread right before
+        a close: one try, and `quiet`, so a 429 on it never stops the close that follows."""
+        return self._summary_of(self._call("GET", "/cfm/balance_summary", retry=False, quiet=True))
+
     def balance(self) -> Balance:
         """Equity = total_usd_balance (cash) + unrealized PnL. Without a readable, finite cash total there
         is no equity: an error, never PnL alone (the breakers and sizing read it)."""
-        bs = self.balance_summary()
+        bs = self._summary_of(self._call("GET", "/cfm/balance_summary"))
         with _parsing("balance_summary"):
             cash = _opt(bs.get("total_usd_balance"))
             if cash is None:

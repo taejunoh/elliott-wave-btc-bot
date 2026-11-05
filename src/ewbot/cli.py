@@ -554,7 +554,7 @@ LIVE_REFUSAL_WAIT_S = 600.0  # a refused start waits before exiting: Docker rest
 # (a start refused because Coinbase could not be read - an outage - waits live_app.OUTAGE_WAIT_S instead)
 ALERTS_GATE = "알림 설정 (Telegram 알림·명령, 헬스체크)"  # a promotion to CANARY or FULL needs them (preflight `alerts`)
 CYCLE_WINDOW = (59, 6)  # promotions and stint restarts are refused from hh:59 to hh:06 UTC (the hour's cycle, entries)
-TEST_TRADE_WAIT_S = 300.0  # `live test-trade` waits this long for the runtime's result (its worst case is about a minute)
+TEST_TRADE_WAIT_S = 300.0  # `live test-trade` waits this long for the runtime's result (normally seconds)
 TEST_TRADE_HEARTBEAT_S = 180.0  # ... and refuses when the loop's heartbeat is older (the Docker health check's limit)
 
 
@@ -729,7 +729,8 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
                                "paused": journal.get("paused") if journal is not None else None,
                                "trade": trade if trade and trade.get("status") == "OPEN" else None,
                                "pending_intents": len(journal.intents(status="PENDING")) if journal is not None else 0,
-                               "flatten": journal.get(live_runtime.FLATTEN_KEY) if journal is not None else None}
+                               "flatten": journal.get(live_runtime.FLATTEN_KEY) if journal is not None else None,
+                               "test_trade": journal is not None and _test_trade_held(journal)}
         if args.exchange:
             try:
                 real = _exchange(s)
@@ -748,7 +749,7 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
             if args.exchange:
                 print(f"exchange position: {out['exchange_position']}, open orders: {out['exchange_open_orders']}")
         held = _held(out["trade"] is not None, out["pending_intents"], out["flatten"] is not None,
-                     out.get("exchange_position") is not None, out.get("exchange_open_orders", 0))
+                     out.get("exchange_position") is not None, out.get("exchange_open_orders", 0), out["test_trade"])
         if args.require_flat and held:
             print(f"not flat: {', '.join(held)} (flatten first: /flatten, or wait until the runtime is done)",
                   file=sys.stderr)
@@ -759,12 +760,20 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
             journal.close()
 
 
-def _held(trade: bool, pending: int, flatten: bool, position: bool, orders: int) -> list[str]:
+def _held(trade: bool, pending: int, flatten: bool, position: bool, orders: int, test_trade: bool = False) -> list[str]:
     """What keeps a book from flat - the running runtime's flat (LiveRuntime.flat): an open trade, an order of unknown
-    outcome (a PENDING intent) or a standing flatten in the journal, a position or a resting order on the account."""
+    outcome (a PENDING intent), a standing flatten or a test trade asked for, under way or waiting for its position in the
+    journal, a position or a resting order on the account."""
     return [what for what, there in (
         ("an open trade", trade), (f"{pending} order(s) of unknown outcome (PENDING)", pending > 0),
-        ("a standing flatten", flatten), ("a position", position), (f"{orders} resting order(s)", orders > 0)) if there]
+        ("a standing flatten", flatten), ("a test trade asked for or under way", test_trade), ("a position", position),
+        (f"{orders} resting order(s)", orders > 0)) if there]
+
+
+def _test_trade_held(journal: Journal) -> bool:
+    """A test trade was asked for, runs, or its filled entry's position is still being looked for."""
+    return any(journal.get(key) is not None for key in (live_runtime.TEST_REQUEST_KEY, live_runtime.TEST_ACTIVE_KEY,
+                                                        live_runtime.TEST_UNSEEN_KEY))
 
 
 def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
@@ -773,7 +782,8 @@ def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
     trade = journal.get("trade")
     real = _exchange(s)
     held = _held(bool(trade and trade.get("status") == "OPEN"), len(journal.intents(status="PENDING")),
-                 journal.get(live_runtime.FLATTEN_KEY) is not None, real.position() is not None, len(real.open_orders()))
+                 journal.get(live_runtime.FLATTEN_KEY) is not None, real.position() is not None, len(real.open_orders()),
+                 _test_trade_held(journal))
     if held:
         print(f"not flat: {', '.join(held)}", file=sys.stderr)
     return not held, real
@@ -858,10 +868,11 @@ def _live_test_trade(s: LiveSettings, args: argparse.Namespace) -> int:
     """`ewbot live test-trade --confirm [--side long|short]`: asks the running runtime for one real round trip and prints its
     result (live/runtime.py, "the test trade"). This process sends no order: a position or a bracket of a second process
     would be closed or cancelled by the runtime's next pass and read as a manual intervention, and no lock exists between
-    the two. Exit 0: passed; 1: it ran and failed; 2: refused, nothing was sent; 3: no result in time (see `live status`)."""
+    the two. Exit 0: passed; 1: it ran and failed; 2: refused, nothing was sent; 3: no result (in time, or Ctrl-C: a request
+    the runtime has not taken is withdrawn; see `live status`)."""
     if not s.journal_path.exists():
         print(f"no journal at {s.journal_path}: start the runtime first (ewbot live run)", file=sys.stderr)
-        return 1
+        return 2
     journal = Journal(s.journal_path)
     try:
         now = time.time()
@@ -897,28 +908,33 @@ def _live_test_trade(s: LiveSettings, args: argparse.Namespace) -> int:
 
 
 def _test_trade_wait(journal: Journal, rid: str) -> int:
-    """The runtime's answer to request `rid`: its result (TEST_TRADE) or refusal, with the raw margin values it journaled."""
+    """The runtime's answer to request `rid`: its result (TEST_TRADE) or refusal, with the raw margin values it journaled.
+    No answer in time, or Ctrl-C: a request it has not taken is withdrawn, so it never runs later; one it took may still run."""
     start = time.monotonic()
-    while True:
-        for kind in (live_runtime.TEST_TRADE_REFUSED, live_runtime.TEST_TRADE):
-            hit = next((e["data"] for e in journal.events(kind=kind) if e["data"].get("request") == rid), None)
-            if hit is None:
-                continue
-            if kind == live_runtime.TEST_TRADE_REFUSED:
-                print(f"거부: {hit['why']}", file=sys.stderr)
-                return 2
-            _print_test_margin(hit.get("margin") or {})
-            print(hit["message"], file=sys.stdout if hit.get("ok") else sys.stderr)
-            return 0 if hit.get("ok") else 1
-        if not 0 <= time.monotonic() - start < TEST_TRADE_WAIT_S:
-            break
-        time.sleep(1.0)
+    why = f"런타임이 {TEST_TRADE_WAIT_S:.0f}초 안에 답하지 않음"
+    try:
+        while True:
+            for kind in (live_runtime.TEST_TRADE_REFUSED, live_runtime.TEST_TRADE):
+                hit = next((e["data"] for e in journal.events(kind=kind) if e["data"].get("request") == rid), None)
+                if hit is None:
+                    continue
+                if kind == live_runtime.TEST_TRADE_REFUSED:
+                    print(f"거부: {hit['why']}", file=sys.stderr)
+                    return 2
+                _print_test_margin(hit.get("margin") or {})
+                print(hit["message"], file=sys.stdout if hit.get("ok") else sys.stderr)
+                return 0 if hit.get("ok") else 1
+            if not 0 <= time.monotonic() - start < TEST_TRADE_WAIT_S:
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        why = "중단됨 (Ctrl-C)"
     cur = journal.get(live_runtime.TEST_REQUEST_KEY)
     if cur is not None and cur.get("id") == rid:
         journal.put(live_runtime.TEST_REQUEST_KEY, None)
-        print(f"런타임이 {TEST_TRADE_WAIT_S:.0f}초 안에 응답하지 않아 요청을 거둠: ewbot live status --exchange 로 확인", file=sys.stderr)
+        print(f"{why}: 요청을 거둠 (아직 주문을 내지 않았음). ewbot live status --exchange 로 확인", file=sys.stderr)
     else:
-        print(f"런타임이 {TEST_TRADE_WAIT_S:.0f}초 안에 결과를 내지 않음 (아직 실행 중일 수 있음): ewbot live status --exchange 로 확인",
+        print(f"{why}: 런타임이 이미 받은 요청이라 아직 실행 중일 수 있음. ewbot live status --exchange 와 Coinbase 앱에서 확인",
               file=sys.stderr)
     return 3
 
@@ -968,7 +984,7 @@ def _live_rebase(s: LiveSettings, args: argparse.Namespace) -> int:
               f"median) - {equity}")
         trade = journal.get("trade")
         held = _held(bool(trade and trade.get("status") == "OPEN"), len(journal.intents(status="PENDING")),
-                     journal.get(live_runtime.FLATTEN_KEY) is not None, position, orders)
+                     journal.get(live_runtime.FLATTEN_KEY) is not None, position, orders, _test_trade_held(journal))
         if held:
             print(f"refusing: not flat: {', '.join(held)} - rebase with a flat book (/flatten, or wait until the runtime "
                   "is done)", file=sys.stderr)
