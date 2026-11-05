@@ -1,6 +1,6 @@
 # ewbot: Elliott Wave BTC bot
 
-`ewbot` trades Bitcoin with a mechanical Elliott Wave strategy. It reads waves on 4-hour bars and times entries on 1-hour breakouts. It goes long and short, using four setups (W3, W5, W5 reversal, end of C), and risks 1% of equity per trade at up to 3x leverage.
+`ewbot` trades Bitcoin with a mechanical Elliott Wave strategy. It reads waves on 4-hour bars and times entries on 1-hour breakouts. It goes long and short, using four setups (W3, W5, W5 reversal, end of C), and risks 1% of equity per trade at up to 3x leverage in the research and paper layers. The live layer sizes by stage: SHADOW and CANARY trade 1 contract (a signal whose 1-contract risk exceeds 15% of the account is skipped); FULL (user decision 2026-11-05) risks 10% of equity per trade with a 5x leverage cap, reduced to the most contracts the 70% overnight-margin limit holds (about 3.3x long and 2.7x short; the exchange's margin rates may change) and capped at 3 contracts until FULL has run 30 days without a CANARY failure. FULL's real-account loss limits are -20% a day and -30% from the peak (-15% in SHADOW and CANARY).
 
 The project was built in three layers. Each layer has to prove itself before the next one gets real money.
 
