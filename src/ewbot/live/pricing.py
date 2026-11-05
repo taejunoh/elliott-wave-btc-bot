@@ -8,26 +8,34 @@ the spec's rule (never triggered earlier than the engine's stop); for a take-pro
 level toward the entry, so the live limit is reached no later than the engine's strict-cross TP.
 
 Sizing: SHADOW and CANARY trade 1 contract and skip a signal whose 1-contract risk exceeds 15% of the
-account (CANARY_MAX_RISK); FULL calls the frozen risk.sizing.size_contracts with the real equity and the conservative
-profile (no strategy file is changed), capped at 3 contracts until FULL has run 30 days without a CANARY
-failure (live/stage.full_cap). Margin is always projected at the OVERNIGHT rate (the stricter one; it applies
-from 16:00 New York)."""
+account (CANARY_MAX_RISK); FULL calls the frozen risk.sizing.size_contracts with the real equity and FULL_RISK
+(10% risk per trade, leverage cap 5x; user decision 2026-11-05; no strategy file is changed, and the paper replay
+stays conservative), with no contract cap (the 3 contracts for the first 30 clean days were removed by the user's
+decision of 2026-11-05; only a manual intervention still in force holds it to 3: live/stage.full_cap). Margin is always projected at the OVERNIGHT rate (the stricter one; it applies from 16:00
+New York); the exchange's overnight rates (about 4.8x long, 3.9x short) are below FULL_RISK's 5x, so the 70% entry
+limit (MARGIN_ENTRY_MAX) binds first, on purpose. In FULL an entry above it is reduced to the most contracts the limit holds
+(runtime._entry_size, max_contracts_for_margin; user decision 2026-11-05: the real risk is then under 10%), refused only
+when not even one fits; SHADOW and CANARY (1 contract) refuse."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
-from ewbot.config import CONSERVATIVE, BotConfig, CostParams
+from ewbot.config import BotConfig, CostParams, RiskProfile
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, ProductSpec
 from ewbot.risk.sizing import size_contracts
 
 CANARY_MAX_RISK = 0.15  # user decision 2026-10-19 (Plan 3 spec amendment; spec 4.3 had 2%)
-FULL_CAP_CONTRACTS = 3  # spec 4.3 / 6.2: until FULL has run FULL_CAP_DAYS without a CANARY failure (stage.full_cap)
-FULL_CAP_DAYS = 30
-MARGIN_ENTRY_MAX = 0.70  # spec 4.5: refuse an entry whose overnight projection exceeds 70%
+FULL_RISK = RiskProfile("full", 0.10, 5.0)  # user decision 2026-11-05 (Plan 3 spec amendment; it was CONSERVATIVE 1% / 3x)
+FULL_CAP_CONTRACTS = 3  # only while a manual intervention is still in force in FULL (stage.full_cap)
+MARGIN_ENTRY_MAX = 0.70  # spec 4.5: an entry whose overnight projection exceeds 70% is refused (FULL: reduced to fit, 2026-11-05)
 MARGIN_WARN = 0.80
 MARGIN_REDUCE = 0.90
+# FULL sizes by one balance read, while the breakers need two: a read this far from the last observation is read again
+# (runtime._sizing_equity), and three reads must agree this closely to size an entry outside the band
+EQUITY_SIZING_BAND = 0.20
+EQUITY_READS_AGREE = 0.01
 BASIS_BAND = 0.02  # a futures mid this far from the spot mid (either way) is no basis: a stale or one-sided book
 _EPS = 1e-9
 
@@ -133,7 +141,7 @@ def stage_contracts(
             return 0, f"1-contract risk {risk:.2f} USD > {CANARY_MAX_RISK:.0%} of equity {equity:.2f}"
         return 1, f"{stage.lower()}: 1 contract"
     if stage == "FULL":
-        n = size_contracts(equity, entry, stop, direction, CONSERVATIVE, risk_mult, cfg.costs)
+        n = size_contracts(equity, entry, stop, direction, FULL_RISK, risk_mult, cfg.costs)
         if n == 0:
             return 0, "size_contracts returned 0"
         if full_cap is not None and n > full_cap:

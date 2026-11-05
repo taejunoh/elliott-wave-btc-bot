@@ -12,10 +12,15 @@ from ewbot.config import BotConfig
 from ewbot.live.audit import AuditError, AuditResult, audit, fetch_paper_ledger
 from ewbot.live.exchange import KeyPermissions
 from ewbot.live.pricing import stage_contracts
+from ewbot.live.shadow import UNVERIFIED_KEY
 from ewbot.live.stage import (
     CANARY_FAIL,
     ORDER_FAILURES,
+    PEAK_REBASE_KEY,
     RAISED_KEY,
+    REQUIRED_GATES,
+    TEST_IDS_KEY,
+    TEST_TRADE,
     Gate,
     StageError,
     canary_entry_gates,
@@ -43,6 +48,8 @@ PAPER_OK = {"c1": True, "c2": True, "c3": False, "count": {"total": 37, "require
 PAPER_ALL = {**PAPER_OK, "c3": True, "count": {"total": 50, "required": 50}}
 AUDIT_GATE = "① 판단이 모의매매와 100% 일치"
 CYCLE_GATE = "② 모든 사이클이 마감 후 2분 안에 끝남"
+TRADES_GATE = "완결 거래 3건 이상 또는 90일"
+PROTECT_GATE = "① 보호 주문이 체결 후 30초 안에 걸림"
 
 
 def good(now: float) -> AuditResult:
@@ -236,7 +243,7 @@ def test_each_shadow_gate_can_fail(tmp_path):
     jr.add_event(S0 + 9 * DAY, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 1, "rebuilt": 0})
     bad = AuditResult((0, int(now) - 2 * H1), 3, 2, ({"id": "x", "type": "DIFFERENT", "cause": "UNEXPLAINED"},), now)
     met = {g.name: g.met for g in shadow_gates(jr, now, bad)}
-    assert met == {"기간 14일 이상": False, "신호 1건 이상": True, AUDIT_GATE: False, CYCLE_GATE: False,
+    assert met == {"기간 14일 이상": True, "신호 1건 이상": True, AUDIT_GATE: False, CYCLE_GATE: False,  # waived 2026-11-05
                    "③ 냈을 주문 전부 preview 통과": False, "④ 장애·재시작 시험 통과": False}
     jr.close()
 
@@ -255,10 +262,10 @@ def test_the_preview_gate_shows_brackets_refused_for_want_of_a_position_apart(tm
     jr.add_event(S0 + 11_000, "PREVIEW", {"kind": "BRACKET", "ok": False, "errors": ["PREVIEW_INVALID_BRACKET_PRICES"]})
     assert not gate(jr, now).met and gate(jr, now).detail.startswith("1/2, ")  # any other refusal fails
     jr.close()
-    only = journal(tmp_path, "only.sqlite")  # nothing the venue could check: not met
+    only = journal(tmp_path, "only.sqlite")  # nothing the venue could check: no failure (user decision 2026-11-05)
     only.set_stage("SHADOW", "initial", S0)
     only.add_event(S0 + 10, "PREVIEW_POSITION_DEPENDENT", flat_only)
-    assert not gate(only, S0 + DAY).met and gate(only, S0 + DAY).detail.startswith("0/0, ")
+    assert gate(only, S0 + DAY).met and gate(only, S0 + DAY).detail.startswith("0/0, ")
     only.close()
 
 
@@ -272,9 +279,9 @@ def test_the_signal_and_cycle_gates_count_the_stage_itself(tmp_path):
 
     # the first cycle records every decision since 2024: none of those signals was first known in the stage
     jr.add_decisions([dec("SIGNAL", 1_730_000_000 + k * H1, 1_730_000_000 + k * H1) for k in range(3)], now=S0 + 40)
-    assert not gate("신호 1건 이상").met
+    assert gate("신호 1건 이상").detail.startswith("단계 중 알게 된 신호 0건")
     jr.add_decisions([dec("SIGNAL", int(S0) + 7200, int(S0) + 7200)], now=S0 + 10_900)
-    assert (gate("신호 1건 이상").met, gate("신호 1건 이상").detail) == (True, "단계 중 알게 된 신호 1건")
+    assert gate("신호 1건 이상").detail.startswith("단계 중 알게 된 신호 1건")
     # a runtime that was down: every hour without a cycle is a miss
     for k in (0, 300):
         bar = int(S0) + k * H1
@@ -369,6 +376,177 @@ def test_canary_needs_shadow_paper_and_a_trade_key(tmp_path):
     jr.close()
 
 
+def bare_shadow(tmp_path, days: float = 0.5, name: str = "bare.sqlite"):
+    """A SHADOW stint without a single signal or preview: on-time cycles and a clean manual restart only."""
+    jr = journal(tmp_path, name)
+    jr.set_stage("SHADOW", "initial", S0)
+    now = S0 + days * DAY
+    jr.add_event(S0 + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    jr.add_event(S0 + 3600, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    hourly(jr, S0, now)
+    return jr, now
+
+
+def nothing_compared(now: float) -> AuditResult:
+    """An audit that ran and found nothing to compare: no decision in the window."""
+    return AuditResult((0, int(now) // H1 * H1 - 2 * H1), 0, 0, (), now - 600)
+
+
+def test_shadow_to_canary_needs_no_signal_and_no_14_days(tmp_path):
+    """User decision 2026-11-05: half a day with no signal, nothing compared and no preview passes, and the promotion goes
+    through; the two waived gates are shown as waived, not as met."""
+    jr, now = bare_shadow(tmp_path)
+    gates = canary_entry_gates(jr, now, nothing_compared(now), PAPER_OK, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)
+    lines = gate_lines(gates)
+    assert any(x.startswith("[면제] 기간 14일 이상: 0.5일") for x in lines)
+    assert any(x.startswith("[면제] 신호 1건 이상: 단계 중 알게 된 신호 0건") for x in lines)
+    assert any(x.startswith(f"[충족] {AUDIT_GATE}: 비교 0건") for x in lines)
+    assert any(x.startswith("[충족] ③ 냈을 주문 전부 preview 통과: 0/0") for x in lines)
+    assert "기간 14일 이상" not in REQUIRED_GATES[("SHADOW", "CANARY")]
+    assert "신호 1건 이상" not in REQUIRED_GATES[("SHADOW", "CANARY")]
+    transition(jr, "CANARY", now, gates, confirm=True, flat=True)
+    assert jr.stage() == ("CANARY", now)
+    jr.close()
+
+
+def test_real_failures_still_fail_the_relaxed_shadow_gates(tmp_path):
+    jr, now = bare_shadow(tmp_path)
+
+    def unmet(res: AuditResult | None) -> list[str]:
+        return [g.name for g in shadow_gates(jr, now, res) if not g.met]
+
+    assert unmet(nothing_compared(now)) == []
+    mismatch = {"id": "x", "type": "DIFFERENT", "cause": "UNEXPLAINED", "known_at": int(S0) + 3600}
+    window = (0, int(now) // H1 * H1 - 2 * H1)
+    # comparisons exist and one mismatched
+    assert unmet(AuditResult(window, 3, 2, (mismatch,), now)) == [AUDIT_GATE]
+    # nothing compared is no pass for an audit that never ran, failed, is stale or does not cover the stage
+    assert unmet(None) == [AUDIT_GATE]
+    assert unmet(AuditResult.failed("paper ledger fetch failed: HTTP 502", now)) == [AUDIT_GATE]
+    assert unmet(AuditResult((0, int(S0) - 10 * DAY), 0, 0, (), now)) == [AUDIT_GATE]
+    assert unmet(AuditResult((int(S0) + 3600, window[1]), 0, 0, (), now)) == [AUDIT_GATE]
+    # a refused preview fails it; an unanswered one stays no failure
+    jr.add_event(now - 60, "PREVIEW", {"kind": "MARKET", "ok": False, "errors": ["PREVIEW_INSUFFICIENT_FUND"]})
+    assert unmet(nothing_compared(now)) == ["③ 냈을 주문 전부 preview 통과"]
+    jr.close()
+
+
+def test_the_shadow_gates_a_signal_cannot_change_stay_required(tmp_path):
+    jr, now = bare_shadow(tmp_path)
+    required = REQUIRED_GATES[("SHADOW", "CANARY")]
+    for name in (AUDIT_GATE, CYCLE_GATE, "③ 냈을 주문 전부 preview 통과", "④ 장애·재시작 시험 통과"):
+        assert name in required
+    # one start only: no restart recovered yet
+    one = journal(tmp_path, "one.sqlite")
+    one.set_stage("SHADOW", "initial", S0)
+    one.add_event(S0 + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    hourly(one, S0, now)
+    assert [g.name for g in shadow_gates(one, now, nothing_compared(now)) if not g.met] == ["④ 장애·재시작 시험 통과"]
+    one.close()
+    # an hour without a cycle
+    late = journal(tmp_path, "late.sqlite")
+    late.set_stage("SHADOW", "initial", S0)
+    late.add_event(S0 + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    late.add_event(S0 + 3600, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    hourly(late, S0, now, skip=(int(S0) + 2 * H1,))
+    assert [g.name for g in shadow_gates(late, now, nothing_compared(now)) if not g.met] == [CYCLE_GATE]
+    late.close()
+    # a stint younger than one hourly bar has nothing to judge the cycles by
+    young = journal(tmp_path, "young.sqlite")
+    young.set_stage("SHADOW", "restart", S0 + 100)
+    assert CYCLE_GATE in [g.name for g in shadow_gates(young, S0 + 200, nothing_compared(S0 + 200)) if not g.met]
+    young.close()
+    jr.close()
+
+
+def test_a_new_process_of_new_code_does_not_restart_the_stint(tmp_path):
+    """Item 2 of the 2026-11-05 decision. The restart on a code change was an operating rule: no code ever restarted a stint
+    on a deploy, and none does (`restart_stint` runs only from `ewbot live stage ... --restart`). A deploy is a restart like
+    any other: one more clean RECOVERY, the same stint, the gates keep counting."""
+    jr, now = bare_shadow(tmp_path)
+    before = jr.stage()
+    jr.add_event(now, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})  # the deploy's start
+    jr.add_event(now, "STARTUP", {"stage": "SHADOW"})
+    assert jr.stage() == before and len(jr.stage_history()) == 1
+    gates = canary_entry_gates(jr, now, nothing_compared(now), PAPER_OK, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)
+    assert "재시작 복구 3회" in {g.name: g.detail for g in gates}["④ 장애·재시작 시험 통과"]
+    jr.close()
+
+
+def test_an_audit_from_before_the_stint_does_not_count(tmp_path):
+    """Review finding: `stage canary --restart` at hh:10, a test trade at hh:11 and `stage full` at hh:12 would rest on the
+    audit of hh:50 before: it says nothing about the stint. Unmet until an audit ran in it, SHADOW and CANARY alike."""
+    jr, now = bare_shadow(tmp_path)
+    restart_stint(jr, "SHADOW", now, confirm=True, flat=True)
+    hi = int(now) // H1 * H1 - 2 * H1
+
+    def audit_gate_at(as_of: float, stage: str = "SHADOW") -> Gate:
+        res = AuditResult((0, hi), 5, 5, (), as_of)
+        gates = shadow_gates(jr, now + 300, res) if stage == "SHADOW" else canary_gates(jr, now + 300, res)
+        return {g.name: g for g in gates}[AUDIT_GATE if stage == "SHADOW" else "모의매매 대조 (최근 감사 통과)"]
+
+    old = audit_gate_at(now - 900)
+    assert not old.met and old.detail.startswith("단계 시작 전 감사")
+    assert audit_gate_at(now + 60).met
+    jr.set_stage("CANARY", "promotion", now + 100)
+    assert not audit_gate_at(now + 60, "CANARY").met and audit_gate_at(now + 200, "CANARY").met
+    jr.close()
+
+
+def test_an_unanswered_preview_keeps_the_preview_gate_open(tmp_path):
+    """Review finding: nothing else to judge, a would-be order Coinbase has not answered for, and 0/0 passed. No verdict on
+    an order is no pass: unmet until it is answered (a refusal then fails it, 24 cycles unanswered record it failed)."""
+    jr, now = bare_shadow(tmp_path)
+    since = jr.stage()[1]
+
+    def gate() -> Gate:
+        return {g.name: g for g in shadow_gates(jr, now, nothing_compared(now))}["③ 냈을 주문 전부 preview 통과"]
+
+    assert gate().met and gate().detail == "0/0"
+    jr.put(UNVERIFIED_KEY, [{"kind": "MARKET", "client_order_id": "ewb-e-1-L", "order": {"side": 1, "size": 1}, "tries": 3,
+                             "ts": since + 60}])
+    assert not gate().met and gate().detail == "0/0, 답을 못 받은 preview 1건"
+    jr.put(UNVERIFIED_KEY, [])  # answered: the verdict is a PREVIEW event
+    assert gate().met
+    jr.put(UNVERIFIED_KEY, [{"kind": "MARKET", "client_order_id": "ewb-e-1-L", "order": {"side": 1, "size": 1}, "tries": 3,
+                             "ts": since - 60}])  # an earlier stint's: this stint's gates count from its start
+    assert gate().met
+    jr.close()
+
+
+def test_a_failed_last_test_trade_closes_the_gates_a_passed_one_opened(tmp_path):
+    jr = canary_journal(tmp_path, closed=0)
+    now = S0 + DAY
+
+    def unmet() -> list[str]:
+        return [g.name for g in canary_gates(jr, now, good(now)) if not g.met]
+
+    assert TRADES_GATE in unmet()
+    for t in (S0 + 100, S0 + 300):
+        jr.add_event(t, "PROTECTED_FIRST", {"trade_id": int(t), "after_entry_s": 1.0})
+    jr.put(TEST_IDS_KEY, [int(S0 + 100), int(S0 + 300)])
+    jr.add_event(S0 + 110, TEST_TRADE, {"ok": True, "trade_id": int(S0 + 100), "fees": 0.3})
+    assert unmet() == []
+    jr.add_event(S0 + 310, TEST_TRADE, {"ok": False, "trade_id": int(S0 + 300), "fees": None})
+    closed = unmet()
+    assert closed == [TRADES_GATE, PROTECT_GATE]  # COSTS holds on this fixture's own daily report
+    assert "마지막 시험 거래 실패" in {g.name: g for g in canary_gates(jr, now, good(now))}[TRADES_GATE].detail
+    jr.add_event(S0 + 500, "PROTECTED_FIRST", {"trade_id": int(S0 + 500), "after_entry_s": 1.0})
+    jr.put(TEST_IDS_KEY, [int(S0 + 100), int(S0 + 300), int(S0 + 500)])
+    jr.add_event(S0 + 510, TEST_TRADE, {"ok": True, "trade_id": int(S0 + 500), "fees": 0.3})
+    assert unmet() == []
+    jr.close()
+    # the other routes do not outrun a failed test trade of the stint either
+    jr = canary_journal(tmp_path, closed=3, name="routes.sqlite")
+    assert all(g.met for g in canary_gates(jr, now, good(now)))
+    jr.add_event(S0 + 3 * DAY + 10, TEST_TRADE, {"ok": False, "trade_id": 99, "fees": None})
+    late = S0 + 95 * DAY
+    assert TRADES_GATE in [g.name for g in canary_gates(jr, late, good(late)) if not g.met]
+    jr.close()
+
+
 def test_transitions_need_confirm_flat_book_and_met_gates(tmp_path):
     jr, now = shadow_journal(tmp_path)
     gates = canary_entry_gates(jr, now, good(now), PAPER_OK, KEY)
@@ -412,7 +590,9 @@ def test_canary_pass_and_full_entry(tmp_path):
     jr = canary_journal(tmp_path)
     now = S0 + 20 * DAY
     assert all(g.met for g in canary_gates(jr, now, good(now))), gate_lines(canary_gates(jr, now, good(now)))
-    assert not all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_OK, KEY))  # 37/50
+    # user decision 2026-11-05: criterion 3 (50 out-of-sample trades) is no longer a FULL gate: 37/50 and c3 False pass
+    assert all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_OK, KEY)), \
+        gate_lines(full_entry_gates(jr, now, good(now), PAPER_OK, KEY))
     assert all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_ALL, KEY))
     jr.add_event(now, "UNPROTECTED_60S", {"trade_id": 9})
     jr.add_event(now, "ADOPTED", {"trade_id": 9})
@@ -421,6 +601,31 @@ def test_canary_pass_and_full_entry(tmp_path):
     assert not met["② 손절 이동과 청산이 목표와 일치"] and not met["③ 보호되지 않은 상태 60초 초과 없음"]
     assert not met["④ 수동 개입 없음"]
     jr.close()
+
+
+def test_full_entry_needs_the_rest_but_not_the_trade_count(tmp_path):
+    jr = canary_journal(tmp_path)
+    now = S0 + 20 * DAY
+    few = {**PAPER_OK, "c3": False, "count": {"total": 0, "required": 50}}
+    gates = full_entry_gates(jr, now, good(now), few, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)  # no trade count gate of any kind
+    assert not any("표본 외" in g.name or "3번" in g.name for g in gates)
+    transition(jr, "FULL", now + 1, gates, confirm=True, flat=True)  # the promotion itself goes through
+    jr.close()
+    for key in ("c1", "c2"):
+        jr = canary_journal(tmp_path, name=f"{key}.sqlite")
+        assert not all(g.met for g in full_entry_gates(jr, now, good(now), {**PAPER_ALL, key: False}, KEY)), key
+        jr.close()
+    jr = canary_journal(tmp_path, name="c4.sqlite")
+    no_c4 = {**PAPER_ALL, "c4": {"met": False, "days": 12.0, "coverage": 0.99, "unexplained": 0}}
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), no_c4, KEY))
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), None, KEY))
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_ALL, KeyPermissions(True, True, True)))
+    assert not all(g.met for g in full_entry_gates(jr, now, good(now), PAPER_ALL, None))
+    jr.close()
+    unmet = canary_journal(tmp_path, closed=1, name="few_trades.sqlite")  # the CANARY gates stay in force
+    assert not all(g.met for g in full_entry_gates(unmet, S0 + 20 * DAY, good(now), PAPER_ALL, KEY))
+    unmet.close()
 
 
 def test_every_canary_failure_pauses_canary_and_keeps_full_closed(tmp_path):
@@ -524,30 +729,31 @@ def test_canary_needs_three_trades_or_ninety_days(tmp_path):
     jr.close()
 
 
-def test_the_cap_is_the_journal_stages_and_lifts_only_after_30_clean_days_of_full(tmp_path):
+def test_the_cap_is_the_journal_stages_and_full_has_none(tmp_path):
+    """User decision 2026-11-05: no 3-contract ramp and no clean-days window. FULL sizes by the risk, the 5x cap and the
+    margin maximum from its first minute; a CANARY failure that is no major incident changes nothing about the size."""
     jr = journal(tmp_path)
-    assert full_cap(jr, S0) == 0  # no stage yet: SHADOW, no real order
+    assert full_cap(jr) == 0  # no stage yet: SHADOW, no real order
     jr.set_stage("CANARY", "promotion", S0)
-    assert full_cap(jr, S0 + 1) == 1
+    assert full_cap(jr) == 1
     jr.set_stage("FULL", "promotion", S0 + 5)
-    assert full_cap(jr, S0 + 6) == 3 and full_cap(jr, S0 + 5 + 30 * DAY) is None
-    assert on_incident(jr, "FOREIGN_ORDERS", S0 + 20 * DAY) == ["3-contract cap for 30 more days"]  # not major
-    assert full_cap(jr, S0 + 5 + 30 * DAY) == 3 and full_cap(jr, S0 + 50 * DAY) is None
-    jr.add_event(S0 + 55 * DAY, "ORDER_UNRESOLVED", {"trade_id": 7, "kind": "CLOSE_FAILED"})  # even without its incident
-    assert full_cap(jr, S0 + 84 * DAY) == 3 and full_cap(jr, S0 + 85 * DAY) is None
+    assert full_cap(jr) is None  # at once, not after 30 days
+    assert on_incident(jr, "FOREIGN_ORDERS", S0 + 20 * DAY) == ["recorded only"]  # not major: still alerted, no cap comes back
+    jr.add_event(S0 + 55 * DAY, "ORDER_UNRESOLVED", {"trade_id": 7, "kind": "CLOSE_FAILED"})
+    assert full_cap(jr) is None
     kw = dict(equity=200_000.0, entry=60_000.0, stop=59_400.0, direction=1, risk_mult=1.0, cfg=BotConfig())
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY), **kw)[0] == 303  # released: uncapped
-    # a manual intervention the runtime still finds (a foreign order left resting) keeps the cap while it lasts,
-    # and the 30 clean days count from its end
-    jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "ended": None, "stint": S0 + 5})
-    assert full_cap(jr, S0 + 150 * DAY) == 3
-    jr.put(RAISED_KEY, {"items": [], "ended": S0 + 151 * DAY, "stint": S0 + 5})
-    assert full_cap(jr, S0 + 180 * DAY) == 3 and full_cap(jr, S0 + 181 * DAY) is None
+    assert stage_contracts("FULL", full_cap=full_cap(jr), **kw)[0] == 1666  # FULL_RISK: 10% would be 3,032 contracts; the 5x cap, 200,000 * 5 / 60,000 / 0.01 = 1,666.7, binds
+    # the safety behavior that does not depend on the 30 days stays: a manual intervention the runtime still finds (a
+    # foreign order left resting) keeps 3 contracts while it lasts, and nothing longer: its end lifts it at once
+    jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "stint": S0 + 5})
+    assert full_cap(jr) == 3
+    jr.put(RAISED_KEY, {"items": [], "stint": S0 + 5})
+    assert full_cap(jr) is None
     # a major incident demotes in the journal while the FULL process still runs: the cap is CANARY's at once
     assert on_incident(jr, "UNPROTECTED_60S", S0 + 186 * DAY) == ["paused", "demoted to CANARY"]
     resume(jr, S0 + 186 * DAY + 1)
-    assert full_cap(jr, S0 + 186 * DAY + 2) == 1
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 186 * DAY + 2), **kw)[0] == 1
+    assert full_cap(jr) == 1
+    assert stage_contracts("FULL", full_cap=full_cap(jr), **kw)[0] == 1
     assert jr.events(kind="STAGE")[-1]["data"] == {"from": "FULL", "to": "CANARY",
                                                    "reason": "major incident UNPROTECTED_60S"}
     jr.close()
@@ -567,6 +773,36 @@ def test_pause_resume_and_incidents_by_stage(tmp_path):
     pause(jr, "user", S0 + 9)
     assert [e["data"]["kind"] for e in jr.events(kind="INCIDENT")] == [
         "UNPROTECTED_60S", "FOREIGN_ORDERS", "BAD_EQUITY", "BREAKER"]
+    jr.close()
+
+
+def test_a_demotion_from_full_to_canary_requests_a_peak_rebase_in_every_path(tmp_path):
+    """FULL's peak is measured against a 30% drawdown; CANARY's guard allows 15%. Every FULL -> CANARY change - the major
+    incident's automatic demotion and the CLI's manual one - leaves a request (applied by the runtime at its next balance
+    read, so it survives a restart); nothing else does."""
+    jr = journal(tmp_path, "auto.sqlite")
+    jr.set_stage("FULL", "promotion", S0)
+    assert jr.get(PEAK_REBASE_KEY) is None
+    assert on_incident(jr, "BAD_EQUITY", S0 + 1) == [] and jr.get(PEAK_REBASE_KEY) is None  # no demotion
+    assert on_incident(jr, "BREAKER", S0 + 2) == ["paused", "demoted to CANARY"]
+    assert jr.get(PEAK_REBASE_KEY) == {"ts": S0 + 2, "reason": "major incident BREAKER"}
+    jr.close()
+    jr = journal(tmp_path, "manual.sqlite")
+    jr.set_stage("FULL", "promotion", S0)
+    transition(jr, "CANARY", S0 + 5, [], confirm=True, flat=False)
+    assert jr.get(PEAK_REBASE_KEY) == {"ts": S0 + 5, "reason": "demotion"}
+    jr.close()
+    jr = journal(tmp_path, "other.sqlite")
+    jr.set_stage("FULL", "promotion", S0)
+    transition(jr, "SHADOW", S0 + 5, [], confirm=True, flat=False)  # not CANARY: unchanged
+    jr.set_stage("CANARY", "promotion", S0 + 6)
+    transition(jr, "SHADOW", S0 + 7, [], confirm=True, flat=False)
+    assert jr.get(PEAK_REBASE_KEY) is None
+    jr.close()
+    jr = journal(tmp_path, "promotion.sqlite")
+    jr.set_stage("CANARY", "promotion", S0)
+    on_incident(jr, "FOREIGN_ORDERS", S0 + 1)
+    assert jr.get(PEAK_REBASE_KEY) is None
     jr.close()
 
 

@@ -3,6 +3,7 @@ SimExchange with prices already set. Synthetic only - no network, no real accoun
 
 from __future__ import annotations
 
+from ewbot.live.exchange import PlaceResult
 from ewbot.live.journal import Journal
 from ewbot.live.reconcile import PlanContext
 from ewbot.live.sim import SimExchange
@@ -63,3 +64,31 @@ def ctx(clock: Clock, ratio: float | None = 1.0, contracts: int = 1, block: str 
         session_open: bool = True, max_contracts: int | None = None) -> PlanContext:
     return PlanContext(now=clock(), ratio=ratio, tick=5.0, session_open=session_open, entry_contracts=contracts,
                        entry_block=block, max_contracts=max_contracts)
+
+
+class Lag:
+    """On a harness's exchange: the fill is on the order, and /cfm/positions does not show it for `reads` more reads (set
+    `left` to 0 to end it). With `refuse`, Coinbase refuses a bracket for want of the position it does not see yet, its own
+    answer on a flat account (live/shadow.py, 2026-10-05)."""
+
+    def __init__(self, hs, reads: int, refuse: bool = False) -> None:
+        self.left, self.armed = reads, False
+        real_pos, real_market, real_bracket = hs.ex.position, hs.ex.place_market, hs.ex.place_bracket
+
+        def position():
+            if self.armed and self.left > 0:
+                self.left -= 1
+                return None
+            return real_pos()
+
+        def market(cid, side, size):
+            out = real_market(cid, side, size)
+            self.armed = True
+            return out
+
+        def bracket(cid, side, size, limit, stop):
+            if refuse and self.left > 0:
+                return PlaceResult(cid, None, False, "BRACKET_ORDER_SIZE_EXCEEDS_POSITION")
+            return real_bracket(cid, side, size, limit, stop)
+
+        hs.ex.position, hs.ex.place_market, hs.ex.place_bracket = position, market, bracket

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import ewbot.live.runtime as runtime_mod
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.live.audit import AuditError, audit
 from ewbot.live.control import Command
+from ewbot.live.executor import ENTRY_CLAIM_MAX_S, ENTRY_SHOW_MAX_S
 from ewbot.live.exchange import (
     Balance,
     ExchangeError,
@@ -29,10 +31,12 @@ from ewbot.live.feed import Tick, TickerFeed
 from ewbot.live.health import Heartbeat
 from ewbot.live.notify import RESENT, UNANSWERED, LiveNotifier, TelegramError
 from ewbot.live.preflight import BASELINE_FINGERPRINT
+from ewbot.live.pricing import MARGIN_ENTRY_MAX, margin_ratio
 from ewbot.live.journal import Journal
-from ewbot.live.reconcile import PlanContext, pending_position
+from ewbot.live.reconcile import ENTRY_NOT_SEEN, PlanContext, pending_position
 from ewbot.live.runtime import (
     AUDIT_FETCH_MAX_S,
+    FLATTEN_KEY,
     STARTUP_READ_MAX_S,
     STOP_GRACE_S,
     StartupRefused,
@@ -41,12 +45,24 @@ from ewbot.live.runtime import (
 )
 from ewbot.live.shadow import CALLS_KEPT, FILLS_KEPT, PREVIEW_RETRY_LIMIT, ShadowExchange
 from ewbot.live.sim import SimCrash, SimExchange
-from ewbot.live.stage import canary_gates, full_cap, on_incident, paused, restart_stint, resume, shadow_gates
-from ewbot.live.target import compute_target
+from ewbot.live.stage import (
+    RAISED_KEY,
+    canary_failures,
+    canary_gates,
+    full_cap,
+    on_incident,
+    paused,
+    restart_stint,
+    resume,
+    shadow_gates,
+    transition,
+)
+from ewbot.live.target import Target, TargetEntry, compute_target
+from ewbot.live.watchdog import AccountGuard
 from ewbot.paper.decisions import known_at
 from ewbot.paper.notify import SendError
 from tests.live.harness import Harness
-from tests.live.helpers import Clock, journal, position
+from tests.live.helpers import Clock, Lag, journal, position
 from tests.paper.helpers import synth_frame, ts
 
 SIGNAL = ts("2024-03-13 22:00")  # C_END long: entry 23:00, trail 03-14 07:00, TP1 + break-even 03-14 23:00
@@ -64,8 +80,8 @@ def h(tmp_path):
 
 @pytest.fixture
 def hf(tmp_path):
-    """FULL keeps the strategy's daily -3% real-account breaker (SHADOW and CANARY use LIVE_DAILY_LOSS, 20%)."""
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    """FULL: the real-account breakers are daily -20% and total -30% (user decision 2026-11-05)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
     yield hs
@@ -250,7 +266,7 @@ def test_the_account_breaker_flattens_and_pauses(hf):
     entered(h)  # the day's first balance read
     h.at(ENTRY_BAR + 90)
     h.at(ENTRY_BAR + 150)  # three reads: the day's reference (their median)
-    h.ex.cash -= 400.0  # equity 10_000 -> ~9_600: the daily -3% breaker
+    h.ex.cash -= 2_100.0  # equity 10_000 -> ~7_900: the daily -20% breaker (the total -30% is far off)
     seen = alerts_with_positions(h)
     h.at(ENTRY_BAR + 210)
     assert h.ex.position() is not None and paused(h.journal) is None  # one breaching balance read is not enough
@@ -264,24 +280,24 @@ def test_the_account_breaker_flattens_and_pauses(hf):
     assert not g["daily_tripped"] and g["day_ref"] == h.ex.balance().equity and g["peak"] == peak  # the peak stays
 
 
-@pytest.mark.parametrize(("stage", "daily"), [("SHADOW", 0.20), ("CANARY", 0.20), ("FULL", 0.03)])
-def test_the_real_account_guard_follows_the_stage(tmp_path, stage, daily):
-    """User decision 2026-10-19: daily 20% in SHADOW and CANARY, 3% in FULL, total 15% in all; the engine's own breakers
-    (cfg.breakers: paper equity, the target replay) keep 3%."""
+@pytest.mark.parametrize(("stage", "daily", "total"), [("SHADOW", 0.20, 0.15), ("CANARY", 0.20, 0.15), ("FULL", 0.20, 0.30)])
+def test_the_real_account_guard_follows_the_stage(tmp_path, stage, daily, total):
+    """User decisions 2026-10-19 and 2026-11-05: daily 20% in every stage, total 15% in SHADOW and CANARY and 30% in FULL; the
+    engine's own breakers (cfg.breakers: paper equity, the target replay) keep 3% / 15%."""
     hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=10)
-    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (daily, 0.15)
+    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (daily, total)
     assert (hs.rt.cfg.breakers.daily_loss, hs.rt.cfg.breakers.total_dd) == (0.03, 0.15)
     hs.journal.close()
 
 
 def test_the_guard_params_follow_a_stage_that_is_read_again(tmp_path):
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
-    assert hs.rt.guard.params.daily_loss == 0.03
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
+    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (0.20, 0.30)
     hs.journal.set_stage("CANARY", "demotion", ENTRY_BAR)
     hs.rt = hs.make_runtime()  # a restart reads the journal's stage again
-    assert hs.rt.stage == "CANARY" and hs.rt.guard.params.daily_loss == 0.20
+    assert hs.rt.stage == "CANARY" and (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (0.20, 0.15)
     hs.rt = hs.make_runtime(stage="FULL")  # a process kept on a stage other than the journal's
-    assert hs.rt.stage == "FULL" and hs.rt.guard.params.daily_loss == 0.03
+    assert hs.rt.stage == "FULL" and (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (0.20, 0.30)
     hs.journal.close()
     fresh = Harness(tmp_path / "fresh", ENTRY_BAR, stage=None)  # a journal without a stage: SHADOW is recorded at start
     assert fresh.rt.guard.params.daily_loss == 0.20
@@ -343,7 +359,7 @@ def test_a_position_flipped_or_opened_by_hand_is_closed_and_pauses_canary(h):
 
 
 def test_an_unexplained_reduction_keeps_the_stop_and_protects_the_rest(tmp_path):
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)
@@ -841,7 +857,8 @@ def test_the_audit_stops_at_the_last_decided_bar_and_never_passes_on_a_failed_on
 def test_a_demotion_applies_to_the_next_entry_while_the_process_still_runs(tmp_path):
     sizes = {}
     for demoted in (False, True):
-        hs = Harness(tmp_path / str(demoted), ENTRY_BAR, stage="FULL", stage_days=40)  # the cap is released
+        hs = Harness(tmp_path / str(demoted), ENTRY_BAR, stage="FULL", stage_days=10)  # no contract cap in FULL: this
+        # fixture's 0.6% stop sizes 186 contracts at FULL_RISK: 105% overnight margin, reduced to the 124 the 70% entry limit holds
         hs.price(float(hs.bar(ENTRY_BAR)["open"]))
         hs.rt.startup()
         hs.at(ENTRY_BAR + 1)  # this minute's stage check is done: the next one would restart the flat runtime
@@ -852,7 +869,7 @@ def test_a_demotion_applies_to_the_next_entry_while_the_process_still_runs(tmp_p
         hs.at(ENTRY_BAR + 30)
         sizes[demoted] = hs.ex.position().contracts
         hs.journal.close()
-    assert sizes[False] > 3 and sizes[True] == 1  # CANARY's one contract at once, not FULL's uncapped size
+    assert sizes[False] == 124 and sizes[True] == 1  # CANARY's one contract at once, not FULL's size
 
 
 def test_an_order_failure_is_a_canary_failure_only_when_not_resolved_in_time(h):
@@ -973,7 +990,7 @@ def test_a_failure_awaiting_confirmation_does_not_hide_a_later_one(tmp_path):
         if stage == "CANARY":
             assert paused(hs.journal)["reason"] == "incident ORDER_UNRESOLVED"  # paused again after the /resume
         else:
-            assert full_cap(hs.journal, s + 31 * 86_400) == 3  # the 30 clean days start again from the new one
+            assert full_cap(hs.journal) is None  # recorded and alerted: no cap comes back in FULL (2026-11-05)
         hs.journal.close()
 
 
@@ -1018,7 +1035,7 @@ def test_a_new_unresolved_failure_after_an_episode_is_a_new_incident(tmp_path):
         if stage == "CANARY":
             assert paused(hs.journal)["reason"] == "incident ORDER_UNRESOLVED"  # paused again
         else:
-            assert full_cap(hs.journal, t0 + 31 * 86_400) == 3  # the 30 clean days start again from the new one
+            assert full_cap(hs.journal) is None  # recorded and alerted: no cap comes back in FULL (2026-11-05)
         hs.journal.close()
     # no trade open: each failure is an episode of its own, and a restarted stint starts afresh
     hs = Harness(tmp_path / "flat", t0, stage="CANARY", stage_days=1.0)
@@ -1176,7 +1193,7 @@ def test_a_fill_between_the_position_and_the_order_read_is_read_again(tmp_path):
     reads the position again after the orders and repeats the pair until both agree, so a stale position is
     never paired with a vanished leg (that would place the TP1 limit again below the market, then sell the TP2
     contracts too): the fill is the live TP1 at once."""
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.ex = RacyExchange(clock=hs.clock)
     hs.rt = hs.make_runtime()
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
@@ -1197,7 +1214,7 @@ def test_an_ambiguous_tp1_sync_is_read_from_the_position_not_sold_again(tmp_path
     """Probe (a) end to end: the engine's TP1 (spot) filled, the live TP1 limit did not; the market reduce that
     syncs it fills, but its answer is lost and the lookup fails. The next poll reads the smaller position as that
     reduce: one sale, no UNEXPLAINED_REDUCTION incident, the rest at break-even."""
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)
@@ -1224,10 +1241,10 @@ def test_an_ambiguous_tp1_sync_is_read_from_the_position_not_sold_again(tmp_path
 
 
 def tripped(h: Harness, t0: float = ENTRY_BAR + 30) -> None:
-    """Three balance reads base the day's reference, then a -4% equity: the next minute's read is the first breach."""
+    """Three balance reads base the day's reference, then a -21% equity: the next minute's read is the first breach."""
     h.at(t0 + 60)
     h.at(t0 + 120)
-    h.ex.cash -= 400.0
+    h.ex.cash -= 2_100.0
     h.at(t0 + 180)
 
 
@@ -1279,7 +1296,7 @@ def test_a_flatten_confirmed_while_the_venue_is_closed_closes_at_the_reopen(h):
 
 @pytest.mark.parametrize("crash", ["before the request", "before the close"])
 def test_a_crash_before_the_breaker_close_went_out_still_flattens_after_the_restart(tmp_path, crash):
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)
@@ -1608,7 +1625,7 @@ def test_the_daily_summary_and_key_check_are_done_for_the_day_only_once_they_suc
 
 
 def test_bracket_fills_are_read_back_until_the_read_succeeds_and_partial_fills_count(tmp_path):
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
     hs.at(ENTRY_BAR + 30)  # 3 contracts: TP1 leg 1 @ 27_245, TP2 leg 2 @ 27_610
@@ -2191,9 +2208,264 @@ def test_an_entry_is_never_sized_without_a_margin_rate(tmp_path):
     hs = Harness(tmp_path, ENTRY_BAR + 30)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
-    hs.rt.product = dataclasses.replace(hs.rt.product, overnight_margin=(0.0, 0.0))
+    hs.ex.spec = dataclasses.replace(hs.ex.spec, overnight_margin=(0.0, 0.0))  # the entry reads the rates again: a missing one reads 0
     hs.at(ENTRY_BAR + 30)
     assert hs.ex.position() is None and "증거금률" in hs.journal.events(kind="SKIP")[0]["data"]["reason"]
+    hs.journal.close()
+
+
+def sized(tmp_path, stage: str, equity: float, *, direction: int = 1, stop_dist: float = 240.0,
+          stage_days: float = 60.0, risk_mult: float = 1.0, manual: bool = False,
+          overnight: tuple[float, float] | None = None) -> tuple[int, str | None, Harness]:
+    """`_entry_size` for a hand-made entry at 26,740 (ratio 1.0, so entry == entry_ref) with the stop `stop_dist` away,
+    on a `stage` harness. `manual`: a manual intervention still in force (the only cap FULL has). `overnight`: the
+    exchange's overnight margin rates (long, short) after the runtime started (the entry reads them again)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=stage_days, equity=equity)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    if overnight is not None:
+        hs.ex.spec = dataclasses.replace(hs.ex.spec, overnight_margin=overnight)
+    if manual:
+        hs.journal.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "stint": hs.journal.stage()[1]})
+    ent = TargetEntry(SIGNAL, "W3", direction, 26_740.0, 26_740.0 - direction * stop_dist,
+                      26_740.0 + direction * 760.0, None, risk_mult, 5, "test signal")
+    hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
+    n, block = hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True)
+    return n, block, hs
+
+
+def test_full_enters_at_the_margin_maximum_when_the_risk_size_would_exceed_the_limit(tmp_path):
+    """User decision 2026-11-05: FULL reduces an entry the 70% overnight-margin limit cannot hold instead of refusing it.
+    Long, equity 10,000, entry 26,740, stop 26,500: the 5x leverage cap sizes 186 contracts (the 10% risk would allow 375);
+    186 contracts are 186 * 0.01 * 26,740 * 0.21025 / 10,000 = 105% of the account, above 70%. One contract needs
+    0.01 * 26,740 * 0.21025 = 56.22 USD, so the most that fits is floor(0.70 * 10,000 / 56.22) = floor(124.5) = 124."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0)
+    assert (n, block) == (124, None)
+    assert margin_ratio(124, 26_740.0, 1, hs.rt.product, 10_000.0) <= MARGIN_ENTRY_MAX
+    assert margin_ratio(125, 26_740.0, 1, hs.rt.product, 10_000.0) > MARGIN_ENTRY_MAX
+    hs.journal.close()
+
+
+def test_full_has_no_contract_cap_from_its_first_day(tmp_path):
+    """User decision 2026-11-05: the first hour of FULL sizes like any later one, min(risk 10%, 5x, margin maximum with the
+    70% overnight check): the very same 124 as after 60 days, no 3 anywhere. No cap reaches the sizing, the planner's stage
+    maximum for a position taken over, or the status line."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, stage_days=0.01)
+    assert (n, block) == (124, None) and hs.rt._entry_reduction["cap"] is None
+    assert hs.rt._limits() == ("FULL", None) and hs.rt._ctx(ENTRY_BAR + 30).max_contracts is None
+    assert status_lines(hs.journal, ENTRY_BAR + 30)[0].count("상한 없음") == 1
+    hs.journal.close()
+    wide, block, hs = sized(tmp_path / "wide", "FULL", 10_000.0, stage_days=0.01, stop_dist=2_000.0)  # the risk size binds
+    assert (wide, block) == (49, None) and wide > 3 and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+def test_a_manual_intervention_still_in_force_holds_full_to_3_contracts(tmp_path):
+    """This safety behavior never depended on the 30 days and stays: the minimum of the risk size (186), the cap (3) and the
+    margin maximum (124) is the cap: nothing is reduced, and the status says why."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, manual=True)
+    assert (n, block) == (3, None) and hs.rt._entry_reduction is None
+    assert "수동 개입 중 상한 3계약" in status_lines(hs.journal, ENTRY_BAR + 30)[0]
+    hs.journal.close()
+
+
+def test_a_foreign_order_first_read_in_the_cycles_pass_caps_that_entry(tmp_path):
+    """Review finding: the cap came from the journal, written at the end of the pass that first read the order: that pass's
+    own entry went out at 124 contracts, and only the next one was capped at 3."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="FULL", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    real = hs.ex.open_orders
+    foreign = Order("f1", "manual-1", -1, "OTHER", 1, 0, "OPEN")
+    hs.ex.open_orders = lambda: real() + [foreign]  # placed after the last poll, first read by the cycle's pass
+    assert full_cap(hs.journal) is None
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position().contracts == 3 and full_cap(hs.journal) == 3
+    hs.ex.open_orders = real  # gone: this process no longer holds to it either
+    hs.at(ENTRY_BAR + 41)
+    assert hs.rt._limits() == ("FULL", None)
+    hs.journal.close()
+
+
+def guarded(hs: Harness, equity: float | None) -> None:
+    hs.journal.put(AccountGuard.KEY, {"equity": equity, "peak": equity, "day": "2024-03-13", "day_ref": equity,
+                                      "daily_tripped": False, "total_tripped": False})
+
+
+def sizing(tmp_path, *reads, stage: str = "FULL", reference: float | None = 10_000.0) -> tuple[Harness, list]:
+    """A FULL entry at 26,740 with its stop 240 away (one contract's overnight margin: 56.22 USD), the guard's last observation
+    at `reference`, and balance() answering `reads` in turn (an exception raises), the last one from then on."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    if reference is not None:
+        guarded(hs, reference)
+    ent = TargetEntry(SIGNAL, "W3", 1, 26_740.0, 26_500.0, 27_500.0, None, 1.0, 5, "test signal")
+    hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
+    calls: list[float] = []
+
+    def balance() -> Balance:
+        x = reads[min(len(calls), len(reads) - 1)]
+        calls.append(x)
+        if isinstance(x, Exception):
+            raise x
+        return Balance(float(x), None)
+
+    hs.ex.balance = balance
+    return hs, calls
+
+
+def size_now(hs: Harness) -> tuple[int, str | None]:
+    return hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True)
+
+
+@pytest.mark.parametrize("read", [10_000.0, 11_900.0, 8_100.0])
+def test_a_balance_read_in_the_band_is_read_once(tmp_path, read):
+    hs, calls = sizing(tmp_path, read)
+    assert size_now(hs)[0] > 0 and calls == [read] and hs.journal.events(kind="EQUITY_CHANGED") == []
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("reads,median,contracts", [
+    ((30_000.0, 30_100.0, 29_950.0), 30_000.0, 373),  # a deposit: floor(0.70 * 30,000 / 56.22)
+    ((5_000.0, 5_010.0, 4_990.0), 5_000.0, 62),  # a withdrawal, or a stale reference after downtime
+])
+def test_three_reads_that_agree_size_the_entry_even_outside_the_band_and_it_says_so(tmp_path, reads, median, contracts):
+    """User decision 2026-11-05: signals come about once a month. A real change of the balance, or a reference gone stale, is
+    no reason to skip one: the median of three reads that agree within 1% sizes it."""
+    hs, calls = sizing(tmp_path, *reads)
+    start = hs.clock.now
+    assert size_now(hs) == (contracts, None) and calls == list(reads)
+    assert hs.rt._entry_reduction["equity"] == median
+    assert 0 < hs.clock.now - start <= 5  # within a few seconds
+    assert hs.journal.events(kind="EQUITY_CHANGED")[-1]["data"]["median"] == median
+    said = [t for k, t in hs.alerts.items if k == "EQUITY_CHANGED"]
+    assert len(said) == 1 and said[0].startswith("[잔고 변경]") and "10,000.00" in said[0] and f"{median:,.2f}" in said[0]
+    assert size_now(hs)[0] > 0 and len([k for k in hs.alerts.kinds() if k == "EQUITY_CHANGED"]) == 1  # once a signal
+    hs.journal.close()
+
+
+def test_one_wild_read_followed_by_normal_ones_loses_no_signal(tmp_path):
+    """Three reads always, once one is out of the band: the median discards the wild one, and nothing says the balance
+    changed, because the median is in the band."""
+    hs, calls = sizing(tmp_path, 100_000.0, 10_000.0, 10_000.0)
+    assert size_now(hs) == (124, None) and calls == [100_000.0, 10_000.0, 10_000.0]
+    assert hs.journal.events(kind="EQUITY_CHANGED") == []
+    assert hs.journal.events(kind="EQUITY_READ_OFF")[-1]["data"]["reads"] == calls
+    assert any(t.startswith("[잔고 조회 이상]") for _, t in hs.alerts.items)
+    hs.journal.close()
+
+
+def test_flapping_reads_with_a_poisoned_reference_size_on_the_truth(tmp_path):
+    """Re-review M3: the true read looked out of the band, a wrong second read looked back in it, and the entry doubled
+    (248 for 124). The reference is 20,000 from a wrong minute; the truth is 10,000."""
+    hs, calls = sizing(tmp_path, 10_000.0, 20_000.0, 10_000.0, reference=20_000.0)
+    assert size_now(hs) == (124, None) and len(calls) == 3
+    hs.journal.close()
+
+
+def test_two_of_three_agreeing_above_the_band_are_used_and_said(tmp_path):
+    hs, calls = sizing(tmp_path, 30_000.0, 30_000.0, 10_000.0)
+    assert size_now(hs) == (373, None) and len(calls) == 3
+    assert hs.journal.events(kind="EQUITY_CHANGED")[-1]["data"]["median"] == 30_000.0
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("reads,why", [
+    ((30_000.0, 20_000.0, 10_000.0), "서로 다름"),  # no two within 1%
+    ((5_000.0, 5_200.0, 5_400.0), "서로 다름"),  # a real move between the reads: nothing to size on
+    ((30_000.0, 30_000.0, float("nan")), "읽지 못함"),
+    ((float("inf"), float("inf"), float("inf")), "읽지 못함"),
+    ((30_000.0, Unavailable("HTTP 503")), "읽지 못함"),
+    ((30_000.0, 30_000.0, RateLimited("429")), "읽지 못함"),
+])
+def test_reads_that_disagree_or_fail_refuse_the_entry_and_say_why(tmp_path, reads, why):
+    hs, _ = sizing(tmp_path, *reads)
+    hs.rt.poll(ENTRY_BAR + 31)  # a whole pass: skipped, and the skip is alerted
+    assert hs.ex.position() is None and hs.journal.events(kind="EQUITY_CHANGED") == []
+    said = [t for k, t in hs.alerts.items if k == "SKIP"]
+    assert len(said) == 1 and why in said[0] and hs.journal.events(kind="SKIP")[-1]["data"]["signal_ts"] == SIGNAL
+    hs.journal.close()
+
+
+def test_a_signal_already_traded_or_skipped_is_not_read_again(tmp_path):
+    hs, calls = sizing(tmp_path, 30_000.0)
+    hs.journal.put("skipped_signals", [SIGNAL])
+    size_now(hs)
+    assert calls == [30_000.0]
+    hs.journal.close()
+
+
+def test_the_balance_check_is_for_full_only_and_needs_a_reference(tmp_path):
+    for name, stage, ref, wanted in (("canary", "CANARY", 5_000.0, 1), ("first", "FULL", None, 124)):
+        # far from the read: CANARY's one contract has its own risk and margin checks
+        hs, calls = sizing(tmp_path / name, 10_000.0, stage=stage, reference=ref)
+        assert size_now(hs) == (wanted, None) and calls == [10_000.0]
+        hs.journal.close()
+
+
+def test_the_margin_maximum_wins_when_it_is_smaller_than_the_risk_size(tmp_path):
+    """Equity 200: the risk size is 3 (the 5x cap: floor(5 * 200 / 267.4) = 3), 3 contracts are 3 * 56.22 / 200 = 84% > 70%;
+    the most that fits is floor(0.70 * 200 / 56.22) = floor(2.49) = 2."""
+    n, block, hs = sized(tmp_path, "FULL", 200.0)
+    assert (n, block) == (2, None)
+    hs.journal.close()
+
+
+def test_full_at_or_under_the_margin_limit_is_unchanged(tmp_path):
+    """A wide stop (26,740 to 24,740: 2,000 + 0.0005 * 51,480 = 2,025.7 per BTC, 20.26 USD per contract) sizes
+    floor(1,000 / 20.26) = 49 contracts at 10% risk: 49 * 56.22 / 10,000 = 27.5%, under 70%: entered whole, no reduction."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, stop_dist=2_000.0)
+    assert (n, block) == (49, None) and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+def test_full_refuses_when_not_even_one_contract_fits(tmp_path):
+    """Equity 54: 1 contract is 56.22 / 54 = 104% > 70% and floor(0.70 * 54 / 56.22) = floor(0.67) = 0: refused,
+    with the message the refusal always had."""
+    n, block, hs = sized(tmp_path, "FULL", 54.0)
+    assert (n, block) == (0, "오버나이트 증거금 예상 104% > 70%") and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage", ["CANARY", "SHADOW"])
+def test_canary_and_shadow_above_the_limit_still_refuse(tmp_path, stage):
+    """They trade 1 contract, never a reduced FULL size: equity 54 projects 104% for it."""
+    n, block, hs = sized(tmp_path, stage, 54.0)
+    assert (n, block) == (0, "오버나이트 증거금 예상 104% > 70%") and hs.rt._entry_reduction is None
+    hs.journal.close()
+
+
+def test_a_short_is_reduced_with_the_higher_short_margin_rate(tmp_path):
+    """Short, equity 10,000, entry 26,740: 186 contracts again, at the short overnight rate 0.256625 one contract needs
+    0.01 * 26,740 * 0.256625 = 68.62 USD, so floor(0.70 * 10,000 / 68.62) = floor(102.0) = 102 (a long fits 124)."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, direction=-1)
+    assert (n, block) == (102, None)
+    assert margin_ratio(102, 26_740.0, -1, hs.rt.product, 10_000.0) <= MARGIN_ENTRY_MAX
+    assert margin_ratio(103, 26_740.0, -1, hs.rt.product, 10_000.0) > MARGIN_ENTRY_MAX
+    hs.journal.close()
+
+
+def test_a_reduced_full_entry_is_sent_recorded_once_and_left_alone_by_the_margin_watchdog(tmp_path):
+    """The cycle enters the reduced size (the fixture's long: the margin maximum floor(0.70 * 10,000 / 56.23) = 124),
+    journals and alerts the needed and the entered contracts once, and the minute checks (warn 80%, reduce 90% of the
+    overnight projection) leave a position entered just under 70% alone."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position().contracts == 124
+    rows = hs.journal.events(kind="ENTRY_REDUCED")
+    assert len(rows) == 1
+    d = rows[0]["data"]
+    assert (d["entered"], d["margin_max"], d["cap"], d["stage"]) == (124, 124, None, "FULL") and d["needed"] > 124
+    texts = [t for k, t in hs.alerts.items if k == "ENTRY_REDUCED"]
+    assert len(texts) == 1 and texts[0].startswith("[진입 축소]") and f"{d['needed']}계약" in texts[0] and "124계약" in texts[0]
+    for k in range(1, 8):
+        hs.at(ENTRY_BAR + 30 + 60 * k)
+    assert len(hs.journal.events(kind="ENTRY_REDUCED")) == 1 and hs.ex.position().contracts == 124
+    assert "MARGIN" not in hs.alerts.kinds() and not hs.journal.events(kind="REDUCED")
     hs.journal.close()
 
 
@@ -2284,7 +2556,7 @@ def test_alert_wording_matches_what_happened(h):
     reply = h.rt.handle("/resume", ENTRY_BAR + 50)
     assert "SHADOW" in reply and "다음 신호부터 진입" not in reply
     h.journal.set_stage("FULL", "test", ENTRY_BAR + 60)
-    assert "3계약 상한" in h.rt._unresolved_note() and "CANARY 기준 ② 실패" not in h.rt._unresolved_note()
+    assert "FULL에서는 기록만" in h.rt._unresolved_note() and "CANARY 기준 ② 실패" not in h.rt._unresolved_note()
     h.journal.set_stage("CANARY", "test", ENTRY_BAR + 70)
     assert "CANARY 기준 ② 실패" in h.rt._unresolved_note()
     h.ex.balance = lambda: Balance(math.nan, None)
@@ -2411,7 +2683,7 @@ def test_a_watchdog_close_never_cancels_a_leg_that_still_protects(tmp_path):
     """Re-review A (probe pG): FULL, 3 contracts, the TP2 leg gone and order entry disabled; the price through the stop
     the venue has not triggered yet. The any-refusal close applies to a gapped stop and to a trade with no leg resting
     only: here the TP1 leg still protects a contract and is kept."""
-    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10, capped=3)
     hs.ex = RefusesNewOrders(clock=hs.clock)
     hs.rt = hs.make_runtime()
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
@@ -2484,4 +2756,630 @@ def test_a_gapped_stops_close_ends_when_cancels_take_longer_than_the_wait(tmp_pa
             break
     assert hs.ex.position() is None and hs.ex.calls.count("place_bracket") == placed
     assert hs.rt.executor.trade().exit_reason in ("STOP_GAP", "STOP_UNPROTECTED")
+    hs.journal.close()
+
+
+def test_the_margin_rates_are_read_again_right_before_an_entry_is_sized(tmp_path):
+    """The rates were read at the start (0.21025 long); the exchange raised them to 0.30 since. The entry re-reads the
+    product: the cycle sizes with 0.30. One contract needs 0.01 * 26,747 * 0.30 = 80.24 USD, so the most that fits the 70%
+    limit is floor(0.70 * 10,000 / 80.24) = floor(87.2) = 87 (124 with the start's rate)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    reads = hs.ex.calls.count("product")
+    hs.ex.spec = dataclasses.replace(hs.ex.spec, overnight_margin=(0.30, 0.30))
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.calls.count("product") > reads and hs.rt.product.overnight_margin == (0.30, 0.30)
+    assert hs.ex.position().contracts == 87
+    assert margin_ratio(87, 26_747.0, 1, hs.rt.product, 10_000.0) <= MARGIN_ENTRY_MAX < margin_ratio(88, 26_747.0, 1, hs.rt.product, 10_000.0)
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage", ["SHADOW", "CANARY", "FULL"])
+def test_every_stage_reads_the_rates_again_before_sizing(tmp_path, stage):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    reads = hs.ex.calls.count("product")
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.calls.count("product") == reads + 1  # one re-read for the entry, none for the passes after it
+    hs.at(ENTRY_BAR + 40)
+    assert hs.ex.calls.count("product") == reads + 1
+    hs.journal.close()
+
+
+def test_a_higher_margin_rate_gives_fewer_contracts(tmp_path):
+    """Equity 10,000, entry 26,740, stop 26,500: the 5x cap sizes 186 whatever the rates are; the 70% limit holds
+    floor(7,000 / (0.01 * 26,740 * rate)) of them: rate 0.21025 -> floor(124.5) = 124; 0.25 -> floor(104.7) = 104;
+    0.30 -> floor(87.26) = 87."""
+    got = {}
+    for k, rate in enumerate((0.21025, 0.25, 0.30)):
+        n, block, hs = sized(tmp_path / str(k), "FULL", 10_000.0, overnight=(rate, rate))
+        assert block is None
+        got[rate] = n
+        hs.journal.close()
+    assert got == {0.21025: 124, 0.25: 104, 0.30: 87}
+
+
+@pytest.mark.parametrize("bad", [Unavailable("429 or a timeout"), (0.0, 0.0), (0.21, float("nan")), (float("inf"), 0.25),
+                                 (-0.2, 0.2), (0.21025, 0.0)])
+def test_a_failed_or_invalid_refresh_refuses_the_entry_and_keeps_the_last_rates(tmp_path, bad):
+    """Entering on stale rates is the risk: a failed read or a rate that is missing (reads 0), closed or not finite refuses
+    this signal with a Korean reason (the SKIP alert); the watchdog keeps the last good product. The rates are fine the
+    next pass, and the signal stays skipped (a skip is final: an entry is never sent later)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    last = hs.rt.product
+    if isinstance(bad, BaseException):
+        hs.ex.fail_next("product", bad)
+    else:
+        hs.ex.spec = dataclasses.replace(hs.ex.spec, overnight_margin=bad)
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position() is None and hs.rt.product is last
+    skip = hs.journal.events(kind="SKIP")
+    assert len(skip) == 1 and "증거금률" in skip[0]["data"]["reason"] and "SKIP" in hs.alerts.kinds()
+    hs.ex.clear_faults()
+    hs.ex.spec = dataclasses.replace(hs.ex.spec, overnight_margin=last.overnight_margin)
+    hs.at(ENTRY_BAR + 40)
+    assert hs.ex.position() is None and hs.rt.product is not None
+    hs.journal.close()
+
+
+def test_the_watchdog_refreshes_the_rates_and_keeps_the_last_good_ones_when_a_refresh_fails(tmp_path):
+    """An entry at the 70% limit (124 contracts, long rate 0.21025) is 70% of the account. The long rate rises to 0.26:
+    the true ratio is 0.70 * 0.26 / 0.21025 = 86.6%. Within the refresh interval plus a minute the watchdog reads
+    that (the 80% warning); a failing refresh keeps the last good rates and is alerted, limited."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position().contracts == 124
+    t = ENTRY_BAR + 60
+    for k in range(1, 6):
+        hs.at(t + 60 * k)
+    assert "MARGIN" not in hs.alerts.kinds() and hs.rt.product.overnight_margin[0] == 0.21025
+    raised = dataclasses.replace(hs.ex.spec, overnight_margin=(0.26, 0.26))
+    hs.ex.spec = raised
+    for k in range(6, 6 + int(runtime_mod.PRODUCT_REFRESH_S // 60) + 3):
+        hs.at(t + 60 * k)
+    assert hs.rt.product.overnight_margin == (0.26, 0.26)
+    warn = [x for kind, x in hs.alerts.items if kind == "MARGIN"]
+    assert len(warn) == 1 and "86%" in warn[0] and hs.journal.events(kind="MARGIN_RATES_CHANGED")
+    t2 = t + 60 * (6 + int(runtime_mod.PRODUCT_REFRESH_S // 60) + 3)
+    hs.ex.fail_next("product", Unavailable("down"), times=50)
+    for k in range(1, 2 * int(runtime_mod.PRODUCT_REFRESH_S // 60) + 3):
+        hs.at(t2 + 60 * k)
+    assert hs.rt.product.overnight_margin == (0.26, 0.26)  # the last good rates stay in force
+    failed = [x for kind, x in hs.alerts.items if kind == "MARGIN_RATE"]
+    assert 1 <= len(failed) <= 2 and "마지막" in failed[0] and hs.journal.events(kind="PRODUCT_REFRESH_FAILED")
+    hs.journal.close()
+
+
+@pytest.mark.parametrize(("risk_mult", "needed", "pct"), [(1.0, 186, "3.3%"), (0.5, 186, "3.3%"), (0.4, 150, "3.3%")])
+def test_the_reduced_entry_alert_states_the_real_risk_of_the_entered_contracts(tmp_path, risk_mult, needed, pct):
+    """Equity 10,000, long 26,740, stop 26,500: distance 240 + 0.0005 * (26,740 + 26,500) = 266.62 USD per BTC, 2.6662 USD per
+    contract. The 5x cap allows floor(50,000 / 26,740 / 0.01) = 186; the risk size at risk_mult m is
+    floor(1,000 * m / 266.62 / 0.01): 375 at 1.0 and 187 at 0.5 (the cap binds: 186 either way), 150 at 0.4 (the risk binds).
+    The 70% limit holds 124, so 124 enter: real risk 124 * 2.6662 / 10,000 = 3.306%. The old text said 10% * 124 / needed:
+    6.7% (needed 186), 8.3% (150)."""
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, risk_mult=risk_mult)
+    assert (n, block) == (124, None) and hs.rt._entry_reduction["needed"] == needed
+    hs.rt.executor.trade = lambda: SimpleNamespace(trade_id=SIGNAL, contracts=n)
+    hs.rt._record_entry_reduction(hs.rt._entry_reduction, ENTRY_BAR + 31)
+    text = [t for k, t in hs.alerts.items if k == "ENTRY_REDUCED"][0]
+    assert f"기준 {needed}계약" in text and f"실제 위험은 약 {pct}" in text
+    assert "6.7%" not in text and "8.3%" not in text
+    hs.journal.close()
+
+
+def _demote(hs: Harness, how: str, now: float) -> None:
+    if how == "incident":
+        hs.rt._incident("UNPROTECTED_60S", now)  # a major incident in FULL: paused and demoted to CANARY
+    else:
+        transition(hs.journal, "CANARY", now, [], confirm=True, flat=False)  # the CLI's demotion
+
+
+@pytest.mark.parametrize("how", ["incident", "cli"])
+@pytest.mark.parametrize("restart_first", [False, True])
+def test_a_demotion_to_canary_at_a_loss_rebases_the_peak_and_trips_nothing(tmp_path, how, restart_first):
+    """FULL with a position open (the process keeps running), peak 9,996.90 (the entry fee), equity 8,096.90 (-19%: FULL's
+    30% and the daily 20% are fine). The demotion to CANARY (15%) leaves a request; the first balance read after it - in
+    this process or after a restart - re-bases the peak to the read (journaled REBASED), so the next reads never trip
+    TOTAL_DD and a /resume sent in between is not paused again."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    entered(hs)
+    for k in range(3):
+        hs.at(ENTRY_BAR + 60 * k + 90)  # the day's reference and the peak: three reads
+    peak = hs.rt.guard.state()["peak"]
+    assert peak == pytest.approx(10_000.0, abs=10.0)
+    hs.ex.cash -= 1_900.0
+    now = ENTRY_BAR + 300
+    hs.at(now)
+    _demote(hs, how, now + 1)
+    assert hs.journal.stage()[0] == "CANARY"
+    hs.rt.handle("/resume", now + 2)
+    if restart_first:
+        hs.rt = hs.make_runtime()  # CANARY's 15% from the start
+        hs.rt.startup()
+        assert hs.rt.guard.params.total_dd == 0.15 and hs.rt.guard.state()["peak"] == peak
+    for k in range(1, 8):
+        hs.at(now + 60 * k + 2)
+    assert not hs.journal.events(kind="BREAKER") and paused(hs.journal) is None
+    assert hs.ex.position() is not None  # nothing was flattened
+    g = hs.rt.guard.state()
+    assert g["peak"] == pytest.approx(peak - 1_900.0, abs=5.0) and not g["total_tripped"]
+    rows = hs.journal.events(kind="REBASED")
+    assert len(rows) == 1 and rows[0]["data"]["before"]["peak"] == peak and "FULL" in rows[0]["data"]["reason"]
+    assert rows[0]["data"]["after"]["peak"] == pytest.approx(peak - 1_900.0, abs=5.0)
+    assert hs.journal.get(runtime_mod.PEAK_REBASE_KEY) is None and "REBASE" in hs.alerts.kinds()
+    hs.journal.close()
+
+
+def test_a_canary_drawdown_from_the_rebased_peak_still_trips_the_breaker(tmp_path):
+    """After the re-base (peak about 8,097) CANARY's 15% is real: equity 8,097 - 1,300 = 6,797 (-16%) breaches on two reads
+    in a row and flattens, pauses and files the BREAKER incident as it always did."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    entered(hs)
+    for k in range(3):
+        hs.at(ENTRY_BAR + 60 * k + 90)
+    hs.ex.cash -= 1_900.0
+    hs.at(ENTRY_BAR + 300)
+    hs.rt._incident("UNPROTECTED_60S", ENTRY_BAR + 301)
+    hs.rt.handle("/resume", ENTRY_BAR + 302)
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    for k in range(1, 6):
+        hs.at(ENTRY_BAR + 300 + 60 * k)
+    assert not hs.journal.events(kind="BREAKER") and hs.ex.position() is not None
+    st = hs.rt.guard.state()
+    assert st["peak"] == pytest.approx(8_097.0, abs=5.0)
+    st.update(day_ref=st["peak"], day_reads=None)  # only the total drawdown is in play
+    hs.journal.put(hs.rt.guard.KEY, st)
+    hs.ex.cash -= 1_300.0
+    hs.at(ENTRY_BAR + 660)
+    assert paused(hs.journal) is None  # one breaching read is not enough
+    hs.at(ENTRY_BAR + 720)
+    assert paused(hs.journal)["reason"] == "breaker TOTAL_DD" and hs.ex.position() is None
+    assert hs.journal.events(kind="BREAKER")[-1]["data"]["kind"] == "TOTAL_DD" and "BREAKER" in hs.alerts.kinds()
+    hs.journal.close()
+
+
+def test_a_breaker_trip_in_full_still_flattens_pauses_and_demotes_and_the_resume_rebases(tmp_path):
+    """A TOTAL_DD trip in FULL (-30%): flatten, pause and the major incident as today (demoted to CANARY); the peak is
+    re-based by the demotion's request at the next read and again by /resume (the tripped breaker's own re-base)."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    entered(hs)
+    for k in range(3):
+        hs.at(ENTRY_BAR + 60 * k + 90)
+    hs.ex.cash -= 3_100.0  # -31%
+    hs.at(ENTRY_BAR + 300)
+    hs.at(ENTRY_BAR + 360)
+    assert hs.ex.position() is None and paused(hs.journal)["reason"].startswith("breaker ")
+    assert hs.journal.stage()[0] == "CANARY" and hs.journal.get(runtime_mod.PEAK_REBASE_KEY) is not None
+    assert hs.rt.exit_code == 0  # flat and demoted: this process ends; the restart (CANARY) applies the request
+    hs.rt = hs.make_runtime()
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 420)
+    assert hs.journal.get(runtime_mod.PEAK_REBASE_KEY) is None and hs.rt.guard.state()["peak"] < 7_500.0
+    assert hs.rt.handle("/resume", ENTRY_BAR + 430).startswith("재개")
+    assert not hs.rt.guard.state()["total_tripped"]
+    hs.journal.close()
+
+
+# ---------------------------------------------------------------------------- a position read that lags a strategy entry
+def lagged_entry(tmp_path, stage: str, refuse: bool = True, reads: int = 10_000) -> tuple[Harness, Lag]:
+    """A strategy entry on a venue whose positions read does not show it yet. The probe's result before the fix: FULL's 124
+    contracts with no stop for about 30 s, the journal saying CLOSED/BRACKET, and then a false ADOPTED."""
+    hs = Harness(tmp_path / stage / str(refuse), ENTRY_BAR, stage=stage, stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    lag = Lag(hs, reads, refuse=refuse)
+    hs.at(ENTRY_BAR + 30)
+    return hs, lag
+
+
+def real_stops(hs: Harness) -> int:
+    return sum(o.size - o.filled for o in hs.ex.open_orders() if o.kind == "BRACKET" and o.stop_price is not None)
+
+
+def assert_nothing_false(hs: Harness) -> None:
+    """No false exit, no false adoption, no incident."""
+    assert hs.journal.events(kind="CLOSED") == [] and hs.journal.events(kind="ADOPTED") == []
+    assert hs.journal.events(kind="INCIDENT") == [] and paused(hs.journal) is None
+    assert (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    assert canary_failures(hs.journal, hs.journal.stage()[1]) == {}
+
+
+@pytest.mark.parametrize("stage,contracts", [("CANARY", 1), ("FULL", 124)])
+def test_a_strategy_entry_not_read_yet_is_kept_and_protected_as_soon_as_it_shows(tmp_path, stage, contracts):
+    hs, lag = lagged_entry(tmp_path, stage)
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and hs.ex.pos.contracts == contracts and real_stops(hs) == 0
+    for k in range(1, 4):  # read every second: not closed, nothing cancelled or entered
+        hs.at(ENTRY_BAR + 30 + k)
+        assert hs.rt.executor.trade().status == "OPEN" and real_stops(hs) == 0
+    assert len(hs.journal.events(kind="POSITION_NOT_SEEN")) == 1 and hs.alerts.kinds().count("POSITION_NOT_SEEN") == 1
+    assert hs.rt.active is True and hs.rt.flat() is False
+    tries = len(hs.journal.events(kind="BRACKET_FAILED"))
+    assert tries >= 2  # its stop kept being tried: Coinbase may take it before the read shows
+    lag.left = 0
+    hs.at(ENTRY_BAR + 34)  # the first pass that reads it places the stop
+    assert real_stops(hs) == contracts
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is False
+    for k in range(5, 8):
+        hs.at(ENTRY_BAR + 30 + 10 * k)
+    assert real_stops(hs) == contracts and hs.ex.position().contracts == contracts
+    assert hs.rt.executor.trade().unprotected_since is None  # the next pass reads it covered
+    assert_nothing_false(hs)
+    assert hs.journal.events(kind="ORDER_UNRESOLVED") == []
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage,contracts", [("CANARY", 1), ("FULL", 124)])
+def test_a_bracket_coinbase_takes_while_the_read_lags_is_kept_not_doubled(tmp_path, stage, contracts):
+    hs, lag = lagged_entry(tmp_path, stage, refuse=False)
+    placed = hs.ex.open_orders()
+    assert real_stops(hs) == contracts
+    for k in range(1, 4):
+        hs.at(ENTRY_BAR + 30 + k)
+    assert [o.order_id for o in hs.ex.open_orders()] == [o.order_id for o in placed]  # never cancelled as FLAT, never again
+    lag.left = 0
+    hs.at(ENTRY_BAR + 34)
+    assert [o.order_id for o in hs.ex.open_orders()] == [o.order_id for o in placed]
+    assert_nothing_false(hs)
+    hs.journal.close()
+
+
+def test_a_short_lag_is_nothing_but_one_more_read(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "CANARY", reads=1)  # the entry's own read did not show it
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is True
+    hs.at(ENTRY_BAR + 31)
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is False and real_stops(hs) == 1
+    assert hs.journal.events(kind="POSITION_NOT_SEEN") == []
+    assert_nothing_false(hs)
+    hs.journal.close()
+
+
+def test_an_entry_the_read_shows_at_once_is_never_held(tmp_path):
+    """No lag: as before the fix, a flat read after it is believed at once when its brackets do not contradict it."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is False
+    hs.journal.close()
+
+
+def test_a_leg_that_filled_explains_the_flat_read_at_once(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "CANARY", refuse=False)
+    stop = next(o.stop_price for o in hs.ex.open_orders())
+    hs.ex.set_prices(stop - 1.0)  # stopped out while the positions read still lags
+    hs.at(ENTRY_BAR + 31)
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET") and hs.journal.events(kind="POSITION_NOT_SEEN") == []
+    assert hs.journal.events(kind="ADOPTED") == [] and paused(hs.journal) is None
+    hs.journal.close()
+
+
+def test_an_entry_that_never_shows_is_given_up_after_5_minutes_and_says_so(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "CANARY", refuse=False)
+    opened = hs.rt.executor.trade().opened_ts
+    now = ENTRY_BAR + 30
+    while now < opened + ENTRY_SHOW_MAX_S - 10:
+        now += 10
+        hs.at(now)
+        assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    hs.at(opened + ENTRY_SHOW_MAX_S + 1)
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", ENTRY_NOT_SEEN) and paused(hs.journal) is not None
+    assert any("나타나지 않음" in text for _, text in hs.alerts.items)
+    assert hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == ENTRY_NOT_SEEN  # never called a bracket's exit
+    hs.at(opened + ENTRY_SHOW_MAX_S + 12)
+    assert hs.ex.open_orders() == []  # the wait is over: what rests on a book read flat is cancelled
+    hs.journal.close()
+
+
+def test_a_restart_keeps_the_entry_it_has_not_seen(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "FULL")
+    hs.clock.now = ENTRY_BAR + 60
+    hs.rt = hs.make_runtime()
+    assert hs.rt.active is True
+    hs.rt.startup()
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    lag.left = 0
+    hs.at(ENTRY_BAR + 71)
+    assert real_stops(hs) == 124 and hs.journal.events(kind="ADOPTED") == []
+    hs.journal.close()
+
+
+def test_a_close_of_an_entry_not_seen_records_no_exit(tmp_path):
+    """The watchdog's and any other close reach `Executor.close`, whose flat branch would call this a bracket's exit."""
+    hs, lag = lagged_entry(tmp_path, "CANARY")
+    assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(ENTRY_BAR + 31)) is False
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    lag.left = 0
+    assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(ENTRY_BAR + 32)) is True
+    assert hs.ex.pos is None and hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_GAP"
+    hs.journal.close()
+
+
+def test_a_flatten_stands_through_the_lag_and_closes_when_it_shows(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "FULL")
+    hs.rt._flatten("USER_FLATTEN", "USER", "user /flatten", ENTRY_BAR + 31)
+    assert hs.journal.get(FLATTEN_KEY) is not None and hs.rt.executor.trade().status == "OPEN"
+    hs.at(ENTRY_BAR + 32)
+    assert hs.journal.get(FLATTEN_KEY) is not None
+    lag.left = 0
+    hs.at(ENTRY_BAR + 33)
+    assert hs.ex.pos is None and hs.journal.get(FLATTEN_KEY) is None
+    assert hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "USER_FLATTEN"
+    assert hs.journal.events(kind="ADOPTED") == []
+    hs.journal.close()
+
+
+def two_legs(tmp_path, refuse: bool = False) -> tuple[Harness, Lag]:
+    """FULL at 4 contracts: a 2-contract TP1 leg and a 2-contract TP2 leg, the position read lagging."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="FULL", stage_days=10, capped=4)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    lag = Lag(hs, 10_000, refuse=refuse)
+    hs.at(ENTRY_BAR + 30)
+    return hs, lag
+
+
+def test_one_filled_leg_with_another_resting_explains_nothing(tmp_path):
+    """Re-review M1: TP1 filled while the read lags, and the trade closed as BRACKET: the planner cancelled TP2 and the stop,
+    leaving 2 real contracts with no orders."""
+    hs, lag = two_legs(tmp_path)
+    t = hs.rt.executor.trade()
+    assert [(leg.name, leg.size) for leg in t.legs] == [("tp1", 2), ("tp2", 2)]
+    hs.ex.set_prices(next(leg for leg in t.legs if leg.name == "tp1").limit_price + 1.0)
+    assert hs.ex.pos.contracts == 2
+    hs.at(ENTRY_BAR + 31)
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    assert real_stops(hs) == 2 and hs.journal.events(kind="UNPROTECTED") == []  # what is left is covered
+    assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(ENTRY_BAR + 32)) is False  # the close's flat branch agrees
+    lag.left = 0
+    hs.at(ENTRY_BAR + 33)
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and t.tp1_filled and hs.ex.position().contracts == 2 and real_stops(hs) == 2
+    assert hs.journal.events(kind="ADOPTED") == [] and (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    hs.journal.close()
+
+
+def test_every_leg_gone_with_a_fill_is_a_bracket_exit(tmp_path):
+    hs, _ = two_legs(tmp_path)
+    t = hs.rt.executor.trade()
+    hs.ex.set_prices(t.stop_price - 1.0)  # both legs stopped out while the read lags
+    assert hs.ex.pos is None
+    hs.at(ENTRY_BAR + 31)
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET")
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage", ["CANARY", "FULL"])
+def test_no_stop_during_the_wait_counts_as_unprotected(tmp_path, stage):
+    """Re-review M2: the unprotected clock, the major incident and FULL's demotion stayed silent through a hold."""
+    hs, lag = lagged_entry(tmp_path, stage)
+    hs.at(ENTRY_BAR + 31)
+    assert hs.rt.executor.trade().unprotected_since is not None and hs.journal.events(kind="UNPROTECTED")
+    assert hs.rt._stop_waits() is True  # a stop request gives the passes that place it their time
+    now = float(ENTRY_BAR + 31)
+    while now < ENTRY_BAR + 31 + 65:
+        now += 10
+        hs.at(now)
+    assert hs.journal.events(kind="UNPROTECTED_60S") and paused(hs.journal) is not None
+    assert hs.journal.stage()[0] == "CANARY"  # FULL demoted: the next order at once, this position as it is
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and hs.ex.pos is not None and hs.rt._ctx(now).max_contracts == 1
+    lag.left = 0
+    hs.at(now + 10)
+    assert real_stops(hs) == t.contracts  # protected when it shows, at its real size
+    hs.journal.close()
+
+
+def test_stops_that_rest_through_the_wait_raise_no_alarm(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "FULL", refuse=False)
+    for k in range(1, 8):
+        hs.at(ENTRY_BAR + 30 + 10 * k)
+    assert hs.rt.executor.trade().unprotected_since is None and hs.journal.events(kind="UNPROTECTED") == []
+    assert hs.rt._stop_waits() is False and paused(hs.journal) is None and hs.journal.stage()[0] == "FULL"
+    hs.journal.close()
+
+
+def test_a_stop_during_the_wait_says_so_and_a_price_through_the_stop_sends_no_blind_close(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "CANARY")
+    hs.at(ENTRY_BAR + 31)
+    stop = hs.rt.executor.trade().stop_price
+    hs.rt.stop_requested = True
+    hs.rt.stop_since = hs.rt.mono() - STOP_GRACE_S - 1.0  # its grace is over
+    assert hs.rt.run_forever() == 0
+    said = [t for k, t in hs.alerts.items if k == "STOPPED"]
+    assert said and "거래소 손절 주문이 없음" in said[-1] and "보호 주문은 그대로" not in said[-1]
+    hs.journal.close()
+    hs, _ = lagged_entry(tmp_path / "price", "CANARY")
+    hs.at(ENTRY_BAR + 31)
+    calls = len(hs.ex.calls)
+    hs.ex.set_prices(stop - 50.0)
+    hs.at(ENTRY_BAR + 42)
+    assert hs.journal.events(kind="STOP_UNPROTECTED") and "close_position" not in hs.ex.calls[calls:]
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    said = [t for k, t in hs.alerts.items if k == "STOP_UNPROTECTED"]
+    assert said and "읽히지 않아" in said[-1]
+    hs.journal.close()
+
+
+def test_the_entrys_position_read_never_holds_back_its_first_stop(tmp_path):
+    """Re-review L1: three timeouts and their back-off on the read before the stop made a real PROTECT_SLOW."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    market, position, state = hs.ex.place_market, hs.ex.position, {"armed": False}
+
+    def m(*a):
+        out = market(*a)
+        state["armed"] = True
+        return out
+
+    def p():
+        if state["armed"]:
+            state["armed"] = False
+            hs.clock.now += 33.0
+        return position()
+
+    hs.ex.place_market, hs.ex.position = m, p
+    hs.at(ENTRY_BAR + 30)
+    assert [e["data"]["after_entry_s"] for e in hs.journal.events(kind="PROTECTED_FIRST")] == [0.0]
+    hs.at(hs.clock.now + 11)
+    assert "PROTECT_SLOW" not in canary_failures(hs.journal, hs.journal.stage()[1])
+    hs.journal.close()
+
+
+def test_a_failed_first_stop_still_marks_the_entry_not_shown(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    Lag(hs, 10_000)
+    real = hs.ex.open_orders
+
+    def fails_once_filled():
+        if hs.ex.pos is not None:
+            raise Unavailable("503")
+        return real()
+
+    hs.ex.open_orders = fails_once_filled
+    hs.at(ENTRY_BAR + 30)
+    assert hs.journal.events(kind="ENTRY") and hs.journal.events(kind="ACTION_ERROR")
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is True
+    hs.journal.close()
+
+
+def test_a_clock_behind_coinbase_is_no_expired_wait(tmp_path):
+    """Re-review L2: `created_time` ahead of this clock read as a negative age, which counted as expired: given up at once."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    real = hs.ex.get_order
+
+    def ahead(order_id):
+        o = real(order_id)
+        return dataclasses.replace(o, created_ts=hs.clock.now + 5.0) if o.client_order_id.startswith("ewb-e-") else o
+
+    hs.ex.get_order = ahead
+    lag = Lag(hs, 10_000)
+    hs.at(ENTRY_BAR + 30)
+    hs.at(hs.clock.now + 1)
+    assert hs.rt.executor.trade().status == "OPEN" and paused(hs.journal) is None
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) and lag.left > 0
+    hs.journal.close()
+
+
+def test_a_locked_journal_in_the_ticks_cadence_read_does_not_end_the_process(tmp_path):
+    """Re-review L4: this read sat outside the sections' guard, and `database is locked` would have ended the process."""
+    hs, _ = lagged_entry(tmp_path, "CANARY")
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    hs.rt.executor.trade = locked
+    hs.clock.now += 1
+    hs.rt.tick()  # survives: the failing sections are guarded, and the cadence falls back to the normal poll
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("with_target", [False, True])
+def test_a_position_that_shows_after_the_wait_is_claimed_and_protected(tmp_path, with_target):
+    """Re-review L5: with no target it got an alert only, no stop. Within ENTRY_CLAIM_MAX_S it is that entry's again."""
+    hs, lag = lagged_entry(tmp_path, "CANARY", refuse=False)
+    opened = hs.rt.executor.trade().opened_ts
+    hs.at(opened + ENTRY_SHOW_MAX_S + 1)
+    assert hs.rt.executor.trade().exit_reason == ENTRY_NOT_SEEN
+    hs.at(opened + ENTRY_SHOW_MAX_S + 12)  # what rested was cancelled: the book read flat
+    assert hs.ex.open_orders() == [] and hs.ex.pos is not None
+    if not with_target:
+        hs.rt.target = None
+    lag.left = 0
+    hs.at(opened + ENTRY_SHOW_MAX_S + 72)
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and t.exit_reason is None and real_stops(hs) == 1
+    assert any(text.startswith("[경고]") and "늦게 나타남" in text for _, text in hs.alerts.items)
+    assert hs.journal.events(kind="ADOPTED") == [] and (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    assert not {"UNKNOWN_POSITION", "ADOPTED"} & set(canary_failures(hs.journal, hs.journal.stage()[1]))
+    assert paused(hs.journal) is not None  # the pause stays the user's to lift
+    hs.journal.close()
+
+
+def test_a_position_that_shows_past_the_claim_is_a_foreign_one_as_before(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "CANARY", refuse=False)
+    opened = hs.rt.executor.trade().opened_ts
+    hs.at(opened + ENTRY_SHOW_MAX_S + 1)
+    hs.rt.target = None
+    lag.left = 0
+    hs.at(opened + ENTRY_CLAIM_MAX_S + 1)
+    assert hs.journal.events(kind="ENTRY_SHOWN_LATE") == []
+    # read as anything else the journal does not know: the hour's cycle in this tick adopts it, the engine holding that side
+    assert hs.journal.events(kind="ADOPTED") or (hs.journal.get(RAISED_KEY) or {}).get("items")
+    hs.journal.close()
+
+
+def ended_late(hs: Harness, after: float) -> None:
+    """Our IOC entry reads open for `after` seconds from its first read, unfilled, and has ended with nothing since."""
+    hs.ex.market_fill_ratio = 0.0
+    real, start = hs.ex.get_order, {"t": None}
+
+    def late(order_id):
+        o = real(order_id)
+        if o.client_order_id.startswith("ewb-e-"):
+            start["t"] = hs.clock.now if start["t"] is None else start["t"]
+            if hs.clock.now - start["t"] <= after:
+                return dataclasses.replace(o, status="OPEN")
+        return o
+
+    hs.ex.get_order = late
+
+
+def test_a_strategy_entry_that_ends_unfilled_settles_at_the_next_read(tmp_path):
+    """Finding 8 again, on the strategy path: it stayed "unsettled" for up to 2 hours (fast polls, no flat book, so no stage
+    change either), after an IOC that read open past the 10 s wait and then ended with nothing."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    ended_late(hs, hs.rt.executor.fill_timeout)
+    hs.at(ENTRY_BAR + 30)
+    assert hs.rt.executor.unsettled_entry(hs.clock.now) is not None and hs.rt._busy() is True  # may still fill: watched
+    assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False]
+    hs.at(hs.clock.now + 11)
+    assert hs.rt.executor.unsettled_entry(hs.clock.now) is None and hs.rt._busy() is False and hs.rt.flat() is True
+    assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False, True]
+    assert any(text.startswith("[진입 미체결 확정]") for _, text in hs.alerts.items)
+    n = len(hs.journal.events(kind="ENTRY_UNFILLED"))
+    hs.at(hs.clock.now + 11)
+    assert len(hs.journal.events(kind="ENTRY_UNFILLED")) == n and hs.ex.position() is None
+    hs.journal.close()
+
+
+def test_an_entry_still_open_stays_watched_and_one_that_fills_late_is_ours(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    ended_late(hs, 1_000.0)
+    hs.at(ENTRY_BAR + 30)
+    hs.at(hs.clock.now + 11)
+    assert hs.rt.executor.unsettled_entry(hs.clock.now) is not None  # it has not ended: not settled by the read
+    assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False]
     hs.journal.close()

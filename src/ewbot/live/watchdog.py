@@ -3,10 +3,11 @@
   StopGapWatch   a bracket stop fills as a limit 5% beyond the stop; when the futures price has passed
                  that limit and the position is still open 10 s later, the runtime closes at market.
   margin_status  overnight-margin projection of the open position: >= 80% warn, >= 90% reduce back to
-                 the 70% entry limit (entries above 70% are refused before sending, live/pricing.py).
-  AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.97 (x 0.80 in SHADOW and
-                 CANARY: LIVE_DAILY_LOSS, user decision 2026-10-19), or <= the peak x 0.85 -> flatten and pause
-                 (spec 4.5), on the second observation in a row that breaches.
+                 the 70% entry limit (an entry above 70% is refused before sending - FULL: reduced to fit - live/pricing.py).
+  AccountGuard   real-account breakers: equity <= the New York day's opening equity x 0.80 (LIVE_DAILY_LOSS, every
+                 stage: user decisions 2026-10-19 for SHADOW and CANARY, 2026-11-05 for FULL), or <= the peak x 0.85
+                 (x 0.70 in FULL: FULL_TOTAL_DD, user decision 2026-11-05) -> flatten and pause (spec 4.5), on the
+                 second observation in a row that breaches.
                  State lives in the journal (survives restarts). A deliberate capital change (`ewbot live rebase`)
                  re-bases both references (`rebase`).
   SessionWatch   session state changes and the next scheduled maintenance (noticed 24 h ahead, or at once
@@ -42,7 +43,8 @@ WS_STALE_S = 60.0
 REST_POLL_S = 10.0
 MAINTENANCE_NOTICE_S = 24 * 3600
 BASING_READS = 3  # a reference (the day's, a re-based peak) is the median of its first three valid reads
-LIVE_DAILY_LOSS = 0.20  # SHADOW/CANARY real-account daily breaker; FULL keeps the strategy's (user decision 2026-10-19)
+LIVE_DAILY_LOSS = 0.20  # real-account daily breaker in every stage (user decisions 2026-10-19 SHADOW/CANARY, 2026-11-05 FULL)
+FULL_TOTAL_DD = 0.30  # FULL real-account drawdown from the peak; SHADOW/CANARY keep the strategy's 15% (user decision 2026-11-05)
 CLOCK_SLACK_S = 1.0  # a price stamped up to this much after `now` (another thread's clock read) is still fresh
 
 
@@ -115,9 +117,12 @@ def _basing(reads: list[float], e: float) -> tuple[list[float] | None, float]:
 
 
 def live_breakers(base: BreakerParams, stage: str) -> BreakerParams:
-    """The real account's breaker thresholds for a stage: the daily one is LIVE_DAILY_LOSS in SHADOW and CANARY and
-    `base`'s in FULL; the total drawdown is `base`'s everywhere. The paper engine's breakers (cfg.breakers) are untouched."""
-    return replace(base, daily_loss=LIVE_DAILY_LOSS) if stage in ("SHADOW", "CANARY") else base
+    """The real account's breaker thresholds for a stage: the daily one is LIVE_DAILY_LOSS (20%) in every stage; the total
+    drawdown is `base`'s in SHADOW and CANARY (15%) and FULL_TOTAL_DD (30%) in FULL. The paper engine's breakers
+    (cfg.breakers) are untouched."""
+    if stage in ("SHADOW", "CANARY"):
+        return replace(base, daily_loss=LIVE_DAILY_LOSS)
+    return replace(base, daily_loss=LIVE_DAILY_LOSS, total_dd=FULL_TOTAL_DD)
 
 
 class AccountGuard:
@@ -147,7 +152,7 @@ class AccountGuard:
 
     def __init__(self, journal: Journal, params: BreakerParams | None = None) -> None:
         self.journal = journal
-        self.params = BreakerParams() if params is None else params  # daily 3%, total 15% (spec 4.5; the runtime passes live_breakers(...))
+        self.params = BreakerParams() if params is None else params  # the strategy's daily 3%, total 15% (spec 4.5); the runtime passes live_breakers(...)
 
     def state(self) -> dict[str, Any] | None:
         return self.journal.get(self.KEY)
@@ -195,6 +200,20 @@ class AccountGuard:
                   equity=e)
         self.journal.put(self.KEY, st)
         return before, {"day": day, "day_ref": e, "peak": e}
+
+    def rebase_peak(self, equity: float, now: float) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """A FULL -> CANARY demotion: only the peak is based again - this read is the first of its three basing reads, like
+        a tripped TOTAL_DD's /resume - and the total breach flag is cleared; the day's reference and every trip stay (a
+        tripped breaker is re-based by /resume). None when the guard has no state yet (no peak to carry over).
+        Returns (before, after): day, day_ref, peak (as `rebase`)."""
+        e = _observed(equity)
+        st = self.state()
+        if not st or st.get("peak") is None:
+            return None
+        before = {"day": st.get("day"), "day_ref": st.get("day_ref"), "peak": st.get("peak")}
+        st.update(peak=e, peak_reads=[e], total_breach=False, equity=e)
+        self.journal.put(self.KEY, st)
+        return before, {"day": st.get("day"), "day_ref": st.get("day_ref"), "peak": e}
 
     def reset(self, equity: float, now: float) -> list[str]:
         """After the user resumes: only a breaker that tripped is re-based - the peak after TOTAL_DD, the day's

@@ -528,3 +528,45 @@ def test_a_flat_read_while_the_legs_still_rest_whole_needs_a_second_read():
     for orders in (resting(tr, tp1={"filled": 1}), resting(tr)[1:], []):  # a leg filled or gone: flat at once
         t4, ev = observe(tr, None, orders, now=100.0)
         assert t4.status == "CLOSED" and ev[0][0] == "CLOSED"
+
+
+def test_a_flat_read_the_caller_holds_does_not_close_the_trade_and_says_so_once():
+    """A filled entry no read has shown yet, with no leg filled: the runtime decides that (it reads the legs), observe only
+    does not fold it. The position, once there, ends the hold; without the hold a flat read closes as it always did."""
+    tr = trade()
+    t1, ev = observe(tr, None, resting(tr), now=100.0, hold_flat=0)
+    assert (t1.status, t1.flat_seen) == ("OPEN", 100.0) and ev == [("POSITION_NOT_SEEN", {"trade_id": tr.trade_id})]
+    t2, ev = observe(t1, None, resting(tr), now=110.0, hold_flat=0)
+    assert t2.status == "OPEN" and ev == []  # said once
+    t3, ev = observe(t2, Position(1, 3, 60_020.0), resting(tr), now=120.0)
+    assert (t3.status, t3.flat_seen) == ("OPEN", None) and ev == []
+    t4, ev = observe(t2, None, [], now=120.0)
+    assert t4.status == "CLOSED" and [k for k, _ in ev] == ["CLOSED"]
+
+
+def test_a_position_not_read_yet_gets_its_legs_tried_and_nothing_else():
+    """Coinbase may take a bracket while its positions read lags: its protection is tried, nothing is cancelled or entered."""
+    tr = trade()
+    bare = LiveTrade.from_json({**tr.to_json(), "legs": []})
+    unseen = PlanContext(now=T + 3630.0, ratio=1.0, tick=5.0, entry_contracts=1, entry_unseen=True)
+    acts = plan(target(entry=tentry()), bare, None, [], unseen)
+    assert [type(a).__name__ for a in acts] == ["Protect"] and sum(leg.size for leg in acts[0].legs) == bare.contracts
+    assert plan(target(entry=tentry()), tr, None, resting(tr), unseen) == []  # they rest: nothing to do
+    assert plan(target(entry=tentry()), bare, None, [], CTX) == []  # not an entry unseen: as ever
+
+
+def test_a_held_flat_read_still_keeps_the_unprotected_clock():
+    """Re-review M2: the hold returned before the coverage check, so nothing downstream knew no stop rested."""
+    tr = LiveTrade.from_json({**trade().to_json(), "legs": []})
+    t1, ev = observe(tr, None, [], now=100.0, hold_flat=0)
+    assert t1.unprotected_since == 100.0 and [k for k, _ in ev] == ["POSITION_NOT_SEEN", "UNPROTECTED"]
+    t2, ev = observe(t1, None, [], now=161.0, hold_flat=0)
+    assert t2.unprotected_since == 100.0 and t2.incident_unprotected and [k for k, _ in ev] == ["UNPROTECTED_60S"]
+    # stops that cover what it holds end it, as they do with the position in sight
+    whole = trade(unprotected_since=100.0)
+    t3, ev = observe(whole, None, resting(whole), now=170.0, hold_flat=0)
+    assert t3.unprotected_since is None and "PROTECTED" in [k for k, _ in ev]
+    # what a leg already sold needs no stop: 2 of 3 left, covered by the 2 resting
+    tr = trade()
+    t4, ev = observe(tr, None, resting(tr)[1:], now=100.0, hold_flat=1)
+    assert t4.unprotected_since is None and "UNPROTECTED" not in [k for k, _ in ev]

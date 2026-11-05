@@ -68,7 +68,8 @@ POSITION_DEPENDENT = frozenset({"PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION"})
 
 class ShadowExchange(SimExchange):
     # these reads go to the real exchange (no _fault): inject their faults there, `real.fail_next(...)`
-    FAULT_METHODS = SimExchange.FAULT_METHODS - {"product", "session", "quote", "balance", "key_permissions"}
+    FAULT_METHODS = SimExchange.FAULT_METHODS - {"product", "session", "quote", "balance", "balance_summary",
+                                                 "key_permissions"}
 
     def __init__(self, real: Exchange, journal: Journal, *, clock: Callable[[], float] = time.time,
                  alert: Callable[[str, str], Any] | None = None) -> None:
@@ -116,6 +117,9 @@ class ShadowExchange(SimExchange):
 
     def balance(self) -> Balance:
         return self.real.balance()  # sizing and the CANARY risk-cap check use the real account
+
+    def balance_summary(self) -> dict[str, Any]:
+        return self.real.balance_summary()
 
     def key_permissions(self) -> KeyPermissions:
         return self.real.key_permissions()
@@ -197,7 +201,8 @@ class ShadowExchange(SimExchange):
             self.alert("PREVIEW_FAILED", f"[SHADOW preview 실패] {kind} {client_order_id}: {', '.join(res.errors)}")
 
     def _unverified(self, kind: str, client_order_id: str, order: dict[str, Any], exc: ExchangeError) -> None:
-        """The API did not answer: no verdict on the order (gate ③ neither passes nor fails on it yet)."""
+        """The API did not answer: no verdict on the order. Gate ③ stays unmet while it waits (stage.shadow_gates), and is
+        then decided by the answer."""
         why = f"{type(exc).__name__}: {exc}"[:200]
         items = list(self.journal.get(UNVERIFIED_KEY) or [])
         items.append({"kind": kind, "client_order_id": client_order_id, "order": order, "tries": 0,

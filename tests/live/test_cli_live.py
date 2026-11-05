@@ -240,7 +240,7 @@ def test_run_status_and_backup(live_env, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr("ewbot.cli.time.time", lambda: NOW + 30)
     assert main(["live", "status"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("단계 SHADOW") and "[미충족] 기간 14일 이상" in out
+    assert out.startswith("단계 SHADOW") and "[면제] 기간 14일 이상" in out
     assert main(["live", "status", "--json", "--exchange", "--max-age", "180"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["stage"] == "SHADOW" and data["exchange_position"] is None and data["heartbeat_age"] == 30.0

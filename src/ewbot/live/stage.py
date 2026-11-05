@@ -13,8 +13,8 @@ an order failure the executor did not resolve (`ORDER_UNRESOLVED`, recorded by l
 bracket not replaced within PROTECT_MAX_S, a failed close or reduction not done by the next pass; a failure it
 resolved in time is no CANARY failure). In CANARY each one pauses entries (`on_incident`), and the CANARY pass and
 FULL entry gates are unmet after any of them in the current CANARY stint, while the runtime is paused and
-without a current passing audit. In FULL the major incidents pause and demote to CANARY, and every CANARY
-failure restarts the 30-day clean window of the 3-contract cap (spec 6.2 FULL `이상이 없으면 상한을 해제`).
+without a current passing audit. In FULL the major incidents pause and demote to CANARY; another CANARY failure is
+recorded and alerted (the 3-contract cap for the first 30 clean days was removed: user decision 2026-11-05).
 A failed stint is started again with `restart_stint` (flat, --confirm, a STAGE event `restart`): SHADOW after a
 fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY after a CANARY failure (spec 6.2 `재개는 사용자가 결정한다`,
 no SHADOW again). Every gate of that stage then counts from the restart - days, signals, cycles, previews,
@@ -22,24 +22,33 @@ restarts, trades, failures and the audit's mismatches; without a restart a faile
 
 Gates (spec 6.2), all computed from the journal. Times are the journal's (the VPS clock, NTP-synchronised): a
 clock step moves every window with it.
-  SHADOW pass   >= 14 days and >= 1 signal first known in the stage; (1) decisions equal the paper ledger's (an
-                audit from at or before the stage's start to at most AUDIT_MAX_AGE_S ago, with no mismatch the
-                data do not explain: a DATA_REVISION is shown, not counted);
+  SHADOW pass   (1) decisions equal the paper ledger's (an audit run in the stint, from at or before the stage's start to at
+                most AUDIT_MAX_AGE_S ago, with no mismatch the data do not explain: a DATA_REVISION is shown, not counted;
+                nothing to compare in it is no failure: user decision 2026-11-05);
                 (2) every hourly bar that closed in the stage has a cycle that ended OK within 2 min of the
                 close (a bar with no cycle row at all while the futures session was recorded closed is excused:
                 a span from a SESSION event whose state is not OPEN to the next SESSION or STARTUP event, at most
-                SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due); (3) every would-be order
-                passed preview (at least one did; a bracket Coinbase refused only for want of a position - SHADOW's
-                real account is flat, live/shadow.py PREVIEW_POSITION_DEPENDENT - is counted in the detail, never
-                failing it: the first CANARY trade confirms the brackets); (4) restart test: at least one restart
-                recovered with no unresolved intent.
+                SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due; at least one bar must have been
+                due); (3) no would-be order refused by preview and none still unanswered (no order at all is no failure:
+                user decision 2026-11-05; a bracket Coinbase refused only for want of a position - SHADOW's real account is flat, live/shadow.py
+                PREVIEW_POSITION_DEPENDENT - is counted in the detail, never failing it: the first CANARY trade confirms
+                the brackets); (4) restart test: at least one restart recovered with no unresolved intent.
+                Waived by the user's decision of 2026-11-05 and shown as such (`Gate.waived`), never required: the 14 days
+                and the signal. No code restarts a stint on a deploy - that was an operating rule, also dropped on
+                2026-11-05 -: a deploy is one more start of the same stint.
   CANARY start  SHADOW pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission.
-  CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
-                closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
-                manual intervention; (5) costs measured (a daily summary with fills); no other CANARY failure
-                (audit mismatch, breaker, transfer key); not paused; a current audit without an unexplained
-                mismatch of a decision known in the stint.
-  FULL start    CANARY pass + paper criteria 1-4 all met (incl. 50 out-of-sample trades)."""
+  CANARY pass   >= 3 closed strategy trades or 90 days, or one passed test trade (`ewbot live test-trade`, user decision
+                2026-11-05) - and in any case no failed test trade as the stint's last one -; (1) protection within 30 s of every fill, with at least one protected entry - a strategy
+                trade's or the passed test trade's -; (2) stop moves and closes executed as targeted (no unresolved order
+                failure); (3) never unprotected > 60 s; (4) no manual intervention; (5) costs measured (a daily summary
+                with fills, or the fees the passed test trade measured); no other CANARY failure (audit mismatch, breaker,
+                transfer key); not paused; a current audit without an unexplained mismatch of a decision known in the
+                stint (nothing to compare is no failure).
+                A test trade is no strategy trade: its id is in TEST_IDS_KEY before its first order, and nothing counts it
+                as one (the closed trades here, the cost report in live/runtime.py); its decisions do not exist, so the
+                paper comparison never sees it.
+  FULL start    CANARY pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission (criterion 3,
+                the 50 out-of-sample trades, is no longer required: user decision 2026-11-05)."""
 
 from __future__ import annotations
 
@@ -51,13 +60,13 @@ from typing import Any, Sequence
 from ewbot.live.audit import AuditResult
 from ewbot.live.exchange import SESSION_OPEN, KeyPermissions
 from ewbot.live.journal import Journal
-from ewbot.live.pricing import FULL_CAP_CONTRACTS, FULL_CAP_DAYS
+from ewbot.live.pricing import FULL_CAP_CONTRACTS
+from ewbot.live.shadow import UNVERIFIED_KEY
 from ewbot.paper.decisions import known_at
 from ewbot.types import H1
 
 STAGES = ("SHADOW", "CANARY", "FULL")
 DAY = 86_400
-SHADOW_MIN_DAYS = 14
 CYCLE_DEADLINE_S = 120
 CANARY_MIN_TRADES = 3
 CANARY_MAX_DAYS = 90
@@ -68,8 +77,9 @@ AUDIT_MAX_AGE_S = 3 * 3600  # a gate's audit must reach a bar that closed at mos
 SESSION_CLOSED_MAX_S = 4 * 3600
 PAUSE_KEY = "paused"
 # the manual interventions the runtime's planner still finds, one per (kind, trade id) episode (live/runtime.py):
-# {"items": [[kind, trade id], ...], "ended": when the last of them ended (None: never), "stint": their stage row}
+# {"items": [[kind, trade id], ...], "stint": their stage row}
 RAISED_KEY = "incidents_raised"
+PEAK_REBASE_KEY = "peak_rebase_request"  # a FULL -> CANARY change: the runtime re-bases the guard's peak at its next balance read
 MAJOR = ("UNPROTECTED_60S", "AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY")  # spec 6.2 중대 사건
 # the position changed outside our orders: a foreign order or position, more contracts than the trade holds,
 # fewer than its legs explain (reconcile.observe), the trade's position on the other side (brackets and closes only
@@ -82,6 +92,13 @@ CANARY_FAIL = MAJOR + ("PROTECT_SLOW",) + MANUAL + (ORDER_UNRESOLVED,)
 # on a venue that refuses overlapping brackets the executor cancels the old leg first by design (a replacement that
 # then fails is BRACKET_FAILED). Each one is resolved or becomes ORDER_UNRESOLVED.
 ORDER_FAILURES = ("BRACKET_FAILED", "CLOSE_FAILED", "CLOSE_UNCONFIRMED", "REDUCE_FAILED")
+# the test trade (`ewbot live test-trade`, live/runtime.py): its result, a refusal, the margin values read during it
+TEST_TRADE = "TEST_TRADE"
+TEST_TRADE_REFUSED = "TEST_TRADE_REFUSED"
+TEST_TRADE_MARGIN = "TEST_TRADE_MARGIN"
+TEST_REQUEST_KEY = "test_trade_request"  # the command's request: {"id", "side", "ts"}; the runtime takes it once
+TEST_ACTIVE_KEY = "test_trade_active"  # one is under way: {"request", "trade_id", "side", "ts"} (a crash leaves it)
+TEST_IDS_KEY = "test_trade_ids"  # the ids of every test trade, written before its first order
 
 # gate names: transition() checks that a promotion got every one of its gates, met
 G_DAYS = "기간 14일 이상"
@@ -102,12 +119,11 @@ G_AUDIT_NOW = "모의매매 대조 (최근 감사 통과)"
 G_C1 = "모의매매 1번 (위험 대비 수익)"
 G_C2 = "모의매매 2번 (최대 낙폭)"
 G_C4 = "모의매매 4번 (28일, 원인 불명 0건, 커버리지 95%)"
-G_C3 = "모의매매 3번 (표본 외 50건)"
 G_KEY = "거래 키 권한 (view+trade, 송금 불가)"
-SHADOW_PASS = (G_DAYS, G_SIGNAL, G_AUDIT, G_CYCLES, G_PREVIEW, G_RESTART)
+SHADOW_PASS = (G_AUDIT, G_CYCLES, G_PREVIEW, G_RESTART)  # G_DAYS and G_SIGNAL: waived, user decision 2026-11-05
 CANARY_PASS = (G_TRADES, G_PROTECT, G_ORDERS, G_UNPROTECTED, G_MANUAL, G_COSTS, G_MAJOR, G_RUNNING, G_AUDIT_NOW)
 REQUIRED_GATES = {("SHADOW", "CANARY"): SHADOW_PASS + (G_C1, G_C2, G_C4, G_KEY),
-                  ("CANARY", "FULL"): CANARY_PASS + (G_C1, G_C2, G_C4, G_C3, G_KEY)}
+                  ("CANARY", "FULL"): CANARY_PASS + (G_C1, G_C2, G_C4, G_KEY)}
 
 
 class StageError(RuntimeError):
@@ -119,10 +135,11 @@ class Gate:
     name: str
     met: bool
     detail: str
+    waived: bool = False  # shown for what it says, never blocking: the user decided it is not required
 
 
 def gate_lines(gates: Sequence[Gate]) -> list[str]:
-    return [f"[{'충족' if g.met else '미충족'}] {g.name}: {g.detail}" for g in gates]
+    return [f"[{'면제' if g.waived else '충족' if g.met else '미충족'}] {g.name}: {g.detail}" for g in gates]
 
 
 def _utc(ts: float) -> str:
@@ -143,6 +160,16 @@ def resume(journal: Journal, now: float) -> None:
     journal.add_event(now, "RESUMED", {})
 
 
+def ids_of_test_trades(journal: Journal) -> set[int]:
+    return {int(x) for x in journal.get(TEST_IDS_KEY) or []}
+
+
+def last_test_trade(journal: Journal, since: float) -> dict[str, Any] | None:
+    """The latest test trade of the stint (its TEST_TRADE event): only that one speaks for the gates, a pass or not."""
+    found = journal.events(kind=TEST_TRADE, since=since)
+    return found[-1] if found else None
+
+
 def canary_failures(journal: Journal, since: float) -> dict[str, tuple[int, float]]:
     """The CANARY failures since `since`: kind -> (count, latest time). Read from the INCIDENT events
     (`on_incident`) and from the events of those kinds themselves, so a failure journaled but never handed to
@@ -160,27 +187,31 @@ def canary_failures(journal: Journal, since: float) -> dict[str, tuple[int, floa
     return found
 
 
-def full_cap(journal: Journal, now: float) -> int | None:
-    """The most contracts the journal's current stage allows - never more than the stage that is in force:
-    SHADOW 0 (no real order), CANARY 1, FULL FULL_CAP_CONTRACTS until it has run FULL_CAP_DAYS without a CANARY
-    failure (each one restarts the window, counted from the journal's event times) and with no manual intervention
-    still in force (RAISED_KEY; the window then counts from its end), None (uncapped) only then."""
+def full_cap(journal: Journal) -> int | None:
+    """The most contracts the journal's current stage allows - never more than the stage that is in force: SHADOW 0 (no
+    real order), CANARY 1, FULL None: no contract cap (user decision 2026-11-05: the 3-contract cap for the first 30 clean
+    days is gone; the size is min(risk 10%, 5x, margin maximum with the 70% overnight check)). The one exception never
+    depended on those days and stays: FULL_CAP_CONTRACTS while a manual intervention the runtime still finds is in force
+    (RAISED_KEY: a foreign order left resting)."""
     stage, since = journal.stage()
     if stage == "CANARY":
         return 1
     if stage != "FULL" or since is None:
         return 0
-    raised = journal.get(RAISED_KEY) or {}
-    if raised.get("items"):
-        return FULL_CAP_CONTRACTS
-    ended = [float(raised["ended"])] if raised.get("ended") is not None and float(raised["ended"]) >= float(since) else []
-    clean_from = max([float(since)] + ended + [last for _, last in canary_failures(journal, float(since)).values()])
-    return None if now - clean_from >= FULL_CAP_DAYS * DAY else FULL_CAP_CONTRACTS
+    return FULL_CAP_CONTRACTS if (journal.get(RAISED_KEY) or {}).get("items") else None
+
+
+def _demoted_from_full(journal: Journal, to: str, reason: str, now: float) -> None:
+    """A FULL -> CANARY change (the automatic demotion and the CLI's): FULL's peak was judged against a 30% drawdown, CANARY's
+    guard allows 15%, so the same peak would trip TOTAL_DD at a loss between 15% and 30% on the second read. A request in
+    the journal (it survives a restart) makes the runtime re-base the peak to its next balance read (`rebase_peak`)."""
+    if to == "CANARY":
+        journal.put(PEAK_REBASE_KEY, {"ts": now, "reason": reason})
 
 
 def on_incident(journal: Journal, kind: str, now: float) -> list[str]:
-    """Pause in CANARY for a CANARY failure; in FULL pause and demote to CANARY for a major incident (another
-    CANARY failure keeps the 3-contract cap for 30 more days). Returns what was done."""
+    """Pause in CANARY for a CANARY failure; in FULL pause and demote to CANARY for a major incident (another CANARY
+    failure is recorded, and alerted through `done`). Returns what was done."""
     stage, _ = journal.stage()
     done: list[str] = []
     if (stage == "CANARY" and kind in CANARY_FAIL) or (stage == "FULL" and kind in MAJOR):
@@ -191,9 +222,10 @@ def on_incident(journal: Journal, kind: str, now: float) -> list[str]:
             reason = f"major incident {kind}"
             journal.set_stage("CANARY", reason, now)
             journal.add_event(now, "STAGE", {"from": "FULL", "to": "CANARY", "reason": reason})
+            _demoted_from_full(journal, "CANARY", reason, now)
             done.append("demoted to CANARY")
     elif stage == "FULL" and kind in CANARY_FAIL:
-        done.append(f"{FULL_CAP_CONTRACTS}-contract cap for {FULL_CAP_DAYS} more days")
+        done.append("recorded only")
     journal.add_event(now, "INCIDENT", {"kind": kind, "stage": stage, "done": done})
     return done
 
@@ -212,10 +244,11 @@ def _restarted(journal: Journal) -> bool:
 
 
 def audit_gate(name: str, res: AuditResult | None, since: float, now: float, after: float | None = None) -> Gate:
-    """An audit that covers the stage - its window starts at or before `since` and reaches a bar that closed at most
-    AUDIT_MAX_AGE_S ago - with something compared and no unexplained mismatch (a DATA_REVISION is shown in the
-    detail but explained); with `after`, only mismatches of decisions first known after it count (a CANARY stint).
-    A failed audit (fetch, invalid ledger) is unmet, never the last good one."""
+    """An audit that ran in the stage and covers it - run at or after `since`, its window starting at or before `since` and
+    reaching a bar that closed at most AUDIT_MAX_AGE_S ago - with no unexplained mismatch (a DATA_REVISION is shown in the detail but explained); with
+    `after`, only mismatches of decisions first known after it count (a CANARY stint). Nothing to compare in such an audit
+    is no failure (user decision 2026-11-05: without a signal there may be no decision at all), and the detail says so. A
+    failed audit (fetch, invalid ledger), a stale one or none at all stays unmet, never the last good one."""
     if res is None:
         return Gate(name, False, "미실행")
     if res.error is not None:
@@ -225,6 +258,8 @@ def audit_gate(name: str, res: AuditResult | None, since: float, now: float, aft
         return Gate(name, False, f"오래된 감사: {_utc(hi)} 봉까지 ({_utc(res.as_of)} 실행)")
     if lo > since:
         return Gate(name, False, f"감사 구간이 단계 시작 뒤부터 ({_utc(lo)} 이후)")
+    if res.as_of < since:  # it says nothing of this stint: the next audit runs from minute 50 of the hour
+        return Gate(name, False, f"단계 시작 전 감사 ({_utc(res.as_of)} 실행): 다음 대조를 기다림")
     counted = res.unexplained(after)
     parts = [f"비교 {res.compared}건, 불일치 {len(counted)}건"]
     revisions = sum(1 for m in res.mismatches if m.get("cause") == "DATA_REVISION")
@@ -233,7 +268,9 @@ def audit_gate(name: str, res: AuditResult | None, since: float, now: float, aft
     earlier = len(res.unexplained()) - len(counted)
     if earlier:
         parts.append(f"단계 시작 전 불일치 {earlier}건 제외")
-    return Gate(name, res.compared > 0 and not counted, ", ".join(parts) + f" ({_utc(hi)} 봉까지)")
+    if res.compared == 0:
+        parts.append("비교할 판단 없음 (2026-11-05 결정으로 통과, 신호 기반 대조는 안 됨)")
+    return Gate(name, not counted, ", ".join(parts) + f" ({_utc(hi)} 봉까지)")
 
 
 def _closed_spans(journal: Journal, since: float, now: float) -> list[tuple[float, float]]:
@@ -289,35 +326,35 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     unverifiable = len(journal.events(kind="PREVIEW_POSITION_DEPENDENT", since=since))
     if unverifiable:
         preview += f", 포지션이 없어 확인 못 한 브래킷 {unverifiable}건 (CANARY 첫 거래에서 확인)"
+    # no verdict yet on an order Coinbase has not answered for (live/shadow.py asks again every cycle): no pass either
+    unanswered = [u for u in journal.get(UNVERIFIED_KEY) or [] if float(u.get("ts", since)) >= since]
+    if unanswered:
+        preview += f", 답을 못 받은 preview {len(unanswered)}건"
     recoveries = journal.events(kind="RECOVERY", since=since)
     clean = [r for r in recoveries if not r["data"].get("unknown")]
     return [
-        Gate(G_DAYS, days >= SHADOW_MIN_DAYS, f"{days:.1f}/{SHADOW_MIN_DAYS}일"),
-        Gate(G_SIGNAL, len(signals) >= 1, f"단계 중 알게 된 신호 {len(signals)}건"),
+        Gate(G_DAYS, True, f"{days:.1f}일 (2026-11-05 결정으로 면제)", waived=True),
+        Gate(G_SIGNAL, True, f"단계 중 알게 된 신호 {len(signals)}건 (2026-11-05 결정으로 면제)", waived=True),
         # the first SHADOW audits the whole epoch; a restarted one counts the mismatches of its own decisions
         audit_gate(G_AUDIT, audit_result, since, now, after=since if _restarted(journal) else None),
         _cycle_gate(journal, since, now),
-        Gate(G_PREVIEW, bool(previews) and not failed, preview),
+        Gate(G_PREVIEW, not failed and not unanswered, preview),  # no would-be order at all is no failure (2026-11-05)
         Gate(G_RESTART, len(recoveries) >= 2 and len(clean) == len(recoveries),
              f"재시작 복구 {len(recoveries)}회 (첫 시작 포함), 미해결 {len(recoveries) - len(clean)}회"),
     ]
 
 
-def _paper_gates(paper_status: dict[str, Any] | None, full: bool) -> list[Gate]:
+def _paper_gates(paper_status: dict[str, Any] | None) -> list[Gate]:
     if paper_status is None:
         return [Gate("모의매매 판정", False, "paper ledger를 읽지 못함")]
     c4 = paper_status.get("c4") or {}
-    gates = [
+    return [
         Gate(G_C1, bool(paper_status.get("c1")), str(paper_status.get("c1"))),
         Gate(G_C2, bool(paper_status.get("c2")), str(paper_status.get("c2"))),
         Gate(G_C4, bool(c4.get("met")),
              f"{float(c4.get('days', 0.0)):.1f}일, 커버리지 {float(c4.get('coverage', 0.0)) * 100:.1f}%, "
              f"원인 불명 {c4.get('unexplained')}건"),
     ]
-    if full:
-        count = paper_status.get("count") or {}
-        gates.append(Gate(G_C3, bool(paper_status.get("c3")), f"{count.get('total')}/{count.get('required')}"))
-    return gates
 
 
 def _key_gate(perms: KeyPermissions | None) -> Gate:
@@ -329,7 +366,7 @@ def _key_gate(perms: KeyPermissions | None) -> Gate:
 
 def canary_entry_gates(journal: Journal, now: float, audit_result: AuditResult | None,
                        paper_status: dict[str, Any] | None, perms: KeyPermissions | None) -> list[Gate]:
-    return shadow_gates(journal, now, audit_result) + _paper_gates(paper_status, full=False) + [_key_gate(perms)]
+    return shadow_gates(journal, now, audit_result) + _paper_gates(paper_status) + [_key_gate(perms)]
 
 
 def _counted(found: dict[str, tuple[int, float]], kinds: Sequence[str]) -> tuple[bool, str]:
@@ -342,9 +379,18 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     if since is None:
         return [Gate("CANARY 단계", False, "현재 단계가 CANARY가 아님")]
     days = (now - since) / DAY
-    n_closed = len({e["data"]["trade_id"] for e in journal.events(kind="CLOSED", since=since) if e["data"].get("trade_id")})
-    protected = journal.events(kind="PROTECTED_FIRST", since=since)
-    slow = [p for p in protected if p["data"]["after_entry_s"] > PROTECT_MAX_S]
+    tests, last = ids_of_test_trades(journal), last_test_trade(journal, since)
+    passed = [last] if last is not None and last["data"].get("ok") else []  # a later failure closes what a pass opened
+    n_closed = len({e["data"]["trade_id"] for e in journal.events(kind="CLOSED", since=since)
+                    if e["data"].get("trade_id") and int(e["data"]["trade_id"]) not in tests})
+    every = journal.events(kind="PROTECTED_FIRST", since=since)
+    slow = [p for p in every if p["data"]["after_entry_s"] > PROTECT_MAX_S]  # a test trade's as well: it is the same path
+    shown = {int(e["data"]["trade_id"]) for e in passed}  # of the test trades, only a passed one shows protection
+    protected = [p for p in every if int(p["data"].get("trade_id") or 0) not in tests - shown]
+    fast = [p for p in protected if p["data"]["after_entry_s"] <= PROTECT_MAX_S]
+    fees = [float(e["data"]["fees"]) for e in passed if e["data"].get("fees") is not None]
+    # a fee that stayed 0 may be unsettled, or truly free: it passes - it must not lock FULL for ever - in plain sight
+    free = any(e["data"].get(k) == 0 for e in passed for k in ("fees", "entry_fee", "close_fee"))
     found = canary_failures(journal, since)
     costs = journal.events(kind="COSTS", since=since)
     p = paused(journal)
@@ -357,12 +403,18 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
         major += f" · 손실 한도 기준 재설정 {rebased}회"
     slow_ok = not slow and "PROTECT_SLOW" not in found
     return [
-        Gate(G_TRADES, n_closed >= CANARY_MIN_TRADES or days >= CANARY_MAX_DAYS, f"{n_closed}건, {days:.1f}일"),
-        Gate(G_PROTECT, bool(protected) and slow_ok, f"{len(protected) - len(slow)}/{len(protected)}"),
+        Gate(G_TRADES, (last is None or bool(passed)) and (n_closed >= CANARY_MIN_TRADES or days >= CANARY_MAX_DAYS
+                                                            or bool(passed)),
+             f"{n_closed}건, {days:.1f}일, " + ("마지막 시험 거래 실패" if last is not None and not passed
+                                               else f"시험 거래 성공 {len(passed)}건")),
+        Gate(G_PROTECT, bool(protected) and slow_ok,
+             f"{len(fast)}/{len(protected)}" + (" (성공한 시험 거래 포함)" if shown else "")),
         Gate(G_ORDERS, orders_ok, f"해결되지 않은 주문 실패: {orders}"),
         Gate(G_UNPROTECTED, unprotected_ok, unprotected),
         Gate(G_MANUAL, manual_ok, manual),
-        Gate(G_COSTS, bool(costs), f"비용 보고 {len(costs)}회"),
+        Gate(G_COSTS, bool(costs) or bool(fees),
+             f"비용 보고 {len(costs)}회" + (f", 시험 거래 수수료 실측 {fees[-1]:.2f} USD" if fees else "")
+             + (", 수수료 0 (확인 필요)" if free else "")),
         Gate(G_MAJOR, major_ok, major),
         Gate(G_RUNNING, p is None, "운영 중" if p is None else f"일시 정지: {p['reason']}"),
         audit_gate(G_AUDIT_NOW, audit_result, since, now, after=since),
@@ -371,7 +423,7 @@ def canary_gates(journal: Journal, now: float, audit_result: AuditResult | None)
 
 def full_entry_gates(journal: Journal, now: float, audit_result: AuditResult | None,
                      paper_status: dict[str, Any] | None, perms: KeyPermissions | None) -> list[Gate]:
-    return canary_gates(journal, now, audit_result) + _paper_gates(paper_status, full=True) + [_key_gate(perms)]
+    return canary_gates(journal, now, audit_result) + _paper_gates(paper_status) + [_key_gate(perms)]
 
 
 def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, confirm: bool, flat: bool) -> None:
@@ -400,6 +452,8 @@ def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, 
     reason = "promotion" if promotion else "demotion"
     journal.set_stage(to, reason, now)
     journal.add_event(now, "STAGE", {"from": cur, "to": to, "reason": reason})
+    if cur == "FULL":
+        _demoted_from_full(journal, to, reason, now)
 
 
 def restart_stint(journal: Journal, stage: str, now: float, *, confirm: bool, flat: bool) -> None:

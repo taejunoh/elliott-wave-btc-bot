@@ -5,10 +5,12 @@ import math
 
 import pytest
 
-from ewbot.config import AGGRESSIVE, BotConfig
+from ewbot.config import AGGRESSIVE, BotConfig, RiskProfile
 from ewbot.live.pricing import (
     BASIS_BAND,
     CANARY_MAX_RISK,
+    FULL_RISK,
+    MARGIN_ENTRY_MAX,
     BasisOutOfBand,
     basis_ratio,
     map_level,
@@ -124,9 +126,10 @@ def test_stage_contracts_fails_closed_on_bad_sizing_inputs():
     assert stage_contracts("CANARY", **good)[0] == 1
 
 
-def test_full_uses_the_frozen_sizing_with_the_conservative_profile_and_the_cap():
+def test_full_uses_the_frozen_sizing_with_the_full_profile_and_the_cap():
+    """User decision 2026-11-05: FULL sizes with FULL_RISK (10%, 5x), not cfg.risk (the paper replay stays conservative)."""
     kw = dict(entry=60_000.0, stop=59_400.0, direction=1, risk_mult=1.0, cfg=CFG)
-    expected = size_contracts(20_000.0, 60_000.0, 59_400.0, 1, CFG.risk, 1.0, CFG.costs)
+    expected = size_contracts(20_000.0, 60_000.0, 59_400.0, 1, FULL_RISK, 1.0, CFG.costs)
     assert expected > 3
     assert stage_contracts("FULL", equity=20_000.0, **kw) == (expected, f"full: {expected}")
     assert stage_contracts("FULL", equity=20_000.0, full_cap=3, **kw)[0] == 3
@@ -138,6 +141,50 @@ def test_full_uses_the_frozen_sizing_with_the_conservative_profile_and_the_cap()
         stage_contracts("FULL", equity=20_000.0, full_cap=-1, **kw)
     with pytest.raises(ValueError):
         stage_contracts("PAPER", equity=1.0, **kw)
+
+
+def test_full_risk_profile_is_ten_percent_and_five_x():
+    assert FULL_RISK == RiskProfile("full", 0.10, 5.0)  # user decision 2026-11-05
+
+
+def test_full_sizes_ten_percent_of_equity_at_a_hand_computed_case():
+    """equity 10,000, long, entry 80,000, stop 78,400, default costs (slippage 0.0005, contract 0.01 BTC):
+    distance = 1,600 + 0.0005 * (80,000 + 78,400) = 1,600 + 79.2 = 1,679.2
+    risk USD = 10,000 * 0.10 * 1.0 = 1,000;  qty = 1,000 / 1,679.2 = 0.59552 BTC  (the 5x cap would allow 0.625: not binding)
+    contracts = floor(0.59552 / 0.01) = floor(59.55) = 59."""
+    kw = dict(equity=10_000.0, entry=80_000.0, stop=78_400.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("FULL", **kw) == (59, "full: 59")
+    assert stage_contracts("FULL", full_cap=3, **kw) == (3, "full: 59 capped at 3")
+
+
+def test_full_leverage_cap_binds_at_five_x_on_a_narrow_stop():
+    """entry 80,000, stop 79,900: distance = 100 + 0.0005 * 159,900 = 179.95, uncapped qty = 1,000 / 179.95 = 5.557 BTC
+    (555 contracts); the cap is equity * 5 / entry = 0.625 BTC = 62.5 -> 62 contracts (4.96x)."""
+    kw = dict(equity=10_000.0, entry=80_000.0, stop=79_900.0, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("FULL", direction=1, **kw) == (62, "full: 62")
+    short = dict(kw, stop=80_100.0)
+    assert stage_contracts("FULL", direction=-1, **short) == (62, "full: 62")
+
+
+def test_full_margin_check_binds_before_the_leverage_cap():
+    """59 contracts at 80,000 are 4.72x notional; the overnight margin (0.21025 long) projects
+    59 * 800 * 0.21025 / 10,000 = 99.2% of equity, above MARGIN_ENTRY_MAX 70%: the runtime reduces a FULL entry to the margin maximum (SHADOW/CANARY refuse).
+    The most that passes is floor(0.70 * 10,000 / (800 * 0.21025)) = floor(41.6) = 41 contracts."""
+    n, _ = stage_contracts("FULL", equity=10_000.0, entry=80_000.0, stop=78_400.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert n == 59
+    ratio = margin_ratio(n, 80_000.0, 1, BIP_SPEC, 10_000.0)
+    assert ratio == pytest.approx(0.99238, abs=1e-5) and ratio > MARGIN_ENTRY_MAX
+    m = max_contracts_for_margin(80_000.0, 1, BIP_SPEC, 10_000.0)
+    assert m == 41 and margin_ratio(m, 80_000.0, 1, BIP_SPEC, 10_000.0) <= MARGIN_ENTRY_MAX
+    assert margin_ratio(m + 1, 80_000.0, 1, BIP_SPEC, 10_000.0) > MARGIN_ENTRY_MAX
+
+
+def test_canary_and_shadow_sizing_is_unchanged_by_the_full_profile():
+    kw = dict(equity=10_000.0, entry=80_000.0, stop=78_400.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("CANARY", **kw) == (1, "canary: 1 contract")
+    assert stage_contracts("SHADOW", **kw) == (1, "shadow: 1 contract")
+    assert CANARY_MAX_RISK == 0.15
+    assert stage_contracts("CANARY", full_cap=50, **kw)[0] == 1
 
 
 def test_margin_projection_uses_the_overnight_rate():

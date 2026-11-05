@@ -6,7 +6,10 @@ the engine's target (live/target.py) and the exchange's position and open orders
   1. `observe` folds exchange facts into the trade: flat -> CLOSED (but a flat read while every leg of the trade
      still rests with all the trade holds - nothing of them filled, so no bracket explains it - is unconfirmed,
      FLAT_UNCONFIRMED: the trade stays OPEN, nothing is cancelled or entered, and the next read decides: flat again
-     -> CLOSED, the position again -> it was a wrong read); a reduce of ours that the executor
+     -> CLOSED, the position again -> it was a wrong read; and a flat read the caller holds - a filled entry no read has
+     shown yet, nothing but filled legs to explain it: `hold_flat`, the runtime reads the legs - does not close it at all,
+     POSITION_NOT_SEEN: /cfm/positions can lag the fill the order shows, and the unprotected clock runs on what the trade
+     still holds); a reduce of ours that the executor
      recorded before sending it (`pending_reduce`, intent before state) and that now shows in the position
      is ours whatever its answer was (REDUCE_SETTLED: TP1_SYNC -> the live TP1, MARGIN -> a smaller trade;
      a filled reduce the position still does not show after REDUCE_SETTLE_S yields to the position,
@@ -27,8 +30,9 @@ the engine's target (live/target.py) and the exchange's position and open orders
          one is then the incident) -, never left unprotected until a target comes; any other is alerted;
        - within the hour after an entry the replay still shows it as queued (`target.entry`): the live
          trade of that signal is the engine position (`pending_position`), never a reason to close;
-       - flat: nothing while the trade is still OPEN (its flat read is unconfirmed: observe); else cancel our
-         leftover orders; enter when the engine queued an entry at the last close
+       - flat: nothing while the trade is still OPEN (its flat read is unconfirmed: observe), but its legs are tried
+         while its entry was not read yet (`ctx.entry_unseen`: the venue may take a bracket before its read shows the
+         position); else cancel our leftover orders; enter when the engine queued an entry at the last close
          (never a signal the live trade already traded: closed early by its bracket, it is not
          re-entered);
        - engine flat / another trade / exit queued (TIME, LINEAGE, BREAKER, FLIP, ...): close, then
@@ -73,6 +77,7 @@ from ewbot.live.target import Target, TargetEntry, TargetPosition
 PREFIX = "ewb-"
 UNPROTECTED_MAX_S = 60.0  # spec 6.2: a position unprotected for longer is a major incident
 REDUCE_SETTLE_S = 60.0  # a reduce the venue reported filled but the position does not show by then: the position wins
+ENTRY_NOT_SEEN = "ENTRY_NOT_SEEN"  # the exit of a filled entry whose position no read showed in time (executor.ENTRY_SHOW_MAX_S)
 
 
 def entry_cid(signal_ts: int, direction: int) -> str:
@@ -211,6 +216,7 @@ class PlanContext:
     # intent opens (`entry_position`; the runtime: Executor.unsettled_entry): without a target a position on its side
     # is taken over from it
     own_entry: TargetPosition | None = None
+    entry_unseen: bool = False  # the open trade's entry filled and no read has shown its position yet (Executor.entry_unseen)
 
     def __post_init__(self) -> None:
         if self.max_contracts is not None and self.max_contracts < 1:
@@ -297,6 +303,11 @@ def _fold_reduction(t: LiveTrade, n: int, orders: list[Order]) -> tuple[str, dic
     return "UNEXPLAINED_REDUCTION", {"trade_id": t.trade_id, "expected": expected, "position": n}
 
 
+def legs_left(trade: LiveTrade, orders: list[Order]) -> int:
+    """Contracts the trade's resting legs still have to fill."""
+    return sum(max(o.size - o.filled, 0) for _, o in _open_legs(trade, orders))
+
+
 def _legs_whole(trade: LiveTrade, orders: list[Order]) -> bool:
     """Every leg of the trade still rests, and together they still hold all the trade holds: nothing of them filled
     (a flat position is then explained by no bracket of ours)."""
@@ -305,14 +316,39 @@ def _legs_whole(trade: LiveTrade, orders: list[Order]) -> bool:
             and sum(o.size - o.filled for _, o in resting) >= expected_contracts(trade))
 
 
-def observe(trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float
-            ) -> tuple[LiveTrade | None, list[tuple[str, dict[str, Any]]]]:
-    """Fold exchange facts into the trade (a modified copy) and return the events they raise."""
+def _track_cover(t: LiveTrade, held: int, orders: list[Order], now: float, events: list[tuple[str, dict[str, Any]]]) -> None:
+    """The unprotected clock: resting stop legs cover `held` contracts, or not since when (a major incident after 60 s)."""
+    covered = sum(o.size - o.filled for leg, o in _open_legs(t, orders) if o.stop_price is not None)
+    if covered >= held:
+        if t.unprotected_since is not None:
+            events.append(("PROTECTED", {"trade_id": t.trade_id, "after_s": round(now - t.unprotected_since, 3)}))
+        t.unprotected_since = None
+        t.incident_unprotected = False  # the incident ends here: a later gap is a new one
+    else:
+        if t.unprotected_since is None:
+            t.unprotected_since = now
+            events.append(("UNPROTECTED", {"trade_id": t.trade_id, "covered": covered, "position": held}))
+        elif now - t.unprotected_since > UNPROTECTED_MAX_S and not t.incident_unprotected:
+            t.incident_unprotected = True
+            events.append(("UNPROTECTED_60S", {"trade_id": t.trade_id, "since": t.unprotected_since}))
+
+
+def observe(trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float,
+            hold_flat: int | None = None) -> tuple[LiveTrade | None, list[tuple[str, dict[str, Any]]]]:
+    """Fold exchange facts into the trade (a modified copy) and return the events they raise. `hold_flat`: a flat read that
+    must not close the trade, and the contracts its legs already sold (module docstring; decided by the caller: this
+    module does no I/O)."""
     if trade is None or trade.status != "OPEN":
         return trade, []
     t = LiveTrade.from_json(trade.to_json())
     events: list[tuple[str, dict[str, Any]]] = []
     if position is None:
+        if hold_flat is not None:
+            if t.flat_seen is None:
+                t.flat_seen = now
+                events.append(("POSITION_NOT_SEEN", {"trade_id": t.trade_id}))
+            _track_cover(t, max(expected_contracts(t) - hold_flat, 0), orders, now, events)
+            return t, events
         if t.flat_seen is None and _legs_whole(t, orders):  # one flat read the legs contradict: the next decides
             t.flat_seen = now
             events.append(("FLAT_UNCONFIRMED", {"trade_id": t.trade_id}))
@@ -337,19 +373,7 @@ def observe(trade: LiveTrade | None, position: Position | None, orders: list[Ord
     held = _held(t, position.contracts)
     if held < expected_contracts(t):
         events.append(_fold_reduction(t, held, orders))
-    covered = sum(o.size - o.filled for leg, o in _open_legs(t, orders) if o.stop_price is not None)
-    if covered >= held:
-        if t.unprotected_since is not None:
-            events.append(("PROTECTED", {"trade_id": t.trade_id, "after_s": round(now - t.unprotected_since, 3)}))
-        t.unprotected_since = None
-        t.incident_unprotected = False  # the incident ends here: a later gap is a new one
-    else:
-        if t.unprotected_since is None:
-            t.unprotected_since = now
-            events.append(("UNPROTECTED", {"trade_id": t.trade_id, "covered": covered, "position": held}))
-        elif now - t.unprotected_since > UNPROTECTED_MAX_S and not t.incident_unprotected:
-            t.incident_unprotected = True
-            events.append(("UNPROTECTED_60S", {"trade_id": t.trade_id, "since": t.unprotected_since}))
+    _track_cover(t, held, orders, now, events)
     return t, events
 
 
@@ -506,6 +530,8 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
 
     if position is None:
         if open_trade is not None:  # its flat read is unconfirmed (observe): nothing cancelled or entered until the next
+            if ctx.entry_unseen:
+                return acts + _protection(open_trade, orders, expected_contracts(open_trade), open_trade.stop_spot, ctx)
             return acts
         if ours:
             acts.append(Cancel(tuple(o.order_id for o in ours), "FLAT"))
