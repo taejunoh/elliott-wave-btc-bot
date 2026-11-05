@@ -13,8 +13,8 @@ an order failure the executor did not resolve (`ORDER_UNRESOLVED`, recorded by l
 bracket not replaced within PROTECT_MAX_S, a failed close or reduction not done by the next pass; a failure it
 resolved in time is no CANARY failure). In CANARY each one pauses entries (`on_incident`), and the CANARY pass and
 FULL entry gates are unmet after any of them in the current CANARY stint, while the runtime is paused and
-without a current passing audit. In FULL the major incidents pause and demote to CANARY, and every CANARY
-failure restarts the 30-day clean window of the 3-contract cap (spec 6.2 FULL `이상이 없으면 상한을 해제`).
+without a current passing audit. In FULL the major incidents pause and demote to CANARY; another CANARY failure is
+recorded and alerted (the 3-contract cap for the first 30 clean days was removed: user decision 2026-11-05).
 A failed stint is started again with `restart_stint` (flat, --confirm, a STAGE event `restart`): SHADOW after a
 fix (spec 6.2 `수정한 뒤 SHADOW를 다시 한다`), CANARY after a CANARY failure (spec 6.2 `재개는 사용자가 결정한다`,
 no SHADOW again). Every gate of that stage then counts from the restart - days, signals, cycles, previews,
@@ -55,7 +55,7 @@ from typing import Any, Sequence
 from ewbot.live.audit import AuditResult
 from ewbot.live.exchange import SESSION_OPEN, KeyPermissions
 from ewbot.live.journal import Journal
-from ewbot.live.pricing import FULL_CAP_CONTRACTS, FULL_CAP_DAYS
+from ewbot.live.pricing import FULL_CAP_CONTRACTS
 from ewbot.paper.decisions import known_at
 from ewbot.types import H1
 
@@ -71,7 +71,7 @@ AUDIT_MAX_AGE_S = 3 * 3600  # a gate's audit must reach a bar that closed at mos
 SESSION_CLOSED_MAX_S = 4 * 3600
 PAUSE_KEY = "paused"
 # the manual interventions the runtime's planner still finds, one per (kind, trade id) episode (live/runtime.py):
-# {"items": [[kind, trade id], ...], "ended": when the last of them ended (None: never), "stint": their stage row}
+# {"items": [[kind, trade id], ...], "stint": their stage row}
 RAISED_KEY = "incidents_raised"
 PEAK_REBASE_KEY = "peak_rebase_request"  # a FULL -> CANARY change: the runtime re-bases the guard's peak at its next balance read
 MAJOR = ("UNPROTECTED_60S", "AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY")  # spec 6.2 중대 사건
@@ -164,22 +164,18 @@ def canary_failures(journal: Journal, since: float) -> dict[str, tuple[int, floa
     return found
 
 
-def full_cap(journal: Journal, now: float) -> int | None:
-    """The most contracts the journal's current stage allows - never more than the stage that is in force:
-    SHADOW 0 (no real order), CANARY 1, FULL FULL_CAP_CONTRACTS until it has run FULL_CAP_DAYS without a CANARY
-    failure (each one restarts the window, counted from the journal's event times) and with no manual intervention
-    still in force (RAISED_KEY; the window then counts from its end), None (uncapped) only then."""
+def full_cap(journal: Journal) -> int | None:
+    """The most contracts the journal's current stage allows - never more than the stage that is in force: SHADOW 0 (no
+    real order), CANARY 1, FULL None: no contract cap (user decision 2026-11-05: the 3-contract cap for the first 30 clean
+    days is gone; the size is min(risk 10%, 5x, margin maximum with the 70% overnight check)). The one exception never
+    depended on those days and stays: FULL_CAP_CONTRACTS while a manual intervention the runtime still finds is in force
+    (RAISED_KEY: a foreign order left resting)."""
     stage, since = journal.stage()
     if stage == "CANARY":
         return 1
     if stage != "FULL" or since is None:
         return 0
-    raised = journal.get(RAISED_KEY) or {}
-    if raised.get("items"):
-        return FULL_CAP_CONTRACTS
-    ended = [float(raised["ended"])] if raised.get("ended") is not None and float(raised["ended"]) >= float(since) else []
-    clean_from = max([float(since)] + ended + [last for _, last in canary_failures(journal, float(since)).values()])
-    return None if now - clean_from >= FULL_CAP_DAYS * DAY else FULL_CAP_CONTRACTS
+    return FULL_CAP_CONTRACTS if (journal.get(RAISED_KEY) or {}).get("items") else None
 
 
 def _demoted_from_full(journal: Journal, to: str, reason: str, now: float) -> None:
@@ -191,8 +187,8 @@ def _demoted_from_full(journal: Journal, to: str, reason: str, now: float) -> No
 
 
 def on_incident(journal: Journal, kind: str, now: float) -> list[str]:
-    """Pause in CANARY for a CANARY failure; in FULL pause and demote to CANARY for a major incident (another
-    CANARY failure keeps the 3-contract cap for 30 more days). Returns what was done."""
+    """Pause in CANARY for a CANARY failure; in FULL pause and demote to CANARY for a major incident (another CANARY
+    failure is recorded, and alerted through `done`). Returns what was done."""
     stage, _ = journal.stage()
     done: list[str] = []
     if (stage == "CANARY" and kind in CANARY_FAIL) or (stage == "FULL" and kind in MAJOR):
@@ -206,7 +202,7 @@ def on_incident(journal: Journal, kind: str, now: float) -> list[str]:
             _demoted_from_full(journal, "CANARY", reason, now)
             done.append("demoted to CANARY")
     elif stage == "FULL" and kind in CANARY_FAIL:
-        done.append(f"{FULL_CAP_CONTRACTS}-contract cap for {FULL_CAP_DAYS} more days")
+        done.append("recorded only")
     journal.add_event(now, "INCIDENT", {"kind": kind, "stage": stage, "done": done})
     return done
 

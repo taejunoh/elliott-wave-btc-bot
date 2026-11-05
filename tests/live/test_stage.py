@@ -652,30 +652,31 @@ def test_canary_needs_three_trades_or_ninety_days(tmp_path):
     jr.close()
 
 
-def test_the_cap_is_the_journal_stages_and_lifts_only_after_30_clean_days_of_full(tmp_path):
+def test_the_cap_is_the_journal_stages_and_full_has_none(tmp_path):
+    """User decision 2026-11-05: no 3-contract ramp and no clean-days window. FULL sizes by the risk, the 5x cap and the
+    margin maximum from its first minute; a CANARY failure that is no major incident changes nothing about the size."""
     jr = journal(tmp_path)
-    assert full_cap(jr, S0) == 0  # no stage yet: SHADOW, no real order
+    assert full_cap(jr) == 0  # no stage yet: SHADOW, no real order
     jr.set_stage("CANARY", "promotion", S0)
-    assert full_cap(jr, S0 + 1) == 1
+    assert full_cap(jr) == 1
     jr.set_stage("FULL", "promotion", S0 + 5)
-    assert full_cap(jr, S0 + 6) == 3 and full_cap(jr, S0 + 5 + 30 * DAY) is None
-    assert on_incident(jr, "FOREIGN_ORDERS", S0 + 20 * DAY) == ["3-contract cap for 30 more days"]  # not major
-    assert full_cap(jr, S0 + 5 + 30 * DAY) == 3 and full_cap(jr, S0 + 50 * DAY) is None
-    jr.add_event(S0 + 55 * DAY, "ORDER_UNRESOLVED", {"trade_id": 7, "kind": "CLOSE_FAILED"})  # even without its incident
-    assert full_cap(jr, S0 + 84 * DAY) == 3 and full_cap(jr, S0 + 85 * DAY) is None
+    assert full_cap(jr) is None  # at once, not after 30 days
+    assert on_incident(jr, "FOREIGN_ORDERS", S0 + 20 * DAY) == ["recorded only"]  # not major: still alerted, no cap comes back
+    jr.add_event(S0 + 55 * DAY, "ORDER_UNRESOLVED", {"trade_id": 7, "kind": "CLOSE_FAILED"})
+    assert full_cap(jr) is None
     kw = dict(equity=200_000.0, entry=60_000.0, stop=59_400.0, direction=1, risk_mult=1.0, cfg=BotConfig())
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY), **kw)[0] == 1666  # released: uncapped (FULL_RISK: 10% would be 3,032 contracts; the 5x cap, 200,000 * 5 / 60,000 / 0.01 = 1,666.7, binds)
-    # a manual intervention the runtime still finds (a foreign order left resting) keeps the cap while it lasts,
-    # and the 30 clean days count from its end
-    jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "ended": None, "stint": S0 + 5})
-    assert full_cap(jr, S0 + 150 * DAY) == 3
-    jr.put(RAISED_KEY, {"items": [], "ended": S0 + 151 * DAY, "stint": S0 + 5})
-    assert full_cap(jr, S0 + 180 * DAY) == 3 and full_cap(jr, S0 + 181 * DAY) is None
+    assert stage_contracts("FULL", full_cap=full_cap(jr), **kw)[0] == 1666  # FULL_RISK: 10% would be 3,032 contracts; the 5x cap, 200,000 * 5 / 60,000 / 0.01 = 1,666.7, binds
+    # the safety behavior that does not depend on the 30 days stays: a manual intervention the runtime still finds (a
+    # foreign order left resting) keeps 3 contracts while it lasts, and nothing longer: its end lifts it at once
+    jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "stint": S0 + 5})
+    assert full_cap(jr) == 3
+    jr.put(RAISED_KEY, {"items": [], "stint": S0 + 5})
+    assert full_cap(jr) is None
     # a major incident demotes in the journal while the FULL process still runs: the cap is CANARY's at once
     assert on_incident(jr, "UNPROTECTED_60S", S0 + 186 * DAY) == ["paused", "demoted to CANARY"]
     resume(jr, S0 + 186 * DAY + 1)
-    assert full_cap(jr, S0 + 186 * DAY + 2) == 1
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 186 * DAY + 2), **kw)[0] == 1
+    assert full_cap(jr) == 1
+    assert stage_contracts("FULL", full_cap=full_cap(jr), **kw)[0] == 1
     assert jr.events(kind="STAGE")[-1]["data"] == {"from": "FULL", "to": "CANARY",
                                                    "reason": "major incident UNPROTECTED_60S"}
     jr.close()

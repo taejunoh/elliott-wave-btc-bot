@@ -4,9 +4,10 @@ decisions, stops, TPs and exits must match the paper replay of the same bars.
 Three walks cover every exit path of the strategy's trades on the synthetic series: a short closed by
 its TIME stop (exit queued at a close, executed by the runtime), a short with a trailing stop that is
 stopped out (bracket), and a long with a trailing stop, TP1 + break-even and TP2 (brackets). The basis
-ratio is 1.0005, so every futures level is the spot level x 1.0005 on the $5 tick. The walks run in the
-first 30 days of FULL (3 contracts: a 1-contract TP1 leg and a 2-contract TP2 leg), so the live trade
-follows the engine's TP1 / break-even / TP2 path; a 1-contract CANARY trade exits whole at TP1.
+ratio is 1.0005, so every futures level is the spot level x 1.0005 on the $5 tick. The walks run in FULL
+at a size held to 3 contracts (a 1-contract TP1 leg and a 2-contract TP2 leg; FULL itself has no contract cap since
+2026-11-05), so the live trade follows the engine's TP1 / break-even / TP2 path; a 1-contract CANARY trade exits whole
+at TP1.
 
 The levels are checked at the venue - every bracket and fill the SimExchange received, each leg named by its
 client order id - against futures levels computed here from the engine's spot levels and the rule of Plan 3
@@ -62,7 +63,7 @@ def reference():
 @pytest.fixture(scope="module", params=sorted(WALKS))
 def walked(request, tmp_path_factory, reference):
     start, end = WALKS[request.param]
-    h = Harness(tmp_path_factory.mktemp(request.param), start + 30, stage="FULL", stage_days=10, ratio=RATIO)
+    h = Harness(tmp_path_factory.mktemp(request.param), start + 30, stage="FULL", stage_days=10, capped=3, ratio=RATIO)
     h.price(float(h.bar(start)["open"]))
     h.rt.startup()
     h.walk(start, end)

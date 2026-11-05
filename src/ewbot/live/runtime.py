@@ -381,7 +381,7 @@ class LiveRuntime:
         self.observed_close: float | None = None  # monotonic: a trade closed by observation (not by our own close)
         raised = self.journal.get(RAISED_KEY) or {}  # the planned manual incidents in force, and their stint
         self.raised = {(str(k), int(t)) for k, t in raised.get("items", [])}
-        self.raised_stint, self.raised_ended = raised.get("stint"), raised.get("ended")
+        self.raised_stint = raised.get("stint")
         self.active = self._fast()  # from the journal: a restart polls fast and watches at once
 
     # ------------------------------------------------------------------ helpers
@@ -457,14 +457,14 @@ class LiveRuntime:
             again = " (재개는 /resume)" if "paused" in done else ""
             self.alert("INCIDENT", f"[{label}] {kind}: {', '.join(done)}{again}")
 
-    def _limits(self, now: float) -> tuple[str, int | None]:
+    def _limits(self) -> tuple[str, int | None]:
         """(stage to size with, contract cap), read from the journal before every entry and adoption: the more
         conservative of the stage this process runs in and the journal's - an incident's or the CLI's demotion
         applies to the next order at once, not only after the restart - and `stage.full_cap`, the journal stage's
-        maximum (0 in SHADOW: no real order; 1 in CANARY; 3 in FULL until released)."""
+        maximum (0 in SHADOW: no real order; 1 in CANARY; None in FULL, 3 while a manual intervention is in force)."""
         cur, _ = self.journal.stage()
         stage = min(self.stage, cur if cur in STAGES else "SHADOW", key=STAGES.index)
-        return stage, full_cap(self.journal, now)
+        return stage, full_cap(self.journal)
 
     def _ctx(self, now: float) -> PlanContext:
         ratio = price = None
@@ -483,7 +483,7 @@ class LiveRuntime:
         session_open = self.session is not None and self.session.is_open
         n, block = self._entry_size(now, ratio, session_open)
         tick = self.product.price_increment if self.product is not None else 5.0
-        stage, cap = self._limits(now)
+        stage, cap = self._limits()
         most = cap if stage == "FULL" else 1  # the stage maximum for a position taken over (a real one in SHADOW too)
         own = self.executor.unsettled_entry(now)  # without a target, a position on its side is taken over from it
         return PlanContext(now=now, ratio=ratio, tick=tick, session_open=session_open, entry_contracts=n,
@@ -512,7 +512,7 @@ class LiveRuntime:
         g = self.guard.state() or {}
         if g.get("total_tripped") or (g.get("daily_tripped") and g.get("day") == ny_date(now)):
             return 0, "실계좌 손실 한도 발동 중"
-        stage, cap = self._limits(now)
+        stage, cap = self._limits()
         if cap == 0 and self.stage != "SHADOW":
             return 0, "단계가 SHADOW로 바뀜: 실주문을 내지 않음 (포지션이 없으면 재시작)"
         t = self.executor.trade()
@@ -931,9 +931,8 @@ class LiveRuntime:
         for kind, _ in sorted(raised - (self.raised if self.raised_stint == stint else set())):
             self._incident(kind, now)
         if raised != self.raised or stint != self.raised_stint:
-            ended = now if self.raised and not raised else self.raised_ended  # the FULL cap's clean days count from it
-            self.raised, self.raised_stint, self.raised_ended = raised, stint, ended
-            self.journal.put(RAISED_KEY, {"items": sorted([k, t] for k, t in raised), "ended": ended, "stint": stint})
+            self.raised, self.raised_stint = raised, stint
+            self.journal.put(RAISED_KEY, {"items": sorted([k, t] for k, t in raised), "stint": stint})
         if self.journal.events(kind="ADOPTED", since=now):  # a foreign position: taken over now, or a provisional
             self._incident("ADOPTED", now)  # trade settled as foreign (never our own entry rebuilt from its intent)
         t = self.executor.trade()
@@ -1036,8 +1035,8 @@ class LiveRuntime:
         (`covered`) for one first seen in a strict pass, which the next strict pass must confirm. A reduction is
         resolved by a strict pass with no reduction pending and no order failure for the trade, or by its
         REDUCED / REDUCE_SETTLED; a close or a reduction must be resolved by the next pass. Otherwise a failure is
-        unresolved, a CANARY failure (incident: it pauses CANARY, fails the CANARY gate and in FULL keeps the
-        3-contract cap) - so is a fix still not confirmed after CONFIRM_PASSES further strict passes and
+        unresolved, a CANARY failure (incident: it pauses CANARY and fails the CANARY gate; in FULL it is recorded and
+        alerted) - so is a fix still not confirmed after CONFIRM_PASSES further strict passes and
         CONFIRM_MAX_S (legs placed again and again, never as wanted); without strict passes (a data or quote outage)
         it waits without escalating. Unresolved failures are grouped in episodes - per
         trade, or per failure while no trade is open - recorded once (ORDER_UNRESOLVED event, incident, then alert):
@@ -1138,7 +1137,7 @@ class LiveRuntime:
         if stage == "CANARY":
             return "CANARY 기준 ② 실패: 일시 정지"
         if stage == "FULL":
-            return "CANARY 실패 기준: FULL의 3계약 상한이 30일 더 유지됨"
+            return "CANARY 실패 기준: FULL에서는 기록만 (일시 정지 없음)"
         return f"{stage}: 기록만 (CANARY라면 기준 ② 실패)"
 
     def _record_fills(self, trade: LiveTrade | None, orders: list[Order], now: float) -> None:
@@ -1894,7 +1893,7 @@ class LiveRuntime:
             reply = "일시 정지: 신규 진입 중단 (보호 주문과 청산은 계속)"
         elif cmd == "/resume":
             resume(self.journal, now)
-            _, cap = self._limits(now)
+            _, cap = self._limits()
             if cap == 0 and self.stage != "SHADOW":  # a demotion to SHADOW: this process opens nothing real
                 reply = ("재개: 단, 단계가 SHADOW로 바뀌어 실계좌 신규 진입은 없음 (남은 포지션·주문을 관리하고 정리되면 "
                          "SHADOW로 다시 시작)")
@@ -2023,8 +2022,8 @@ def status_lines(journal: Journal, now: float) -> list[str]:
     days = "" if since is None else f" (D+{(now - since) / 86_400:.1f})"
     cap = ""
     if stage == "FULL":
-        most = full_cap(journal, now)
-        cap = " · 상한 해제" if most is None else f" · 상한 {most}계약"
+        most = full_cap(journal)
+        cap = " · 계약 상한 없음" if most is None else f" · 수동 개입 중 상한 {most}계약"
     p = paused(journal)
     lines = [f"단계 {stage}{days}{cap} · {'일시 정지: ' + p['reason'] if p else '운영 중'}"]
     f = journal.get(FLATTEN_KEY)

@@ -25,8 +25,10 @@ from tests.paper.helpers import FakeFetch, make_lock, synth_frame
 class Harness:
     def __init__(self, tmp_path: Path, start: int, *, stage: str | None = "CANARY", stage_days: float = 60.0,
                  equity: float = 10_000.0, ratio: float = 1.0, df: pd.DataFrame | None = None,
-                 exchange: SimExchange | None = None, journal_name: str = "journal.sqlite", **sim_kw) -> None:
+                 exchange: SimExchange | None = None, journal_name: str = "journal.sqlite", capped: int | None = None,
+                 **sim_kw) -> None:
         self.tmp = tmp_path
+        self.capped = capped  # FULL has no contract cap (2026-11-05): a test of the two-leg paths asks for a small size
         self.df = synth_frame() if df is None else df
         self.lock = make_lock(self.df)  # a temp holdout lock (PARAMS) for these candles
         self.ratio = ratio
@@ -47,7 +49,16 @@ class Harness:
         deps = {"journal": self.journal, "exchange": self.ex, "lock": self.lock, "fetch": self.fetch,
                 "cache_dir": self.tmp / "cache", "notify": self.alerts, "clock": self.clock, "sleep": self.clock.sleep,
                 "monotonic": self.clock, "commands": self.commands, **kw}
-        return LiveRuntime(LiveDeps(**deps))
+        rt = LiveRuntime(LiveDeps(**deps))
+        if self.capped is not None:
+            limits, most = rt._limits, self.capped
+
+            def small() -> tuple[str, int | None]:
+                stage, cap = limits()
+                return stage, most if cap is None else cap
+
+            rt._limits = small  # type: ignore[method-assign]
+        return rt
 
     def price(self, spot: float) -> None:
         self.ex.set_prices(spot * self.ratio, spot)

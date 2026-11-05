@@ -93,7 +93,7 @@ def test_killed_right_after_an_order_was_accepted(tmp_path, method, nth):
     """Killed right after the venue accepted the entry, its TP1 leg or both legs: the restart looks every PENDING
     intent up and takes the accepted orders over - the entry rebuilt, a resting leg claimed by its client order id -
     so nothing is sent twice: one entry, exactly the two legs, and no unprotected time when both legs rested."""
-    h = started(tmp_path, stage="FULL", stage_days=10)
+    h = started(tmp_path, stage="FULL", stage_days=10, capped=3)
     crash_on(h, method, nth)
     with pytest.raises(SimCrash):
         h.at(ENTRY_BAR + 30)
@@ -114,7 +114,7 @@ def test_killed_between_the_journaled_intent_and_the_send(tmp_path):
     """Killed after the entry's intent was committed and before the request left: nothing reached the venue. The
     restart finds the intent PENDING and not on the exchange (younger than 10 minutes: kept), and the interrupted
     cycle looks it up again before sending it once under the same client order id."""
-    h = started(tmp_path, stage="FULL", stage_days=10)
+    h = started(tmp_path, stage="FULL", stage_days=10, capped=3)
     cid = f"ewb-e-{SIGNAL}-L"
     h.ex.fail_next("place_market", SimCrash("killed before the send"))  # raised before the venue sees it
     with pytest.raises(SimCrash):
@@ -242,7 +242,7 @@ def test_killed_in_the_middle_of_a_stop_move(tmp_path):
     takes the accepted new leg over by its client order id instead of placing it again, moves the TP2 leg and
     cancels the old ones: exactly one set of legs at the new stop, the position covered all along."""
     trail = ts("2024-03-14 07:00")  # the engine trails the long's stop at this close
-    h = started(tmp_path, stage="FULL", stage_days=10)
+    h = started(tmp_path, stage="FULL", stage_days=10, capped=3)
     h.walk(ENTRY_BAR, trail + 3600)
     assert legs(h) == LEGS
     h.price(float(h.bar(trail + 3600)["open"]))
