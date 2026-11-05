@@ -126,6 +126,8 @@ from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.pricing import (
+    EQUITY_SIZING_BAND,
+    FULL_CAP_CONTRACTS,
     FULL_RISK,
     MARGIN_ENTRY_MAX,
     BasisOutOfBand,
@@ -388,6 +390,7 @@ class LiveRuntime:
         self.sessions = SessionWatch()
         self.target: Target | None = None
         self._entry_reduction: dict[str, Any] | None = None  # the last _entry_size's FULL margin reduction, if any
+        self.foreign_now = False  # the pass running read an order of someone else's (it holds FULL's size before the journal does)
         self.frame: pd.DataFrame | None = None  # the candles of the last cycle (the audit's DATA_REVISION check)
         self.product: ProductSpec | None = None
         self.product_read: float | None = None  # monotonic: the last product read (start, an entry's, the minute's), good or not
@@ -506,10 +509,12 @@ class LiveRuntime:
         """(stage to size with, contract cap), read from the journal before every entry and adoption: the more
         conservative of the stage this process runs in and the journal's - an incident's or the CLI's demotion
         applies to the next order at once, not only after the restart - and `stage.full_cap`, the journal stage's
-        maximum (0 in SHADOW: no real order; 1 in CANARY; None in FULL, 3 while a manual intervention is in force)."""
+        maximum (0 in SHADOW: no real order; 1 in CANARY; None in FULL, 3 while a manual intervention is in force - also in
+        the very pass that first reads a foreign order: the journal records it only at that pass's end)."""
         cur, _ = self.journal.stage()
         stage = min(self.stage, cur if cur in STAGES else "SHADOW", key=STAGES.index)
-        return stage, full_cap(self.journal)
+        cap = full_cap(self.journal)
+        return stage, FULL_CAP_CONTRACTS if cap is None and self.foreign_now else cap
 
     def _ctx(self, now: float) -> PlanContext:
         ratio = price = None
@@ -560,6 +565,10 @@ class LiveRuntime:
         stage, cap = self._limits()
         if cap == 0 and self.stage != "SHADOW":
             return 0, "단계가 SHADOW로 바뀜: 실주문을 내지 않음 (포지션이 없으면 재시작)"
+        last = usable_price(g.get("equity"))  # the guard's last observation: FULL scales all of its limits from this one read
+        if stage == "FULL" and last is not None and abs(equity / last - 1.0) > EQUITY_SIZING_BAND:
+            return 0, (f"잔고 {equity:,.2f} USD가 직전 조회 {last:,.2f} USD와 {EQUITY_SIZING_BAND:.0%} 넘게 다름: "
+                       "한 번의 조회로 크기를 정하지 않음")
         t = self.executor.trade()
         if not (t is not None and t.trade_id == e.signal_ts) and e.signal_ts not in self.journal.get(SKIPS_KEY, []):
             # The margin rates may change while the bot runs and FULL sizes to the 70% limit itself: they are read again right
@@ -922,6 +931,7 @@ class LiveRuntime:
         self.executor.resolve_reduce()  # a reduce with an unknown outcome: looked up by its id, never a second one
         pos, orders = self._snapshot()
         self._read_ok("positions")
+        self.foreign_now = any(o.is_open and not is_ours(o) for o in orders)
         trade = self.executor.trade()
         seen, events = observe(trade, pos, orders, now)
         # the trades this pass found protected: resting stop legs cover the position (reconcile.observe)

@@ -32,6 +32,8 @@ FULL_CAP_CONTRACTS = 3  # only while a manual intervention is still in force in 
 MARGIN_ENTRY_MAX = 0.70  # spec 4.5: an entry whose overnight projection exceeds 70% is refused (FULL: reduced to fit, 2026-11-05)
 MARGIN_WARN = 0.80
 MARGIN_REDUCE = 0.90
+# FULL sizes by one balance read, while the breakers need two: a read this far from the last observation sizes nothing
+EQUITY_SIZING_BAND = 0.20
 BASIS_BAND = 0.02  # a futures mid this far from the spot mid (either way) is no basis: a stale or one-sided book
 _EPS = 1e-9
 

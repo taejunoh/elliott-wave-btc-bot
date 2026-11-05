@@ -54,6 +54,7 @@ from ewbot.live.stage import (
     transition,
 )
 from ewbot.live.target import Target, TargetEntry, compute_target
+from ewbot.live.watchdog import AccountGuard
 from ewbot.paper.decisions import known_at
 from ewbot.paper.notify import SendError
 from tests.live.harness import Harness
@@ -2262,6 +2263,63 @@ def test_a_manual_intervention_still_in_force_holds_full_to_3_contracts(tmp_path
     assert (n, block) == (3, None) and hs.rt._entry_reduction is None
     assert "수동 개입 중 상한 3계약" in status_lines(hs.journal, ENTRY_BAR + 30)[0]
     hs.journal.close()
+
+
+def test_a_foreign_order_first_read_in_the_cycles_pass_caps_that_entry(tmp_path):
+    """Review finding: the cap came from the journal, written at the end of the pass that first read the order: that pass's
+    own entry went out at 124 contracts, and only the next one was capped at 3."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="FULL", stage_days=10)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    real = hs.ex.open_orders
+    foreign = Order("f1", "manual-1", -1, "OTHER", 1, 0, "OPEN")
+    hs.ex.open_orders = lambda: real() + [foreign]  # placed after the last poll, first read by the cycle's pass
+    assert full_cap(hs.journal) is None
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position().contracts == 3 and full_cap(hs.journal) == 3
+    hs.ex.open_orders = real  # gone: this process no longer holds to it either
+    hs.at(ENTRY_BAR + 41)
+    assert hs.rt._limits() == ("FULL", None)
+    hs.journal.close()
+
+
+def guarded(hs: Harness, equity: float | None) -> None:
+    hs.journal.put(AccountGuard.KEY, {"equity": equity, "peak": equity, "day": "2024-03-13", "day_ref": equity,
+                                      "daily_tripped": False, "total_tripped": False})
+
+
+@pytest.mark.parametrize("read,agrees", [(10_000.0, True), (11_900.0, True), (8_100.0, True), (12_100.0, False),
+                                         (7_900.0, False), (100_000.0, False)])
+def test_full_refuses_to_size_on_a_balance_read_far_from_the_last_good_one(tmp_path, read, agrees):
+    """Review finding: with no contract cap every FULL limit scales from one balance read, while the breakers need two reads
+    or a median of three. A read more than 20% from the guard's last observation (a minute old, in the journal) sizes
+    nothing: the signal is skipped and says why. Both ways: a wrong read is no reason to trust either side of it."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=60.0, equity=read)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    guarded(hs, 10_000.0)
+    ent = TargetEntry(SIGNAL, "W3", 1, 26_740.0, 26_500.0, 27_500.0, None, 1.0, 5, "test signal")
+    hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
+    n, block = hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True)
+    if agrees:
+        assert n > 0 and block is None
+    else:
+        assert n == 0 and "다름" in block
+    hs.journal.close()
+
+
+def test_the_balance_check_is_for_full_only_and_needs_a_reference(tmp_path):
+    for name, stage, ref, wanted in (("canary", "CANARY", 10_000.0, 1), ("first", "FULL", None, 124)):
+        hs = Harness(tmp_path / name, ENTRY_BAR + 30, stage=stage, stage_days=60.0, equity=10_000.0)
+        hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+        hs.rt.startup()
+        if ref is not None:
+            guarded(hs, ref * 0.5)  # far from the read: CANARY's one contract has its own risk and margin checks
+        ent = TargetEntry(SIGNAL, "W3", 1, 26_740.0, 26_500.0, 27_500.0, None, 1.0, 5, "test signal")
+        hs.rt.target = Target(SIGNAL, 26_740.0, None, None, ent, ())
+        assert hs.rt._entry_size(ENTRY_BAR + 30, 1.0, True) == (wanted, None)
+        hs.journal.close()
 
 
 def test_the_margin_maximum_wins_when_it_is_smaller_than_the_risk_size(tmp_path):
