@@ -201,6 +201,20 @@ class AccountGuard:
         self.journal.put(self.KEY, st)
         return before, {"day": day, "day_ref": e, "peak": e}
 
+    def rebase_peak(self, equity: float, now: float) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """A FULL -> CANARY demotion: only the peak is based again - this read is the first of its three basing reads, like
+        a tripped TOTAL_DD's /resume - and the total breach flag is cleared; the day's reference and every trip stay (a
+        tripped breaker is re-based by /resume). None when the guard has no state yet (no peak to carry over).
+        Returns (before, after): day, day_ref, peak (as `rebase`)."""
+        e = _observed(equity)
+        st = self.state()
+        if not st or st.get("peak") is None:
+            return None
+        before = {"day": st.get("day"), "day_ref": st.get("day_ref"), "peak": st.get("peak")}
+        st.update(peak=e, peak_reads=[e], total_breach=False, equity=e)
+        self.journal.put(self.KEY, st)
+        return before, {"day": st.get("day"), "day_ref": st.get("day_ref"), "peak": e}
+
     def reset(self, equity: float, now: float) -> list[str]:
         """After the user resumes: only a breaker that tripped is re-based - the peak after TOTAL_DD, the day's
         reference after DAILY_LOSS (a TOTAL_DD trip marks the day too) - starting from this read as the first of

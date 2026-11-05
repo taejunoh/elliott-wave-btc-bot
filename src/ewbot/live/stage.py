@@ -70,6 +70,7 @@ PAUSE_KEY = "paused"
 # the manual interventions the runtime's planner still finds, one per (kind, trade id) episode (live/runtime.py):
 # {"items": [[kind, trade id], ...], "ended": when the last of them ended (None: never), "stint": their stage row}
 RAISED_KEY = "incidents_raised"
+PEAK_REBASE_KEY = "peak_rebase_request"  # a FULL -> CANARY change: the runtime re-bases the guard's peak at its next balance read
 MAJOR = ("UNPROTECTED_60S", "AUDIT_MISMATCH", "BREAKER", "TRANSFER_KEY")  # spec 6.2 중대 사건
 # the position changed outside our orders: a foreign order or position, more contracts than the trade holds,
 # fewer than its legs explain (reconcile.observe), the trade's position on the other side (brackets and closes only
@@ -178,6 +179,14 @@ def full_cap(journal: Journal, now: float) -> int | None:
     return None if now - clean_from >= FULL_CAP_DAYS * DAY else FULL_CAP_CONTRACTS
 
 
+def _demoted_from_full(journal: Journal, to: str, reason: str, now: float) -> None:
+    """A FULL -> CANARY change (the automatic demotion and the CLI's): FULL's peak was judged against a 30% drawdown, CANARY's
+    guard allows 15%, so the same peak would trip TOTAL_DD at a loss between 15% and 30% on the second read. A request in
+    the journal (it survives a restart) makes the runtime re-base the peak to its next balance read (`rebase_peak`)."""
+    if to == "CANARY":
+        journal.put(PEAK_REBASE_KEY, {"ts": now, "reason": reason})
+
+
 def on_incident(journal: Journal, kind: str, now: float) -> list[str]:
     """Pause in CANARY for a CANARY failure; in FULL pause and demote to CANARY for a major incident (another
     CANARY failure keeps the 3-contract cap for 30 more days). Returns what was done."""
@@ -191,6 +200,7 @@ def on_incident(journal: Journal, kind: str, now: float) -> list[str]:
             reason = f"major incident {kind}"
             journal.set_stage("CANARY", reason, now)
             journal.add_event(now, "STAGE", {"from": "FULL", "to": "CANARY", "reason": reason})
+            _demoted_from_full(journal, "CANARY", reason, now)
             done.append("demoted to CANARY")
     elif stage == "FULL" and kind in CANARY_FAIL:
         done.append(f"{FULL_CAP_CONTRACTS}-contract cap for {FULL_CAP_DAYS} more days")
@@ -400,6 +410,8 @@ def transition(journal: Journal, to: str, now: float, gates: Sequence[Gate], *, 
     reason = "promotion" if promotion else "demotion"
     journal.set_stage(to, reason, now)
     journal.add_event(now, "STAGE", {"from": cur, "to": to, "reason": reason})
+    if cur == "FULL":
+        _demoted_from_full(journal, to, reason, now)
 
 
 def restart_stint(journal: Journal, stage: str, now: float, *, confirm: bool, flat: bool) -> None:

@@ -15,6 +15,7 @@ from ewbot.live.pricing import stage_contracts
 from ewbot.live.stage import (
     CANARY_FAIL,
     ORDER_FAILURES,
+    PEAK_REBASE_KEY,
     RAISED_KEY,
     Gate,
     StageError,
@@ -567,6 +568,36 @@ def test_pause_resume_and_incidents_by_stage(tmp_path):
     pause(jr, "user", S0 + 9)
     assert [e["data"]["kind"] for e in jr.events(kind="INCIDENT")] == [
         "UNPROTECTED_60S", "FOREIGN_ORDERS", "BAD_EQUITY", "BREAKER"]
+    jr.close()
+
+
+def test_a_demotion_from_full_to_canary_requests_a_peak_rebase_in_every_path(tmp_path):
+    """FULL's peak is measured against a 30% drawdown; CANARY's guard allows 15%. Every FULL -> CANARY change - the major
+    incident's automatic demotion and the CLI's manual one - leaves a request (applied by the runtime at its next balance
+    read, so it survives a restart); nothing else does."""
+    jr = journal(tmp_path, "auto.sqlite")
+    jr.set_stage("FULL", "promotion", S0)
+    assert jr.get(PEAK_REBASE_KEY) is None
+    assert on_incident(jr, "BAD_EQUITY", S0 + 1) == [] and jr.get(PEAK_REBASE_KEY) is None  # no demotion
+    assert on_incident(jr, "BREAKER", S0 + 2) == ["paused", "demoted to CANARY"]
+    assert jr.get(PEAK_REBASE_KEY) == {"ts": S0 + 2, "reason": "major incident BREAKER"}
+    jr.close()
+    jr = journal(tmp_path, "manual.sqlite")
+    jr.set_stage("FULL", "promotion", S0)
+    transition(jr, "CANARY", S0 + 5, [], confirm=True, flat=False)
+    assert jr.get(PEAK_REBASE_KEY) == {"ts": S0 + 5, "reason": "demotion"}
+    jr.close()
+    jr = journal(tmp_path, "other.sqlite")
+    jr.set_stage("FULL", "promotion", S0)
+    transition(jr, "SHADOW", S0 + 5, [], confirm=True, flat=False)  # not CANARY: unchanged
+    jr.set_stage("CANARY", "promotion", S0 + 6)
+    transition(jr, "SHADOW", S0 + 7, [], confirm=True, flat=False)
+    assert jr.get(PEAK_REBASE_KEY) is None
+    jr.close()
+    jr = journal(tmp_path, "promotion.sqlite")
+    jr.set_stage("CANARY", "promotion", S0)
+    on_incident(jr, "FOREIGN_ORDERS", S0 + 1)
+    assert jr.get(PEAK_REBASE_KEY) is None
     jr.close()
 
 

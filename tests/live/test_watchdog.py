@@ -153,6 +153,45 @@ def test_an_account_guard_with_the_canary_params_trips_the_total_drawdown_at_fif
     jr.close()
 
 
+def test_rebase_peak_moves_only_the_peak_and_a_canary_trip_from_the_new_peak_still_fires(tmp_path):
+    """A FULL -> CANARY demotion at -19% (peak 10,000, equity 8,100): the CANARY guard (15%) would trip on the second read
+    against the old peak. `rebase_peak` sets the peak to the read (the first of three basing reads) and clears the total
+    breach flag; the day's reference is untouched. From the new peak the 15% drawdown still trips: 8,100 x 0.85 = 6,885."""
+    jr = journal(tmp_path)
+    full = AccountGuard(jr, live_breakers(BreakerParams(), "FULL"))
+    for k in range(3):
+        assert full.update(10_000.0, NY_NOON + 60 * k) is None
+    assert full.update(8_100.0, NY_NOON + 180) is None  # FULL's 30%: no breach (the daily -20% is 8,000)
+    g = AccountGuard(jr, live_breakers(BreakerParams(), "CANARY"))  # the restart into CANARY
+    got = g.rebase_peak(8_100.0, NY_NOON + 240)
+    assert got is not None
+    before, after = got
+    assert (before["peak"], after["peak"]) == (10_000.0, 8_100.0) and before["day_ref"] == after["day_ref"] == 10_000.0
+    st = g.state()
+    assert st["peak"] == 8_100.0 and st["peak_reads"] == [8_100.0] and not st["total_breach"] and st["day_ref"] == 10_000.0
+    st.update(day_ref=8_100.0, day_reads=None)  # only the total drawdown is in play from here
+    jr.put(g.KEY, st)
+    for k in range(4):
+        assert g.update(8_100.0, NY_NOON + 300 + 60 * k) is None
+    assert g.state()["peak"] == 8_100.0
+    assert g.update(6_900.0, NY_NOON + 600) is None and g.update(6_900.0, NY_NOON + 660) is None  # -14.8%: no breach
+    assert g.update(6_800.0, NY_NOON + 720) is None  # -16%: the first breaching read
+    assert g.update(6_800.0, NY_NOON + 780) == "TOTAL_DD"
+    jr.close()
+
+
+def test_rebase_peak_without_a_state_does_nothing_and_a_bad_read_is_not_an_observation(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr, live_breakers(BreakerParams(), "CANARY"))
+    assert g.rebase_peak(8_100.0, NY_NOON) is None and g.state() is None
+    for k in range(3):
+        g.update(10_000.0, NY_NOON + 60 * k)
+    with pytest.raises(BadEquity):
+        g.rebase_peak(float("nan"), NY_NOON + 200)
+    assert g.state()["peak"] == 10_000.0
+    jr.close()
+
+
 def test_one_bad_balance_read_never_trips_a_breaker_nor_raises_the_peak(tmp_path):
     jr = journal(tmp_path)
     g = AccountGuard(jr)

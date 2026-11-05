@@ -109,7 +109,7 @@ from ewbot.execution.costs import fee as model_fee
 from ewbot.live.audit import AuditError, AuditResult, audit
 from ewbot.live.control import Command
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, Order, Position, ProductSpec, SessionInfo
-from ewbot.live.executor import CANCEL_QUEUED, CLOSE_CONFLICTS, OVERLAP_REFUSALS, Executor
+from ewbot.live.executor import CANCEL_QUEUED, CLOSE_CONFLICTS, OVERLAP_REFUSALS, SKIPS_KEY, Executor
 from ewbot.live.feed import usable_price
 from ewbot.live.journal import Journal
 from ewbot.live.preflight import BASELINE_FINGERPRINT
@@ -121,6 +121,7 @@ from ewbot.live.pricing import (
     map_level,
     margin_ratio,
     max_contracts_for_margin,
+    risk_per_contract,
     stage_contracts,
 )
 from ewbot.live.reconcile import (
@@ -143,6 +144,7 @@ from ewbot.live.stage import (
     MAJOR,
     ORDER_FAILURES,
     ORDER_UNRESOLVED,
+    PEAK_REBASE_KEY,
     PROTECT_MAX_S,
     RAISED_KEY,
     STAGES,
@@ -220,6 +222,7 @@ STARTUP_RETRY_MAX_S = 60.0
 FETCH_WAIT_S = 5.0  # the loop waits at most this long for a candle download (a worker thread), then ticks on
 STOP_GRACE_S = 90.0  # a stop request waits at most this long while the open trade has no resting stop (docker: 150 s)
 REBASE_KEY = "rebase_request"  # `ewbot live rebase --confirm`: the breakers re-based at the next minute
+PRODUCT_REFRESH_S = 900.0  # the product (its margin rates may change) is read again this often for the watchdog; an entry reads it itself
 UNREADABLE_ALERT_S = 180.0  # an account read failing this long while there is something to manage is alerted ...
 UNREADABLE_IDLE_ALERT_S = 900.0  # ... this long otherwise
 UNREADABLE_FAIL_S = 1800.0  # ... and with something to manage this long healthchecks.io gets a /fail as well
@@ -342,6 +345,7 @@ class LiveRuntime:
         self._entry_reduction: dict[str, Any] | None = None  # the last _entry_size's FULL margin reduction, if any
         self.frame: pd.DataFrame | None = None  # the candles of the last cycle (the audit's DATA_REVISION check)
         self.product: ProductSpec | None = None
+        self.product_read: float | None = None  # monotonic: the last product read (start, an entry's, the minute's), good or not
         self.session: SessionInfo | None = None
         self.done_bar: int | None = None
         self.next_try: float | None = None  # monotonic: when the cycle of `try_bar` is tried again
@@ -511,6 +515,14 @@ class LiveRuntime:
         stage, cap = self._limits(now)
         if cap == 0 and self.stage != "SHADOW":
             return 0, "단계가 SHADOW로 바뀜: 실주문을 내지 않음 (포지션이 없으면 재시작)"
+        t = self.executor.trade()
+        if not (t is not None and t.trade_id == e.signal_ts) and e.signal_ts not in self.journal.get(SKIPS_KEY, []):
+            # The margin rates may change while the bot runs and FULL sizes to the 70% limit itself: they are read again right
+            # before every entry is sized (a signal already traded or skipped is not sized again). A failed or unusable read
+            # refuses the entry - sizing on stale rates is the risk - and the watchdog keeps the last good ones.
+            why = self._read_product(now)
+            if why is not None:
+                return 0, f"증거금률을 새로 읽지 못함 ({why}): 낡은 증거금률로 진입하지 않음 (증거금 감시는 마지막 정상 값 사용)"
         rate = self.product.margin_rate(e.direction, True)
         if not (math.isfinite(rate) and rate > 0):  # a rate read as 0 would turn the 70% limit off: never sized blind
             return 0, "증거금률을 읽지 못함"
@@ -533,24 +545,68 @@ class LiveRuntime:
                                         risk_mult=e.risk_mult, cfg=self.cfg, full_cap=None)
             self._entry_reduction = {"signal_ts": e.signal_ts, "stage": stage, "direction": e.direction, "needed": wanted,
                                      "cap": cap, "margin_max": fit, "entered": fit, "projected": projected,
-                                     "risk": FULL_RISK.risk_pct}
+                                     "risk": FULL_RISK.risk_pct, "equity": equity,
+                                     "risk_per_contract": risk_per_contract(entry, stop, self.cfg.costs)}
             return fit, None
         return n, None
 
     def _record_entry_reduction(self, r: dict[str, Any], now: float) -> None:
         """A FULL entry that entered with the margin maximum instead of the risk size: once per signal, after the entry
-        exists (a failed send is recorded when a later pass enters). Shows the needed and the entered contracts, so the
-        reduced risk (about the risk fraction times entered / needed) is visible."""
+        exists (a failed send is recorded when a later pass enters). Shows the needed and the entered contracts and the
+        real risk of the entered contracts: risk_per_contract(entry, stop, costs) x entered / equity - not the risk
+        fraction x entered / needed, which ignores the 5x cap and the signal's risk_mult that already shrank `needed`."""
         t = self.executor.trade()
         if t is None or t.trade_id != r["signal_ts"] or not self._once(f"entry_reduced:{r['signal_ts']}"):
             return
         self.journal.add_event(now, "ENTRY_REDUCED", r)
         needed, entered = int(r["needed"]), t.contracts
-        real = float(r["risk"]) * entered / needed if needed > 0 else 0.0
+        real = float(r["risk_per_contract"]) * entered / float(r["equity"])
         self.alert("ENTRY_REDUCED", f"[진입 축소] 위험 {float(r['risk']):.0%} 기준 {needed}계약이 필요하나 오버나이트 증거금 "
                                     f"{MARGIN_ENTRY_MAX:.0%} 한도(최대 {r['margin_max']}계약"
                                     + (f", 단계 상한 {r['cap']}계약" if r["cap"] is not None else "")
                                     + f")로 {entered}계약 진입 - 실제 위험은 약 {real:.1%}")
+
+    @staticmethod
+    def _product_usable(spec: ProductSpec) -> bool:
+        """A product whose margin rates (intraday and overnight, long and short), contract size and tick are finite numbers
+        above 0: a rate that is missing or closed reads 0 (coinbase `_num`) and would turn the 70% limit off."""
+        vals = (*spec.intraday_margin, *spec.overnight_margin, spec.contract_size, spec.price_increment)
+        return all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in vals)
+
+    def _read_product(self, now: float) -> str | None:
+        """Read the product again (the margin rates may change). A usable one replaces `self.product` - a change of the
+        rates is journaled (MARGIN_RATES_CHANGED) and alerted - and None is returned; a failed or unusable read keeps the
+        last good product (the watchdog's) and returns why."""
+        self.product_read = self.mono()
+        try:
+            spec = self.ex.product()
+        except ExchangeError as exc:
+            return self.d.redact(f"{type(exc).__name__}: {exc}")[:160]
+        if not self._product_usable(spec):
+            return f"증거금률 {list(spec.overnight_margin)} 등이 없거나 0 이하"
+        old = self.product
+        self.product = spec
+        if old is not None and (old.overnight_margin, old.intraday_margin) != (spec.overnight_margin, spec.intraday_margin):
+            data = {"overnight": list(spec.overnight_margin), "intraday": list(spec.intraday_margin),
+                    "was_overnight": list(old.overnight_margin), "was_intraday": list(old.intraday_margin)}
+            self.journal.add_event(now, "MARGIN_RATES_CHANGED", data)
+            self.alert("MARGIN_RATES", f"[증거금률 변경] 오버나이트 롱/숏 {old.overnight_margin[0]:.4f}/{old.overnight_margin[1]:.4f} → "
+                                       f"{spec.overnight_margin[0]:.4f}/{spec.overnight_margin[1]:.4f} (이후 진입과 증거금 감시에 적용)")
+        return None
+
+    def _product_due(self, now: float) -> None:
+        """Every minute, each PRODUCT_REFRESH_S: the watchdog's margin rates are read again. A failed read keeps the last good
+        rates (alerted, limited) and is tried again after the next interval."""
+        if self.product_read is not None and 0 <= self.mono() - self.product_read < PRODUCT_REFRESH_S:
+            return
+        why = self._read_product(now)
+        if why is None:
+            return
+        held = self._limited("MARGIN_RATE")
+        if held is not None:
+            self.journal.add_event(now, "PRODUCT_REFRESH_FAILED", {"error": why})
+            self.alert("MARGIN_RATE", f"[증거금률 조회 실패] {why}: 증거금 감시는 마지막 정상 값으로 계속, 새 진입은 새로 읽을 때까지 보류"
+                       + (f" (같은 경보 {held}건 생략)" if held else ""))
 
     def flat(self) -> bool:
         """Nothing left to manage: no open trade, no order of unknown outcome (PENDING), no standing flatten (the
@@ -596,6 +652,7 @@ class LiveRuntime:
             self.stage, self.stage_since = self.journal.stage()
             self.guard.params = live_breakers(self.cfg.breakers, self.stage)  # the guard's thresholds follow the stage
         self.product = self._startup_read("product", self.ex.product)
+        self.product_read = self.mono()
         self.session = self._startup_read("session", self.ex.session)
         now = self.clock()
         notices = self.sessions.update(self.session, now)  # a maintenance within 24 h is announced at start too
@@ -1214,7 +1271,7 @@ class LiveRuntime:
             self.journal.add_event(now, "LOOP_ERROR", {"section": "telegram", "error": type(exc).__name__})
             print(f"[LIVE] telegram and heartbeat check failed: {type(exc).__name__}", file=sys.stderr)
         steps: list[tuple[str, Callable[[float], None]]] = [
-            ("session", self._minute_session), ("money", self._money), ("account", self._account_check),
+            ("session", self._minute_session), ("product", self._product_due), ("money", self._money), ("account", self._account_check),
             ("feed", self._feed_health), ("pending", self._resolve_pending), ("margin1530", self._margin_1530_due),
             ("daily", self._daily_step), ("audit", self._audit_due), ("stage", self._stage_change)]
         for name, step in steps:
@@ -1436,6 +1493,8 @@ class LiveRuntime:
         self._read_ok("balance")
         try:
             rebased = self._rebase_due(equity, now)  # a capital change re-based both breakers with this read
+            if not rebased:
+                self._peak_rebase_due(equity, now)  # a FULL -> CANARY demotion re-bases the peak (this read is its first)
             trip = None if rebased else self.guard.update(equity, now)  # trips on the second breaching read in a row
         except BadEquity:  # not an observation: no breaker sample and no margin check this minute
             self.bad_equity_reads += 1
@@ -1484,6 +1543,25 @@ class LiveRuntime:
         elif st.level == "REDUCE" and st.reduce_by > 0:
             self._margin_reduce(equity, price, now)
 
+    def _peak_rebase_due(self, equity: float, now: float) -> None:
+        """A FULL -> CANARY demotion (PEAK_REBASE_KEY, set by stage.on_incident or stage.transition): the guard's peak is
+        based again from this read (AccountGuard.rebase_peak; BadEquity for an unusable read - the request waits for a good
+        one), journaled (REBASED: before and after) and alerted. Without it FULL's peak, judged by CANARY's 15% instead of
+        FULL's 30%, would trip TOTAL_DD (flatten, pause, BREAKER incident) after a loss between the two. Applied in every
+        process and after a restart; a trip's own flatten, pause and incident are not touched."""
+        req = self.journal.get(PEAK_REBASE_KEY)
+        if req is None:
+            return
+        done = self.guard.rebase_peak(equity, now)
+        self.journal.put(PEAK_REBASE_KEY, None)
+        if done is None:
+            return
+        before, after = done
+        self.journal.add_event(now, "REBASED", {"requested_ts": req.get("ts"), "reason": f"FULL → CANARY ({req.get('reason')})",
+                                                "before": before, "after": after})
+        self.alert("REBASE", f"[손실 한도 기준 재설정] FULL → CANARY 강등: 최고점 {float(before['peak']):,.2f} → "
+                             f"{float(after['peak']):,.2f} USD (CANARY의 15% 한도는 이 값에서 시작, 지금과 다음 두 번 조회의 중앙값으로 확정)")
+
     def _rebase_due(self, equity: float, now: float) -> bool:
         """A `ewbot live rebase --confirm` request (REBASE_KEY): both breakers' references are based again from this
         read (AccountGuard.rebase; BadEquity for an unusable read - the request waits for a good one), journaled
@@ -1498,6 +1576,7 @@ class LiveRuntime:
             return False
         before, after = self.guard.rebase(equity, now)
         self.journal.put(REBASE_KEY, None)
+        self.journal.put(PEAK_REBASE_KEY, None)  # this re-base covers the peak as well
         self.journal.add_event(now, "REBASED", {"requested_ts": req.get("ts"), "before": before, "after": after})
 
         def usd(x: Any) -> str:
