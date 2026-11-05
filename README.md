@@ -14,6 +14,7 @@ The project was built in three layers. Each layer has to prove itself before the
 | **Strategy C** (Plan 5b) | Strategy B2's rules one timeframe up (4h structure and trend, 1h confirmation) on BTC and ETH. | - | Ended before walk-forward: 0.81 trades/month in 2017–2023, too few for a 50-trade holdout ([spec §11](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md)) |
 | **Strategy D** (Plan 6) | Strategy A's rules one timeframe down (1h waves, 15m breakout trigger) on BTC. | - | Ended at the pre-registered count check before walk-forward: median 3.18 trades/month in 2017–2023, fallback 3.44, bar 4.0; no performance computed ([spec §8](docs/superpowers/specs/2026-11-04-ewbot-plan6-strategy-d-design.md)). |
 | **Strategy E** (Plan 7) | Daily channel-breakout trend following on BTC, without waves, with a −30% drawdown limit. | - | Ended at the pre-registered count check before walk-forward: median 0.435 trades/month in 2017–2023, bar 1.0; no performance computed ([spec §8](docs/superpowers/specs/2026-11-04-ewbot-plan7-strategy-e-design.md)). |
+| **Strategy F** (Plan 8) | Strategy A's rules on 5m waves and a 1m breakout trigger on BTC. | - | Ended at walk-forward: out-of-sample −97.24%, Sharpe −4.85, 1,697 trades, all 10 folds negative; 2024+ never read ([spec §8](docs/superpowers/specs/2026-11-04-ewbot-plan8-strategy-f-design.md)). |
 
 ## Live stages
 
@@ -70,6 +71,7 @@ uv run --group live pytest
   - [Plan 5b: strategy C](docs/superpowers/specs/2026-10-08-ewbot-plan5b-strategy-c-design.md) (ended)
   - [Plan 6: strategy D](docs/superpowers/specs/2026-11-04-ewbot-plan6-strategy-d-design.md) (ended)
   - [Plan 7: strategy E](docs/superpowers/specs/2026-11-04-ewbot-plan7-strategy-e-design.md) (ended)
+  - [Plan 8: strategy F](docs/superpowers/specs/2026-11-04-ewbot-plan8-strategy-f-design.md) (ended)
 - Implementation plans: `docs/superpowers/plans/`.
 
 ## Layout
