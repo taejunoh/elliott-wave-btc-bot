@@ -26,6 +26,7 @@ from ewbot.live.stage import (
     TEST_TRADE,
     TEST_TRADE_MARGIN,
     TEST_TRADE_REFUSED,
+    TEST_UNSEEN_KEY,
     canary_failures,
     canary_gates,
     full_entry_gates,
@@ -341,6 +342,189 @@ def test_protection_slower_than_30_s_is_no_pass_and_the_real_canary_failure(h):
     assert "PROTECT_SLOW" in canary_failures(h.journal, h.journal.stage()[1])
 
 
+# ---------------------------------------------------------------------------- a position read that lags the fill
+class Lag:
+    """The fill is on the order; /cfm/positions does not show it for `reads` more reads (independent review of 2026-11-05).
+    With `refuse`, Coinbase refuses a bracket for want of the position it does not see yet, its own answer on a flat account
+    (live/shadow.py, 2026-10-05)."""
+
+    def __init__(self, hs: Harness, reads: int, refuse: bool = False) -> None:
+        self.left, self.armed = reads, False
+        real_pos, real_market, real_bracket = hs.ex.position, hs.ex.place_market, hs.ex.place_bracket
+
+        def position():
+            if self.armed and self.left > 0:
+                self.left -= 1
+                return None
+            return real_pos()
+
+        def market(cid, side, size):
+            out = real_market(cid, side, size)
+            self.armed = True
+            return out
+
+        def bracket(cid, side, size, limit, stop):
+            if refuse and self.left > 0:
+                return PlaceResult(cid, None, False, "BRACKET_ORDER_SIZE_EXCEEDS_POSITION")
+            return real_bracket(cid, side, size, limit, stop)
+
+        hs.ex.position, hs.ex.place_market, hs.ex.place_bracket = position, market, bracket
+
+
+def assert_no_false_manual(hs: Harness) -> None:
+    assert hs.journal.events(kind="ADOPTED") == [] and (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    assert not {"UNKNOWN_POSITION", "ADOPTED", "FOREIGN_ORDERS", "EXCESS_POSITION", "UNEXPLAINED_REDUCTION"} & set(
+        canary_failures(hs.journal, hs.journal.stage()[1]))
+
+
+@pytest.mark.parametrize("refuse", [True, False])
+def test_a_short_lag_is_waited_for_and_the_trade_passes(h, refuse):
+    """A flat read right after the fill is not believed: no leg read back with a fill explains it."""
+    Lag(h, 4, refuse=refuse)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is True and r["position"] == "flat" and r["why"] is None
+    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert [e["data"]["reason"] for e in h.journal.events(kind="CLOSED")] == ["TEST_TRADE"]  # never read as a bracket's exit
+    ticks(h, 3, 61.0)
+    assert_nothing_false(h)
+    assert h.journal.events(kind="ORDER_UNRESOLVED") == []
+
+
+def test_a_refusal_for_want_of_the_position_does_not_count_while_it_is_not_seen(h):
+    Lag(h, 13, refuse=True)  # 4 s of flat reads, each with a refusal: more than TEST_BRACKET_REFUSALS, none of them about the terms
+    ask(h)
+    r = result(h)
+    assert r["ok"] is True and len(h.journal.events(kind="BRACKET_FAILED")) > rt_mod.TEST_BRACKET_REFUSALS
+
+
+def unseen_lag(hs: Harness, refuse: bool = True) -> tuple[Lag, dict]:
+    lag = Lag(hs, 10_000, refuse=refuse)
+    ask(hs)
+    return lag, result(hs)
+
+
+def assert_unseen(hs: Harness, r: dict) -> None:
+    assert r["ok"] is False and r["step"] == "protect" and r["position"] == "unseen"
+    assert "포지션 없음" not in r["message"] and "먼저" not in r["message"] and "읽히지 않음" in r["message"]
+    assert hs.journal.get(TEST_UNSEEN_KEY)["trade_id"] == r["trade_id"] and paused(hs.journal) is not None
+    assert hs.rt.active is True and hs.rt.observed_close is not None  # fast polls, across which it is looked for
+    assert hs.rt.flat() is False  # no promotion, no new test trade, no restart into a new stage while it may show
+    assert any(k == TEST_TRADE and t.startswith("[시험 거래 실패]") and "읽히지 않음" in t for k, t in hs.alerts.items)
+
+
+def test_a_position_not_seen_within_the_limit_and_shown_later_with_no_target_is_protected_and_closed(h):
+    """The reviewer's probe: no target (a held hour), and it sat unprotected until the next hour with `포지션 없음` said."""
+    h.rt.target = None
+    lag, r = unseen_lag(h)
+    assert_unseen(h, r)
+    assert h.ex.pos is not None  # the real one, on the venue
+    placed = []
+    real = h.ex.place_bracket
+    h.ex.place_bracket = lambda *a: placed.append(a) or real(*a)
+    lag.left = 0
+    h.at(h.clock.now + 11)
+    assert placed, "protected from the entry's own levels before the close"
+    assert h.ex.position() is None and h.ex.open_orders() == []
+    assert h.journal.get(TEST_UNSEEN_KEY) is None and h.journal.get(FLATTEN_KEY) is None
+    assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "TEST_TRADE_FAILED"
+    assert h.journal.events(kind="RECOVERED_ENTRY")
+    assert_no_false_manual(h)
+
+
+def test_a_late_position_with_a_flat_engine_is_no_unknown_position(h):
+    lag, r = unseen_lag(h)
+    assert_unseen(h, r)
+    lag.left = 0
+    h.at(h.clock.now + 11)
+    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert_no_false_manual(h)
+    assert not [a for a in h.journal.events(kind="CLOSED") if a["data"]["reason"] == "UNKNOWN_POSITION"]
+
+
+def test_a_late_position_on_the_engines_side_is_not_adopted(h):
+    h.rt.target = Target(QUIET, 22_000.0, position(QUIET - 7200), None, None, ())
+    lag, r = unseen_lag(h)
+    assert_unseen(h, r)
+    lag.left = 0
+    h.at(h.clock.now + 11)
+    assert h.ex.position() is None
+    assert_no_false_manual(h)
+
+
+def test_its_stop_stays_while_the_position_may_still_show_and_is_taken_back(h):
+    """Bracket accepted, the position late: the leg is not cancelled as FLAT in the meantime, and no second one is placed."""
+    lag, r = unseen_lag(h, refuse=False)
+    assert_unseen(h, r)
+    h.at(h.clock.now + 11)
+    h.at(h.clock.now + 11)
+    assert [o.kind for o in h.ex.open_orders()] == ["BRACKET"]
+    lag.left = 0
+    h.at(h.clock.now + 11)
+    assert h.journal.events(kind="LEG_ADOPTED") and h.ex.position() is None and h.ex.open_orders() == []
+    assert_no_false_manual(h)
+
+
+def test_a_restart_keeps_looking_for_it(h):
+    lag, r = unseen_lag(h)
+    assert_unseen(h, r)
+    h.clock.now += 30
+    h.rt = h.make_runtime()
+    assert h.rt.active is True
+    lag.left = 0
+    h.rt.startup()
+    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert_no_false_manual(h)
+
+
+def test_a_position_that_never_shows_ends_the_wait_says_so_and_leaves_the_pause(h):
+    lag, r = unseen_lag(h, refuse=False)
+    assert_unseen(h, r)
+    for _ in range(35):
+        h.at(h.clock.now + 11)
+        if h.journal.get(TEST_UNSEEN_KEY) is None:
+            break
+    assert h.journal.get(TEST_UNSEEN_KEY) is None
+    assert h.journal.events(kind="TEST_TRADE_UNSEEN_ENDED") and paused(h.journal) is not None
+    assert any("나타나지 않음" in t for _, t in h.alerts.items)
+    h.at(h.clock.now + 11)
+    assert h.ex.open_orders() == []  # the wait is over: the planner cancels what rests on a book it reads flat
+
+
+def test_a_flat_read_at_the_close_with_no_fill_is_not_called_a_bracket_exit(h):
+    """Verified, then flat with the leg unfilled: the close has nothing to send. No fill says the position left."""
+    lag = Lag(h, 0)
+    real = h.ex.balance_summary
+
+    def hide():
+        lag.left = 10_000
+        return real()
+
+    h.ex.balance_summary = hide
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and r["position"] == "unseen" and "먼저" not in r["why"] and "포지션 없음" not in r["message"]
+    assert h.journal.get(TEST_UNSEEN_KEY) is not None
+    lag.left = 0
+    h.at(h.clock.now + 11)
+    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert_no_false_manual(h)
+
+
+def test_a_new_test_trade_is_refused_while_the_last_position_may_still_show(h):
+    lag, r = unseen_lag(h)
+    resume(h.journal, h.clock.now)
+    assert "읽히지 않" in rt_mod.refusal_of_test_trade(h.journal, h.ex, h.clock.now)
+
+
+def test_two_refusals_of_the_stop_are_at_least_a_retry_apart(h):
+    """Review finding: the second refusal came 0.0 s after the first, so the limit of two meant no retry at all."""
+    h.ex.place_bracket = refuse_bracket
+    ask(h)
+    times = [e["ts"] for e in h.journal.events(kind="BRACKET_FAILED")]
+    assert len(times) == rt_mod.TEST_BRACKET_REFUSALS and times[1] - times[0] >= rt_mod.TEST_RETRY_S
+
+
 # ---------------------------------------------------------------------------- an entry whose outcome is unknown
 def test_an_entry_answer_and_lookup_lost_is_protected_and_closed_as_ours(h):
     h.ex.crash_after_accept("place_market", Unavailable("timeout"))
@@ -366,6 +550,7 @@ def test_a_position_that_appears_after_the_test_gave_up_is_not_taken_for_a_manua
     ask(h)
     r = result(h)
     assert r["ok"] is False and r["step"] == "entry" and "확인하지 못함" in r["why"]
+    assert r["position"] == "unseen" and "포지션 없음" not in r["message"]  # not read, which says nothing of it being gone
     h.ex.position = real
     h.ex.clear_faults()
     ticks(h, 3, 11.0)

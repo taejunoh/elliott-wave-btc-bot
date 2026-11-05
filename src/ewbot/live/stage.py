@@ -99,6 +99,8 @@ TEST_TRADE_MARGIN = "TEST_TRADE_MARGIN"
 TEST_REQUEST_KEY = "test_trade_request"  # the command's request: {"id", "side", "ts"}; the runtime takes it once
 TEST_ACTIVE_KEY = "test_trade_active"  # one is under way: {"request", "trade_id", "side", "ts"} (a crash leaves it)
 TEST_IDS_KEY = "test_trade_ids"  # the ids of every test trade, written before its first order
+# its entry filled but the position is not read yet: {"trade_id", "side", "until"}; a position on that side is that entry's
+TEST_UNSEEN_KEY = "test_trade_unseen"
 
 # gate names: transition() checks that a promotion got every one of its gates, met
 G_DAYS = "기간 14일 이상"
