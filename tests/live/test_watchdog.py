@@ -14,6 +14,7 @@ from ewbot.live.feed import HEALTHY_S, PUBLIC_WS_URL, SILENT_S, Tick, TickerFeed
 from ewbot.live.sim import BIP_SPEC
 from ewbot.config import BreakerParams
 from ewbot.live.watchdog import (
+    FULL_TOTAL_DD,
     LIVE_DAILY_LOSS,
     AccountGuard,
     BadEquity,
@@ -77,16 +78,47 @@ def test_account_guard_trips_on_two_breaching_reads_once_a_day_and_survives_a_re
     jr.close()
 
 
-@pytest.mark.parametrize(("stage", "daily"), [("SHADOW", 0.20), ("CANARY", 0.20), ("FULL", 0.03)])
-def test_live_breakers_loosen_only_the_daily_limit_and_only_before_full(stage, daily):
-    """User decision 2026-10-19: the real account's daily breaker is 20% in SHADOW and CANARY, the strategy's 3% in FULL;
-    the total drawdown stays 15% everywhere and the base (the engine's cfg.breakers) is never changed."""
+@pytest.mark.parametrize(("stage", "daily", "total"), [("SHADOW", 0.20, 0.15), ("CANARY", 0.20, 0.15), ("FULL", 0.20, 0.30)])
+def test_live_breakers_per_stage(stage, daily, total):
+    """The real account's breakers: daily 20% in every stage (user decision 2026-10-19 for SHADOW and CANARY, 2026-11-05 for
+    FULL); total drawdown 15% in SHADOW and CANARY, 30% in FULL (2026-11-05). The base (the engine's cfg.breakers) is never changed."""
     base = BreakerParams()
-    assert LIVE_DAILY_LOSS == 0.20 and (base.daily_loss, base.total_dd) == (0.03, 0.15)
+    assert LIVE_DAILY_LOSS == 0.20 and FULL_TOTAL_DD == 0.30 and (base.daily_loss, base.total_dd) == (0.03, 0.15)
     p = live_breakers(base, stage)
-    assert (p.daily_loss, p.total_dd) == (daily, 0.15)
+    assert (p.daily_loss, p.total_dd) == (daily, total)
     assert (p.enabled, p.max_consec_losses) == (base.enabled, base.max_consec_losses)
     assert (base.daily_loss, base.total_dd) == (0.03, 0.15)
+
+
+def test_a_full_guard_flattens_at_exactly_minus_thirty_percent_from_the_peak_and_not_at_minus_twenty_nine(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr, live_breakers(BreakerParams(), "FULL"))
+    for k in range(3):
+        assert g.update(10_000.0, NY_NOON + 60 * k) is None
+    st = g.state()
+    st.update(day_ref=7_000.0, day_reads=None)  # the day's reference below the drop: only the total drawdown is in play
+    jr.put(g.KEY, st)
+    assert g.update(7_001.0, NY_NOON + 180) is None  # -29.99%
+    assert g.update(7_001.0, NY_NOON + 240) is None
+    assert g.update(7_100.0, NY_NOON + 300) is None  # -29%
+    assert g.update(7_100.0, NY_NOON + 360) is None
+    assert g.update(7_000.0, NY_NOON + 420) is None  # exactly -30%: the first breaching read
+    assert g.update(7_000.0, NY_NOON + 480) == "TOTAL_DD"
+    jr.close()
+
+
+def test_a_full_guard_trips_the_daily_breaker_at_minus_twenty_percent_in_a_day(tmp_path):
+    jr = journal(tmp_path)
+    g = AccountGuard(jr, live_breakers(BreakerParams(), "FULL"))
+    for k in range(3):
+        assert g.update(10_000.0, NY_NOON + 60 * k) is None
+    for k in range(4):  # -19.99%: no breach of either breaker
+        assert g.update(8_001.0, NY_NOON + 180 + 60 * k) is None
+    assert not g.state()["daily_breach"]
+    assert g.update(8_000.0, NY_NOON + 420) is None  # exactly -20%: the first breaching read
+    assert g.update(8_000.0, NY_NOON + 480) == "DAILY_LOSS"  # the total drawdown (30%) is far off
+    assert not g.state()["total_tripped"]
+    jr.close()
 
 
 def test_an_account_guard_with_the_canary_params_trips_the_daily_breaker_at_twenty_percent(tmp_path):

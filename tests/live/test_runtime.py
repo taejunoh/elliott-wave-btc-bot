@@ -64,7 +64,7 @@ def h(tmp_path):
 
 @pytest.fixture
 def hf(tmp_path):
-    """FULL keeps the strategy's daily -3% real-account breaker (SHADOW and CANARY use LIVE_DAILY_LOSS, 20%)."""
+    """FULL: the real-account breakers are daily -20% and total -30% (user decision 2026-11-05)."""
     hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
     hs.price(float(hs.bar(ENTRY_BAR)["open"]))
     hs.rt.startup()
@@ -250,7 +250,7 @@ def test_the_account_breaker_flattens_and_pauses(hf):
     entered(h)  # the day's first balance read
     h.at(ENTRY_BAR + 90)
     h.at(ENTRY_BAR + 150)  # three reads: the day's reference (their median)
-    h.ex.cash -= 400.0  # equity 10_000 -> ~9_600: the daily -3% breaker
+    h.ex.cash -= 2_100.0  # equity 10_000 -> ~7_900: the daily -20% breaker (the total -30% is far off)
     seen = alerts_with_positions(h)
     h.at(ENTRY_BAR + 210)
     assert h.ex.position() is not None and paused(h.journal) is None  # one breaching balance read is not enough
@@ -264,24 +264,24 @@ def test_the_account_breaker_flattens_and_pauses(hf):
     assert not g["daily_tripped"] and g["day_ref"] == h.ex.balance().equity and g["peak"] == peak  # the peak stays
 
 
-@pytest.mark.parametrize(("stage", "daily"), [("SHADOW", 0.20), ("CANARY", 0.20), ("FULL", 0.03)])
-def test_the_real_account_guard_follows_the_stage(tmp_path, stage, daily):
-    """User decision 2026-10-19: daily 20% in SHADOW and CANARY, 3% in FULL, total 15% in all; the engine's own breakers
-    (cfg.breakers: paper equity, the target replay) keep 3%."""
+@pytest.mark.parametrize(("stage", "daily", "total"), [("SHADOW", 0.20, 0.15), ("CANARY", 0.20, 0.15), ("FULL", 0.20, 0.30)])
+def test_the_real_account_guard_follows_the_stage(tmp_path, stage, daily, total):
+    """User decisions 2026-10-19 and 2026-11-05: daily 20% in every stage, total 15% in SHADOW and CANARY and 30% in FULL; the
+    engine's own breakers (cfg.breakers: paper equity, the target replay) keep 3% / 15%."""
     hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=10)
-    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (daily, 0.15)
+    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (daily, total)
     assert (hs.rt.cfg.breakers.daily_loss, hs.rt.cfg.breakers.total_dd) == (0.03, 0.15)
     hs.journal.close()
 
 
 def test_the_guard_params_follow_a_stage_that_is_read_again(tmp_path):
     hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL", stage_days=10)
-    assert hs.rt.guard.params.daily_loss == 0.03
+    assert (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (0.20, 0.30)
     hs.journal.set_stage("CANARY", "demotion", ENTRY_BAR)
     hs.rt = hs.make_runtime()  # a restart reads the journal's stage again
-    assert hs.rt.stage == "CANARY" and hs.rt.guard.params.daily_loss == 0.20
+    assert hs.rt.stage == "CANARY" and (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (0.20, 0.15)
     hs.rt = hs.make_runtime(stage="FULL")  # a process kept on a stage other than the journal's
-    assert hs.rt.stage == "FULL" and hs.rt.guard.params.daily_loss == 0.03
+    assert hs.rt.stage == "FULL" and (hs.rt.guard.params.daily_loss, hs.rt.guard.params.total_dd) == (0.20, 0.30)
     hs.journal.close()
     fresh = Harness(tmp_path / "fresh", ENTRY_BAR, stage=None)  # a journal without a stage: SHADOW is recorded at start
     assert fresh.rt.guard.params.daily_loss == 0.20
@@ -841,7 +841,8 @@ def test_the_audit_stops_at_the_last_decided_bar_and_never_passes_on_a_failed_on
 def test_a_demotion_applies_to_the_next_entry_while_the_process_still_runs(tmp_path):
     sizes = {}
     for demoted in (False, True):
-        hs = Harness(tmp_path / str(demoted), ENTRY_BAR, stage="FULL", stage_days=40)  # the cap is released
+        hs = Harness(tmp_path / str(demoted), ENTRY_BAR, stage="FULL", stage_days=10)  # the 3-contract cap applies (uncapped,
+        # this fixture's 0.6% stop sizes 186 contracts at FULL_RISK: 105% overnight margin, refused by the 70% entry limit)
         hs.price(float(hs.bar(ENTRY_BAR)["open"]))
         hs.rt.startup()
         hs.at(ENTRY_BAR + 1)  # this minute's stage check is done: the next one would restart the flat runtime
@@ -852,7 +853,7 @@ def test_a_demotion_applies_to_the_next_entry_while_the_process_still_runs(tmp_p
         hs.at(ENTRY_BAR + 30)
         sizes[demoted] = hs.ex.position().contracts
         hs.journal.close()
-    assert sizes[False] > 3 and sizes[True] == 1  # CANARY's one contract at once, not FULL's uncapped size
+    assert sizes[False] == 3 and sizes[True] == 1  # CANARY's one contract at once, not FULL's capped size
 
 
 def test_an_order_failure_is_a_canary_failure_only_when_not_resolved_in_time(h):
@@ -1224,10 +1225,10 @@ def test_an_ambiguous_tp1_sync_is_read_from_the_position_not_sold_again(tmp_path
 
 
 def tripped(h: Harness, t0: float = ENTRY_BAR + 30) -> None:
-    """Three balance reads base the day's reference, then a -4% equity: the next minute's read is the first breach."""
+    """Three balance reads base the day's reference, then a -21% equity: the next minute's read is the first breach."""
     h.at(t0 + 60)
     h.at(t0 + 120)
-    h.ex.cash -= 400.0
+    h.ex.cash -= 2_100.0
     h.at(t0 + 180)
 
 

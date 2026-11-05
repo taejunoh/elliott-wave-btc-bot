@@ -536,7 +536,7 @@ def test_the_cap_is_the_journal_stages_and_lifts_only_after_30_clean_days_of_ful
     jr.add_event(S0 + 55 * DAY, "ORDER_UNRESOLVED", {"trade_id": 7, "kind": "CLOSE_FAILED"})  # even without its incident
     assert full_cap(jr, S0 + 84 * DAY) == 3 and full_cap(jr, S0 + 85 * DAY) is None
     kw = dict(equity=200_000.0, entry=60_000.0, stop=59_400.0, direction=1, risk_mult=1.0, cfg=BotConfig())
-    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY), **kw)[0] == 303  # released: uncapped
+    assert stage_contracts("FULL", full_cap=full_cap(jr, S0 + 86 * DAY), **kw)[0] == 1666  # released: uncapped (FULL_RISK: 10% would be 3,032 contracts; the 5x cap, 200,000 * 5 / 60,000 / 0.01 = 1,666.7, binds)
     # a manual intervention the runtime still finds (a foreign order left resting) keeps the cap while it lasts,
     # and the 30 clean days count from its end
     jr.put(RAISED_KEY, {"items": [["FOREIGN_ORDERS", 7]], "ended": None, "stint": S0 + 5})
