@@ -516,12 +516,20 @@ class CoinbaseExchange:
                 return o
         return None
 
+    def balance_summary(self) -> dict[str, Any]:
+        """The `balance_summary` object of GET /cfm/balance_summary exactly as Coinbase sent it: nothing is converted and
+        no unit assumed. Coinbase documents amounts as {value, currency}, one field as "expressed as a percentage", and no
+        unit for the margin window measures' strings."""
+        bs = self._call("GET", "/cfm/balance_summary").get("balance_summary")
+        if not isinstance(bs, dict):
+            raise ExchangeError("balance_summary: a reply without its object")
+        return bs
+
     def balance(self) -> Balance:
         """Equity = total_usd_balance (cash) + unrealized PnL. Without a readable, finite cash total there
         is no equity: an error, never PnL alone (the breakers and sizing read it)."""
-        reply = self._call("GET", "/cfm/balance_summary")
+        bs = self.balance_summary()
         with _parsing("balance_summary"):
-            bs = reply.get("balance_summary") or {}
             cash = _opt(bs.get("total_usd_balance"))
             if cash is None:
                 raise ExchangeError("balance_summary without a total_usd_balance")

@@ -135,6 +135,40 @@ def test_balance_is_cash_plus_unrealized_pnl_and_permissions():
     assert (k.can_view, k.can_trade, k.can_transfer, k.portfolio_type) == (True, True, False, "DEFAULT")
 
 
+# the fields docs.cdp.coinbase.com documents for GET /cfm/balance_summary (read 2026-11-05): a documented shape, NOT a
+# recorded reply (no private reply with a position exists yet; a percentage is documented only for the *_percentage field)
+DOCUMENTED_SUMMARY = {"balance_summary": {
+    "total_usd_balance": {"value": "5000.00", "currency": "USD"},
+    "unrealized_pnl": {"value": "13.05", "currency": "USD"},
+    "initial_margin": {"value": "651.80", "currency": "USD"},
+    "available_margin": {"value": "4361.25", "currency": "USD"},
+    "liquidation_threshold": {"value": "325.90", "currency": "USD"},
+    "liquidation_buffer_amount": {"value": "4687.15", "currency": "USD"},
+    "liquidation_buffer_percentage": "1438",
+    "intraday_margin_window_measure": {"margin_window_type": "FCM_MARGIN_WINDOW_TYPE_INTRADAY",
+                                       "margin_level": "MARGIN_LEVEL_TYPE_BASE", "initial_margin": "100",
+                                       "maintenance_margin": "50", "liquidation_buffer": "4900"},
+    "overnight_margin_window_measure": {"margin_window_type": "FCM_MARGIN_WINDOW_TYPE_OVERNIGHT",
+                                        "margin_level": "MARGIN_LEVEL_TYPE_BASE", "initial_margin": "210",
+                                        "maintenance_margin": "105", "liquidation_buffer": "4800"},
+}}
+
+
+def test_balance_summary_is_the_replys_object_untouched_and_balance_reads_the_same_reply():
+    ex, _, _ = make({("GET", "/cfm/balance_summary"): DOCUMENTED_SUMMARY})
+    assert ex.balance_summary() == DOCUMENTED_SUMMARY["balance_summary"]  # nothing converted, no unit assumed
+    assert ex.balance().equity == pytest.approx(5013.05) and ex.balance().available_margin == pytest.approx(4361.25)
+
+
+@pytest.mark.parametrize("reply", [{}, {"balance_summary": None}, {"balance_summary": ["x"]}])
+def test_balance_summary_without_its_object_is_an_exchange_error(reply):
+    ex, _, _ = make({("GET", "/cfm/balance_summary"): reply})
+    with pytest.raises(ExchangeError):
+        ex.balance_summary()
+    with pytest.raises(ExchangeError):
+        ex.balance()
+
+
 def by_status(pages: dict[str, list]):
     """A List Orders route: each status answered from its own pages (consumed in order), no orders otherwise."""
     def answer(params):

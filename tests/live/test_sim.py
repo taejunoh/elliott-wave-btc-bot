@@ -326,3 +326,14 @@ def test_an_edit_below_what_already_filled_is_refused(ex):
     assert not ex.edit_bracket(b.order_id, 1, 61_000.0, 59_500.0) and not ex.edit_bracket(b.order_id, 2, 61_000.0,
                                                                                           59_500.0)
     assert ex.edit_bracket(b.order_id, 3, 61_000.0, 59_500.0) and ex.get_order(b.order_id).stop_price == 59_500.0
+
+
+def test_the_sim_answers_the_balance_summary_a_test_sets_and_has_no_margin_model():
+    ex = SimExchange()
+    assert ex.balance_summary() == {}  # no margin model: nothing is made up
+    ex.summary = {"liquidation_threshold": {"value": "1", "currency": "USD"}}
+    got = ex.balance_summary()
+    assert got == ex.summary and got is not ex.summary
+    ex.fail_next("balance_summary", ExchangeError("down"))
+    with pytest.raises(ExchangeError):
+        ex.balance_summary()

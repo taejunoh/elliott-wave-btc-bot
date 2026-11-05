@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from ewbot.live.exchange import (
     FUTURES_PRODUCT,
@@ -90,7 +90,7 @@ class SimExchange:
     # _accepted() after accepting an order. A subclass overriding one without that call narrows these.
     FAULT_METHODS: frozenset[str] = frozenset({
         "product", "session", "quote", "position", "open_orders", "get_order", "find_order", "balance",
-        "key_permissions", "place_market", "place_bracket", "edit_bracket", "cancel", "close_position",
+        "balance_summary", "key_permissions", "place_market", "place_bracket", "edit_bracket", "cancel", "close_position",
         "preview_market", "preview_bracket",
     })
     CRASH_METHODS: frozenset[str] = frozenset({"place_market", "place_bracket", "close_position"})
@@ -131,6 +131,7 @@ class SimExchange:
         self.market_fill_ratio = 1.0
         self.bracket_fill_cap: int | None = None
         self.preview_errors: tuple[str, ...] = ()
+        self.summary: dict[str, Any] = {}  # balance_summary()'s answer: the sim has no margin model, a test sets it
         self.fills: list[dict] = []
         self.calls: list[str] = []
         self._faults: dict[str, list[BaseException]] = {}
@@ -225,6 +226,10 @@ class SimExchange:
         if self.pos is not None:
             upnl = self.pos.side * (self.fut_price - self.pos.avg_entry) * self.pos.contracts * self.spec.contract_size
         return Balance(self.cash + upnl, None)
+
+    def balance_summary(self) -> dict[str, Any]:
+        self._fault("balance_summary")
+        return dict(self.summary)
 
     def key_permissions(self) -> KeyPermissions:
         self._fault("key_permissions")

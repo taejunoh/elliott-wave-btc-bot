@@ -8,7 +8,7 @@ already on the product's tick grid when they are sent (live/pricing.py does the 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 FUTURES_PRODUCT = "BIP-20DEC30-CDE"  # nano Bitcoin perp-style future, 0.01 BTC per contract
 SPOT_PRODUCT = "BTC-USD"  # the signal source (same candles as the paper runtime)
@@ -157,6 +157,10 @@ class Exchange(Protocol):
     def get_order(self, order_id: str) -> Order: ...
     def find_order(self, client_order_id: str, since_ts: float) -> Order | None: ...
     def balance(self) -> Balance: ...
+    def balance_summary(self) -> dict[str, Any]:
+        """The venue's whole balance summary as it sent it: nothing converted, no unit assumed (`balance` reads two of
+        its fields). The test trade journals its margin fields, the only measure of the unpublished maintenance rate."""
+        ...
     def key_permissions(self) -> KeyPermissions: ...
     def place_market(self, client_order_id: str, side: int, size: int) -> PlaceResult: ...
     def place_bracket(
