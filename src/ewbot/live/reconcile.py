@@ -6,7 +6,9 @@ the engine's target (live/target.py) and the exchange's position and open orders
   1. `observe` folds exchange facts into the trade: flat -> CLOSED (but a flat read while every leg of the trade
      still rests with all the trade holds - nothing of them filled, so no bracket explains it - is unconfirmed,
      FLAT_UNCONFIRMED: the trade stays OPEN, nothing is cancelled or entered, and the next read decides: flat again
-     -> CLOSED, the position again -> it was a wrong read); a reduce of ours that the executor
+     -> CLOSED, the position again -> it was a wrong read; and a flat read the caller holds - a filled entry no read has
+     shown yet, no leg filled: `hold_flat`, the runtime reads the legs - does not close it at all, POSITION_NOT_SEEN:
+     /cfm/positions can lag the fill the order shows); a reduce of ours that the executor
      recorded before sending it (`pending_reduce`, intent before state) and that now shows in the position
      is ours whatever its answer was (REDUCE_SETTLED: TP1_SYNC -> the live TP1, MARGIN -> a smaller trade;
      a filled reduce the position still does not show after REDUCE_SETTLE_S yields to the position,
@@ -27,8 +29,9 @@ the engine's target (live/target.py) and the exchange's position and open orders
          one is then the incident) -, never left unprotected until a target comes; any other is alerted;
        - within the hour after an entry the replay still shows it as queued (`target.entry`): the live
          trade of that signal is the engine position (`pending_position`), never a reason to close;
-       - flat: nothing while the trade is still OPEN (its flat read is unconfirmed: observe); else cancel our
-         leftover orders; enter when the engine queued an entry at the last close
+       - flat: nothing while the trade is still OPEN (its flat read is unconfirmed: observe), but its legs are tried
+         while its entry was not read yet (`ctx.entry_unseen`: the venue may take a bracket before its read shows the
+         position); else cancel our leftover orders; enter when the engine queued an entry at the last close
          (never a signal the live trade already traded: closed early by its bracket, it is not
          re-entered);
        - engine flat / another trade / exit queued (TIME, LINEAGE, BREAKER, FLIP, ...): close, then
@@ -73,6 +76,7 @@ from ewbot.live.target import Target, TargetEntry, TargetPosition
 PREFIX = "ewb-"
 UNPROTECTED_MAX_S = 60.0  # spec 6.2: a position unprotected for longer is a major incident
 REDUCE_SETTLE_S = 60.0  # a reduce the venue reported filled but the position does not show by then: the position wins
+ENTRY_NOT_SEEN = "ENTRY_NOT_SEEN"  # the exit of a filled entry whose position no read showed in time (executor.ENTRY_SHOW_MAX_S)
 
 
 def entry_cid(signal_ts: int, direction: int) -> str:
@@ -211,6 +215,7 @@ class PlanContext:
     # intent opens (`entry_position`; the runtime: Executor.unsettled_entry): without a target a position on its side
     # is taken over from it
     own_entry: TargetPosition | None = None
+    entry_unseen: bool = False  # the open trade's entry filled and no read has shown its position yet (Executor.entry_unseen)
 
     def __post_init__(self) -> None:
         if self.max_contracts is not None and self.max_contracts < 1:
@@ -305,14 +310,20 @@ def _legs_whole(trade: LiveTrade, orders: list[Order]) -> bool:
             and sum(o.size - o.filled for _, o in resting) >= expected_contracts(trade))
 
 
-def observe(trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float
+def observe(trade: LiveTrade | None, position: Position | None, orders: list[Order], now: float, hold_flat: bool = False
             ) -> tuple[LiveTrade | None, list[tuple[str, dict[str, Any]]]]:
-    """Fold exchange facts into the trade (a modified copy) and return the events they raise."""
+    """Fold exchange facts into the trade (a modified copy) and return the events they raise. `hold_flat`: a flat read that
+    must not close the trade (module docstring; decided by the caller: this module does no I/O)."""
     if trade is None or trade.status != "OPEN":
         return trade, []
     t = LiveTrade.from_json(trade.to_json())
     events: list[tuple[str, dict[str, Any]]] = []
     if position is None:
+        if hold_flat:
+            if t.flat_seen is None:
+                t.flat_seen = now
+                events.append(("POSITION_NOT_SEEN", {"trade_id": t.trade_id}))
+            return t, events
         if t.flat_seen is None and _legs_whole(t, orders):  # one flat read the legs contradict: the next decides
             t.flat_seen = now
             events.append(("FLAT_UNCONFIRMED", {"trade_id": t.trade_id}))
@@ -506,6 +517,8 @@ def plan(target: Target | None, trade: LiveTrade | None, position: Position | No
 
     if position is None:
         if open_trade is not None:  # its flat read is unconfirmed (observe): nothing cancelled or entered until the next
+            if ctx.entry_unseen:
+                return acts + _protection(open_trade, orders, expected_contracts(open_trade), open_trade.stop_spot, ctx)
             return acts
         if ours:
             acts.append(Cancel(tuple(o.order_id for o in ours), "FLAT"))

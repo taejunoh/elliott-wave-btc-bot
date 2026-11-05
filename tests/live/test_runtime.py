@@ -14,6 +14,7 @@ import ewbot.live.runtime as runtime_mod
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.live.audit import AuditError, audit
 from ewbot.live.control import Command
+from ewbot.live.executor import ENTRY_SHOW_MAX_S
 from ewbot.live.exchange import (
     Balance,
     ExchangeError,
@@ -31,9 +32,10 @@ from ewbot.live.notify import RESENT, UNANSWERED, LiveNotifier, TelegramError
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.pricing import MARGIN_ENTRY_MAX, margin_ratio
 from ewbot.live.journal import Journal
-from ewbot.live.reconcile import PlanContext, pending_position
+from ewbot.live.reconcile import ENTRY_NOT_SEEN, PlanContext, pending_position
 from ewbot.live.runtime import (
     AUDIT_FETCH_MAX_S,
+    FLATTEN_KEY,
     STARTUP_READ_MAX_S,
     STOP_GRACE_S,
     StartupRefused,
@@ -44,6 +46,7 @@ from ewbot.live.shadow import CALLS_KEPT, FILLS_KEPT, PREVIEW_RETRY_LIMIT, Shado
 from ewbot.live.sim import SimCrash, SimExchange
 from ewbot.live.stage import (
     RAISED_KEY,
+    canary_failures,
     canary_gates,
     full_cap,
     on_incident,
@@ -58,7 +61,7 @@ from ewbot.live.watchdog import AccountGuard
 from ewbot.paper.decisions import known_at
 from ewbot.paper.notify import SendError
 from tests.live.harness import Harness
-from tests.live.helpers import Clock, journal, position
+from tests.live.helpers import Clock, Lag, journal, position
 from tests.paper.helpers import synth_frame, ts
 
 SIGNAL = ts("2024-03-13 22:00")  # C_END long: entry 23:00, trail 03-14 07:00, TP1 + break-even 03-14 23:00
@@ -2887,4 +2890,206 @@ def test_a_breaker_trip_in_full_still_flattens_pauses_and_demotes_and_the_resume
     assert hs.journal.get(runtime_mod.PEAK_REBASE_KEY) is None and hs.rt.guard.state()["peak"] < 7_500.0
     assert hs.rt.handle("/resume", ENTRY_BAR + 430).startswith("재개")
     assert not hs.rt.guard.state()["total_tripped"]
+    hs.journal.close()
+
+
+# ---------------------------------------------------------------------------- a position read that lags a strategy entry
+def lagged_entry(tmp_path, stage: str, refuse: bool = True, reads: int = 10_000) -> tuple[Harness, Lag]:
+    """A strategy entry on a venue whose positions read does not show it yet. The probe's result before the fix: FULL's 124
+    contracts with no stop for about 30 s, the journal saying CLOSED/BRACKET, and then a false ADOPTED."""
+    hs = Harness(tmp_path / stage / str(refuse), ENTRY_BAR, stage=stage, stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    lag = Lag(hs, reads, refuse=refuse)
+    hs.at(ENTRY_BAR + 30)
+    return hs, lag
+
+
+def real_stops(hs: Harness) -> int:
+    return sum(o.size - o.filled for o in hs.ex.open_orders() if o.kind == "BRACKET" and o.stop_price is not None)
+
+
+def assert_nothing_false(hs: Harness) -> None:
+    """No false exit, no false adoption, no incident."""
+    assert hs.journal.events(kind="CLOSED") == [] and hs.journal.events(kind="ADOPTED") == []
+    assert hs.journal.events(kind="INCIDENT") == [] and paused(hs.journal) is None
+    assert (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
+    assert canary_failures(hs.journal, hs.journal.stage()[1]) == {}
+
+
+@pytest.mark.parametrize("stage,contracts", [("CANARY", 1), ("FULL", 124)])
+def test_a_strategy_entry_not_read_yet_is_kept_and_protected_as_soon_as_it_shows(tmp_path, stage, contracts):
+    hs, lag = lagged_entry(tmp_path, stage)
+    t = hs.rt.executor.trade()
+    assert t.status == "OPEN" and hs.ex.pos.contracts == contracts and real_stops(hs) == 0
+    for k in range(1, 4):  # read every second: not closed, nothing cancelled or entered
+        hs.at(ENTRY_BAR + 30 + k)
+        assert hs.rt.executor.trade().status == "OPEN" and real_stops(hs) == 0
+    assert len(hs.journal.events(kind="POSITION_NOT_SEEN")) == 1 and hs.alerts.kinds().count("POSITION_NOT_SEEN") == 1
+    assert hs.rt.active is True and hs.rt.flat() is False
+    tries = len(hs.journal.events(kind="BRACKET_FAILED"))
+    assert tries >= 2  # its stop kept being tried: Coinbase may take it before the read shows
+    lag.left = 0
+    hs.at(ENTRY_BAR + 34)  # the first pass that reads it places the stop
+    assert real_stops(hs) == contracts
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is False
+    for k in range(5, 8):
+        hs.at(ENTRY_BAR + 30 + 10 * k)
+    assert real_stops(hs) == contracts and hs.ex.position().contracts == contracts
+    assert hs.rt.executor.trade().unprotected_since is None  # the next pass reads it covered
+    assert_nothing_false(hs)
+    assert hs.journal.events(kind="ORDER_UNRESOLVED") == []
+    hs.journal.close()
+
+
+@pytest.mark.parametrize("stage,contracts", [("CANARY", 1), ("FULL", 124)])
+def test_a_bracket_coinbase_takes_while_the_read_lags_is_kept_not_doubled(tmp_path, stage, contracts):
+    hs, lag = lagged_entry(tmp_path, stage, refuse=False)
+    placed = hs.ex.open_orders()
+    assert real_stops(hs) == contracts
+    for k in range(1, 4):
+        hs.at(ENTRY_BAR + 30 + k)
+    assert [o.order_id for o in hs.ex.open_orders()] == [o.order_id for o in placed]  # never cancelled as FLAT, never again
+    lag.left = 0
+    hs.at(ENTRY_BAR + 34)
+    assert [o.order_id for o in hs.ex.open_orders()] == [o.order_id for o in placed]
+    assert_nothing_false(hs)
+    hs.journal.close()
+
+
+def test_a_short_lag_is_nothing_but_one_more_read(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "CANARY", reads=1)  # the entry's own read did not show it
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is True
+    hs.at(ENTRY_BAR + 31)
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is False and real_stops(hs) == 1
+    assert hs.journal.events(kind="POSITION_NOT_SEEN") == []
+    assert_nothing_false(hs)
+    hs.journal.close()
+
+
+def test_an_entry_the_read_shows_at_once_is_never_held(tmp_path):
+    """No lag: as before the fix, a flat read after it is believed at once when its brackets do not contradict it."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    assert hs.rt.executor.entry_unseen(hs.rt.executor.trade()) is False
+    hs.journal.close()
+
+
+def test_a_leg_that_filled_explains_the_flat_read_at_once(tmp_path):
+    hs, _ = lagged_entry(tmp_path, "CANARY", refuse=False)
+    stop = next(o.stop_price for o in hs.ex.open_orders())
+    hs.ex.set_prices(stop - 1.0)  # stopped out while the positions read still lags
+    hs.at(ENTRY_BAR + 31)
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET") and hs.journal.events(kind="POSITION_NOT_SEEN") == []
+    assert hs.journal.events(kind="ADOPTED") == [] and paused(hs.journal) is None
+    hs.journal.close()
+
+
+def test_an_entry_that_never_shows_is_given_up_after_5_minutes_and_says_so(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "CANARY", refuse=False)
+    opened = hs.rt.executor.trade().opened_ts
+    now = ENTRY_BAR + 30
+    while now < opened + ENTRY_SHOW_MAX_S - 10:
+        now += 10
+        hs.at(now)
+        assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    hs.at(opened + ENTRY_SHOW_MAX_S + 1)
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", ENTRY_NOT_SEEN) and paused(hs.journal) is not None
+    assert any("나타나지 않음" in text for _, text in hs.alerts.items)
+    assert hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == ENTRY_NOT_SEEN  # never called a bracket's exit
+    hs.at(opened + ENTRY_SHOW_MAX_S + 12)
+    assert hs.ex.open_orders() == []  # the wait is over: what rests on a book read flat is cancelled
+    hs.journal.close()
+
+
+def test_a_restart_keeps_the_entry_it_has_not_seen(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "FULL")
+    hs.clock.now = ENTRY_BAR + 60
+    hs.rt = hs.make_runtime()
+    assert hs.rt.active is True
+    hs.rt.startup()
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    lag.left = 0
+    hs.at(ENTRY_BAR + 71)
+    assert real_stops(hs) == 124 and hs.journal.events(kind="ADOPTED") == []
+    hs.journal.close()
+
+
+def test_a_close_of_an_entry_not_seen_records_no_exit(tmp_path):
+    """The watchdog's and any other close reach `Executor.close`, whose flat branch would call this a bracket's exit."""
+    hs, lag = lagged_entry(tmp_path, "CANARY")
+    assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(ENTRY_BAR + 31)) is False
+    assert hs.rt.executor.trade().status == "OPEN" and hs.journal.events(kind="CLOSED") == []
+    lag.left = 0
+    assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(ENTRY_BAR + 32)) is True
+    assert hs.ex.pos is None and hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "STOP_GAP"
+    hs.journal.close()
+
+
+def test_a_flatten_stands_through_the_lag_and_closes_when_it_shows(tmp_path):
+    hs, lag = lagged_entry(tmp_path, "FULL")
+    hs.rt._flatten("USER_FLATTEN", "USER", "user /flatten", ENTRY_BAR + 31)
+    assert hs.journal.get(FLATTEN_KEY) is not None and hs.rt.executor.trade().status == "OPEN"
+    hs.at(ENTRY_BAR + 32)
+    assert hs.journal.get(FLATTEN_KEY) is not None
+    lag.left = 0
+    hs.at(ENTRY_BAR + 33)
+    assert hs.ex.pos is None and hs.journal.get(FLATTEN_KEY) is None
+    assert hs.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "USER_FLATTEN"
+    assert hs.journal.events(kind="ADOPTED") == []
+    hs.journal.close()
+
+
+def ended_late(hs: Harness, after: float) -> None:
+    """Our IOC entry reads open for `after` seconds from its first read, unfilled, and has ended with nothing since."""
+    hs.ex.market_fill_ratio = 0.0
+    real, start = hs.ex.get_order, {"t": None}
+
+    def late(order_id):
+        o = real(order_id)
+        if o.client_order_id.startswith("ewb-e-"):
+            start["t"] = hs.clock.now if start["t"] is None else start["t"]
+            if hs.clock.now - start["t"] <= after:
+                return dataclasses.replace(o, status="OPEN")
+        return o
+
+    hs.ex.get_order = late
+
+
+def test_a_strategy_entry_that_ends_unfilled_settles_at_the_next_read(tmp_path):
+    """Finding 8 again, on the strategy path: it stayed "unsettled" for up to 2 hours (fast polls, no flat book, so no stage
+    change either), after an IOC that read open past the 10 s wait and then ended with nothing."""
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    ended_late(hs, hs.rt.executor.fill_timeout)
+    hs.at(ENTRY_BAR + 30)
+    assert hs.rt.executor.unsettled_entry(hs.clock.now) is not None and hs.rt._busy() is True  # may still fill: watched
+    assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False]
+    hs.at(hs.clock.now + 11)
+    assert hs.rt.executor.unsettled_entry(hs.clock.now) is None and hs.rt._busy() is False and hs.rt.flat() is True
+    assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False, True]
+    assert any(text.startswith("[진입 미체결 확정]") for _, text in hs.alerts.items)
+    n = len(hs.journal.events(kind="ENTRY_UNFILLED"))
+    hs.at(hs.clock.now + 11)
+    assert len(hs.journal.events(kind="ENTRY_UNFILLED")) == n and hs.ex.position() is None
+    hs.journal.close()
+
+
+def test_an_entry_still_open_stays_watched_and_one_that_fills_late_is_ours(tmp_path):
+    hs = Harness(tmp_path, ENTRY_BAR, stage="CANARY", stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 1)
+    ended_late(hs, 1_000.0)
+    hs.at(ENTRY_BAR + 30)
+    hs.at(hs.clock.now + 11)
+    assert hs.rt.executor.unsettled_entry(hs.clock.now) is not None  # it has not ended: not settled by the read
+    assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False]
     hs.journal.close()

@@ -27,7 +27,6 @@ from ewbot.live.stage import (
     TEST_TRADE,
     TEST_TRADE_MARGIN,
     TEST_TRADE_REFUSED,
-    TEST_UNSEEN_KEY,
     canary_failures,
     canary_gates,
     full_entry_gates,
@@ -40,7 +39,7 @@ from ewbot.live.stage import (
 from ewbot.live.target import Target
 from ewbot.types import H1
 from tests.live.harness import Harness
-from tests.live.helpers import entry, position
+from tests.live.helpers import Lag, entry, position
 from tests.paper.helpers import ts
 
 QUIET = ts("2024-02-01 10:00")  # the synthetic candles' engine is flat and queues nothing around here
@@ -407,9 +406,12 @@ def test_ok_needs_the_end_state_to_be_flat(h, monkeypatch):
     monkeypatch.setattr(h.rt, "_test_end_state", a_position_shows)
     ask(h)
     r = result(h)
-    assert r["ok"] is False and r["position"] == "unseen" and "끝" in r["why"] and "포지션 없음" not in r["message"]
-    assert h.journal.get(TEST_UNSEEN_KEY) is not None and h.journal.get(TEST_ACTIVE_KEY) is None
+    assert r["ok"] is False and r["position"] in ("protected", "unprotected") and "끝" in r["why"]
+    assert "포지션 없음" not in r["message"] and h.journal.get(TEST_ACTIVE_KEY) is None
+    assert h.rt.executor.trade().status == "OPEN" and h.journal.get(FLATTEN_KEY) is not None  # back on the record, its close stands
     h.ex.position = real
+    h.at(h.clock.now + 11)
+    assert h.journal.get(FLATTEN_KEY) is None and h.ex.position() is None
     assert_no_false_manual(h)
 
 
@@ -440,34 +442,6 @@ def test_a_bug_while_writing_the_result_still_writes_it_and_clears_the_active_ke
 
 
 # ---------------------------------------------------------------------------- a position read that lags the fill
-class Lag:
-    """The fill is on the order; /cfm/positions does not show it for `reads` more reads (independent review of 2026-11-05).
-    With `refuse`, Coinbase refuses a bracket for want of the position it does not see yet, its own answer on a flat account
-    (live/shadow.py, 2026-10-05)."""
-
-    def __init__(self, hs: Harness, reads: int, refuse: bool = False) -> None:
-        self.left, self.armed = reads, False
-        real_pos, real_market, real_bracket = hs.ex.position, hs.ex.place_market, hs.ex.place_bracket
-
-        def position():
-            if self.armed and self.left > 0:
-                self.left -= 1
-                return None
-            return real_pos()
-
-        def market(cid, side, size):
-            out = real_market(cid, side, size)
-            self.armed = True
-            return out
-
-        def bracket(cid, side, size, limit, stop):
-            if refuse and self.left > 0:
-                return PlaceResult(cid, None, False, "BRACKET_ORDER_SIZE_EXCEEDS_POSITION")
-            return real_bracket(cid, side, size, limit, stop)
-
-        hs.ex.position, hs.ex.place_market, hs.ex.place_bracket = position, market, bracket
-
-
 def assert_no_false_manual(hs: Harness) -> None:
     assert hs.journal.events(kind="ADOPTED") == [] and (hs.journal.get(RAISED_KEY) or {}).get("items", []) == []
     assert not {"UNKNOWN_POSITION", "ADOPTED", "FOREIGN_ORDERS", "EXCESS_POSITION", "UNEXPLAINED_REDUCTION"} & set(
@@ -481,7 +455,7 @@ def test_a_short_lag_is_waited_for_and_the_trade_passes(h, refuse):
     ask(h)
     r = result(h)
     assert r["ok"] is True and r["position"] == "flat" and r["why"] is None
-    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert h.ex.position() is None and h.journal.get(FLATTEN_KEY) is None
     assert [e["data"]["reason"] for e in h.journal.events(kind="CLOSED")] == ["TEST_TRADE"]  # never read as a bracket's exit
     ticks(h, 3, 61.0)
     assert_nothing_false(h)
@@ -504,8 +478,10 @@ def unseen_lag(hs: Harness, refuse: bool = True) -> tuple[Lag, dict]:
 def assert_unseen(hs: Harness, r: dict) -> None:
     assert r["ok"] is False and r["step"] == "protect" and r["position"] == "unseen"
     assert "포지션 없음" not in r["message"] and "먼저" not in r["message"] and "읽히지 않음" in r["message"]
-    assert hs.journal.get(TEST_UNSEEN_KEY)["trade_id"] == r["trade_id"] and paused(hs.journal) is not None
-    assert hs.rt.active is True and hs.rt.observed_close is not None  # fast polls, across which it is looked for
+    t = hs.rt.executor.trade()
+    assert t.trade_id == r["trade_id"] and t.status == "OPEN" and hs.rt.executor.entry_unseen(t)  # never closed on the record
+    assert hs.journal.get(FLATTEN_KEY)["reason"] == "TEST_TRADE_FAILED" and paused(hs.journal) is not None
+    assert hs.rt.active is True  # fast polls, across which it is looked for
     assert hs.rt.flat() is False  # no promotion, no new test trade, no restart into a new stage while it may show
     assert any(k == TEST_TRADE and t.startswith("[시험 거래 실패]") and "읽히지 않음" in t for k, t in hs.alerts.items)
 
@@ -516,16 +492,29 @@ def test_a_position_not_seen_within_the_limit_and_shown_later_with_no_target_is_
     lag, r = unseen_lag(h)
     assert_unseen(h, r)
     assert h.ex.pos is not None  # the real one, on the venue
-    placed = []
-    real = h.ex.place_bracket
-    h.ex.place_bracket = lambda *a: placed.append(a) or real(*a)
     lag.left = 0
     h.at(h.clock.now + 11)
-    assert placed, "protected from the entry's own levels before the close"
-    assert h.ex.position() is None and h.ex.open_orders() == []
-    assert h.journal.get(TEST_UNSEEN_KEY) is None and h.journal.get(FLATTEN_KEY) is None
+    assert h.ex.position() is None and h.ex.open_orders() == []  # its standing close went out at the first read that shows it
+    assert h.journal.get(FLATTEN_KEY) is None
     assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "TEST_TRADE_FAILED"
-    assert h.journal.events(kind="RECOVERED_ENTRY")
+    assert_no_false_manual(h)
+
+
+def test_a_late_position_whose_close_fails_gets_its_stop(h):
+    """The close is first (market, with nothing else to do), and when it fails the position is protected at once."""
+    h.rt.target = None
+    lag, r = unseen_lag(h)
+    real, placed = h.ex.close_position, []
+    h.ex.close_position = lambda cid, size=None: PlaceResult(cid, None, False, "SOME_NEW_REFUSAL: no")
+    bracket = h.ex.place_bracket
+    h.ex.place_bracket = lambda *a: placed.append(a) or bracket(*a)
+    lag.left = 0
+    h.at(h.clock.now + 11)
+    assert h.ex.position() is not None and placed and [o.kind for o in h.ex.open_orders()] == ["BRACKET"]
+    assert h.journal.get(FLATTEN_KEY) is not None
+    h.ex.close_position = real
+    h.at(h.clock.now + 11)
+    assert h.ex.position() is None and h.journal.get(FLATTEN_KEY) is None
     assert_no_false_manual(h)
 
 
@@ -534,7 +523,7 @@ def test_a_late_position_with_a_flat_engine_is_no_unknown_position(h):
     assert_unseen(h, r)
     lag.left = 0
     h.at(h.clock.now + 11)
-    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert h.ex.position() is None and h.journal.get(FLATTEN_KEY) is None
     assert_no_false_manual(h)
     assert not [a for a in h.journal.events(kind="CLOSED") if a["data"]["reason"] == "UNKNOWN_POSITION"]
 
@@ -549,7 +538,7 @@ def test_a_late_position_on_the_engines_side_is_not_adopted(h):
     assert_no_false_manual(h)
 
 
-def test_its_stop_stays_while_the_position_may_still_show_and_is_taken_back(h):
+def test_its_stop_stays_while_the_position_may_still_show(h):
     """Bracket accepted, the position late: the leg is not cancelled as FLAT in the meantime, and no second one is placed."""
     lag, r = unseen_lag(h, refuse=False)
     assert_unseen(h, r)
@@ -558,7 +547,7 @@ def test_its_stop_stays_while_the_position_may_still_show_and_is_taken_back(h):
     assert [o.kind for o in h.ex.open_orders()] == ["BRACKET"]
     lag.left = 0
     h.at(h.clock.now + 11)
-    assert h.journal.events(kind="LEG_ADOPTED") and h.ex.position() is None and h.ex.open_orders() == []
+    assert h.ex.position() is None and h.ex.open_orders() == []
     assert_no_false_manual(h)
 
 
@@ -570,7 +559,7 @@ def test_a_restart_keeps_looking_for_it(h):
     assert h.rt.active is True
     lag.left = 0
     h.rt.startup()
-    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert h.ex.position() is None and h.journal.get(FLATTEN_KEY) is None
     assert_no_false_manual(h)
 
 
@@ -579,11 +568,10 @@ def test_a_position_that_never_shows_ends_the_wait_says_so_and_leaves_the_pause(
     assert_unseen(h, r)
     for _ in range(35):
         h.at(h.clock.now + 11)
-        if h.journal.get(TEST_UNSEEN_KEY) is None:
+        if h.rt.executor.trade().status != "OPEN":
             break
-    assert h.journal.get(TEST_UNSEEN_KEY) is None
-    assert h.journal.events(kind="TEST_TRADE_UNSEEN_ENDED") and paused(h.journal) is not None
-    assert any("나타나지 않음" in t for _, t in h.alerts.items)
+    assert h.rt.executor.trade().exit_reason == "ENTRY_NOT_SEEN" and h.journal.get(FLATTEN_KEY) is None
+    assert paused(h.journal) is not None and any("나타나지 않음" in t for _, t in h.alerts.items)
     h.at(h.clock.now + 11)
     assert h.ex.open_orders() == []  # the wait is over: the planner cancels what rests on a book it reads flat
 
@@ -601,10 +589,11 @@ def test_a_flat_read_at_the_close_with_no_fill_is_not_called_a_bracket_exit(h):
     ask(h)
     r = result(h)
     assert r["ok"] is False and r["position"] == "unseen" and "먼저" not in r["why"] and "포지션 없음" not in r["message"]
-    assert h.journal.get(TEST_UNSEEN_KEY) is not None
+    assert h.rt.executor.trade().status == "OPEN" and h.journal.events(kind="CLOSED") == []  # no bracket's exit on the record
     lag.left = 0
     h.at(h.clock.now + 11)
-    assert h.ex.position() is None and h.journal.get(TEST_UNSEEN_KEY) is None
+    assert h.ex.position() is None and h.journal.get(FLATTEN_KEY) is None
+    assert h.journal.events(kind="CLOSED")[-1]["data"]["reason"] == "TEST_TRADE_FAILED"
     assert_no_false_manual(h)
 
 
@@ -612,6 +601,7 @@ def test_a_new_test_trade_is_refused_while_the_last_position_may_still_show(h):
     lag, r = unseen_lag(h)
     resume(h.journal, h.clock.now)
     assert "읽히지 않" in rt_mod.refusal_of_test_trade(h.journal, h.ex, h.clock.now)
+    assert "전량 청산" not in rt_mod.refusal_of_test_trade(h.journal, h.ex, h.clock.now)  # it says what is really going on
 
 
 def test_two_refusals_of_the_stop_are_at_least_a_retry_apart(h):
@@ -1151,11 +1141,10 @@ def test_ctrl_c_after_the_runtime_took_it_says_it_may_be_running(env, capsys, mo
 
 
 @pytest.mark.parametrize("key,value", [(TEST_REQUEST_KEY, {"id": "r", "side": 1, "ts": 1.0}),
-                                       (TEST_ACTIVE_KEY, {"request": "r", "trade_id": 1, "side": 1, "ts": 1.0}),
-                                       (TEST_UNSEEN_KEY, {"trade_id": 1, "side": 1, "until": 1.0})])
+                                       (TEST_ACTIVE_KEY, {"request": "r", "trade_id": 1, "side": 1, "ts": 1.0})])
 def test_a_test_trade_under_way_holds_the_book_for_deploy_rebase_and_promotions(env, capsys, key, value):
-    """Review finding: `live status --require-flat`, `rebase` and the promotions did not see a test trade asked for, under
-    way, or waiting for its position, each of which can be an order of the next seconds or a position nobody reads yet."""
+    """Review finding: `live status --require-flat`, `rebase` and the promotions did not see a test trade asked for or under
+    way, either of which can be an order of the next seconds. One whose position is not read yet is an open trade."""
     env.journal.put(key, value)
     assert main(["live", "status", "--json", "--require-flat", "--exchange"]) == 3
     captured = capsys.readouterr()

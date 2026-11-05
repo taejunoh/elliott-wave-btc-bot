@@ -762,8 +762,8 @@ def _live_status(s: LiveSettings, args: argparse.Namespace) -> int:
 
 def _held(trade: bool, pending: int, flatten: bool, position: bool, orders: int, test_trade: bool = False) -> list[str]:
     """What keeps a book from flat - the running runtime's flat (LiveRuntime.flat): an open trade, an order of unknown
-    outcome (a PENDING intent), a standing flatten or a test trade asked for, under way or waiting for its position in the
-    journal, a position or a resting order on the account."""
+    outcome (a PENDING intent), a standing flatten or a test trade asked for or under way in the journal, a position or a
+    resting order on the account."""
     return [what for what, there in (
         ("an open trade", trade), (f"{pending} order(s) of unknown outcome (PENDING)", pending > 0),
         ("a standing flatten", flatten), ("a test trade asked for or under way", test_trade), ("a position", position),
@@ -771,9 +771,8 @@ def _held(trade: bool, pending: int, flatten: bool, position: bool, orders: int,
 
 
 def _test_trade_held(journal: Journal) -> bool:
-    """A test trade was asked for, runs, or its filled entry's position is still being looked for."""
-    return any(journal.get(key) is not None for key in (live_runtime.TEST_REQUEST_KEY, live_runtime.TEST_ACTIVE_KEY,
-                                                        live_runtime.TEST_UNSEEN_KEY))
+    """A test trade was asked for or runs."""
+    return any(journal.get(key) is not None for key in (live_runtime.TEST_REQUEST_KEY, live_runtime.TEST_ACTIVE_KEY))
 
 
 def _flat_book(s: LiveSettings, journal: Journal) -> tuple[bool, Exchange]:
