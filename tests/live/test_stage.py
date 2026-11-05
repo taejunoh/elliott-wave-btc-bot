@@ -17,6 +17,7 @@ from ewbot.live.stage import (
     ORDER_FAILURES,
     PEAK_REBASE_KEY,
     RAISED_KEY,
+    REQUIRED_GATES,
     Gate,
     StageError,
     canary_entry_gates,
@@ -237,7 +238,7 @@ def test_each_shadow_gate_can_fail(tmp_path):
     jr.add_event(S0 + 9 * DAY, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 1, "rebuilt": 0})
     bad = AuditResult((0, int(now) - 2 * H1), 3, 2, ({"id": "x", "type": "DIFFERENT", "cause": "UNEXPLAINED"},), now)
     met = {g.name: g.met for g in shadow_gates(jr, now, bad)}
-    assert met == {"기간 14일 이상": False, "신호 1건 이상": True, AUDIT_GATE: False, CYCLE_GATE: False,
+    assert met == {"기간 14일 이상": True, "신호 1건 이상": True, AUDIT_GATE: False, CYCLE_GATE: False,  # waived 2026-11-05
                    "③ 냈을 주문 전부 preview 통과": False, "④ 장애·재시작 시험 통과": False}
     jr.close()
 
@@ -256,10 +257,10 @@ def test_the_preview_gate_shows_brackets_refused_for_want_of_a_position_apart(tm
     jr.add_event(S0 + 11_000, "PREVIEW", {"kind": "BRACKET", "ok": False, "errors": ["PREVIEW_INVALID_BRACKET_PRICES"]})
     assert not gate(jr, now).met and gate(jr, now).detail.startswith("1/2, ")  # any other refusal fails
     jr.close()
-    only = journal(tmp_path, "only.sqlite")  # nothing the venue could check: not met
+    only = journal(tmp_path, "only.sqlite")  # nothing the venue could check: no failure (user decision 2026-11-05)
     only.set_stage("SHADOW", "initial", S0)
     only.add_event(S0 + 10, "PREVIEW_POSITION_DEPENDENT", flat_only)
-    assert not gate(only, S0 + DAY).met and gate(only, S0 + DAY).detail.startswith("0/0, ")
+    assert gate(only, S0 + DAY).met and gate(only, S0 + DAY).detail.startswith("0/0, ")
     only.close()
 
 
@@ -273,9 +274,9 @@ def test_the_signal_and_cycle_gates_count_the_stage_itself(tmp_path):
 
     # the first cycle records every decision since 2024: none of those signals was first known in the stage
     jr.add_decisions([dec("SIGNAL", 1_730_000_000 + k * H1, 1_730_000_000 + k * H1) for k in range(3)], now=S0 + 40)
-    assert not gate("신호 1건 이상").met
+    assert gate("신호 1건 이상").detail.startswith("단계 중 알게 된 신호 0건")
     jr.add_decisions([dec("SIGNAL", int(S0) + 7200, int(S0) + 7200)], now=S0 + 10_900)
-    assert (gate("신호 1건 이상").met, gate("신호 1건 이상").detail) == (True, "단계 중 알게 된 신호 1건")
+    assert gate("신호 1건 이상").detail.startswith("단계 중 알게 된 신호 1건")
     # a runtime that was down: every hour without a cycle is a miss
     for k in (0, 300):
         bar = int(S0) + k * H1
@@ -367,6 +368,105 @@ def test_canary_needs_shadow_paper_and_a_trade_key(tmp_path):
     assert not all(g.met for g in canary_entry_gates(jr, now, good(now), no_c4, KEY))
     assert not all(g.met for g in canary_entry_gates(jr, now, good(now), PAPER_OK, KeyPermissions(True, True, True)))
     assert not all(g.met for g in canary_entry_gates(jr, now, good(now), None, KEY))
+    jr.close()
+
+
+def bare_shadow(tmp_path, days: float = 0.5, name: str = "bare.sqlite"):
+    """A SHADOW stint without a single signal or preview: on-time cycles and a clean manual restart only."""
+    jr = journal(tmp_path, name)
+    jr.set_stage("SHADOW", "initial", S0)
+    now = S0 + days * DAY
+    jr.add_event(S0 + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    jr.add_event(S0 + 3600, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    hourly(jr, S0, now)
+    return jr, now
+
+
+def nothing_compared(now: float) -> AuditResult:
+    """An audit that ran and found nothing to compare: no decision in the window."""
+    return AuditResult((0, int(now) // H1 * H1 - 2 * H1), 0, 0, (), now - 600)
+
+
+def test_shadow_to_canary_needs_no_signal_and_no_14_days(tmp_path):
+    """User decision 2026-11-05: half a day with no signal, nothing compared and no preview passes, and the promotion goes
+    through; the two waived gates are shown as waived, not as met."""
+    jr, now = bare_shadow(tmp_path)
+    gates = canary_entry_gates(jr, now, nothing_compared(now), PAPER_OK, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)
+    lines = gate_lines(gates)
+    assert any(x.startswith("[면제] 기간 14일 이상: 0.5일") for x in lines)
+    assert any(x.startswith("[면제] 신호 1건 이상: 단계 중 알게 된 신호 0건") for x in lines)
+    assert any(x.startswith(f"[충족] {AUDIT_GATE}: 비교 0건") for x in lines)
+    assert any(x.startswith("[충족] ③ 냈을 주문 전부 preview 통과: 0/0") for x in lines)
+    assert "기간 14일 이상" not in REQUIRED_GATES[("SHADOW", "CANARY")]
+    assert "신호 1건 이상" not in REQUIRED_GATES[("SHADOW", "CANARY")]
+    transition(jr, "CANARY", now, gates, confirm=True, flat=True)
+    assert jr.stage() == ("CANARY", now)
+    jr.close()
+
+
+def test_real_failures_still_fail_the_relaxed_shadow_gates(tmp_path):
+    jr, now = bare_shadow(tmp_path)
+
+    def unmet(res: AuditResult | None) -> list[str]:
+        return [g.name for g in shadow_gates(jr, now, res) if not g.met]
+
+    assert unmet(nothing_compared(now)) == []
+    mismatch = {"id": "x", "type": "DIFFERENT", "cause": "UNEXPLAINED", "known_at": int(S0) + 3600}
+    window = (0, int(now) // H1 * H1 - 2 * H1)
+    # comparisons exist and one mismatched
+    assert unmet(AuditResult(window, 3, 2, (mismatch,), now)) == [AUDIT_GATE]
+    # nothing compared is no pass for an audit that never ran, failed, is stale or does not cover the stage
+    assert unmet(None) == [AUDIT_GATE]
+    assert unmet(AuditResult.failed("paper ledger fetch failed: HTTP 502", now)) == [AUDIT_GATE]
+    assert unmet(AuditResult((0, int(S0) - 10 * DAY), 0, 0, (), now)) == [AUDIT_GATE]
+    assert unmet(AuditResult((int(S0) + 3600, window[1]), 0, 0, (), now)) == [AUDIT_GATE]
+    # a refused preview fails it; an unanswered one stays no failure
+    jr.add_event(now - 60, "PREVIEW", {"kind": "MARKET", "ok": False, "errors": ["PREVIEW_INSUFFICIENT_FUND"]})
+    assert unmet(nothing_compared(now)) == ["③ 냈을 주문 전부 preview 통과"]
+    jr.close()
+
+
+def test_the_shadow_gates_a_signal_cannot_change_stay_required(tmp_path):
+    jr, now = bare_shadow(tmp_path)
+    required = REQUIRED_GATES[("SHADOW", "CANARY")]
+    for name in (AUDIT_GATE, CYCLE_GATE, "③ 냈을 주문 전부 preview 통과", "④ 장애·재시작 시험 통과"):
+        assert name in required
+    # one start only: no restart recovered yet
+    one = journal(tmp_path, "one.sqlite")
+    one.set_stage("SHADOW", "initial", S0)
+    one.add_event(S0 + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    hourly(one, S0, now)
+    assert [g.name for g in shadow_gates(one, now, nothing_compared(now)) if not g.met] == ["④ 장애·재시작 시험 통과"]
+    one.close()
+    # an hour without a cycle
+    late = journal(tmp_path, "late.sqlite")
+    late.set_stage("SHADOW", "initial", S0)
+    late.add_event(S0 + 10, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    late.add_event(S0 + 3600, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})
+    hourly(late, S0, now, skip=(int(S0) + 2 * H1,))
+    assert [g.name for g in shadow_gates(late, now, nothing_compared(now)) if not g.met] == [CYCLE_GATE]
+    late.close()
+    # a stint younger than one hourly bar has nothing to judge the cycles by
+    young = journal(tmp_path, "young.sqlite")
+    young.set_stage("SHADOW", "restart", S0 + 100)
+    assert CYCLE_GATE in [g.name for g in shadow_gates(young, S0 + 200, nothing_compared(S0 + 200)) if not g.met]
+    young.close()
+    jr.close()
+
+
+def test_a_new_process_of_new_code_does_not_restart_the_stint(tmp_path):
+    """Item 2 of the 2026-11-05 decision. The restart on a code change was an operating rule: no code ever restarted a stint
+    on a deploy, and none does (`restart_stint` runs only from `ewbot live stage ... --restart`). A deploy is a restart like
+    any other: one more clean RECOVERY, the same stint, the gates keep counting."""
+    jr, now = bare_shadow(tmp_path)
+    before = jr.stage()
+    jr.add_event(now, "RECOVERY", {"accepted": 0, "abandoned": 0, "unknown": 0, "rebuilt": 0})  # the deploy's start
+    jr.add_event(now, "STARTUP", {"stage": "SHADOW"})
+    assert jr.stage() == before and len(jr.stage_history()) == 1
+    gates = canary_entry_gates(jr, now, nothing_compared(now), PAPER_OK, KEY)
+    assert all(g.met for g in gates), gate_lines(gates)
+    assert "재시작 복구 3회" in {g.name: g.detail for g in gates}["④ 장애·재시작 시험 통과"]
     jr.close()
 
 

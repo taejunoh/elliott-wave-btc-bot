@@ -22,17 +22,20 @@ restarts, trades, failures and the audit's mismatches; without a restart a faile
 
 Gates (spec 6.2), all computed from the journal. Times are the journal's (the VPS clock, NTP-synchronised): a
 clock step moves every window with it.
-  SHADOW pass   >= 14 days and >= 1 signal first known in the stage; (1) decisions equal the paper ledger's (an
-                audit from at or before the stage's start to at most AUDIT_MAX_AGE_S ago, with no mismatch the
-                data do not explain: a DATA_REVISION is shown, not counted);
+  SHADOW pass   (1) decisions equal the paper ledger's (an audit from at or before the stage's start to at most
+                AUDIT_MAX_AGE_S ago, with no mismatch the data do not explain: a DATA_REVISION is shown, not counted;
+                nothing to compare in it is no failure: user decision 2026-11-05);
                 (2) every hourly bar that closed in the stage has a cycle that ended OK within 2 min of the
                 close (a bar with no cycle row at all while the futures session was recorded closed is excused:
                 a span from a SESSION event whose state is not OPEN to the next SESSION or STARTUP event, at most
-                SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due); (3) every would-be order
-                passed preview (at least one did; a bracket Coinbase refused only for want of a position - SHADOW's
-                real account is flat, live/shadow.py PREVIEW_POSITION_DEPENDENT - is counted in the detail, never
-                failing it: the first CANARY trade confirms the brackets); (4) restart test: at least one restart
-                recovered with no unresolved intent.
+                SESSION_CLOSED_MAX_S; a cycle not yet past its deadline is not due; at least one bar must have been
+                due); (3) no would-be order refused by preview (none at all is no failure: user decision 2026-11-05; a
+                bracket Coinbase refused only for want of a position - SHADOW's real account is flat, live/shadow.py
+                PREVIEW_POSITION_DEPENDENT - is counted in the detail, never failing it: the first CANARY trade confirms
+                the brackets); (4) restart test: at least one restart recovered with no unresolved intent.
+                Waived by the user's decision of 2026-11-05 and shown as such (`Gate.waived`), never required: the 14 days
+                and the signal. No code restarts a stint on a deploy - that was an operating rule, also dropped on
+                2026-11-05 -: a deploy is one more start of the same stint.
   CANARY start  SHADOW pass + paper criteria 1, 2 and 4 met + a trade key without transfer permission.
   CANARY pass   >= 3 closed trades or 90 days; (1) protection within 30 s of every fill; (2) stop moves and
                 closes executed as targeted (no unresolved order failure); (3) never unprotected > 60 s; (4) no
@@ -58,7 +61,6 @@ from ewbot.types import H1
 
 STAGES = ("SHADOW", "CANARY", "FULL")
 DAY = 86_400
-SHADOW_MIN_DAYS = 14
 CYCLE_DEADLINE_S = 120
 CANARY_MIN_TRADES = 3
 CANARY_MAX_DAYS = 90
@@ -105,7 +107,7 @@ G_C1 = "모의매매 1번 (위험 대비 수익)"
 G_C2 = "모의매매 2번 (최대 낙폭)"
 G_C4 = "모의매매 4번 (28일, 원인 불명 0건, 커버리지 95%)"
 G_KEY = "거래 키 권한 (view+trade, 송금 불가)"
-SHADOW_PASS = (G_DAYS, G_SIGNAL, G_AUDIT, G_CYCLES, G_PREVIEW, G_RESTART)
+SHADOW_PASS = (G_AUDIT, G_CYCLES, G_PREVIEW, G_RESTART)  # G_DAYS and G_SIGNAL: waived, user decision 2026-11-05
 CANARY_PASS = (G_TRADES, G_PROTECT, G_ORDERS, G_UNPROTECTED, G_MANUAL, G_COSTS, G_MAJOR, G_RUNNING, G_AUDIT_NOW)
 REQUIRED_GATES = {("SHADOW", "CANARY"): SHADOW_PASS + (G_C1, G_C2, G_C4, G_KEY),
                   ("CANARY", "FULL"): CANARY_PASS + (G_C1, G_C2, G_C4, G_KEY)}
@@ -120,10 +122,11 @@ class Gate:
     name: str
     met: bool
     detail: str
+    waived: bool = False  # shown for what it says, never blocking: the user decided it is not required
 
 
 def gate_lines(gates: Sequence[Gate]) -> list[str]:
-    return [f"[{'충족' if g.met else '미충족'}] {g.name}: {g.detail}" for g in gates]
+    return [f"[{'면제' if g.waived else '충족' if g.met else '미충족'}] {g.name}: {g.detail}" for g in gates]
 
 
 def _utc(ts: float) -> str:
@@ -223,9 +226,10 @@ def _restarted(journal: Journal) -> bool:
 
 def audit_gate(name: str, res: AuditResult | None, since: float, now: float, after: float | None = None) -> Gate:
     """An audit that covers the stage - its window starts at or before `since` and reaches a bar that closed at most
-    AUDIT_MAX_AGE_S ago - with something compared and no unexplained mismatch (a DATA_REVISION is shown in the
-    detail but explained); with `after`, only mismatches of decisions first known after it count (a CANARY stint).
-    A failed audit (fetch, invalid ledger) is unmet, never the last good one."""
+    AUDIT_MAX_AGE_S ago - with no unexplained mismatch (a DATA_REVISION is shown in the detail but explained); with
+    `after`, only mismatches of decisions first known after it count (a CANARY stint). Nothing to compare in such an audit
+    is no failure (user decision 2026-11-05: without a signal there may be no decision at all), and the detail says so. A
+    failed audit (fetch, invalid ledger), a stale one or none at all stays unmet, never the last good one."""
     if res is None:
         return Gate(name, False, "미실행")
     if res.error is not None:
@@ -243,7 +247,9 @@ def audit_gate(name: str, res: AuditResult | None, since: float, now: float, aft
     earlier = len(res.unexplained()) - len(counted)
     if earlier:
         parts.append(f"단계 시작 전 불일치 {earlier}건 제외")
-    return Gate(name, res.compared > 0 and not counted, ", ".join(parts) + f" ({_utc(hi)} 봉까지)")
+    if res.compared == 0:
+        parts.append("비교할 판단 없음 (2026-11-05 결정으로 통과, 신호 기반 대조는 안 됨)")
+    return Gate(name, not counted, ", ".join(parts) + f" ({_utc(hi)} 봉까지)")
 
 
 def _closed_spans(journal: Journal, since: float, now: float) -> list[tuple[float, float]]:
@@ -302,12 +308,12 @@ def shadow_gates(journal: Journal, now: float, audit_result: AuditResult | None)
     recoveries = journal.events(kind="RECOVERY", since=since)
     clean = [r for r in recoveries if not r["data"].get("unknown")]
     return [
-        Gate(G_DAYS, days >= SHADOW_MIN_DAYS, f"{days:.1f}/{SHADOW_MIN_DAYS}일"),
-        Gate(G_SIGNAL, len(signals) >= 1, f"단계 중 알게 된 신호 {len(signals)}건"),
+        Gate(G_DAYS, True, f"{days:.1f}일 (2026-11-05 결정으로 면제)", waived=True),
+        Gate(G_SIGNAL, True, f"단계 중 알게 된 신호 {len(signals)}건 (2026-11-05 결정으로 면제)", waived=True),
         # the first SHADOW audits the whole epoch; a restarted one counts the mismatches of its own decisions
         audit_gate(G_AUDIT, audit_result, since, now, after=since if _restarted(journal) else None),
         _cycle_gate(journal, since, now),
-        Gate(G_PREVIEW, bool(previews) and not failed, preview),
+        Gate(G_PREVIEW, not failed, preview),  # no would-be order at all is no failure (user decision 2026-11-05)
         Gate(G_RESTART, len(recoveries) >= 2 and len(clean) == len(recoveries),
              f"재시작 복구 {len(recoveries)}회 (첫 시작 포함), 미해결 {len(recoveries) - len(clean)}회"),
     ]
