@@ -635,6 +635,22 @@ def test_a_failed_test_trade_opens_nothing(h, arrange):
     assert not gates["⑤ 비용 실측치 비교"].met
 
 
+def test_a_later_failed_test_trade_closes_the_gates_until_one_passes_again(h):
+    ask(h)
+    assert result(h)["ok"] is True
+    h.clock.now += 300
+    h.ex.place_bracket = refuse_bracket
+    ask(h)
+    del h.ex.place_bracket
+    assert result(h)["ok"] is False
+    resume(h.journal, h.clock.now)
+    ticks(h, 4, 61.0)
+    unmet = {g.name for g in full_gates(h, h.clock.now) if not g.met}
+    assert unmet == {"완결 거래 3건 이상 또는 90일", "① 보호 주문이 체결 후 30초 안에 걸림", "⑤ 비용 실측치 비교"}
+    ask(h)
+    assert result(h)["ok"] is True and all(g.met for g in full_gates(h, h.clock.now + 60))
+
+
 def test_a_pass_with_no_fee_read_does_not_measure_the_costs(tmp_path):
     hs = started(tmp_path)
     real = hs.ex.get_order

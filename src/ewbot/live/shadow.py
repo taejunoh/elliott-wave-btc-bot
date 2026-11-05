@@ -201,7 +201,8 @@ class ShadowExchange(SimExchange):
             self.alert("PREVIEW_FAILED", f"[SHADOW preview 실패] {kind} {client_order_id}: {', '.join(res.errors)}")
 
     def _unverified(self, kind: str, client_order_id: str, order: dict[str, Any], exc: ExchangeError) -> None:
-        """The API did not answer: no verdict on the order (gate ③ neither passes nor fails on it yet)."""
+        """The API did not answer: no verdict on the order. Gate ③ stays unmet while it waits (stage.shadow_gates), and is
+        then decided by the answer."""
         why = f"{type(exc).__name__}: {exc}"[:200]
         items = list(self.journal.get(UNVERIFIED_KEY) or [])
         items.append({"kind": kind, "client_order_id": client_order_id, "order": order, "tries": 0,

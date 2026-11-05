@@ -12,12 +12,15 @@ from ewbot.config import BotConfig
 from ewbot.live.audit import AuditError, AuditResult, audit, fetch_paper_ledger
 from ewbot.live.exchange import KeyPermissions
 from ewbot.live.pricing import stage_contracts
+from ewbot.live.shadow import UNVERIFIED_KEY
 from ewbot.live.stage import (
     CANARY_FAIL,
     ORDER_FAILURES,
     PEAK_REBASE_KEY,
     RAISED_KEY,
     REQUIRED_GATES,
+    TEST_IDS_KEY,
+    TEST_TRADE,
     Gate,
     StageError,
     canary_entry_gates,
@@ -45,6 +48,8 @@ PAPER_OK = {"c1": True, "c2": True, "c3": False, "count": {"total": 37, "require
 PAPER_ALL = {**PAPER_OK, "c3": True, "count": {"total": 50, "required": 50}}
 AUDIT_GATE = "① 판단이 모의매매와 100% 일치"
 CYCLE_GATE = "② 모든 사이클이 마감 후 2분 안에 끝남"
+TRADES_GATE = "완결 거래 3건 이상 또는 90일"
+PROTECT_GATE = "① 보호 주문이 체결 후 30초 안에 걸림"
 
 
 def good(now: float) -> AuditResult:
@@ -467,6 +472,78 @@ def test_a_new_process_of_new_code_does_not_restart_the_stint(tmp_path):
     gates = canary_entry_gates(jr, now, nothing_compared(now), PAPER_OK, KEY)
     assert all(g.met for g in gates), gate_lines(gates)
     assert "재시작 복구 3회" in {g.name: g.detail for g in gates}["④ 장애·재시작 시험 통과"]
+    jr.close()
+
+
+def test_an_audit_from_before_the_stint_does_not_count(tmp_path):
+    """Review finding: `stage canary --restart` at hh:10, a test trade at hh:11 and `stage full` at hh:12 would rest on the
+    audit of hh:50 before: it says nothing about the stint. Unmet until an audit ran in it, SHADOW and CANARY alike."""
+    jr, now = bare_shadow(tmp_path)
+    restart_stint(jr, "SHADOW", now, confirm=True, flat=True)
+    hi = int(now) // H1 * H1 - 2 * H1
+
+    def audit_gate_at(as_of: float, stage: str = "SHADOW") -> Gate:
+        res = AuditResult((0, hi), 5, 5, (), as_of)
+        gates = shadow_gates(jr, now + 300, res) if stage == "SHADOW" else canary_gates(jr, now + 300, res)
+        return {g.name: g for g in gates}[AUDIT_GATE if stage == "SHADOW" else "모의매매 대조 (최근 감사 통과)"]
+
+    old = audit_gate_at(now - 900)
+    assert not old.met and old.detail.startswith("단계 시작 전 감사")
+    assert audit_gate_at(now + 60).met
+    jr.set_stage("CANARY", "promotion", now + 100)
+    assert not audit_gate_at(now + 60, "CANARY").met and audit_gate_at(now + 200, "CANARY").met
+    jr.close()
+
+
+def test_an_unanswered_preview_keeps_the_preview_gate_open(tmp_path):
+    """Review finding: nothing else to judge, a would-be order Coinbase has not answered for, and 0/0 passed. No verdict on
+    an order is no pass: unmet until it is answered (a refusal then fails it, 24 cycles unanswered record it failed)."""
+    jr, now = bare_shadow(tmp_path)
+    since = jr.stage()[1]
+
+    def gate() -> Gate:
+        return {g.name: g for g in shadow_gates(jr, now, nothing_compared(now))}["③ 냈을 주문 전부 preview 통과"]
+
+    assert gate().met and gate().detail == "0/0"
+    jr.put(UNVERIFIED_KEY, [{"kind": "MARKET", "client_order_id": "ewb-e-1-L", "order": {"side": 1, "size": 1}, "tries": 3,
+                             "ts": since + 60}])
+    assert not gate().met and gate().detail == "0/0, 답을 못 받은 preview 1건"
+    jr.put(UNVERIFIED_KEY, [])  # answered: the verdict is a PREVIEW event
+    assert gate().met
+    jr.put(UNVERIFIED_KEY, [{"kind": "MARKET", "client_order_id": "ewb-e-1-L", "order": {"side": 1, "size": 1}, "tries": 3,
+                             "ts": since - 60}])  # an earlier stint's: this stint's gates count from its start
+    assert gate().met
+    jr.close()
+
+
+def test_a_failed_last_test_trade_closes_the_gates_a_passed_one_opened(tmp_path):
+    jr = canary_journal(tmp_path, closed=0)
+    now = S0 + DAY
+
+    def unmet() -> list[str]:
+        return [g.name for g in canary_gates(jr, now, good(now)) if not g.met]
+
+    assert TRADES_GATE in unmet()
+    for t in (S0 + 100, S0 + 300):
+        jr.add_event(t, "PROTECTED_FIRST", {"trade_id": int(t), "after_entry_s": 1.0})
+    jr.put(TEST_IDS_KEY, [int(S0 + 100), int(S0 + 300)])
+    jr.add_event(S0 + 110, TEST_TRADE, {"ok": True, "trade_id": int(S0 + 100), "fees": 0.3})
+    assert unmet() == []
+    jr.add_event(S0 + 310, TEST_TRADE, {"ok": False, "trade_id": int(S0 + 300), "fees": None})
+    closed = unmet()
+    assert closed == [TRADES_GATE, PROTECT_GATE]  # COSTS holds on this fixture's own daily report
+    assert "마지막 시험 거래 실패" in {g.name: g for g in canary_gates(jr, now, good(now))}[TRADES_GATE].detail
+    jr.add_event(S0 + 500, "PROTECTED_FIRST", {"trade_id": int(S0 + 500), "after_entry_s": 1.0})
+    jr.put(TEST_IDS_KEY, [int(S0 + 100), int(S0 + 300), int(S0 + 500)])
+    jr.add_event(S0 + 510, TEST_TRADE, {"ok": True, "trade_id": int(S0 + 500), "fees": 0.3})
+    assert unmet() == []
+    jr.close()
+    # the other routes do not outrun a failed test trade of the stint either
+    jr = canary_journal(tmp_path, closed=3, name="routes.sqlite")
+    assert all(g.met for g in canary_gates(jr, now, good(now)))
+    jr.add_event(S0 + 3 * DAY + 10, TEST_TRADE, {"ok": False, "trade_id": 99, "fees": None})
+    late = S0 + 95 * DAY
+    assert TRADES_GATE in [g.name for g in canary_gates(jr, late, good(late)) if not g.met]
     jr.close()
 
 
