@@ -27,6 +27,12 @@ only once every wanted leg is in place, and the trade records a new stop only on
 placed again for LEG_SETTLE_S (the position read may not show the fill yet, and a take-profit placed
 again below the market would sell at once what the leg already sold) - the next observe folds the fill.
 
+A close_position answered 404 "no positions found" while our own read shows the position (2026-11-06, the first real test
+trade: 1.4 s after the fill /cfm/positions showed it and the close endpoint did not, and 2 s later, the same bracket resting,
+the venue answered with the close conflict instead) is the close not seeing the position yet: it is sent again with the
+brackets resting, a CLOSE_NOT_FOUND_WAIT_S apart, up to CLOSE_NOT_FOUND_TRIES times; still not found, it is handled as a
+close conflict (below); a flat read meanwhile is the flat handling.
+
 Closes never cancel protection before the venue took the close: close_position goes out with the brackets
 resting (both only reduce); only a known close-conflict refusal (`CLOSE_CONFLICTS`: the venue refuses a
 close while brackets rest; the watchdog's closes - a gapped stop, no resting stop - take any refusal for one:
@@ -119,6 +125,9 @@ ENTRY_CLAIM_MAX_S = 3600.0  # ... and a position on its side this long after the
 CLEARING_MAX_S = 30.0  # a close waiting for the brackets it cancelled holds the planner's legs back at most this long
 LEG_SETTLE_S = 30.0  # a leg that left the book with fills is not placed again for this long (the position catches up)
 CLEAR_TIMEOUT_S = 5.0  # an entry after a close or a cancel waits this long for our brackets to leave the book
+CLOSE_NOT_FOUND = "no positions found"  # close_position's 404 while the venue's close does not see the position yet
+CLOSE_NOT_FOUND_TRIES = 3  # ... sent again this many times with the brackets resting ...
+CLOSE_NOT_FOUND_WAIT_S = 1.0  # ... this far apart, then handled as a close conflict
 TRADE_KEY = "trade"
 SKIPS_KEY = "skipped_signals"
 ORPHAN_KEY = "orphan_closes"
@@ -156,6 +165,11 @@ def _code(sent: Sent) -> str | None:
     if sent.status != "REJECTED" or not sent.error:
         return None
     return str(sent.error).split(":", 1)[0].strip()
+
+
+def _not_found(sent: Sent) -> bool:
+    """close_position refused because it found no position (HTTP 404 NOT_FOUND, 2026-11-06)."""
+    return sent.status == "REJECTED" and CLOSE_NOT_FOUND in str(sent.error or "").lower()
 
 
 def _price(x: Any) -> float | None:
@@ -997,29 +1011,33 @@ class Executor:
         stop) - any refusal is taken for a close conflict, since the resting brackets protect nothing any more: their
         stop has triggered and gapped, or there is none. A flat read with nothing to explain it closes no entry not shown
         yet; `hold_flat` (the test trade's close, seconds after it read the position) treats any entry so: not closed, and
-        now not shown."""
-        trade = self.trade()
+        now not shown. A 404 "no positions found" while our read shows the position is sent again, then handled as a close
+        conflict (module docstring)."""
         if self.ex.position() is None:
-            if trade is not None and trade.status == "OPEN":
-                if (hold_flat or self.entry_unseen(trade)) and not trade.exit_reason and not self._flat_explained(trade):
-                    self._set_unseen(trade, True)
-                    return False
-                # flat before this close went out (after the pass's reads): what observe() would have found - a bracket
-                # fill (or an earlier close of ours, whose reason the trade recorded when the venue took it) -, never
-                # this close's reason
-                why = trade.exit_reason or "BRACKET"
-                trade.status, trade.exit_reason, trade.unprotected_since = "CLOSED", why, None
-                self.save(trade)
-                self.event("CLOSED", {"trade_id": trade.trade_id, "reason": why, "observed": True},
-                           f"[청산 확인] 거래 {trade.trade_id} · {why}")
-            return True
+            return self._closed_flat(hold_flat)
         if not ctx.session_open:
             self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
             return False
+        trade = self.trade()
         open_trade = trade if trade is not None and trade.status == "OPEN" else None
         tid = open_trade.trade_id if open_trade is not None else 0
         sent = self._send_close(open_trade, reason)  # the brackets keep protecting until the venue took the close
-        conflict = _code(sent) in self.close_conflicts or (any_refusal and sent.status == "REJECTED")
+        for k in range(CLOSE_NOT_FOUND_TRIES):
+            if not _not_found(sent):
+                break
+            self.event("CLOSE_NOT_FOUND", {"trade_id": tid, "reason": reason, "try": k + 1, "error": str(sent.error)[:200]})
+            self.sleep(CLOSE_NOT_FOUND_WAIT_S)
+            try:
+                if self.ex.position() is None:
+                    return self._closed_flat(hold_flat)
+            except ExchangeError:
+                pass  # unread: the close is sent again all the same, the brackets resting
+            sent = self._send_close(open_trade, reason)
+        if _not_found(sent):  # the last answer: no more waiting with the brackets on
+            self.event("CLOSE_NOT_FOUND", {"trade_id": tid, "reason": reason, "try": CLOSE_NOT_FOUND_TRIES + 1,
+                                           "error": str(sent.error)[:200]})
+        conflict = (_code(sent) in self.close_conflicts or (any_refusal and sent.status == "REJECTED")
+                    or _not_found(sent))
         if conflict:  # refused while brackets rest: cancel them, then close once they left the book
             if not self._session_open():
                 self._alert_once("CLOSE_DEFERRED", f"{reason}: session not open")
@@ -1070,6 +1088,23 @@ class Executor:
             left = []
         if left:
             self._cancel_quietly(left, tid)
+        return True
+
+    def _closed_flat(self, hold_flat: bool) -> bool:
+        """`close` read the account flat (before its close went out, or while it was not found): what observe() would have
+        found - a bracket fill, or an earlier close of ours whose reason the trade recorded when the venue took it -, never
+        this close's reason; an entry not shown yet, or the test trade's (`hold_flat`), with nothing to explain it is not
+        closed (False)."""
+        trade = self.trade()
+        if trade is not None and trade.status == "OPEN":
+            if (hold_flat or self.entry_unseen(trade)) and not trade.exit_reason and not self._flat_explained(trade):
+                self._set_unseen(trade, True)
+                return False
+            why = trade.exit_reason or "BRACKET"
+            trade.status, trade.exit_reason, trade.unprotected_since = "CLOSED", why, None
+            self.save(trade)
+            self.event("CLOSED", {"trade_id": trade.trade_id, "reason": why, "observed": True},
+                       f"[청산 확인] 거래 {trade.trade_id} · {why}")
         return True
 
     def _flat_explained(self, trade: LiveTrade) -> bool:

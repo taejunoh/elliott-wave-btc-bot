@@ -217,6 +217,18 @@ A message that says `경고: ... 손절 주문이 없음` means the runtime coul
 
 Since 2026-11-05 FULL can open after one test trade, so most of this list is first answered in FULL, at FULL's size, unless you check it first. The test trade answers only the first item, part of the close-conflict codes and the fee tier.
 
+**Seen on the real venue (first test trade, 2026-11-06 20:08 UTC, live-v6, 1 contract long at 75,900):**
+- `close_position` 1.4 s after the fill: HTTP 404 `NOT_FOUND` "no positions found for product BIP-20DEC30-CDE", while `/cfm/positions` already showed the position. Two seconds later, with the same bracket resting, the close was refused with `PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION` (a known close conflict), and after the cancel it filled. So a close with a bracket resting is always refused on this venue (the conflict path handles it in one `close`), and the 404 is the close endpoint not seeing the fill yet. Since live-v7 every close sends a not-found close again with the brackets resting, a second apart, three times, then handles it as a close conflict.
+- Fees: 0.869 USD per side on 1 contract, about 0.114% of the 759 USD notional; the entry filled 1 tick (5 USD) above its reference.
+- Margin, raw: `initial_margin` 159.84 (21.06% of notional: the overnight long rate at 15:08 ET, so intraday margin is not in effect on this account), `liquidation_threshold` 140.66 (18.53% of notional), `available_margin` 501.07; both margin window measures came back empty or `UNSPECIFIED`. The Plan 3 spec's amendment of 2026-11-06 recomputes the liquidation distance from them: a long at 3.32x about 14.2%; a short still an estimate (about 11.5%) until a short test trade measures it.
+
+**After that failed test trade (paused, the stint's last test trade failed), to try again:**
+
+1. Deploy the fix (the book is flat): merge, then on your laptop `git tag live-v7 origin/master && git push origin live-v7`, and on the VPS, as `ewbot`, outside hh:54 to hh:05: `cd ~/elliott-wave-btc-bot && bash deploy/live/deploy.sh live-v7`. The pause survives the restart.
+2. Check: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live status`. `② 손절 이동과 청산이 목표와 일치` must read `충족` (the failed close was resolved by the close that followed it, `ORDER_RESOLVED`, so it is no CANARY failure) and `중대 사건 없음` too; `일시 정지 아님` and the trade gates read `미충족` (`마지막 시험 거래 실패`).
+3. `/resume` in Telegram. No `ewbot live stage canary --restart` is needed: a restart is for a CANARY failure, and a later passed test trade replaces the failed one. Only if step 2 shows a CANARY failure: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live stage canary --restart --confirm` (hh:06 to hh:58), then `/resume`.
+4. From hh:06 to hh:54: `docker compose -f deploy/live/docker-compose.yml exec live ewbot live test-trade --confirm`, then `... exec live ewbot live status` (all `충족`), then "From SHADOW to FULL within days", steps 8 and 9.
+
 - That Coinbase takes our brackets. SHADOW cannot check one: the flat account answers every bracket preview with `PREVIEW_BRACKET_ORDER_SIZE_EXCEEDS_POSITION` alone, a valid bracket or not (2026-10-05; gate ③ counts them apart). The test trade's bracket is the first Coinbase judges (`PROTECTED_FIRST`, CANARY gate ①). A refusal (`BRACKET_FAILED`, Coinbase's code in the event) not resolved within 30 s is a CANARY failure (entries paused): find its cause before `/resume` (a code change needs no new SHADOW since 2026-11-05).
 - Duplicate `client_order_id` behaviour (the runtime handles both documented answers; note which one Coinbase gives).
 - Whether brackets survive the Friday 17:00–18:00 New York close.

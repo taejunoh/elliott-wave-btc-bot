@@ -27,7 +27,9 @@ book of the SHADOW stage. It models what the runtime relies on:
     does not honour them (FAULT_METHODS, CRASH_METHODS) is refused with ValueError instead of being silently
     ignored;
   - a repeated client_order_id returns the existing order (`duplicate="existing"`) or an error
-    (`duplicate="error"`): Coinbase documents both, the real behaviour is confirmed in CANARY."""
+    (`duplicate="error"`): Coinbase documents both, the real behaviour is confirmed in CANARY;
+  - `close_conflict`: close_position refused while a bracket rests on the position
+    (PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION), as the real venue answered on 2026-11-06 (off by default)."""
 
 from __future__ import annotations
 
@@ -129,6 +131,7 @@ class SimExchange:
         self.fee_per_contract = float(fee_per_contract)
         self.permissions = permissions
         self.market_fill_ratio = 1.0
+        self.close_conflict = False
         self.bracket_fill_cap: int | None = None
         self.preview_errors: tuple[str, ...] = ()
         self.summary: dict[str, Any] = {}  # balance_summary()'s answer: the sim has no margin model, a test sets it
@@ -349,6 +352,8 @@ class SimExchange:
             return PlaceResult(client_order_id, None, False, "SESSION_NOT_OPEN")
         if self.pos is None:
             return PlaceResult(client_order_id, None, False, "NO_OPEN_POSITION")
+        if self.close_conflict and any(o.kind == "BRACKET" and o.status == "OPEN" for o in self.orders.values()):
+            return PlaceResult(client_order_id, None, False, "PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION")
         qty = self.pos.contracts if size is None else min(int(size), self.pos.contracts)
         o = self._new(client_order_id, -self.pos.side, "MARKET", qty)
         self._execute_market(o)

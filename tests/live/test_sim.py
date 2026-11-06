@@ -337,3 +337,15 @@ def test_the_sim_answers_the_balance_summary_a_test_sets_and_has_no_margin_model
     ex.fail_next("balance_summary", ExchangeError("down"))
     with pytest.raises(ExchangeError):
         ex.balance_summary()
+
+
+def test_the_sim_can_refuse_a_close_while_a_bracket_rests_as_coinbase_did():
+    ex = SimExchange(clock=Clock())
+    ex.set_prices(60_000.0)
+    ex.close_conflict = True
+    ex.place_market("e", 1, 1)
+    ex.place_bracket("b", -1, 1, 61_000.0, 59_000.0)
+    refused = ex.close_position("x1")
+    assert not refused.ok and refused.error == "PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION" and ex.pos is not None
+    ex.cancel([o.order_id for o in ex.open_orders()])
+    assert ex.close_position("x2").ok and ex.pos is None

@@ -92,3 +92,19 @@ class Lag:
             return real_bracket(cid, side, size, limit, stop)
 
         hs.ex.position, hs.ex.place_market, hs.ex.place_bracket = position, market, bracket
+
+
+# close_position's answer on the first real test trade, 1.4 s after the fill (2026-11-06, live-v6): /cfm/positions already
+# showed the position, and 2 s later, with the same bracket resting, the close was refused as a close conflict instead
+NOT_FOUND = ('HTTP 404: {"error":"NOT_FOUND","error_details":"no positions found for product BIP-20DEC30-CDE",'
+             '"message":"no positions found for product BIP-20DEC30-CDE"}')
+
+
+def as_on_2026_11_06(hs, not_found: int = 1) -> None:
+    """The venue as the first real test trade met it: close_position answers 404 `not_found` times, and refuses a close
+    while our bracket rests (PREVIEW_ORDER_SIZE_EXCEEDS_BRACKETED_POSITION) until the bracket is cancelled."""
+    from ewbot.live.exchange import ExchangeError
+
+    hs.ex.close_conflict = True
+    if not_found:
+        hs.ex.fail_next("close_position", ExchangeError(NOT_FOUND), times=not_found)
