@@ -40,7 +40,7 @@ from ewbot.live.stage import (
 from ewbot.live.target import Target
 from ewbot.types import H1
 from tests.live.harness import Harness
-from tests.live.helpers import Lag, entry, position
+from tests.live.helpers import Lag, as_on_2026_11_06, entry, position
 from tests.paper.helpers import ts
 
 QUIET = ts("2024-02-01 10:00")  # the synthetic candles' engine is flat and queues nothing around here
@@ -142,6 +142,67 @@ def test_a_round_trip_through_the_real_order_path(h, side):
     assert h.journal.get(TEST_REQUEST_KEY) is None and h.journal.get(TEST_IDS_KEY) == [tid]
     assert any(k == TEST_TRADE and t.startswith("[시험 거래 성공]") for k, t in h.alerts.items)
     assert_nothing_false(h)
+
+
+def test_the_first_real_runs_close_answers_pass(h):
+    """2026-11-06, live-v6: 404 "no positions found" 1.4 s after the fill, then the close conflict while the bracket rested,
+    then the close after the cancel. The stop was verified and the account ends flat with both fills read: a pass."""
+    as_on_2026_11_06(h, not_found=1)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is True and r["position"] == "flat" and r["close_price"] and r["close_fee"] == pytest.approx(0.15)
+    assert [e["data"]["reason"] for e in h.journal.events(kind="CLOSED")] == ["TEST_TRADE"]
+    assert len(h.journal.events(kind="CLOSE_NOT_FOUND")) == 1 and len(h.journal.events(kind="CLOSE_CONFLICT")) == 1
+    assert h.journal.events(kind="CLOSE_FAILED") == [] and h.journal.get(FLATTEN_KEY) is None and paused(h.journal) is None
+    assert h.ex.position() is None and h.ex.open_orders() == []
+    ticks(h, 3, 61.0)
+    assert_nothing_false(h)
+    assert h.journal.events(kind="ORDER_UNRESOLVED") == []
+    assert all(g.met for g in full_gates(h, h.clock.now + 60)), gate_lines(full_gates(h, h.clock.now + 60))
+
+
+@pytest.mark.parametrize("not_found", [2, 3, 4])
+def test_a_close_that_keeps_finding_no_position_is_retried_then_cancels_and_closes(h, not_found):
+    as_on_2026_11_06(h, not_found=not_found)
+    ask(h)
+    assert result(h)["ok"] is True and h.ex.position() is None and h.journal.events(kind="CLOSE_FAILED") == []
+    assert len(h.journal.events(kind="CLOSE_NOT_FOUND")) == not_found  # every one seen, none taken for a failure
+
+
+def test_a_close_that_never_finds_the_position_fails_with_the_stop_back(h):
+    """A real failure stays one: the stop goes back on at once and the close stands."""
+    as_on_2026_11_06(h, not_found=1000)
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and r["step"] == "close" and r["position"] == "protected"
+    assert h.ex.position() is not None and [o.kind for o in h.ex.open_orders()] == ["BRACKET"]
+    assert h.journal.get(FLATTEN_KEY)["reason"] == "TEST_TRADE_FAILED"
+    h.ex.clear_faults()
+    h.at(h.clock.now + 11)
+    assert h.ex.position() is None and h.journal.get(FLATTEN_KEY) is None
+
+
+def test_a_flat_read_after_a_not_found_is_the_flat_handling(h):
+    """The 404 and then a flat read: what the flat branch always did - a leg that filled closes it as that exit."""
+    as_on_2026_11_06(h, not_found=1)
+    real = h.ex.close_position
+
+    def fill_the_stop_then(cid, size=None):
+        out = real(cid, size)  # the 404, raised from here
+        return out
+
+    stop = {}
+
+    def wrapped(cid, size=None):
+        if not stop:
+            stop["done"] = True
+            h.ex.set_prices(next(o.stop_price for o in h.ex.open_orders()) - 1.0)
+        return fill_the_stop_then(cid, size)
+
+    h.ex.close_position = wrapped
+    ask(h)
+    r = result(h)
+    assert r["ok"] is False and "먼저" in r["why"] and r["close_reason"] == "BRACKET" and h.ex.position() is None
 
 
 def test_a_request_is_run_once(h):

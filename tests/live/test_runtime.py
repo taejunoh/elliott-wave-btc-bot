@@ -33,7 +33,7 @@ from ewbot.live.notify import RESENT, UNANSWERED, LiveNotifier, TelegramError
 from ewbot.live.preflight import BASELINE_FINGERPRINT
 from ewbot.live.pricing import MARGIN_ENTRY_MAX, margin_ratio
 from ewbot.live.journal import Journal
-from ewbot.live.reconcile import ENTRY_NOT_SEEN, PlanContext, pending_position
+from ewbot.live.reconcile import ENTRY_NOT_SEEN, Close, Enter, PlanContext, pending_position
 from ewbot.live.runtime import (
     AUDIT_FETCH_MAX_S,
     FLATTEN_KEY,
@@ -62,7 +62,7 @@ from ewbot.live.watchdog import AccountGuard
 from ewbot.paper.decisions import known_at
 from ewbot.paper.notify import SendError
 from tests.live.harness import Harness
-from tests.live.helpers import Clock, Lag, journal, position
+from tests.live.helpers import Clock, Lag, as_on_2026_11_06, journal, position
 from tests.paper.helpers import synth_frame, ts
 
 SIGNAL = ts("2024-03-13 22:00")  # C_END long: entry 23:00, trail 03-14 07:00, TP1 + break-even 03-14 23:00
@@ -3382,4 +3382,82 @@ def test_an_entry_still_open_stays_watched_and_one_that_fills_late_is_ours(tmp_p
     hs.at(hs.clock.now + 11)
     assert hs.rt.executor.unsettled_entry(hs.clock.now) is not None  # it has not ended: not settled by the read
     assert [e["data"]["terminal"] for e in hs.journal.events(kind="ENTRY_UNFILLED")] == [False]
+    hs.journal.close()
+
+
+# ---------------------------------------------------------------------------- close_position's 404 (2026-11-06)
+def opened(tmp_path, stage: str = "CANARY") -> Harness:
+    hs = Harness(tmp_path, ENTRY_BAR, stage=stage, stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    assert hs.ex.position() is not None and hs.ex.open_orders()
+    return hs
+
+
+def close_via(hs: Harness, path: str) -> None:
+    now = ENTRY_BAR + 40
+    hs.clock.now = float(now)
+    if path == "flatten":
+        hs.rt._flatten("USER_FLATTEN", "USER", "user /flatten", now)
+    elif path == "watchdog":
+        assert hs.rt.executor.close("STOP_GAP", hs.rt._ctx(now), any_refusal=True) is True
+    elif path == "planned":
+        hs.rt.executor.execute([Close("ENGINE_FLAT")], hs.rt._ctx(now))
+    elif path == "flip":
+        t = hs.rt.executor.trade()
+        flip = TargetEntry(ENTRY_BAR, "W3", -t.direction, 26_740.0, 27_500.0, 26_000.0, 25_500.0, 1.0, 1, "flip")
+        hs.rt.executor.execute([Close("FLIP"), Enter(flip, 1)], hs.rt._ctx(now))
+
+
+@pytest.mark.parametrize("path", ["flatten", "watchdog", "planned", "flip"])
+def test_every_close_path_takes_a_not_found_for_the_close_not_seeing_the_position_yet(tmp_path, path):
+    hs = opened(tmp_path / path)
+    side = hs.ex.position().side
+    as_on_2026_11_06(hs, not_found=1)
+    close_via(hs, path)
+    closed = hs.journal.events(kind="CLOSED")
+    assert closed and closed[-1]["data"]["reason"] in ("USER_FLATTEN", "STOP_GAP", "ENGINE_FLAT", "FLIP")
+    assert hs.journal.events(kind="CLOSE_NOT_FOUND") and hs.journal.events(kind="CLOSE_FAILED") == []
+    if path == "flip":
+        assert hs.ex.position().side == -side  # the entry after it went out
+    else:
+        assert hs.ex.position() is None
+    hs.journal.close()
+
+
+def test_a_not_found_the_retries_do_not_end_re_protects_and_counts_as_a_failed_close(tmp_path):
+    hs = opened(tmp_path)
+    as_on_2026_11_06(hs, not_found=1000)
+    ctx = hs.rt._ctx(ENTRY_BAR + 40)
+    start = hs.clock.now
+    assert hs.rt.executor.close("ENGINE_FLAT", ctx) is False
+    assert hs.ex.position() is not None and [o.kind for o in hs.ex.open_orders()] == ["BRACKET"]  # the stop is back
+    assert len(hs.journal.events(kind="CLOSE_FAILED")) == 1 and hs.journal.events(kind="CLOSE_CONFLICT")
+    assert hs.clock.now - start <= 15  # bounded: the retries and one cancel-and-close
+    hs.journal.close()
+
+
+def test_a_not_found_with_the_position_read_flat_is_the_flat_handling(tmp_path):
+    hs = opened(tmp_path)
+    as_on_2026_11_06(hs, not_found=1)
+    real = hs.ex.close_position
+
+    def gone(cid, size=None):
+        hs.ex.set_prices(next(o.stop_price for o in hs.ex.open_orders()) - 1.0)  # its stop fills meanwhile
+        return real(cid, size)
+
+    hs.ex.close_position = gone
+    assert hs.rt.executor.close("ENGINE_FLAT", hs.rt._ctx(ENTRY_BAR + 40)) is True
+    t = hs.rt.executor.trade()
+    assert (t.status, t.exit_reason) == ("CLOSED", "BRACKET") and hs.journal.events(kind="CLOSE_FAILED") == []
+    hs.journal.close()
+
+
+def test_a_close_with_a_resting_bracket_on_this_venue_closes_in_one_call(tmp_path):
+    """No 404, the venue only refusing the close while the bracket rests (seen 2026-11-06): one close() does it."""
+    hs = opened(tmp_path)
+    as_on_2026_11_06(hs, not_found=0)
+    assert hs.rt.executor.close("ENGINE_FLAT", hs.rt._ctx(ENTRY_BAR + 40)) is True and hs.ex.position() is None
+    assert len(hs.journal.events(kind="CLOSE_CONFLICT")) == 1 and hs.journal.events(kind="CLOSE_FAILED") == []
     hs.journal.close()
