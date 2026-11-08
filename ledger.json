@@ -24,7 +24,7 @@
    "fingerprint": "e0435223a3f9f1ef69c79b54541958f9634989b86728da02332f21d298bac5f1",
    "started_ts": 1790938800,
    "reason": "baseline: holdout commit 64e628a",
-   "through_ts": 1794088800
+   "through_ts": 1794092400
   }
  ],
  "trades": [],
@@ -31266,6 +31266,38 @@
    "status": "ok",
    "last_bar_ts": 1794088800,
    "data_sha256": "4c9cc96b2723c4c1d4367f12f253cf00705bb77184700ff94394c95e258fe8a7",
+   "holdout_data_ok": true,
+   "holdout_trades_recomputed": 36,
+   "epoch_id": 1,
+   "paper_trades": 0,
+   "count_total": 36,
+   "new_decisions": 0,
+   "new_discrepancies": 0,
+   "env": {
+    "python": "3.12.13",
+    "system": "Linux",
+    "machine": "x86_64",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "uv_lock_sha256": "47a0a99def92af3825ff16a625de457da5a4313e366dfc5db029c45bfbd0a5ab",
+    "image_os": "ubuntu24",
+    "image_version": "20261101.360.1"
+   },
+   "env_sha256": "849298152f9f8e77cf650c798564ca5d125d7c2272e86b615a0d88a07dd73f18",
+   "warnings": [],
+   "notify": {
+    "sent": 0,
+    "pending": 0,
+    "errors": []
+   }
+  },
+  {
+   "id": "20261108T003805Z",
+   "ts": 1794098285,
+   "status": "ok",
+   "last_bar_ts": 1794092400,
+   "data_sha256": "bdb42653592e3f7ad5f8f67464496b67073fe846536009451cba22dfe21120b8",
    "holdout_data_ok": true,
    "holdout_trades_recomputed": 36,
    "epoch_id": 1,
