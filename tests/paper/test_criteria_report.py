@@ -85,9 +85,9 @@ def test_summarize_compare_and_status_lines():
     st = golive_status(led, T0)
     assert st["c1"] is None and st["c2"] is None and st["c3"] is False and not st["all_met"]
     lines = status_lines(st)
-    assert "미계산" in lines[1] and "3. 표본 외 거래 36/50 (홀드아웃 36 + 모의 0): 미충족" in lines[3]
+    assert "미계산" in lines[1] and "3. 표본 외 거래 36/50 (홀드아웃 36 + 모의 0): 참고용 (2026-11-05부터 FULL 승격에 쓰지 않음)" in lines[3]
     assert "실행 환경 변경" not in lines[4]  # shown only when there is one
-    assert lines[-1] == "=> 실거래 전환 검토 불가"
+    assert lines[-1] == "=> 기준 1·2·4: 미충족 (1·2·4) (실거래 단계는 live 봇의 관문으로 판단)"
 
     led.criteria = summarize_compare(_cmp(), 1_704_067_200, T0, 1, T0)
     assert led.criteria["winners"] == ["A"] and led.criteria["max_dd_ok"] is True
@@ -104,7 +104,7 @@ def test_summarize_compare_and_status_lines():
     assert "[우위: HYBRID]" in status_lines(st)[1]
 
 
-def test_all_four_criteria_met_reads_review_possible():
+def test_criteria_1_2_4_met_reads_met():
     led = new_ledger("fp", "c" * 40, LOCK)
     hours = 28 * 24 + 1
     led.runs = _hourly_runs(T0, hours)
@@ -112,7 +112,7 @@ def test_all_four_criteria_met_reads_review_possible():
     led.criteria = summarize_compare(_cmp(), 1_704_067_200, T0, 1, T0)
     st = golive_status(led, T0 + (hours - 1) * H1 + 600)
     assert st["count"]["total"] == 50 and st["all_met"]
-    assert status_lines(st)[-1] == "=> 실거래 전환 검토 가능 (자동 전환하지 않음)"
+    assert status_lines(st)[-1] == "=> 기준 1·2·4: 충족 (실거래 단계는 live 봇의 관문으로 판단)"
 
 
 def test_other_epoch_is_not_eligible_and_old_criteria_do_not_count():
