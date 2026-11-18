@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import pytest
 
+import ewbot.live.edge as edge_mod
 import ewbot.live.runtime as runtime_mod
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.live.audit import AuditError, audit
@@ -36,6 +37,9 @@ from ewbot.live.journal import Journal
 from ewbot.live.reconcile import ENTRY_NOT_SEEN, Close, Enter, PlanContext, pending_position
 from ewbot.live.runtime import (
     AUDIT_FETCH_MAX_S,
+    EDGE_FREQ_KEY,
+    EDGE_KEY,
+    EDGE_RESUMES_KEY,
     FLATTEN_KEY,
     STARTUP_READ_MAX_S,
     STOP_GRACE_S,
@@ -3534,4 +3538,264 @@ def test_a_floor_entry_is_sent_and_recorded_once_by_the_pass(tmp_path):
     rows = hs.journal.events(kind="ENTRY_FLOOR")
     assert len(rows) == 1 and rows[0]["data"]["signal_ts"] == early and 0.10 < rows[0]["data"]["real"] <= 0.20
     assert hs.alerts.kinds().count("ENTRY_FLOOR") == 1 and not hs.journal.events(kind="ENTRY_REDUCED")
+    hs.journal.close()
+
+
+# ----------------------------------------------------------------------------- the edge rule (user decision 2026-11-18)
+EDGE_START = ts("2024-01-10 00:00")  # the rule's start for these tests (the fixture's clock is in March 2024)
+
+
+def edge_rule(monkeypatch) -> None:
+    monkeypatch.setattr(edge_mod, "START_TS", EDGE_START)
+    monkeypatch.setattr(edge_mod, "VERDICT_TS", EDGE_START + 730 * 86_400)
+
+
+def engine_trade(k: int, r: float, hold: int = 86_400) -> dict[str, Any]:
+    """The k-th closed engine trade of the test ledger: entered every two days from the rule's start."""
+    entry = EDGE_START + k * 2 * 86_400
+    return {"entry_ts": entry, "exit_ts": entry + hold, "setup": "W3", "direction": 1, "contracts": 1,
+            "entry_price": 26_000.0, "exit_price_avg": 26_100.0, "stop0": 25_000.0, "tp1": 27_000.0, "tp2": None,
+            "pnl": 1.0, "fees": 0.1, "funding": 0.0, "r_multiple": r, "exit_reason": "TIME", "snapshot": {}, "epoch_id": 1}
+
+
+def edge_harness(tmp_path, monkeypatch, stage: str = "FULL") -> tuple[Harness, Callable[[list[float], int], Any]]:
+    """A started harness and `audit_with(rs, at)`: one audit at ENTRY_BAR + at against a paper ledger that agrees with the
+    live decisions, holds engine trades with these R and whose last bar closed `behind` seconds before the audit."""
+    edge_rule(monkeypatch)
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage=stage, stage_days=60.0)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    base = paper_ledger(SIGNAL, [d for d in hs.journal.decisions() if d["ts"] < SIGNAL])
+
+    def audit_with(rs: list[float], at: int, behind: int = 0) -> Any:
+        led = dict(base, trades=[engine_trade(k, r) for k, r in enumerate(rs)],
+                   epochs=[dict(base["epochs"][0], through_ts=ENTRY_BAR + at - behind - 3600)])
+        hs.rt.d.paper_ledger = lambda: led
+        return hs.rt.run_audit(ENTRY_BAR + at)
+
+    return hs, audit_with
+
+
+def edge_alerts(hs: Harness) -> list[str]:
+    return [t for k, t in hs.alerts.items if k == "EDGE_RULE"]
+
+
+def test_the_edge_rule_does_not_exist_before_its_start(tmp_path):
+    """The registered start is 2026-11-06: on the fixture's 2024 clock nothing is evaluated, stored or shown, whatever the
+    ledger holds."""
+    hs = Harness(tmp_path, ENTRY_BAR + 30)
+    hs.price(float(hs.bar(ENTRY_BAR)["open"]))
+    hs.rt.startup()
+    hs.at(ENTRY_BAR + 30)
+    led = dict(paper_ledger(SIGNAL, [d for d in hs.journal.decisions() if d["ts"] < SIGNAL]),
+               trades=[engine_trade(k, -3.0) for k in range(4)])
+    hs.rt.d.paper_ledger = lambda: led
+    assert hs.rt.run_audit(ENTRY_BAR + 40).ok
+    assert hs.journal.get(EDGE_KEY) is None and hs.journal.get(EDGE_FREQ_KEY) is None and paused(hs.journal) is None
+    assert not any("엣지 규칙" in x or "신호 빈도" in x for x in status_lines(hs.journal, ENTRY_BAR + 50))
+    hs.journal.close()
+
+
+def test_the_hourly_audit_evaluates_the_edge_rule_and_shows_its_numbers(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    assert audit_with([-1.0, -1.0, 0.5, -1.0, -1.0, -1.0], 40).ok  # -4.5: above the floor
+    st = hs.journal.get(EDGE_KEY)
+    assert st["error"] is None and st["as_of"] == ENTRY_BAR + 40 and len(st["trades"]) == 6
+    assert (st["status"]["phase"], st["status"]["n"]) == ("ACTIVE", 6) and st["status"]["cum"] == pytest.approx(-4.5)
+    assert paused(hs.journal) is None and not edge_alerts(hs) and not hs.journal.events(kind="EDGE_RULE")
+    line = [x for x in status_lines(hs.journal, ENTRY_BAR + 50) if x.startswith("엣지 규칙")]
+    assert len(line) == 1 and "정상" in line[0] and "6건" in line[0] and "-4.50" in line[0] and "하한까지 0.50R" in line[0]
+    assert "엣지 규칙" in hs.rt.handle("/status", ENTRY_BAR + 51)
+    hs.journal.close()
+
+
+def test_the_status_says_when_the_registered_rule_was_not_evaluated_yet(tmp_path, monkeypatch):
+    hs = Harness(tmp_path, ENTRY_BAR + 30, stage="FULL")
+    assert not any("엣지 규칙" in x for x in status_lines(hs.journal, ENTRY_BAR + 40))  # before its start: no rule
+    edge_rule(monkeypatch)
+    assert "엣지 규칙: 아직 평가 없음 (매시 50분의 모의매매 대조 때 평가)" in status_lines(hs.journal, ENTRY_BAR + 40)
+    hs.journal.close()
+
+
+def test_the_floor_pauses_entries_before_its_alert_once_and_resume_is_refused_until_the_way_back(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    seen = noting(hs, lambda: paused(hs.journal))
+    audit_with([-1.0] * 5 + [-0.2], 40)  # -5.0 at the fifth trade
+    p = paused(hs.journal)
+    assert p["reason"].startswith("edge rule: FLOOR at engine trade 5") and "+4R" in p["reason"]
+    texts = edge_alerts(hs)
+    assert len(texts) == 1 and texts[0].startswith("[엣지 규칙] 손실 하한 -5R") and "신규 진입 정지" in texts[0]
+    assert "16건 안에 +4R" in texts[0] and "은퇴" in texts[0]
+    assert [x is not None for k, _, x in seen if k == "EDGE_RULE"] == [True]  # paused before the alert
+    ev = hs.journal.events(kind="EDGE_RULE")
+    assert len(ev) == 1 and ev[0]["data"]["action"] == "STOP" and ev[0]["data"]["paused"] is True
+    assert ev[0]["data"]["stop"]["n"] == 5 and hs.journal.stage()[0] == "FULL"  # nothing is demoted
+    audit_with([-1.0] * 5 + [-0.2], 3640)  # the next hour: the same stop, said once
+    assert len(edge_alerts(hs)) == 1 and len(hs.journal.events(kind="EDGE_RULE")) == 1
+    reply = hs.rt.handle("/resume", ENTRY_BAR + 3650)
+    assert reply.startswith("재개 거부 (엣지 규칙") and "+4R" in reply and paused(hs.journal) is not None
+    assert not hs.journal.get(EDGE_RESUMES_KEY)
+    line = [x for x in status_lines(hs.journal, ENTRY_BAR + 3660) if x.startswith("엣지 규칙")][0]
+    assert "중단" in line and "/resume 거부 중" in line and "남은 거래 15건" in line
+    hs.journal.close()
+
+
+def test_the_way_back_allows_the_resume_records_it_and_a_second_floor_hit_retires(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    audit_with([-1.0] * 5, 40)
+    audit_with([-1.0] * 5 + [1.0] * 4, 3640)  # +4R from the stop: allowed
+    texts = edge_alerts(hs)
+    assert len(texts) == 2 and texts[1].startswith("[엣지 규칙] 재개 조건 충족") and "/resume" in texts[1]
+    assert paused(hs.journal) is not None  # allowed, not resumed: the user decides
+    audit_with([-1.0] * 5 + [1.0] * 4, 7240)
+    assert len(edge_alerts(hs)) == 2
+    reply = hs.rt.handle("/resume", ENTRY_BAR + 7250)
+    assert reply.startswith("재개") and "엣지 규칙" in reply and "-1.00" in reply and paused(hs.journal) is None
+    assert hs.journal.get(EDGE_RESUMES_KEY) == [{"n": 9, "ts": ENTRY_BAR + 7250, "cum": pytest.approx(-1.0)}]
+    assert hs.journal.get(EDGE_KEY)["status"]["phase"] == "RESUMED" and hs.journal.events(kind="EDGE_RESUMED")
+    assert any("재개됨" in x for x in status_lines(hs.journal, ENTRY_BAR + 7260))
+    audit_with([-1.0] * 5 + [1.0] * 4 + [-1.0] * 4, 10_840)  # -4 from the resume level: still on
+    assert hs.journal.get(EDGE_KEY)["status"]["phase"] == "RESUMED"
+    assert paused(hs.journal) is None and len(edge_alerts(hs)) == 2
+    audit_with([-1.0] * 5 + [1.0] * 4 + [-1.0] * 5, 14_440)  # -5 from it: the second floor hit
+    assert paused(hs.journal)["reason"].startswith("edge rule: A retired from live")
+    last = edge_alerts(hs)[-1]
+    assert last.startswith("[엣지 규칙] 은퇴 권고") and "사용자가 결정" in last and hs.journal.stage()[0] == "FULL"
+    assert hs.journal.events(kind="EDGE_RULE")[-1]["data"]["action"] == "RETIRE"
+    assert hs.rt.handle("/resume", ENTRY_BAR + 14_450).startswith("재개 거부 (엣지 규칙") and paused(hs.journal) is not None
+    assert any(x.startswith("엣지 규칙: 은퇴 권고") for x in status_lines(hs.journal, ENTRY_BAR + 14_460))
+    hs.journal.close()
+
+
+def test_sixteen_trades_without_the_recovery_retire_and_nothing_is_demoted_or_closed(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    audit_with([-1.0] * 5, 40)
+    contracts = hs.ex.position().contracts  # the fixture's open trade: the rule never touches a position
+    audit_with([-1.0] * 5 + [0.1] * 16, 3640)
+    assert hs.journal.get(EDGE_KEY)["status"]["retire"] == "NO_RECOVERY"
+    assert edge_alerts(hs)[-1].startswith("[엣지 규칙] 은퇴 권고") and "+4R을 회복하지 못함" in edge_alerts(hs)[-1]
+    assert hs.journal.stage()[0] == "FULL" and hs.ex.position().contracts == contracts
+    assert not hs.journal.events(kind="CLOSED") and hs.journal.get(FLATTEN_KEY) is None
+    hs.journal.close()
+
+
+def test_a_failed_or_stale_ledger_read_never_pauses_and_shows_as_unknown(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+
+    def down() -> dict[str, Any]:
+        raise AuditError("paper ledger fetch failed: HTTP 502")
+
+    hs.rt.d.paper_ledger = down
+    hs.rt.run_audit(ENTRY_BAR + 40)
+    st = hs.journal.get(EDGE_KEY)
+    assert st["status"] is None and "HTTP 502" in st["error"] and paused(hs.journal) is None and not edge_alerts(hs)
+    assert any(x.startswith("엣지 규칙: 알 수 없음") and "HTTP 502" in x for x in status_lines(hs.journal, ENTRY_BAR + 50))
+    assert hs.rt.handle("/resume", ENTRY_BAR + 55).startswith("재개")  # nothing of the rule's is known to stand in the way
+    # a ledger whose last bar closed more than three hours ago holds -6R: stale, never a stop
+    audit_with([-2.0] * 3, 60, behind=3 * 3600 + 1)
+    assert "stale" in hs.journal.get(EDGE_KEY)["error"] and paused(hs.journal) is None and not edge_alerts(hs)
+    # another schema, and a malformed trade
+    hs.rt.d.paper_ledger = lambda: {"schema_version": 2}
+    hs.rt.run_audit(ENTRY_BAR + 70)
+    assert "invalid" in hs.journal.get(EDGE_KEY)["error"] and paused(hs.journal) is None
+    audit_with([-1.0, float("nan"), -9.0], 80)
+    assert "malformed" in hs.journal.get(EDGE_KEY)["error"] and paused(hs.journal) is None
+    # a good read follows: evaluated again; then the read fails while the rule is stopped - the last good status stands
+    audit_with([-1.0] * 5, 3640)
+    assert paused(hs.journal) is not None and hs.journal.get(EDGE_KEY)["error"] is None
+    hs.rt.d.paper_ledger = down
+    hs.rt.run_audit(ENTRY_BAR + 7240)
+    st = hs.journal.get(EDGE_KEY)
+    assert st["status"]["phase"] == "STOPPED" and st["as_of"] == ENTRY_BAR + 3640 and "HTTP 502" in st["error"]
+    reply = hs.rt.handle("/resume", ENTRY_BAR + 7250)
+    assert reply.startswith("재개 거부 (엣지 규칙") and "마지막 정상 평가" in reply and paused(hs.journal) is not None
+    line = [x for x in status_lines(hs.journal, ENTRY_BAR + 7260) if x.startswith("엣지 규칙")][0]
+    assert line.startswith("엣지 규칙: 알 수 없음") and "중단" in line
+    hs.journal.close()
+
+
+def test_a_passed_verdict_asks_for_the_rule_to_be_registered_anew_and_a_failed_one_stops(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    audit_with([0.1] * 24, 40)
+    texts = edge_alerts(hs)
+    assert len(texts) == 1 and texts[0].startswith("[엣지 규칙] 판정 통과") and "다시 등록" in texts[0]
+    assert paused(hs.journal) is None and hs.journal.events(kind="EDGE_RULE")[-1]["data"]["action"] == "VERDICT"
+    audit_with([0.1] * 25, 3640)
+    assert len(edge_alerts(hs)) == 1
+    hs.journal.close()
+    hs, audit_with = edge_harness(tmp_path / "failed", monkeypatch)
+    audit_with([0.5, -0.5] * 12, 40)
+    texts = edge_alerts(hs)
+    assert len(texts) == 1 and texts[0].startswith("[엣지 규칙] 판정 실패") and "신규 진입 정지" in texts[0]
+    assert paused(hs.journal)["reason"].startswith("edge rule: VERDICT at engine trade 24")
+    hs.journal.close()
+
+
+def test_an_edge_stop_while_already_paused_is_still_said_and_a_lifted_pause_is_put_back(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    hs.rt.handle("/pause", ENTRY_BAR + 35)
+    audit_with([-1.0] * 5, 40)
+    assert paused(hs.journal)["reason"] == "user /pause"  # the pause in force stays as it was
+    assert len(edge_alerts(hs)) == 1 and "이미 일시 정지" in edge_alerts(hs)[0]
+    assert hs.journal.events(kind="EDGE_RULE")[0]["data"]["paused"] is False
+    assert hs.rt.handle("/resume", ENTRY_BAR + 45).startswith("재개 거부 (엣지 규칙")
+    hs.journal.put("paused", None)  # the pause gone by some other way while the stop stands
+    audit_with([-1.0] * 5, 3640)
+    assert paused(hs.journal)["reason"].startswith("edge rule: FLOOR") and len(edge_alerts(hs)) == 2
+    hs.journal.close()
+
+
+def test_the_edge_rule_never_breaks_the_audit(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise RuntimeError("edge bug")
+
+    monkeypatch.setattr(edge_mod, "evaluate", boom)
+    res = audit_with([-1.0] * 6, 40)
+    assert res.ok and audit_from_journal(hs.journal).ok and paused(hs.journal) is None
+    assert hs.journal.events(kind="LOOP_ERROR")[-1]["data"]["section"] == "edge"
+    hs.journal.close()
+
+
+def test_the_frequency_review_alerts_once_when_it_begins_and_changes_no_risk(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    now = ENTRY_BAR + 40
+    entries = [now - 200 * 86_400 - k * 40 * 86_400 for k in range(8)]  # the last one 200 days ago, 5 in the year
+    monkeypatch.setattr(hs.rt, "_engine_entries", lambda: entries)
+    audit_with([], 40)
+    f = hs.journal.get(EDGE_FREQ_KEY)
+    assert f["gap"] and f["few"] and f["error"] is None and f["trailing"] == 5
+    texts = [t for k, t in hs.alerts.items if k == "EDGE_FREQ"]
+    assert len(texts) == 1 and texts[0].startswith("[신호 빈도 검토]") and "137일" in texts[0] and "5건" in texts[0]
+    assert "위험은 바꾸지 않음" in texts[0] and paused(hs.journal) is None and hs.journal.stage()[0] == "FULL"
+    assert hs.journal.events(kind="EDGE_FREQ")[0]["data"]["onset"] == ["gap", "few"]
+    audit_with([], 3640)
+    assert hs.alerts.kinds().count("EDGE_FREQ") == 1  # once per onset
+    line = [x for x in status_lines(hs.journal, ENTRY_BAR + 3650) if x.startswith("신호 빈도")]
+    assert len(line) == 1 and "검토 필요" in line[0] and "200일 전" in line[0]
+    entries.append(ENTRY_BAR)  # a new entry: the gap is over, six in the year
+    audit_with([], 7240)
+    f = hs.journal.get(EDGE_FREQ_KEY)
+    assert not f["gap"] and not f["few"] and hs.alerts.kinds().count("EDGE_FREQ") == 1
+    assert not any("검토 필요" in x for x in status_lines(hs.journal, ENTRY_BAR + 7250))
+    del entries[-1]  # (a later onset is a new one)
+    audit_with([], 9_040)
+    assert hs.alerts.kinds().count("EDGE_FREQ") == 2
+    hs.journal.close()
+
+
+def test_the_frequency_review_is_unknown_without_a_recent_cycle_and_reads_the_engines_entry_decisions(tmp_path, monkeypatch):
+    hs, audit_with = edge_harness(tmp_path, monkeypatch)
+    mine = sorted(int(d["ts"]) for d in hs.journal.decisions() if d["kind"] == "ENTRY")
+    assert mine and hs.rt._engine_entries() == mine
+    audit_with([], 40)
+    assert hs.journal.get(EDGE_FREQ_KEY)["last_entry"] == max(t for t in mine if t <= ENTRY_BAR + 40)
+    before = hs.alerts.kinds().count("EDGE_FREQ")
+    monkeypatch.setattr(hs.rt, "_engine_entries", lambda: [ENTRY_BAR - 400 * 86_400])
+    audit_with([], 5 * 3600)  # no cycle ended OK for hours: the journal's decisions may be behind
+    f = hs.journal.get(EDGE_FREQ_KEY)
+    assert "3" in f["error"] and hs.alerts.kinds().count("EDGE_FREQ") == before
+    assert any(x.startswith("신호 빈도: 알 수 없음") for x in status_lines(hs.journal, ENTRY_BAR + 5 * 3600 + 10))
     hs.journal.close()

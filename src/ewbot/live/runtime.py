@@ -6,7 +6,8 @@ every protective action - a stop-gap or unprotected close, a breaker flatten, a 
 is taken before its alert.
 
   commands  Telegram /status /pause /resume /flatten /flatten_confirm /help (live/control.py); a command sent
-            more than 2 minutes before the loop reaches it is ignored with a reply (sent again if wanted),
+            more than 2 minutes before the loop reaches it is ignored with a reply (sent again if wanted), /resume
+            is refused while the edge rule stands in its way (no override command),
             and /flatten_confirm counts only when sent within 60 s of its /flatten (the messages' dates)
   flatten   a breaker or /flatten_confirm journals a flatten request (reason, origin, time) before anything else,
             then pauses entries; every pass while it stands and a position exists sends the close (the brackets
@@ -62,7 +63,10 @@ is taken before its alert.
             waits on GitHub, a DNS lookup included -, one fetch at a time, given up after 60 s, and compared on the
             loop once it is there; a revised bar is alerted only, a decision missing on one side is pending until
             the next audit confirms it, a different decision is a major incident at once; a failed audit is
-            stored as failed and alerted), and the stage-change restart (a new stage or stint once flat: no open
+            stored as failed and alerted; after it, with the same ledger, strategy A's edge rule and the
+            signal-frequency review - live/edge.py, user decision 2026-11-18: cumulative engine R <= -5 or a failed
+            verdict pauses entries before its alert, `/resume` is then refused until the rule's way back is met, and
+            a ledger that was not read or is stale is shown as unknown, never a stop), and the stage-change restart (a new stage or stint once flat: no open
             trade, no order of unknown outcome, no standing flatten, no position or order of ours) - each step
             guarded on its own: one that keeps failing never skips the ones after it
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
@@ -120,6 +124,7 @@ import pandas as pd
 from ewbot.backtest.holdout import data_fingerprint
 from ewbot.data.candles import fill_gaps, load_1h
 from ewbot.execution.costs import fee as model_fee
+from ewbot.live import edge
 from ewbot.live.audit import AuditError, AuditResult, audit
 from ewbot.live.control import Command
 from ewbot.live.exchange import STOP_LIMIT_OFFSET, Exchange, ExchangeError, Order, Position, ProductSpec, SessionInfo
@@ -241,6 +246,12 @@ BAD_EQUITY_PAUSE_READS = 3  # balance reads in a row that are not a finite amoun
 HEARTBEAT_KEY = "heartbeat"
 AUDIT_KEY = "audit"
 AUDIT_PENDING_KEY = "audit_pending"  # mismatches a lag could explain, seen in the last audit (id:type)
+# the edge rule (live/edge.py, user decision 2026-11-18): {"status": the last good evaluation, "as_of", "trades": the engine
+# trades it read, "error": why the last try could not evaluate, "error_ts"}; the resumes the rule allowed, each
+# {"n", "ts", "cum"}; the last frequency review with "as_of" and "error"
+EDGE_KEY = "edge_rule"
+EDGE_RESUMES_KEY = "edge_resumes"
+EDGE_FREQ_KEY = "edge_freq"
 ORDER_FAIL_KEY = "order_failures"  # order failures not resolved yet, and the last event id looked at
 # what an order failure is about: a bracket (protection), a close or a reduction
 FAILURE_CLASS = {"BRACKET_FAILED": "bracket", "CLOSE_FAILED": "close", "CLOSE_UNCONFIRMED": "close",
@@ -1886,8 +1897,10 @@ class LiveRuntime:
         if self.d.paper_ledger is None:
             return None
         read = self.d.paper_ledger if ledger is None else ledger
+        raw: dict[str, Any] | None = None  # the ledger as read: the edge rule reads the same one (None: the read failed)
         try:
-            res = audit(self.journal.decisions(), read(), BASELINE_FINGERPRINT,
+            raw = read()
+            res = audit(self.journal.decisions(), raw, BASELINE_FINGERPRINT,
                         until=self._decided_until(), now=now, data_hash=self._data_hash())
         except Exception as exc:  # noqa: BLE001 - every failure is a failed audit, never the last good one
             why = self.d.redact(str(exc) if isinstance(exc, AuditError) else f"{type(exc).__name__}: {exc}")[:300]
@@ -1896,6 +1909,7 @@ class LiveRuntime:
             self.journal.add_event(now, "AUDIT_ERROR", {"error": why})
             if self._once("auditfail", True):
                 self.alert("AUDIT", f"[모의매매 대조 실패] {why[:200]} (대조가 다시 성공할 때까지 단계 기준 미충족)")
+            self._edge_step(now, raw, why)
             return res
         self.journal.put(AUDIT_KEY, res.to_json())
         if self.journal.get("once:auditfail") is True:
@@ -1928,7 +1942,106 @@ class LiveRuntime:
             self.journal.add_event(now, "AUDIT_MISMATCH", {"items": major[:20]})
             self._incident("AUDIT_MISMATCH", now)
             self.alert("AUDIT_MISMATCH", "[판단 불일치] 실거래 vs 모의매매\n" + lines(major))
+        self._edge_step(now, raw, None)
         return res
+
+    # ------------------------------------------------------------------ the edge rule (live/edge.py)
+    def _edge_step(self, now: float, ledger: dict[str, Any] | None, why: str | None) -> None:
+        """After every audit, with the paper ledger it read (None and `why` when the read failed): strategy A's edge rule
+        and the signal-frequency review (user decision 2026-11-18). Before the rule's start nothing is evaluated. A
+        failure in here is a loop error of its own: it never fails the audit and never pauses anything."""
+        if now < edge.START_TS:
+            return
+        try:
+            self._edge_rule(now, ledger, why)
+        except Exception as exc:  # noqa: BLE001 - the audit's result stands
+            self._loop_error("edge", exc, now)
+        try:
+            self._edge_frequency(now)
+        except Exception as exc:  # noqa: BLE001
+            self._loop_error("edge", exc, now)
+
+    def _edge_rule(self, now: float, ledger: dict[str, Any] | None, why: str | None) -> None:
+        """Evaluate the rule on the ledger's engine trades and act on it. A ledger that was not read, is stale or cannot
+        speak for strategy A (edge.EdgeError) leaves the last good status where it is and is stored as unknown: never a
+        stop by itself."""
+        prev = self.journal.get(EDGE_KEY) or {}
+        try:
+            if ledger is None:
+                raise edge.EdgeError(why or "paper ledger not read")
+            trades = edge.engine_trades(ledger, BASELINE_FINGERPRINT, now=now)
+        except edge.EdgeError as exc:
+            self.journal.put(EDGE_KEY, {"status": prev.get("status"), "as_of": prev.get("as_of"), "trades": prev.get("trades"),
+                                        "error": self.d.redact(str(exc))[:200], "error_ts": now})
+            return
+        status = edge.evaluate(trades, now, self.journal.get(EDGE_RESUMES_KEY) or [])
+        self.journal.put(EDGE_KEY, {"status": status, "as_of": now, "trades": [list(t) for t in trades], "error": None,
+                                    "error_ts": None})
+        self._edge_act(status, now)
+
+    def _edge_act(self, status: dict[str, Any], now: float) -> None:
+        """A STOPPED or RETIRED rule pauses entries - whenever it finds them not paused, and before its alert -; the stop is
+        journaled and alerted once, and again whenever this pauses. Nothing else is done: no demotion, no close, no
+        flatten (the open trade's exits and protection go on, as under every pause). The way back being met and the
+        verdict are alerted once."""
+        stop, verdict = status["stop"], status["verdict"]
+        if status["phase"] in ("STOPPED", "RETIRED"):
+            retired = status["phase"] == "RETIRED"
+            new = self._once("edge_stop", f"{status['phase']}:{stop['kind']}:{stop['n']}:{status['retire']}")
+            applied = paused(self.journal) is None
+            if applied:
+                pause(self.journal, edge_pause_reason(status), now)
+            if new or applied:
+                self.journal.add_event(now, "EDGE_RULE", {
+                    "action": "RETIRE" if retired else "STOP", "paused": applied, "stop": stop, "retire": status["retire"],
+                    "n": status["n"], "cum": status["cum"]})
+                self.alert("EDGE_RULE", f"[엣지 규칙] {edge.stop_text(status)}"
+                                        + ("" if applied else " (이미 일시 정지 중: 그 정지는 그대로)"))
+            if not retired and status["eligible"] and self._once("edge_eligible", f"{stop['kind']}:{stop['n']}"):
+                self.journal.add_event(now, "EDGE_RULE", {"action": "ELIGIBLE", "stop": stop, "n": status["n"],
+                                                          "cum": status["cum"], "best": status["best"]})
+                self.alert("EDGE_RULE", f"[엣지 규칙] 재개 조건 충족: 중단({stop['n']}건째, 누적 R {float(stop['cum']):+.2f}) 뒤 "
+                                        f"+{edge.RECOVER_R:g}R 이상 회복 (최고 {float(status['best']):+.2f}R) - /resume 가능. "
+                                        f"재개하면 그때의 누적 R에서 다시 -{edge.FLOOR_R:g}R이면 은퇴")
+        if verdict is not None and self._once("edge_verdict", f"{verdict['result']}:{verdict['n']}:{verdict['by']}"):
+            self.journal.add_event(now, "EDGE_RULE", {"action": "VERDICT", "verdict": verdict, "phase": status["phase"]})
+            said = f"엔진 거래 {verdict['n']}건, 누적 R {float(verdict['cum']):+.2f}"
+            if verdict["result"] == "PASSED":
+                self.alert("EDGE_RULE", f"[엣지 규칙] 판정 통과 ({said}): 2026-11-18에 등록한 규칙은 여기까지 - 다음 구간의 규칙을 "
+                                        f"다시 등록해야 함 (그때까지 손실 하한 -{edge.FLOOR_R:g}R은 그대로 적용)")
+            elif not (stop is not None and stop["kind"] == "VERDICT" and stop["n"] == verdict["n"]):
+                self.alert("EDGE_RULE", f"[엣지 규칙] 판정 실패 ({said}): 이미 중단 또는 은퇴 권고 상태라 달라지는 것은 없음")
+
+    def _engine_entries(self) -> list[int]:
+        """When the engine entered, from the journal's decisions (every one since 2024: live/target.py)."""
+        return sorted(int(d["ts"]) for d in self.journal.decisions() if d["kind"] == "ENTRY")
+
+    def _edge_frequency(self, now: float) -> None:
+        """The signal-frequency review: alerted once when a condition begins (again when it begins anew), shown in the
+        status, and changing no risk. Unknown - stored as such, the conditions as they were - while no cycle ended OK in
+        the last edge.LEDGER_MAX_AGE_S: the journal's decisions may then be behind the engine."""
+        prev = self.journal.get(EDGE_FREQ_KEY) or {}
+        until = self._decided_until()
+        if until == 0 or now - (until + H1) > edge.LEDGER_MAX_AGE_S:
+            hours = edge.LEDGER_MAX_AGE_S / 3600
+            self.journal.put(EDGE_FREQ_KEY, {**prev, "error": f"no cycle ended OK in the last {hours:g} hours",
+                                             "error_ts": now})
+            return
+        f = edge.frequency(self._engine_entries(), now)
+        onset = [k for k in ("gap", "few") if f[k] and not prev.get(k)]
+        self.journal.put(EDGE_FREQ_KEY, {**f, "as_of": now, "error": None, "error_ts": None})
+        if not onset:
+            return
+        self.journal.add_event(now, "EDGE_FREQ", {"onset": onset, **f})
+        what = []
+        if "gap" in onset:
+            what.append(f"엔진 진입이 {edge.GAP_MAX_DAYS}일 넘게 없음 (마지막 {edge.day_text(float(f['last_entry']))}, "
+                        f"{float(f['gap_days']):.0f}일 전)")
+        if "few" in onset:
+            what.append(f"최근 {edge.TRAILING_DAYS}일 엔진 진입 {f['trailing']}건 ({edge.TRAILING_MAX}건 이하)")
+        self.alert("EDGE_FREQ", "[신호 빈도 검토] " + " · ".join(what) + " - 위험은 바꾸지 않음. 봇과 모의매매 대조가 정상인지 "
+                                "확인하고, 전략 A가 쉬는 동안의 자금 운용을 검토. 신호를 늘리려고 K4·Q_MIN·S_MIN이나 "
+                                "holdout.lock을 바꾸지 않는다")
 
     def costs(self, since: float) -> dict[str, Any]:
         """Measured costs since `since`: fills, entry slippage vs. the engine reference, stop slippage vs. the
@@ -2469,6 +2582,8 @@ class LiveRuntime:
         elif cmd == "/pause":
             pause(self.journal, "user /pause", now)
             reply = "일시 정지: 신규 진입 중단 (보호 주문과 청산은 계속)"
+        elif cmd == "/resume" and self._edge_resume_block() is not None:
+            reply = str(self._edge_resume_block())  # the edge rule stands in the way: nothing is resumed, no override
         elif cmd == "/resume":
             resume(self.journal, now)
             _, cap = self._limits()
@@ -2487,6 +2602,7 @@ class LiveRuntime:
                 reply += f" · 손실 한도 기준을 다시 잡음 (지금과 다음 두 번 조회의 중앙값): {', '.join(rebased)}"
             elif rebased is None:
                 reply += " · 잔고를 읽지 못해 손실 한도 기준은 그대로 (발동 중이면 다시 /resume)"
+            reply += self._edge_resumed(now)
         elif cmd == "/flatten":
             self.flatten_sent = sent
             reply = "60초 안에 /flatten_confirm 을 보내면 전량 청산하고 일시 정지합니다"
@@ -2502,6 +2618,31 @@ class LiveRuntime:
         self.journal.add_event(now, "COMMAND", {"cmd": cmd, "reply": reply[:200]})
         self.alert("COMMAND", f"{reply}\n({stamp} 뉴욕)")
         return reply
+
+    def _edge_resume_block(self) -> str | None:
+        """Why the edge rule refuses `/resume` (edge.resume_block on the last good evaluation), or None. There is no
+        override command: a resume against the rule is a new, dated decision in the code (edge.py), not a message."""
+        state = self.journal.get(EDGE_KEY) or {}
+        block = edge.resume_block(state.get("status"))
+        if block is not None and state.get("error"):
+            block += f" (지금은 평가할 수 없어 마지막 정상 평가 {_utc(float(state['as_of']))} 기준: {str(state['error'])[:80]})"
+        return block
+
+    def _edge_resumed(self, now: float) -> str:
+        """A `/resume` the rule allowed while it was STOPPED: recorded with the trade count and the cumulative R it resumes
+        at (the floor's new reference), the status evaluated again from the trades it was computed on. '' otherwise."""
+        state = self.journal.get(EDGE_KEY) or {}
+        status = state.get("status")
+        if not status or status.get("phase") != "STOPPED":
+            return ""
+        at = {"n": int(status["n"]), "ts": now, "cum": float(status["cum"])}
+        resumes = (self.journal.get(EDGE_RESUMES_KEY) or []) + [at]
+        self.journal.put(EDGE_RESUMES_KEY, resumes)
+        again = edge.evaluate([(int(a), int(b), float(r)) for a, b, r in state.get("trades") or []], now, resumes)
+        self.journal.put(EDGE_KEY, {**state, "status": again})
+        self.journal.add_event(now, "EDGE_RESUMED", {**at, "phase": again["phase"]})
+        return (f" · 엣지 규칙: 재개 기록 (엔진 거래 {at['n']}건, 누적 R {at['cum']:+.2f} 기준) - 여기서 다시 "
+                f"-{edge.FLOOR_R:g}R이면 은퇴")
 
     # ------------------------------------------------------------------ main loop
     def _commands(self, now: float) -> None:
@@ -2683,10 +2824,25 @@ def status_lines(journal: Journal, now: float) -> list[str]:
         explained = len(a.mismatches) - len(a.unexplained())
         lines.append(f"모의매매 대조: 비교 {a.compared}건, 일치 {a.matched}건, 불일치 {len(a.unexplained())}건"
                      + (f" (봉 수정 {explained}건 별도)" if explained else "") + f" ({_utc(a.window[1])} 봉까지, {_utc(a.as_of)})")
+    rule = journal.get(EDGE_KEY)
+    if rule is None and now >= edge.START_TS:  # registered, not evaluated yet (no audit since the start, or none set up)
+        lines.append("엣지 규칙: 아직 평가 없음 (매시 50분의 모의매매 대조 때 평가)")
+    lines += edge.status_text(rule, journal.get(EDGE_FREQ_KEY))
     hb = journal.get(HEARTBEAT_KEY)
     if hb is not None:
         lines.append(f"루프 하트비트: {now - float(hb):.0f}초 전")
     return lines
+
+
+def edge_pause_reason(status: dict[str, Any]) -> str:
+    """The pause reason of an edge stop (shown in the status and in every skipped entry): what stopped, and the way back
+    or that there is none."""
+    stop = status["stop"]
+    at = f"{stop['kind']} at engine trade {stop['n']}, cumulative R {float(stop['cum']):+.2f}"
+    if status["phase"] == "RETIRED":
+        return f"edge rule: A retired from live ({status['retire']}; {at}) - no resume, the user decides"
+    return (f"edge rule: {at} - resume only after +{edge.RECOVER_R:g}R within {edge.RECOVER_TRADES} engine trades, "
+            "else A is retired from live")
 
 
 def audit_from_journal(journal: Journal) -> AuditResult | None:
