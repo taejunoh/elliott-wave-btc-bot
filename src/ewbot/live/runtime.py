@@ -250,6 +250,9 @@ AUDIT_PENDING_KEY = "audit_pending"  # mismatches a lag could explain, seen in t
 # trades it read, "error": why the last try could not evaluate, "error_ts"}; the resumes the rule allowed, each
 # {"n", "ts", "cum"}; the last frequency review with "as_of" and "error"
 EDGE_KEY = "edge_rule"
+# a FULL one-contract floor entry that was sent and not said yet (the `_entry_floor` record of its signal): said by the
+# pass that first sees the trade - the one that entered, or a later one that read the fill
+ENTRY_FLOOR_KEY = "entry_floor"
 EDGE_RESUMES_KEY = "edge_resumes"
 EDGE_FREQ_KEY = "edge_freq"
 ORDER_FAIL_KEY = "order_failures"  # order failures not resolved yet, and the last event id looked at
@@ -635,7 +638,7 @@ class LiveRuntime:
         if stage == "FULL" and why == FULL_FLOOR:
             # user decision 2026-11-18: the 10% risk sized no contract and one contract's risk is within 20% of the account
             self._entry_floor = {"signal_ts": e.signal_ts, "stage": stage, "direction": e.direction, "equity": equity,
-                                 "risk": FULL_RISK.risk_pct, "limit": FULL_MIN_ONE_MAX_RISK,
+                                 "risk": FULL_RISK.risk_pct, "risk_mult": e.risk_mult, "limit": FULL_MIN_ONE_MAX_RISK,
                                  "risk_per_contract": risk_per_contract(entry, stop, self.cfg.costs)}
         return n, None
 
@@ -673,19 +676,34 @@ class LiveRuntime:
                              f"[잔고 조회 이상] {head}: 세 번 읽은 값 ({shown})의 중앙값 {median:,.2f} USD로 크기를 정함")
         return median, None
 
-    def _record_entry_floor(self, f: dict[str, Any], now: float) -> None:
-        """A FULL entry of one contract where the risk size was none (pricing.FULL_FLOOR): once per signal, after the entry
-        exists, with the real risk of that contract - risk_per_contract(entry, stop, costs) / equity, above FULL_RISK's
-        share and at most FULL_MIN_ONE_MAX_RISK. One stop of such a trade is most of the daily loss limit, or all of it."""
-        t = self.executor.trade()
-        if t is None or t.trade_id != f["signal_ts"] or not self._once(f"entry_floor:{f['signal_ts']}"):
+    def _note_entry_floor(self, f: dict[str, Any]) -> None:
+        """A floor entry is about to be sent: its record is kept in the journal under its signal until it is said."""
+        self.journal.put(ENTRY_FLOOR_KEY, f)
+
+    def _record_entry_floor(self, now: float) -> None:
+        """A FULL entry of one contract where the risk size was none (pricing.FULL_FLOOR): journaled and alerted once per
+        signal, by the first pass that sees its trade - the pass that sent it, or a later one when the fill could not be
+        read at once (`ENTRY_UNCONFIRMED`; the note is in the journal, so across a restart too). It states the real risk
+        of that contract, risk_per_contract(entry, stop, costs) / equity: above the signal's own budget (FULL_RISK's
+        share x its risk_mult: 10%, or 5% for a half-risk setup) and at most FULL_MIN_ONE_MAX_RISK. Above FULL_RISK's
+        share one stop is most of the daily loss limit, or all of it, and the alert says so."""
+        f = self.journal.get(ENTRY_FLOOR_KEY)
+        if not f:
             return
+        t = self.executor.trade()
+        if t is None or t.trade_id != f["signal_ts"]:
+            return
+        self.journal.put(ENTRY_FLOOR_KEY, None)
+        if not self._once(f"entry_floor:{f['signal_ts']}"):
+            return
+        risk, mult = float(f["risk"]), float(f.get("risk_mult", 1.0))
         real = float(f["risk_per_contract"]) / float(f["equity"])
+        budget = f"{risk:.0%}" if mult == 1.0 else f"{risk * mult * 100:g}% ({risk:.0%} × {mult:g})"
+        warn = (f"; 손절 한 번이 일일 손실 한도 -{LIVE_DAILY_LOSS:.0%}에 가깝거나 넘을 수 있음" if real > risk else "")
         self.journal.add_event(now, "ENTRY_FLOOR", {**f, "real": real})
-        self.alert("ENTRY_FLOOR", f"[최소 1계약 진입] 위험 {float(f['risk']):.0%} 기준으로는 1계약이 안 되어(0계약) 최소 1계약으로 진입 - "
+        self.alert("ENTRY_FLOOR", f"[최소 1계약 진입] 위험 {budget} 기준으로는 1계약이 안 되어(0계약) 최소 1계약으로 진입 - "
                                   f"1계약 위험 {float(f['risk_per_contract']):,.2f} USD, 실제 위험은 약 {real:.1%} "
-                                  f"(최소 진입 한도 {float(f['limit']):.0%}); 손절 한 번이 일일 손실 한도 "
-                                  f"-{LIVE_DAILY_LOSS:.0%}에 가깝거나 넘을 수 있음")
+                                  f"(최소 진입 한도 {float(f['limit']):.0%}){warn}")
 
     def _record_entry_reduction(self, r: dict[str, Any], now: float) -> None:
         """A FULL entry that entered with the margin maximum instead of the risk size: once per signal, after the entry
@@ -1070,11 +1088,12 @@ class LiveRuntime:
         req = self.journal.get(FLATTEN_KEY)
         actions = planned if req is None else self._flatten_actions(req, planned, pos, ctx, now)
         closes = [e["id"] for e in self.journal.events(kind="CLOSED")][-1:] if req is not None else []
+        if floor is not None and any(isinstance(a, Enter) for a in actions):
+            self._note_entry_floor(floor)  # before it is sent: said by whichever pass first sees the trade
         self.executor.execute(actions, ctx)
         if reduction is not None and any(isinstance(a, Enter) for a in actions):
             self._record_entry_reduction(reduction, now)
-        if floor is not None and any(isinstance(a, Enter) for a in actions):
-            self._record_entry_floor(floor, now)
+        self._record_entry_floor(now)
         if req is not None and pos is not None and ctx.session_open:
             self._flatten_sent(req, closes[0] if closes else 0, now)
         for kind, note in self._after_pass:  # the pass's actions first, then the flatten's alerts

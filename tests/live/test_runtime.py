@@ -40,6 +40,7 @@ from ewbot.live.runtime import (
     EDGE_FREQ_KEY,
     EDGE_KEY,
     EDGE_RESUMES_KEY,
+    ENTRY_FLOOR_KEY,
     FLATTEN_KEY,
     STARTUP_READ_MAX_S,
     STOP_GRACE_S,
@@ -2443,22 +2444,83 @@ def test_full_enters_one_contract_when_ten_percent_sizes_none_and_says_its_real_
     f = hs.rt._entry_floor
     assert f["signal_ts"] == SIGNAL and f["equity"] == 150.0 and f["risk_per_contract"] == pytest.approx(20.2574)
     assert (f["risk"], f["limit"]) == (0.10, 0.20)
+    assert f["risk_mult"] == 1.0
     hs.rt.executor.trade = lambda: SimpleNamespace(trade_id=SIGNAL, contracts=1)
-    hs.rt._record_entry_floor(f, ENTRY_BAR + 31)
-    hs.rt._record_entry_floor(f, ENTRY_BAR + 41)
+    hs.rt._note_entry_floor(f)
+    hs.rt._record_entry_floor(ENTRY_BAR + 31)
+    hs.rt._record_entry_floor(ENTRY_BAR + 41)
     rows = hs.journal.events(kind="ENTRY_FLOOR")
     assert len(rows) == 1 and rows[0]["data"]["real"] == pytest.approx(0.13505, abs=1e-5)
     texts = [t for k, t in hs.alerts.items if k == "ENTRY_FLOOR"]
-    assert len(texts) == 1 and texts[0].startswith("[최소 1계약 진입]")
-    assert "실제 위험은 약 13.5%" in texts[0] and "10%" in texts[0] and "20%" in texts[0]
+    assert len(texts) == 1 and texts[0].startswith("[최소 1계약 진입] 위험 10% 기준으로는 1계약이 안 되어(0계약)")
+    assert "실제 위험은 약 13.5%" in texts[0] and "한도 20%" in texts[0]
+    assert "일일 손실 한도 -20%" in texts[0]  # above 10%: one stop is most of the daily limit
+    assert hs.journal.get(ENTRY_FLOOR_KEY) is None  # said: nothing left to say
     hs.journal.close()
+
+
+def test_the_floor_alert_of_a_half_risk_signal_names_its_budget_and_warns_only_above_ten_percent(tmp_path):
+    """Review finding 2026-11-18. A W5_REV (risk_mult 0.5) on 300 USD, stop 2,000 away: its budget is 10% x 0.5 = 5% = 15 USD,
+    one contract risks 20.2574 USD = 6.75%: the floor enters it. The alert said "위험 10% 기준으로는 1계약이 안 되어" - at 10%
+    one contract does fit - and warned of the daily limit for a 6.8% trade."""
+    n, block, hs = sized(tmp_path, "FULL", 300.0, stop_dist=2_000.0, risk_mult=0.5)
+    assert (n, block) == (1, None) and hs.rt._entry_floor["risk_mult"] == 0.5
+    hs.rt.executor.trade = lambda: SimpleNamespace(trade_id=SIGNAL, contracts=1)
+    hs.rt._note_entry_floor(hs.rt._entry_floor)
+    hs.rt._record_entry_floor(ENTRY_BAR + 31)
+    text = [t for k, t in hs.alerts.items if k == "ENTRY_FLOOR"][0]
+    assert text.startswith("[최소 1계약 진입] 위험 5% (10% × 0.5) 기준으로는 1계약이 안 되어(0계약)")
+    assert "실제 위험은 약 6.8%" in text and "일일 손실 한도" not in text
+    assert hs.journal.events(kind="ENTRY_FLOOR")[0]["data"]["risk_mult"] == 0.5
+    n1, _, hs1 = sized(tmp_path / "one", "FULL", 300.0, stop_dist=2_000.0)  # at 10% the same contract is the risk size
+    assert n1 == 1 and hs1.rt._entry_floor is None
+    hs.journal.close()
+    hs1.journal.close()
 
 
 def test_the_full_floor_is_not_recorded_before_its_entry_exists(tmp_path):
     n, block, hs = sized(tmp_path, "FULL", 150.0, stop_dist=2_000.0)
     assert n == 1
-    hs.rt._record_entry_floor(hs.rt._entry_floor, ENTRY_BAR + 31)  # no trade of this signal yet (a failed send)
+    hs.rt._note_entry_floor(hs.rt._entry_floor)
+    hs.rt._record_entry_floor(ENTRY_BAR + 31)  # no trade of this signal yet (a failed send, a fill not read yet)
     assert not hs.journal.events(kind="ENTRY_FLOOR") and "ENTRY_FLOOR" not in hs.alerts.kinds()
+    assert hs.journal.get(ENTRY_FLOOR_KEY)["signal_ts"] == SIGNAL  # kept for the pass that sees the trade
+    hs.journal.close()
+
+
+def test_a_floor_entry_whose_fill_is_read_in_a_later_pass_is_still_recorded_once(tmp_path):
+    """Review finding 2026-11-18: the order is accepted and its fill cannot be read (`ENTRY_UNCONFIRMED`); the trade is
+    rebuilt by a later pass, which has no Enter action - the floor's record and alert were lost. It is noted under the
+    signal when the entry is sent and said by the pass that first sees the trade, across a restart too."""
+    early = SIGNAL - 7200
+    hs = Harness(tmp_path, early + 3600 + 30, stage="FULL", stage_days=60.0, equity=150.0)
+    hs.price(26_740.0)
+    hs.rt.startup()
+    ent = TargetEntry(early, "W3", 1, 26_740.0, 24_740.0, 27_500.0, 28_500.0, 1.0, 5, "test signal")
+    hs.rt.target = Target(early, 26_740.0, None, None, ent, ())
+    real_await, calls = hs.rt.executor._await_fill, []
+
+    def flaky(order_id: str) -> Any:
+        calls.append(order_id)
+        if len(calls) == 1:
+            raise ExchangeError("order read timed out")
+        return real_await(order_id)
+
+    hs.rt.executor._await_fill = flaky
+    hs.clock.now = float(early + 3600 + 40)
+    hs.rt.reconcile(hs.clock.now)
+    assert hs.journal.events(kind="ENTRY_UNCONFIRMED") and not hs.journal.events(kind="ENTRY_FLOOR")
+    assert hs.journal.get(ENTRY_FLOOR_KEY)["signal_ts"] == early
+    again = hs.make_runtime()  # a restart in between: the note is in the journal
+    again.target = hs.rt.target
+    for k in range(2, 8):
+        hs.clock.now = float(early + 3600 + 30 + 10 * k)
+        again.reconcile(hs.clock.now)
+    t = again.executor.trade()
+    assert hs.ex.position().contracts == 1 and t is not None and t.trade_id == early
+    rows = hs.journal.events(kind="ENTRY_FLOOR")
+    assert len(rows) == 1 and rows[0]["data"]["signal_ts"] == early and hs.alerts.kinds().count("ENTRY_FLOOR") == 1
+    assert hs.journal.get(ENTRY_FLOOR_KEY) is None
     hs.journal.close()
 
 

@@ -22,8 +22,8 @@ risk (0.01 BTC, whole contracts), and the frozen sizing then gives 0 - at 500 US
 about 6% away. FULL then enters ONE contract when that contract's risk (`risk_per_contract`, CANARY's check) is at most
 FULL_MIN_ONE_MAX_RISK (20%) of the account and its notional is within FULL_RISK's 5x; above either it is skipped as
 before. The signal's risk_mult does not scale the floor (CANARY's check does not either). The real risk of such an entry
-is above 10% - up to 20% - and the runtime says so (`ENTRY_FLOOR`, `[최소 1계약 진입]`); the margin limit applies to it
-like to any entry. The sizing's liquidation check cannot bind here: one contract's isolated liquidation distance is
+is above the signal's own budget (10% x risk_mult: 5% for a half-risk setup) and at most 20%, and the runtime says how
+much (`ENTRY_FLOOR`, `[최소 1계약 진입]`); the margin limit and the contract cap apply to it like to any entry. The sizing's liquidation check cannot bind here: one contract's isolated liquidation distance is
 equity / contract_size, five times the widest stop the 20% allows."""
 
 from __future__ import annotations
