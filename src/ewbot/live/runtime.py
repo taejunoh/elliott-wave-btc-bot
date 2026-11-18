@@ -140,6 +140,8 @@ from ewbot.live.pricing import (
     EQUITY_READS_AGREE,
     EQUITY_SIZING_BAND,
     FULL_CAP_CONTRACTS,
+    FULL_FLOOR,
+    FULL_MIN_ONE_MAX_RISK,
     FULL_RISK,
     MARGIN_ENTRY_MAX,
     BasisOutOfBand,
@@ -194,6 +196,7 @@ from ewbot.live.stage import (
 )
 from ewbot.live.target import Target, TargetEntry, TargetError, TargetPosition, compute_target, frozen_config
 from ewbot.live.watchdog import (
+    LIVE_DAILY_LOSS,
     NY,
     WS_STALE_S,
     AccountGuard,
@@ -402,6 +405,7 @@ class LiveRuntime:
         self.sessions = SessionWatch()
         self.target: Target | None = None
         self._entry_reduction: dict[str, Any] | None = None  # the last _entry_size's FULL margin reduction, if any
+        self._entry_floor: dict[str, Any] | None = None  # the last _entry_size's FULL one-contract floor entry, if any
         self.foreign_now = False  # the pass running read an order of someone else's (it holds FULL's size before the journal does)
         self.frame: pd.DataFrame | None = None  # the candles of the last cycle (the audit's DATA_REVISION check)
         self.product: ProductSpec | None = None
@@ -555,6 +559,7 @@ class LiveRuntime:
 
     def _entry_size(self, now: float, ratio: float | None, session_open: bool) -> tuple[int, str | None]:
         self._entry_reduction = None  # set below only when this call reduces a FULL entry to the margin maximum
+        self._entry_floor = None  # set below only when this call sizes FULL's one-contract floor (pricing.FULL_FLOOR)
         t = self.target
         if t is None or t.entry is None:
             return 0, None
@@ -616,6 +621,11 @@ class LiveRuntime:
                                      "risk": FULL_RISK.risk_pct, "equity": equity,
                                      "risk_per_contract": risk_per_contract(entry, stop, self.cfg.costs)}
             return fit, None
+        if stage == "FULL" and why == FULL_FLOOR:
+            # user decision 2026-11-18: the 10% risk sized no contract and one contract's risk is within 20% of the account
+            self._entry_floor = {"signal_ts": e.signal_ts, "stage": stage, "direction": e.direction, "equity": equity,
+                                 "risk": FULL_RISK.risk_pct, "limit": FULL_MIN_ONE_MAX_RISK,
+                                 "risk_per_contract": risk_per_contract(entry, stop, self.cfg.costs)}
         return n, None
 
     def _sizing_equity(self, first: float, signal_ts: int, now: float) -> tuple[float | None, str | None]:
@@ -651,6 +661,20 @@ class LiveRuntime:
                              "크기를 정함 (입출금이면 ewbot live rebase 확인)" if changed else
                              f"[잔고 조회 이상] {head}: 세 번 읽은 값 ({shown})의 중앙값 {median:,.2f} USD로 크기를 정함")
         return median, None
+
+    def _record_entry_floor(self, f: dict[str, Any], now: float) -> None:
+        """A FULL entry of one contract where the risk size was none (pricing.FULL_FLOOR): once per signal, after the entry
+        exists, with the real risk of that contract - risk_per_contract(entry, stop, costs) / equity, above FULL_RISK's
+        share and at most FULL_MIN_ONE_MAX_RISK. One stop of such a trade is most of the daily loss limit, or all of it."""
+        t = self.executor.trade()
+        if t is None or t.trade_id != f["signal_ts"] or not self._once(f"entry_floor:{f['signal_ts']}"):
+            return
+        real = float(f["risk_per_contract"]) / float(f["equity"])
+        self.journal.add_event(now, "ENTRY_FLOOR", {**f, "real": real})
+        self.alert("ENTRY_FLOOR", f"[최소 1계약 진입] 위험 {float(f['risk']):.0%} 기준으로는 1계약이 안 되어(0계약) 최소 1계약으로 진입 - "
+                                  f"1계약 위험 {float(f['risk_per_contract']):,.2f} USD, 실제 위험은 약 {real:.1%} "
+                                  f"(최소 진입 한도 {float(f['limit']):.0%}); 손절 한 번이 일일 손실 한도 "
+                                  f"-{LIVE_DAILY_LOSS:.0%}에 가깝거나 넘을 수 있음")
 
     def _record_entry_reduction(self, r: dict[str, Any], now: float) -> None:
         """A FULL entry that entered with the margin maximum instead of the risk size: once per signal, after the entry
@@ -1028,7 +1052,7 @@ class LiveRuntime:
                 self.journal.add_event(now, "SESSION_ERROR", {"error": self.d.redact(str(exc))[:200]})
                 self._read_failed("session", exc)
         ctx = self._ctx(now)
-        reduction = self._entry_reduction
+        reduction, floor = self._entry_reduction, self._entry_floor
         seen = self.executor.reopen_late_entry(seen, pos, now)
         seen = self._test_entry_left(seen, pos, ctx, now)
         planned = plan(self.target, seen, pos, orders, ctx)
@@ -1038,6 +1062,8 @@ class LiveRuntime:
         self.executor.execute(actions, ctx)
         if reduction is not None and any(isinstance(a, Enter) for a in actions):
             self._record_entry_reduction(reduction, now)
+        if floor is not None and any(isinstance(a, Enter) for a in actions):
+            self._record_entry_floor(floor, now)
         if req is not None and pos is not None and ctx.session_open:
             self._flatten_sent(req, closes[0] if closes else 0, now)
         for kind, note in self._after_pass:  # the pass's actions first, then the flatten's alerts

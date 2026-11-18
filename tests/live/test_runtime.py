@@ -2429,6 +2429,57 @@ def test_full_refuses_when_not_even_one_contract_fits(tmp_path):
     hs.journal.close()
 
 
+def test_full_enters_one_contract_when_ten_percent_sizes_none_and_says_its_real_risk(tmp_path):
+    """User decision 2026-11-18 (FULL_MIN_ONE_MAX_RISK). Equity 150, long 26,740, stop 24,740: 20.2574 USD per contract. The
+    10% risk is 15 USD - no contract by the frozen sizing -; one contract risks 20.2574 / 150 = 13.5% of the account, within
+    20%, its notional 267.4 within 5x (750) and its margin 56.22 / 150 = 37% under 70%: 1 contract, recorded and alerted once
+    with the real risk."""
+    n, block, hs = sized(tmp_path, "FULL", 150.0, stop_dist=2_000.0)
+    assert (n, block) == (1, None) and hs.rt._entry_reduction is None
+    f = hs.rt._entry_floor
+    assert f["signal_ts"] == SIGNAL and f["equity"] == 150.0 and f["risk_per_contract"] == pytest.approx(20.2574)
+    assert (f["risk"], f["limit"]) == (0.10, 0.20)
+    hs.rt.executor.trade = lambda: SimpleNamespace(trade_id=SIGNAL, contracts=1)
+    hs.rt._record_entry_floor(f, ENTRY_BAR + 31)
+    hs.rt._record_entry_floor(f, ENTRY_BAR + 41)
+    rows = hs.journal.events(kind="ENTRY_FLOOR")
+    assert len(rows) == 1 and rows[0]["data"]["real"] == pytest.approx(0.13505, abs=1e-5)
+    texts = [t for k, t in hs.alerts.items if k == "ENTRY_FLOOR"]
+    assert len(texts) == 1 and texts[0].startswith("[최소 1계약 진입]")
+    assert "실제 위험은 약 13.5%" in texts[0] and "10%" in texts[0] and "20%" in texts[0]
+    hs.journal.close()
+
+
+def test_the_full_floor_is_not_recorded_before_its_entry_exists(tmp_path):
+    n, block, hs = sized(tmp_path, "FULL", 150.0, stop_dist=2_000.0)
+    assert n == 1
+    hs.rt._record_entry_floor(hs.rt._entry_floor, ENTRY_BAR + 31)  # no trade of this signal yet (a failed send)
+    assert not hs.journal.events(kind="ENTRY_FLOOR") and "ENTRY_FLOOR" not in hs.alerts.kinds()
+    hs.journal.close()
+
+
+def test_full_skips_a_one_contract_risk_above_twenty_percent(tmp_path):
+    """Equity 100, stop 2,000 away: 20.2574 USD is 20.3% of the account: skipped, the reason naming the limit."""
+    n, block, hs = sized(tmp_path, "FULL", 100.0, stop_dist=2_000.0)
+    assert n == 0 and "> 20%" in block and hs.rt._entry_floor is None
+    hs.journal.close()
+
+
+def test_the_margin_limit_still_refuses_a_floor_entry(tmp_path):
+    """Equity 70, stop 1,000 away (1,000 + 0.0005 * 52,480 = 1,026.24 per BTC, 10.26 USD per contract): the 10% risk (7 USD)
+    sizes none, the floor allows one (14.7%, notional 267.4 within 350), but its overnight margin 56.22 / 70 = 80% is above
+    70% and nothing smaller exists: refused as every such entry is, and no floor entry is noted."""
+    n, block, hs = sized(tmp_path, "FULL", 70.0, stop_dist=1_000.0)
+    assert (n, block) == (0, "오버나이트 증거금 예상 80% > 70%") and hs.rt._entry_floor is None
+    hs.journal.close()
+
+
+def test_a_full_size_from_the_frozen_sizing_notes_no_floor(tmp_path):
+    n, block, hs = sized(tmp_path, "FULL", 10_000.0, stop_dist=2_000.0)
+    assert (n, block) == (49, None) and hs.rt._entry_floor is None
+    hs.journal.close()
+
+
 @pytest.mark.parametrize("stage", ["CANARY", "SHADOW"])
 def test_canary_and_shadow_above_the_limit_still_refuse(tmp_path, stage):
     """They trade 1 contract, never a reduced FULL size: equity 54 projects 104% for it."""
@@ -3460,4 +3511,27 @@ def test_a_close_with_a_resting_bracket_on_this_venue_closes_in_one_call(tmp_pat
     as_on_2026_11_06(hs, not_found=0)
     assert hs.rt.executor.close("ENGINE_FLAT", hs.rt._ctx(ENTRY_BAR + 40)) is True and hs.ex.position() is None
     assert len(hs.journal.events(kind="CLOSE_CONFLICT")) == 1 and hs.journal.events(kind="CLOSE_FAILED") == []
+    hs.journal.close()
+
+
+
+
+def test_a_floor_entry_is_sent_and_recorded_once_by_the_pass(tmp_path):
+    """The pass itself: a hand-made signal (the fixture's own stop is too near for the floor at any equity the 5x cap
+    allows) on a 150 USD FULL account - one contract enters, is protected, and the floor is journaled and alerted once
+    over the passes that follow."""
+    early = SIGNAL - 7200  # no signal of the fixture's here: the start leaves the book flat
+    hs = Harness(tmp_path, early + 3600 + 30, stage="FULL", stage_days=60.0, equity=150.0)
+    hs.price(26_740.0)
+    hs.rt.startup()
+    assert hs.ex.position() is None
+    ent = TargetEntry(early, "W3", 1, 26_740.0, 24_740.0, 27_500.0, 28_500.0, 1.0, 5, "test signal")
+    hs.rt.target = Target(early, 26_740.0, None, None, ent, ())
+    for k in range(1, 4):
+        hs.clock.now = float(early + 3600 + 30 + 10 * k)
+        hs.rt.reconcile(hs.clock.now)
+    assert hs.ex.position().contracts == 1
+    rows = hs.journal.events(kind="ENTRY_FLOOR")
+    assert len(rows) == 1 and rows[0]["data"]["signal_ts"] == early and 0.10 < rows[0]["data"]["real"] <= 0.20
+    assert hs.alerts.kinds().count("ENTRY_FLOOR") == 1 and not hs.journal.events(kind="ENTRY_REDUCED")
     hs.journal.close()
