@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from ewbot.live.exchange import Order, PlaceResult, Position, RateLimited, Unavailable
+from ewbot.live.exchange import Order, PlaceResult, RateLimited, Unavailable
 from ewbot.live.executor import CLEARING_MAX_S, CLOSE_CONFLICTS, UNSETTLED_ENTRY_MAX_S, Executor
 from ewbot.live.reconcile import (
     Adopt,
