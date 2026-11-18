@@ -170,7 +170,10 @@ def stage_contracts(
     if stage == "FULL":
         n = size_contracts(equity, entry, stop, direction, FULL_RISK, risk_mult, cfg.costs)
         if n == 0:
-            return _full_floor(equity, entry, stop, risk_mult, cfg)
+            n, why = _full_floor(equity, entry, stop, risk_mult, cfg)
+            if n and full_cap is not None and n > full_cap:  # the cap holds the floor's contract like any other size
+                return full_cap, f"{why} capped at {full_cap}"
+            return n, why
         if full_cap is not None and n > full_cap:
             return full_cap, f"full: {n} capped at {full_cap}"
         return n, f"full: {n}"

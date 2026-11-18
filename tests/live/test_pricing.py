@@ -230,6 +230,15 @@ def test_full_floor_does_not_scale_with_the_setup_risk_multiplier_and_needs_a_po
     assert stage_contracts("FULL", risk_mult=-1.0, **kw)[0] == 0
 
 
+def test_the_contract_cap_holds_the_floor_like_every_other_full_size():
+    """Review finding 2026-11-18: a cap of 0 held a 49-contract size but not the floor's one contract."""
+    kw = dict(entry=26_740.0, stop=24_740.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("FULL", equity=10_000.0, full_cap=0, **kw) == (0, "full: 49 capped at 0")
+    assert stage_contracts("FULL", equity=150.0, **kw) == (1, FULL_FLOOR)
+    assert stage_contracts("FULL", equity=150.0, full_cap=1, **kw) == (1, FULL_FLOOR)
+    assert stage_contracts("FULL", equity=150.0, full_cap=0, **kw) == (0, "full: 1 (floor) capped at 0")
+
+
 def test_full_floor_leaves_canary_and_shadow_alone():
     kw = dict(entry=78_000.0, stop=73_000.0, direction=1, risk_mult=1.0, cfg=CFG)
     assert stage_contracts("CANARY", equity=500.0, **kw) == (1, "canary: 1 contract")  # 10.15% <= 15%
