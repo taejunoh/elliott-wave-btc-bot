@@ -66,7 +66,8 @@ is taken before its alert.
             stored as failed and alerted; after it, with the same ledger, strategy A's edge rule and the
             signal-frequency review - live/edge.py, user decision 2026-11-18: cumulative engine R <= -5 or a failed
             verdict pauses entries before its alert, `/resume` is then refused until the rule's way back is met, and
-            a ledger that was not read or is stale is shown as unknown, never a stop), and the stage-change restart (a new stage or stint once flat: no open
+            a ledger that was not read or is stale is shown as unknown, never a stop, and said once after three such
+            evaluations in a row), and the stage-change restart (a new stage or stint once flat: no open
             trade, no order of unknown outcome, no standing flatten, no position or order of ours) - each step
             guarded on its own: one that keeps failing never skips the ones after it
   cycle     at hh:00:30 for the bar that just closed: candles, engine replay (target), decisions,
@@ -182,6 +183,7 @@ from ewbot.live.stage import (
     MAJOR,
     ORDER_FAILURES,
     ORDER_UNRESOLVED,
+    PAUSE_KEY,
     PEAK_REBASE_KEY,
     PROTECT_MAX_S,
     RAISED_KEY,
@@ -255,6 +257,8 @@ EDGE_KEY = "edge_rule"
 ENTRY_FLOOR_KEY = "entry_floor"
 EDGE_RESUMES_KEY = "edge_resumes"
 EDGE_FREQ_KEY = "edge_freq"
+EDGE_PAUSE = "edge rule: "  # how the reason of a pause the edge rule wrote begins: only such a pause's reason is rewritten
+EDGE_UNKNOWN_ALERT = 3  # evaluations in a row that could not read the rule's trades before it is said that the rule is off
 ORDER_FAIL_KEY = "order_failures"  # order failures not resolved yet, and the last event id looked at
 # what an order failure is about: a bracket (protection), a close or a reduction
 FAILURE_CLASS = {"BRACKET_FAILED": "bracket", "CLOSE_FAILED": "close", "CLOSE_UNCONFIRMED": "close",
@@ -1981,47 +1985,97 @@ class LiveRuntime:
             self._loop_error("edge", exc, now)
 
     def _edge_rule(self, now: float, ledger: dict[str, Any] | None, why: str | None) -> None:
-        """Evaluate the rule on the ledger's engine trades and act on it. A ledger that was not read, is stale or cannot
-        speak for strategy A (edge.EdgeError) leaves the last good status where it is and is stored as unknown: never a
-        stop by itself."""
+        """Evaluate the rule on the ledger's engine trades and act on it: the pause first, then the stored status (a
+        failure at the pause leaves no stored stop without one), then what is said. A ledger that was not read, is stale
+        or cannot speak for strategy A (edge.EdgeError) is unknown (`_edge_unknown`): never a stop by itself."""
         prev = self.journal.get(EDGE_KEY) or {}
         try:
             if ledger is None:
                 raise edge.EdgeError(why or "paper ledger not read")
             trades = edge.engine_trades(ledger, BASELINE_FINGERPRINT, now=now)
         except edge.EdgeError as exc:
-            self.journal.put(EDGE_KEY, {"status": prev.get("status"), "as_of": prev.get("as_of"), "trades": prev.get("trades"),
-                                        "error": self.d.redact(str(exc))[:200], "error_ts": now})
+            self._edge_unknown(prev, self.d.redact(str(exc))[:200], now)
             return
         status = edge.evaluate(trades, now, self.journal.get(EDGE_RESUMES_KEY) or [])
+        done = self._edge_pause(status, now)
         self.journal.put(EDGE_KEY, {"status": status, "as_of": now, "trades": [list(t) for t in trades], "error": None,
-                                    "error_ts": None})
-        self._edge_act(status, now)
+                                    "error_ts": None, "unknown": 0})
+        if self.journal.get("once:edge_unknown") is True:  # it was said that the rule is off: it is back
+            self.journal.put("once:edge_unknown", False)
+            self.journal.add_event(now, "EDGE_UNKNOWN", {"recovered": True, "evaluations": prev.get("unknown")})
+            self.alert("EDGE_UNKNOWN", f"[엣지 규칙 복구] 다시 평가됨: {edge.rule_line(status)}")
+        self._edge_say(status, done, now)
 
-    def _edge_act(self, status: dict[str, Any], now: float) -> None:
-        """A STOPPED or RETIRED rule pauses entries - whenever it finds them not paused, and before its alert -; the stop is
-        journaled and alerted once, and again whenever this pauses. Nothing else is done: no demotion, no close, no
-        flatten (the open trade's exits and protection go on, as under every pause). The way back being met and the
-        verdict are alerted once."""
+    def _edge_unknown(self, prev: dict[str, Any], why: str, now: float) -> None:
+        """The rule could not be evaluated: the last good status stays and decides `/resume`, nothing new is stopped.
+        Two things are still done. A pause the last good status asks for and nothing holds any more is put back (a stop
+        established earlier is no new stop). And EDGE_UNKNOWN_ALERT such evaluations in a row are said once per episode -
+        the audit itself may pass on a stale ledger, and the rule would be off without a word."""
+        n = int(prev.get("unknown") or 0) + 1
+        self.journal.put(EDGE_KEY, {"status": prev.get("status"), "as_of": prev.get("as_of"), "trades": prev.get("trades"),
+                                    "error": why, "error_ts": now, "unknown": n})
+        last = prev.get("status")
+        if last and last.get("phase") in ("STOPPED", "RETIRED") and paused(self.journal) is None:
+            pause(self.journal, edge_pause_reason(last), now)
+            self.journal.add_event(now, "EDGE_RULE", {"action": "REPAUSE", "paused": True, "stop": last["stop"],
+                                                      "retire": last["retire"], "error": why})
+            self.alert("EDGE_RULE", f"[엣지 규칙] {edge.stop_text(last)} (정지가 풀려 있어 다시 정지함. 지금은 평가할 수 없어 "
+                                    f"마지막 정상 평가 {_utc(float(prev['as_of']))} 기준: {why[:80]})")
+        if n >= EDGE_UNKNOWN_ALERT and self._once("edge_unknown", True):
+            self.journal.add_event(now, "EDGE_UNKNOWN", {"error": why, "evaluations": n})
+            known = (f"마지막 정상 평가 {_utc(float(prev['as_of']))}" if prev.get("status") else "정상 평가가 아직 없음")
+            self.alert("EDGE_UNKNOWN", f"[엣지 규칙 꺼짐] 연속 {n}번 평가하지 못함: {why[:160]} - 그동안 손실 하한과 판정은 "
+                                       f"작동하지 않음 (이 때문에 정지하지는 않음; {known}). 모의매매 런타임(GitHub Actions의 "
+                                       "paper 실행)과 ledger를 확인")
+
+    def _edge_pause(self, status: dict[str, Any], now: float) -> str | None:
+        """Bring the pause in line with the status, before anything is stored or said. A STOPPED or RETIRED rule pauses
+        entries whenever it finds them not paused ("PAUSED"). A pause the rule wrote (EDGE_PAUSE) gets the reason of the
+        status as it is now - the way back met, retired without one - and, when the recomputed trades show no stop any
+        more, the reason that `/resume` works ("LIFTED"): it is never resumed here. A pause of anyone else's is left
+        as it is."""
+        p = paused(self.journal)
+        stopped = status["phase"] in ("STOPPED", "RETIRED")
+        want = edge_pause_reason(status)
+        if p is None:
+            if stopped:
+                pause(self.journal, want, now)
+                return "PAUSED"
+            return None
+        if str(p.get("reason", "")).startswith(EDGE_PAUSE) and p["reason"] != want:
+            self.journal.put(PAUSE_KEY, {**p, "reason": want})
+            return None if stopped else "LIFTED"
+        return None
+
+    def _edge_say(self, status: dict[str, Any], done: str | None, now: float) -> None:
+        """What the evaluation journals and alerts: a stop once - and again whenever this evaluation paused for it -, the
+        way back being met once, a stop the trades no longer show once, the verdict once. Nothing else is done by the
+        rule: no demotion, no close, no flatten (the open trade's exits and protection go on, as under every pause)."""
         stop, verdict = status["stop"], status["verdict"]
         if status["phase"] in ("STOPPED", "RETIRED"):
             retired = status["phase"] == "RETIRED"
             new = self._once("edge_stop", f"{status['phase']}:{stop['kind']}:{stop['n']}:{status['retire']}")
-            applied = paused(self.journal) is None
-            if applied:
-                pause(self.journal, edge_pause_reason(status), now)
-            if new or applied:
+            if new or done == "PAUSED":
+                p = paused(self.journal) or {}
+                other = "" if str(p.get("reason", "")).startswith(EDGE_PAUSE) else " (이미 일시 정지 중: 그 정지는 그대로)"
                 self.journal.add_event(now, "EDGE_RULE", {
-                    "action": "RETIRE" if retired else "STOP", "paused": applied, "stop": stop, "retire": status["retire"],
-                    "n": status["n"], "cum": status["cum"]})
-                self.alert("EDGE_RULE", f"[엣지 규칙] {edge.stop_text(status)}"
-                                        + ("" if applied else " (이미 일시 정지 중: 그 정지는 그대로)"))
+                    "action": "RETIRE" if retired else "STOP", "paused": done == "PAUSED", "stop": stop,
+                    "retire": status["retire"], "n": status["n"], "cum": status["cum"]})
+                self.alert("EDGE_RULE", f"[엣지 규칙] {edge.stop_text(status)}{other}")
             if not retired and status["eligible"] and self._once("edge_eligible", f"{stop['kind']}:{stop['n']}"):
                 self.journal.add_event(now, "EDGE_RULE", {"action": "ELIGIBLE", "stop": stop, "n": status["n"],
                                                           "cum": status["cum"], "best": status["best"]})
                 self.alert("EDGE_RULE", f"[엣지 규칙] 재개 조건 충족: 중단({stop['n']}건째, 누적 R {float(stop['cum']):+.2f}) 뒤 "
                                         f"+{edge.RECOVER_R:g}R 이상 회복 (최고 {float(status['best']):+.2f}R) - /resume 가능. "
                                         f"재개하면 그때의 누적 R에서 다시 -{edge.FLOOR_R:g}R이면 은퇴")
+        elif done == "LIFTED":
+            for key in ("edge_stop", "edge_eligible"):  # the same stop, should it come back, is said again
+                self.journal.put(f"once:{key}", None)
+            self.journal.add_event(now, "EDGE_RULE", {"action": "LIFTED", "phase": status["phase"], "n": status["n"],
+                                                      "cum": status["cum"]})
+            self.alert("EDGE_RULE", f"[엣지 규칙] 중단 해제: 모의매매 ledger의 거래 기록이 바뀌어 중단 조건이 더는 성립하지 않음 "
+                                    f"(엔진 거래 {status['n']}건, 누적 R {float(status['cum']):+.2f}) - 자동으로 재개하지 않음: "
+                                    "/resume 으로 재개")
         if verdict is not None and self._once("edge_verdict", f"{verdict['result']}:{verdict['n']}:{verdict['by']}"):
             self.journal.add_event(now, "EDGE_RULE", {"action": "VERDICT", "verdict": verdict, "phase": status["phase"]})
             said = f"엔진 거래 {verdict['n']}건, 누적 R {float(verdict['cum']):+.2f}"
@@ -2031,22 +2085,32 @@ class LiveRuntime:
             elif not (stop is not None and stop["kind"] == "VERDICT" and stop["n"] == verdict["n"]):
                 self.alert("EDGE_RULE", f"[엣지 규칙] 판정 실패 ({said}): 이미 중단 또는 은퇴 권고 상태라 달라지는 것은 없음")
 
-    def _engine_entries(self) -> list[int]:
-        """When the engine entered, from the journal's decisions (every one since 2024: live/target.py)."""
-        return sorted(int(d["ts"]) for d in self.journal.decisions() if d["kind"] == "ENTRY")
+    def _engine_record(self) -> tuple[int | None, list[int]]:
+        """When the journal's record of the engine's decisions begins (None: no decision) and when the engine entered. Every
+        cycle records every decision of the replay from the holdout start (live/target.py), so the record begins in 2024
+        whenever the journal itself was created."""
+        decisions = self.journal.decisions()
+        begin = min((int(d["ts"]) for d in decisions), default=None)
+        return begin, sorted(int(d["ts"]) for d in decisions if d["kind"] == "ENTRY")
 
     def _edge_frequency(self, now: float) -> None:
         """The signal-frequency review: alerted once when a condition begins (again when it begins anew), shown in the
-        status, and changing no risk. Unknown - stored as such, the conditions as they were - while no cycle ended OK in
-        the last edge.LEDGER_MAX_AGE_S: the journal's decisions may then be behind the engine."""
+        status, and changing no risk. Unknown - stored as such, the conditions as they were, nothing alerted - while no
+        cycle ended OK in the last edge.LEDGER_MAX_AGE_S (the journal's decisions may then be behind the engine) or the
+        record does not cover the trailing year (the count of a shorter span is no fact about a year)."""
         prev = self.journal.get(EDGE_FREQ_KEY) or {}
+
+        def unknown(why: str) -> None:
+            self.journal.put(EDGE_FREQ_KEY, {**prev, "error": why, "error_ts": now})
+
         until = self._decided_until()
         if until == 0 or now - (until + H1) > edge.LEDGER_MAX_AGE_S:
-            hours = edge.LEDGER_MAX_AGE_S / 3600
-            self.journal.put(EDGE_FREQ_KEY, {**prev, "error": f"no cycle ended OK in the last {hours:g} hours",
-                                             "error_ts": now})
-            return
-        f = edge.frequency(self._engine_entries(), now)
+            return unknown(f"no cycle ended OK in the last {edge.LEDGER_MAX_AGE_S / 3600:g} hours")
+        begin, entries = self._engine_record()
+        f = edge.frequency(entries, now, begin)
+        if not f["covered"]:
+            since = "none recorded" if begin is None else f"they begin {edge.day_text(float(begin))}"
+            return unknown(f"the journal's engine decisions do not cover the last {edge.TRAILING_DAYS} days ({since})")
         onset = [k for k in ("gap", "few") if f[k] and not prev.get(k)]
         self.journal.put(EDGE_FREQ_KEY, {**f, "as_of": now, "error": None, "error_ts": None})
         if not onset:
@@ -2605,6 +2669,7 @@ class LiveRuntime:
             reply = str(self._edge_resume_block())  # the edge rule stands in the way: nothing is resumed, no override
         elif cmd == "/resume":
             resume(self.journal, now)
+            noted = self._edge_resumed(now)  # at once: a resume the rule allowed is never left unrecorded
             _, cap = self._limits()
             if cap == 0 and self.stage != "SHADOW":  # a demotion to SHADOW: this process opens nothing real
                 reply = ("재개: 단, 단계가 SHADOW로 바뀌어 실계좌 신규 진입은 없음 (남은 포지션·주문을 관리하고 정리되면 "
@@ -2621,7 +2686,7 @@ class LiveRuntime:
                 reply += f" · 손실 한도 기준을 다시 잡음 (지금과 다음 두 번 조회의 중앙값): {', '.join(rebased)}"
             elif rebased is None:
                 reply += " · 잔고를 읽지 못해 손실 한도 기준은 그대로 (발동 중이면 다시 /resume)"
-            reply += self._edge_resumed(now)
+            reply += noted
         elif cmd == "/flatten":
             self.flatten_sent = sent
             reply = "60초 안에 /flatten_confirm 을 보내면 전량 청산하고 일시 정지합니다"
@@ -2854,13 +2919,19 @@ def status_lines(journal: Journal, now: float) -> list[str]:
 
 
 def edge_pause_reason(status: dict[str, Any]) -> str:
-    """The pause reason of an edge stop (shown in the status and in every skipped entry): what stopped, and the way back
-    or that there is none."""
+    """The reason of the edge rule's pause as the status stands (shown in the status and in every skipped entry; it begins
+    with EDGE_PAUSE): what stopped and the way back, that the way back is met, that there is none, or - for a status
+    that is no stop any more - that the stop is gone and only `/resume` is missing."""
+    if status["phase"] not in ("STOPPED", "RETIRED"):
+        return (f"{EDGE_PAUSE}the stop no longer stands (the paper ledger's trades changed) - not resumed automatically, "
+                "/resume works")
     stop = status["stop"]
     at = f"{stop['kind']} at engine trade {stop['n']}, cumulative R {float(stop['cum']):+.2f}"
     if status["phase"] == "RETIRED":
-        return f"edge rule: A retired from live ({status['retire']}; {at}) - no resume, the user decides"
-    return (f"edge rule: {at} - resume only after +{edge.RECOVER_R:g}R within {edge.RECOVER_TRADES} engine trades, "
+        return f"{EDGE_PAUSE}A retired from live ({status['retire']}; {at}) - no resume, the user decides"
+    if status["eligible"]:
+        return f"{EDGE_PAUSE}{at} - the way back is met ({edge.RECOVER_R:g}R recovered): /resume works"
+    return (f"{EDGE_PAUSE}{at} - resume only after +{edge.RECOVER_R:g}R within {edge.RECOVER_TRADES} engine trades, "
             "else A is retired from live")
 
 

@@ -3,6 +3,7 @@ the paper ledger's strategy-A engine trades and the engine's entry times. Synthe
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
 import pytest
@@ -260,6 +261,36 @@ def test_frequency_counts_the_gap_and_the_trailing_year():
     assert f["last_entry"] is None and f["gap_days"] is None and not f["gap"] and f["few"] and f["trailing"] == 0
 
 
+def test_frequency_knows_whether_the_record_covers_the_trailing_year():
+    """`begin`: when the record of the engine's decisions begins. Both conditions are facts only when it covers the
+    trailing 365 days."""
+    now = float(ts("2026-11-18 12:00"))
+    assert not frequency([], now)["covered"] and frequency([], now)["begin"] is None
+    assert frequency([], now, begin=ts("2024-01-05 00:00"))["covered"]
+    assert frequency([], now, begin=ts("2025-11-18 12:00"))["covered"]  # a year to the second
+    assert not frequency([], now, begin=ts("2025-11-18 13:00"))["covered"]
+    assert not frequency([ts("2026-10-20 00:00")], now, begin=ts("2026-10-02 11:00"))["covered"]  # a journal of October
+
+
+def test_with_the_holdouts_entries_the_review_begins_in_january_2027():
+    """What the review says with strategy A's known entries (reports/holdout.html, Trades - A) and no new one: nothing on
+    2026-11-18 (80 days, 9 in the year); five or fewer once the 2026-01-08 16:00 entry leaves the year, on 2027-01-08
+    16:00; more than 137 days after 2026-08-30 21:00 on 2027-01-14 21:00."""
+    entries = [ts(x) for x in (
+        "2025-08-15 04:00", "2025-09-23 07:00", "2025-09-30 06:00", "2025-11-11 06:00", "2025-11-21 14:00",
+        "2025-12-07 17:00", "2025-12-15 02:00", "2026-01-08 16:00", "2026-05-25 21:00", "2026-06-15 10:00",
+        "2026-08-05 01:00", "2026-08-09 23:00", "2026-08-30 21:00")]
+    begin = ts("2024-01-05 00:00")
+    f = frequency(entries, float(ts("2026-11-18 16:50")), begin)
+    assert f["covered"] and not f["gap"] and not f["few"] and f["trailing"] == 9 and round(f["gap_days"]) == 80
+    f = frequency(entries, float(ts("2027-01-08 15:50")), begin)
+    assert f["trailing"] == 6 and not f["few"] and not f["gap"]
+    f = frequency(entries, float(ts("2027-01-08 16:50")), begin)
+    assert f["trailing"] == 5 and f["few"] and not f["gap"]
+    assert not frequency(entries, float(ts("2027-01-14 20:50")), begin)["gap"]
+    assert frequency(entries, float(ts("2027-01-14 21:50")), begin)["gap"]
+
+
 # ----------------------------------------------------------------------------- the words
 def test_status_text_shows_the_numbers_the_way_back_and_what_is_unknown():
     tr = rows([-1.0, 0.5])
@@ -285,3 +316,45 @@ def test_status_text_shows_the_numbers_the_way_back_and_what_is_unknown():
     retired = rows([-1.0] * 5 + [0.0] * 16)
     line = status_text({"status": evaluate(retired, now=at(retired)), "as_of": 1.0, "error": None}, None)[0]
     assert line.startswith("엣지 규칙: 은퇴 권고") and "사용자" in line
+
+
+# ----------------------------------------------------------------------------- random walks (from the review of 2026-11-18)
+def test_random_trades_and_resumes_never_break_the_rule_or_its_words():
+    """Every prefix of random R sequences, with resumes taken whenever the rule allows one: the words never raise, a stop
+    always names what stopped, RETIRED always refuses and - before the 24-month date - is never left again, an allowed
+    resume is always applied at the level it resumed at, and all four phases occur."""
+    from ewbot.live.runtime import EDGE_PAUSE, edge_pause_reason
+
+    rng = random.Random(7)
+    phases: set[str] = set()
+    for _ in range(600):
+        n = rng.randint(0, 70)
+        mu = rng.choice([-0.6, -0.3, 0.0, 0.2, 0.6])
+        rs = [rng.gauss(mu, 1.2) for _ in range(n)]
+        resumes: list[dict[str, Any]] = []
+        was_retired, applied = False, 0
+        for k in range(n + 1):
+            tr = rows(rs[:k], first=START_TS, step=2 * DAY)
+            now = float(START_TS + 10) if not k else float(tr[-1][1] + H1)
+            if rng.random() < 0.05:
+                now = float(VERDICT_TS + H1)  # some evaluations after the date
+            s = evaluate(tr, now, resumes)
+            status_text({"status": s, "as_of": now, "error": None}, None)
+            status_text({"status": s, "as_of": now, "error": "x"}, {"error": "y"})
+            assert edge_pause_reason(s).startswith(EDGE_PAUSE)
+            if s["phase"] in ("STOPPED", "RETIRED"):
+                assert s["stop"] is not None and edge.stop_text(s)
+            block = resume_block(s)
+            assert (block is not None) == (s["phase"] == "RETIRED" or (s["phase"] == "STOPPED" and not s["eligible"]))
+            if now < VERDICT_TS:
+                assert not (was_retired and s["phase"] != "RETIRED"), (rs[:k], resumes)
+                was_retired = s["phase"] == "RETIRED"
+                assert s["resumes"] >= applied
+                applied = s["resumes"]
+                if s["phase"] == "STOPPED" and block is None and rng.random() < 0.5:
+                    resumes = resumes + [{"n": k, "ts": now + 60, "cum": s["cum"]}]
+                    again = evaluate(tr, now + 60, resumes)
+                    assert again["phase"] == "RESUMED" and again["ref"] == pytest.approx(s["cum"])
+                    applied = again["resumes"]
+            phases.add(s["phase"])
+    assert phases == {"ACTIVE", "STOPPED", "RESUMED", "RETIRED"}

@@ -32,9 +32,18 @@ A ledger that cannot speak for strategy A - unreadable, another schema, a curren
 fingerprint, older than LEDGER_MAX_AGE_S, a malformed trade - is an EdgeError: unknown, never a number and never a
 stop (`engine_trades`).
 
-The frequency review (`frequency`) reads the engine's ENTRY decisions (the live journal holds them since 2024): no
-entry for more than GAP_MAX_DAYS (137, the holdout's longest gap) or TRAILING_MAX (5) or fewer entries in the last
-TRAILING_DAYS (365) is a review, alerted once when it begins. It changes no risk: without trades there is none."""
+The frequency review (`frequency`) reads the engine's ENTRY decisions from the live journal. Every cycle replays the
+engine from the holdout start (2024-01-01) and records every decision of the replay (live/target.py), so the journal
+holds the entries of the years before it was created; the review still checks that the record covers the trailing
+year and says nothing when it does not. No entry for more than GAP_MAX_DAYS (137, the holdout's longest gap) or
+TRAILING_MAX (5) or fewer entries in the last TRAILING_DAYS (365) is a review, alerted once when it begins. It changes
+no risk: without trades there is none.
+
+Known limitation (epochs): the count relies on the paper ledger's epoch bookkeeping. Should the paper fingerprint ever
+change, the rule is unknown for as long as the current epoch is not the baseline's, and trades the engine entered
+during such an epoch, or held across an epoch's boundary, are not in the ledger's baseline trades: the cumulative R
+would miss them. Nothing here corrects that; a fingerprint change is a major incident of its own (AUDIT_MISMATCH)
+and would need a dated decision on how the rule counts from there."""
 
 from __future__ import annotations
 
@@ -184,16 +193,19 @@ def evaluate(trades: Sequence[Row], now: float, resumes: Sequence[dict[str, Any]
             "retire": retire, "verdict": verdict, "resumes": applied, "start_ts": start, "verdict_ts": date}
 
 
-def frequency(entries: Iterable[int], now: float) -> dict[str, Any]:
+def frequency(entries: Iterable[int], now: float, begin: int | None = None) -> dict[str, Any]:
     """The engine's entry times up to `now`: the last one, the days since it, how many fell in the trailing
     TRAILING_DAYS, and the two review conditions - `gap` (more than GAP_MAX_DAYS since the last entry) and `few`
-    (TRAILING_MAX or fewer in the trailing year)."""
+    (TRAILING_MAX or fewer in the trailing year). `begin` is when the record these entries come from begins (the
+    earliest engine decision it holds); `covered` says that it reaches back the whole trailing year - only then are the
+    two conditions facts, and the runtime reviews nothing otherwise."""
     seen = sorted(int(e) for e in entries if e <= now)
     last = seen[-1] if seen else None
     gap_days = None if last is None else (now - last) / DAY
     trailing = sum(1 for e in seen if e > now - TRAILING_DAYS * DAY)
     return {"last_entry": last, "gap_days": gap_days, "trailing": trailing,
-            "gap": gap_days is not None and gap_days > GAP_MAX_DAYS, "few": trailing <= TRAILING_MAX}
+            "gap": gap_days is not None and gap_days > GAP_MAX_DAYS, "few": trailing <= TRAILING_MAX,
+            "begin": begin, "covered": begin is not None and begin <= now - TRAILING_DAYS * DAY}
 
 
 # ----------------------------------------------------------------------------- the words
@@ -240,7 +252,7 @@ def resume_block(status: dict[str, Any] | None) -> str | None:
     return f"재개 거부 (엣지 규칙, 2026-11-18 등록): {stop_text(status)}"
 
 
-def _rule_line(status: dict[str, Any]) -> str:
+def rule_line(status: dict[str, Any]) -> str:
     n, cum = int(status["n"]), float(status["cum"])
     head = f"실전 기간 엔진 거래 {n}건 · 누적 R {cum:+.2f}"
     v = status.get("verdict")
@@ -269,11 +281,11 @@ def status_text(state: dict[str, Any] | None, freq: dict[str, Any] | None) -> li
     if state:
         status, error = state.get("status"), state.get("error")
         if error:
-            last = (f" · 마지막 정상 평가 {_utc(float(state['as_of']))}: {_rule_line(status)}" if status
+            last = (f" · 마지막 정상 평가 {_utc(float(state['as_of']))}: {rule_line(status)}" if status
                     else " · 정상 평가가 아직 없음")
             lines.append(f"엣지 규칙: 알 수 없음 ({str(error)[:120]}){last}")
         elif status:
-            lines.append(f"엣지 규칙: {_rule_line(status)} ({_utc(float(state['as_of']))} 평가)")
+            lines.append(f"엣지 규칙: {rule_line(status)} ({_utc(float(state['as_of']))} 평가)")
     if freq:
         if freq.get("error"):
             lines.append(f"신호 빈도: 알 수 없음 ({str(freq['error'])[:120]})")
