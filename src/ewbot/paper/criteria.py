@@ -110,12 +110,15 @@ def status_lines(st: dict[str, Any]) -> list[str]:
     lines.append(f"2. 최대 낙폭 <= {MAX_DD:.0%} ({GO_LIVE_STRATEGY}): {_mark(st['c2'])}{dd}")
     lines.append(
         f"3. 표본 외 거래 {count['total']}/{count['required']} (홀드아웃 {count['holdout']} + 모의 {count['paper']}): "
-        f"{_mark(st['c3'])}"
+        "참고용 (2026-11-05부터 FULL 승격에 쓰지 않음)"
     )
     env = f", 실행 환경 변경 불일치 {c4['environment']}건(4번 집계 제외)" if c4.get("environment") else ""
     lines.append(
         f"4. 모의매매 재현: {_mark(c4['met'])} (운영 {c4['days']:.1f}/{PAPER_MIN_DAYS}일, 커버리지 "
         f"{c4['coverage'] * 100:.1f}%, 원인 불명 불일치 {c4['unexplained']}건{env})"
     )
-    lines.append("=> 실거래 전환 검토 가능 (자동 전환하지 않음)" if st["all_met"] else "=> 실거래 전환 검토 불가")
+    # Criterion 3 is reference only since 2026-11-05 (live FULL promotion does not use it), so the verdict covers 1, 2 and 4.
+    unmet = [n for n, ok in (("1", st["c1"]), ("2", st["c2"]), ("4", c4["met"])) if not ok]
+    verdict = "충족" if not unmet else f"미충족 ({'·'.join(unmet)})"
+    lines.append(f"=> 기준 1·2·4: {verdict} (실거래 단계는 live 봇의 관문으로 판단)")
     return lines
