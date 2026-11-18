@@ -15,6 +15,7 @@ import pytest
 from ewbot import cli
 from ewbot.cli import build_parser, main
 from ewbot.live import app as live_app
+from ewbot.live import edge
 from ewbot.live import runtime as live_runtime_mod
 from ewbot.live.audit import AuditResult
 from ewbot.live.exchange import ExchangeError, KeyPermissions, Unavailable
@@ -904,3 +905,24 @@ def test_the_extra_refusal_codes_reach_the_runtime(live_env):
     assert "BRACKETS_REST" in wired.runtime.executor.close_conflicts and "TOO_MANY" in wired.runtime.executor.overlap_refusals
     notify.stop()
     jr.close()
+
+
+def test_status_shows_the_edge_rules_numbers(live_env, monkeypatch, capsys):
+    """`ewbot live status` prints what the runtime stored for the edge rule and the frequency review (user decision
+    2026-11-18): the engine trades counted, their cumulative R, the distance to the floor and the verdict's date."""
+    settings, _, _ = live_env
+    now = edge.START_TS + 40 * 86_400
+    day = 86_400
+    trades = [(edge.START_TS + day, edge.START_TS + 2 * day, -1.0), (edge.START_TS + 5 * day, edge.START_TS + 6 * day, 0.25)]
+    jr = Journal(settings.journal_path)
+    jr.set_stage("FULL", "test", now - 86_400)
+    jr.put(live_runtime_mod.EDGE_KEY, {"status": edge.evaluate(trades, now), "as_of": now - 600,
+                                       "trades": [list(t) for t in trades], "error": None, "error_ts": None})
+    jr.put(live_runtime_mod.EDGE_FREQ_KEY, {**edge.frequency([edge.START_TS - 68 * day], now - 600), "as_of": now - 600,
+                                            "error": None})
+    jr.close()
+    monkeypatch.setattr("ewbot.cli.time.time", lambda: now)
+    assert main(["live", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "엣지 규칙: 정상 · 실전 기간 엔진 거래 2건 · 누적 R -0.75 · 하한까지 4.25R" in out and "2028-11-06" in out
+    assert "신호 빈도: 검토 필요 (위험 변경 없음) · 마지막 엔진 진입 2026-08-30 (108일 전, 한도 137일) · 최근 365일 1건" in out

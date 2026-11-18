@@ -9,6 +9,8 @@ from ewbot.config import AGGRESSIVE, BotConfig, RiskProfile
 from ewbot.live.pricing import (
     BASIS_BAND,
     CANARY_MAX_RISK,
+    FULL_FLOOR,
+    FULL_MIN_ONE_MAX_RISK,
     FULL_RISK,
     MARGIN_ENTRY_MAX,
     BasisOutOfBand,
@@ -177,6 +179,71 @@ def test_full_margin_check_binds_before_the_leverage_cap():
     m = max_contracts_for_margin(80_000.0, 1, BIP_SPEC, 10_000.0)
     assert m == 41 and margin_ratio(m, 80_000.0, 1, BIP_SPEC, 10_000.0) <= MARGIN_ENTRY_MAX
     assert margin_ratio(m + 1, 80_000.0, 1, BIP_SPEC, 10_000.0) > MARGIN_ENTRY_MAX
+
+
+def test_full_enters_one_contract_when_the_risk_size_is_below_one_and_its_risk_is_within_twenty_percent():
+    """User decision 2026-11-18. Equity 500, long, entry 78,000, stop 73,000, default costs:
+    distance = 5,000 + 0.0005 * (78,000 + 73,000) = 5,075.5 USD per BTC = 50.755 USD per contract.
+    The 10% risk is 50 USD: floor(50 / 50.755) = 0 contracts by the frozen sizing. One contract risks 50.755 / 500 = 10.15%
+    of the account, within FULL_MIN_ONE_MAX_RISK (20%), and its notional 780 is within 5x (2,500): 1 contract enters."""
+    assert FULL_MIN_ONE_MAX_RISK == 0.20
+    kw = dict(entry=78_000.0, stop=73_000.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert size_contracts(500.0, 78_000.0, 73_000.0, 1, FULL_RISK, 1.0, CFG.costs) == 0
+    assert risk_per_contract(78_000.0, 73_000.0, CFG.costs) == pytest.approx(50.755)
+    assert stage_contracts("FULL", equity=500.0, **kw) == (1, FULL_FLOOR)
+    short = dict(entry=78_000.0, stop=83_000.0, direction=-1, risk_mult=1.0, cfg=CFG)  # 5,000 + 80.5 = 50.805 per contract
+    assert stage_contracts("FULL", equity=500.0, **short) == (1, FULL_FLOOR)
+    assert stage_contracts("FULL", equity=500.0, full_cap=3, **kw) == (1, FULL_FLOOR)  # the manual-intervention cap holds it too
+    # a size the frozen sizing gives is never the floor's: 510 USD risks 51 >= 50.755
+    assert stage_contracts("FULL", equity=510.0, **kw) == (1, "full: 1")
+
+
+def test_full_floor_stops_at_twenty_percent_of_equity():
+    """One contract risks 50.755 USD: exactly 20% of 253.775 (allowed, as CANARY's limit allows its exact 15%), more than
+    20% of anything below. Above the limit the signal is skipped as before, and the reason names the risk and the limit."""
+    kw = dict(entry=78_000.0, stop=73_000.0, direction=1, risk_mult=1.0, cfg=CFG)
+    risk = risk_per_contract(78_000.0, 73_000.0, CFG.costs)
+    assert stage_contracts("FULL", equity=risk / 0.1999, **kw) == (1, FULL_FLOOR)
+    n, why = stage_contracts("FULL", equity=risk / 0.2001, **kw)
+    assert n == 0 and "> 20%" in why and "50.76" in why
+    n, why = stage_contracts("FULL", equity=200.0, **kw)  # 25.4%
+    assert n == 0 and "> 20%" in why
+
+
+def test_full_floor_keeps_the_five_x_cap():
+    """Equity 150, long 78,000, stop 75,100: 2,900 + 0.0005 * 153,100 = 2,976.55 per BTC, 29.77 USD per contract = 19.8% of
+    the account (within 20%), but one contract's notional 780 is above 5 x 150 = 750: skipped, the cap named."""
+    kw = dict(equity=150.0, entry=78_000.0, stop=75_100.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert risk_per_contract(78_000.0, 75_100.0, CFG.costs) / 150.0 < FULL_MIN_ONE_MAX_RISK
+    n, why = stage_contracts("FULL", **kw)
+    assert n == 0 and "5x" in why
+    assert stage_contracts("FULL", **{**kw, "equity": 157.0})[0] == 1  # 785 >= 780
+
+
+def test_full_floor_does_not_scale_with_the_setup_risk_multiplier_and_needs_a_positive_one():
+    """The floor is CANARY's check with another limit: the 1-contract risk against the account, whatever the signal's
+    risk_mult (a W5_REV at 0.5 has a 5% budget; its one contract may still risk up to 20%). A multiplier of 0 or less
+    never enters."""
+    kw = dict(equity=500.0, entry=78_000.0, stop=73_000.0, direction=1, cfg=CFG)
+    assert stage_contracts("FULL", risk_mult=0.5, **kw) == (1, FULL_FLOOR)
+    assert stage_contracts("FULL", risk_mult=0.0, **kw)[0] == 0
+    assert stage_contracts("FULL", risk_mult=-1.0, **kw)[0] == 0
+
+
+def test_the_contract_cap_holds_the_floor_like_every_other_full_size():
+    """Review finding 2026-11-18: a cap of 0 held a 49-contract size but not the floor's one contract."""
+    kw = dict(entry=26_740.0, stop=24_740.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("FULL", equity=10_000.0, full_cap=0, **kw) == (0, "full: 49 capped at 0")
+    assert stage_contracts("FULL", equity=150.0, **kw) == (1, FULL_FLOOR)
+    assert stage_contracts("FULL", equity=150.0, full_cap=1, **kw) == (1, FULL_FLOOR)
+    assert stage_contracts("FULL", equity=150.0, full_cap=0, **kw) == (0, "full: 1 (floor) capped at 0")
+
+
+def test_full_floor_leaves_canary_and_shadow_alone():
+    kw = dict(entry=78_000.0, stop=73_000.0, direction=1, risk_mult=1.0, cfg=CFG)
+    assert stage_contracts("CANARY", equity=500.0, **kw) == (1, "canary: 1 contract")  # 10.15% <= 15%
+    assert stage_contracts("CANARY", equity=300.0, **kw)[0] == 0  # 16.9% > 15%, although FULL's floor would take it
+    assert stage_contracts("FULL", equity=300.0, **kw) == (1, FULL_FLOOR)
 
 
 def test_canary_and_shadow_sizing_is_unchanged_by_the_full_profile():

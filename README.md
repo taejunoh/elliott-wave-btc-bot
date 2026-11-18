@@ -1,6 +1,6 @@
 # ewbot: Elliott Wave BTC bot
 
-`ewbot` trades Bitcoin with a mechanical Elliott Wave strategy. It reads waves on 4-hour bars and times entries on 1-hour breakouts. It goes long and short, using four setups (W3, W5, W5 reversal, end of C), and risks 1% of equity per trade at up to 3x leverage in the research and paper layers. The live layer sizes by stage: SHADOW and CANARY trade 1 contract (a signal whose 1-contract risk exceeds 15% of the account is skipped); FULL (user decision 2026-11-05) risks 10% of equity per trade with a 5x leverage cap, reduced to the most contracts the 70% overnight-margin limit holds (about 3.3x long and 2.7x short; the exchange's margin rates may change), with no contract cap (user decision 2026-11-05). FULL's real-account loss limits are -20% a day and -30% from the peak (-15% in SHADOW and CANARY).
+`ewbot` trades Bitcoin with a mechanical Elliott Wave strategy. It reads waves on 4-hour bars and times entries on 1-hour breakouts. It goes long and short, using four setups (W3, W5, W5 reversal, end of C), and risks 1% of equity per trade at up to 3x leverage in the research and paper layers. The live layer sizes by stage: SHADOW and CANARY trade 1 contract (a signal whose 1-contract risk exceeds 15% of the account is skipped); FULL (user decision 2026-11-05) risks 10% of equity per trade with a 5x leverage cap, reduced to the most contracts the 70% overnight-margin limit holds (about 3.3x long and 2.7x short; the exchange's margin rates may change), with no contract cap (user decision 2026-11-05); when 10% is less than one contract's risk it enters one contract if that risks at most 20% of the account (user decision 2026-11-18). FULL's real-account loss limits are -20% a day and -30% from the peak (-15% in SHADOW and CANARY).
 
 The project was built in three layers. Each layer has to prove itself before the next one gets real money.
 
@@ -22,9 +22,11 @@ The project was built in three layers. Each layer has to prove itself before the
 |---|---|---|
 | **SHADOW** | None. Decisions are checked against paper trading, and orders are only previewed. | Every gate met (no minimum days and no signal since 2026-11-05: decisions and previews must only not disagree, every hourly cycle on time, a clean restart), a trade key, then your explicit `ewbot live stage canary --confirm` |
 | **CANARY** | 1 contract | One passed `ewbot live test-trade --confirm` (or ≥ 3 strategy trades or 90 days), with no incident |
-| **FULL** | Sized by the strategy: min(10% risk, 5x, 70% overnight margin), no contract cap | CANARY passed and paper criteria 1, 2 and 4 met (no 50-trade requirement since 2026-11-05), plus your explicit approval |
+| **FULL** | Sized by the strategy: min(10% risk, 5x, 70% overnight margin), no contract cap; at least 1 contract when its risk is at most 20% of the account | CANARY passed and paper criteria 1, 2 and 4 met (no 50-trade requirement since 2026-11-05), plus your explicit approval |
 
 Any serious incident pauses trading or demotes the bot, and the Telegram commands `/status`, `/pause`, `/resume` and `/flatten` always work.
+
+Strategy A's live results are judged by a rule registered on 2026-11-18, before the first trade of the live period closed: counted in the engine's R over every signal since FULL began, a cumulative −5R, or no gain after 24 trades or 24 months, pauses new entries, and `/resume` is refused until the rule's way back is met (+4R within 16 trades). `ewbot live status` shows the rule's numbers; details in [docs/live-trading.md](docs/live-trading.md).
 
 ## Main commands
 

@@ -15,7 +15,16 @@ decision of 2026-11-05; only a manual intervention still in force holds it to 3:
 New York); the exchange's overnight rates (about 4.8x long, 3.9x short) are below FULL_RISK's 5x, so the 70% entry
 limit (MARGIN_ENTRY_MAX) binds first, on purpose. In FULL an entry above it is reduced to the most contracts the limit holds
 (runtime._entry_size, max_contracts_for_margin; user decision 2026-11-05: the real risk is then under 10%), refused only
-when not even one fits; SHADOW and CANARY (1 contract) refuse."""
+when not even one fits; SHADOW and CANARY (1 contract) refuse.
+
+FULL's one-contract floor (user decision 2026-11-18): the 10% risk of a small account is often less than one contract's
+risk (0.01 BTC, whole contracts), and the frozen sizing then gives 0 - at 500 USD every signal whose stop is more than
+about 6% away. FULL then enters ONE contract when that contract's risk (`risk_per_contract`, CANARY's check) is at most
+FULL_MIN_ONE_MAX_RISK (20%) of the account and its notional is within FULL_RISK's 5x; above either it is skipped as
+before. The signal's risk_mult does not scale the floor (CANARY's check does not either). The real risk of such an entry
+is above the signal's own budget (10% x risk_mult: 5% for a half-risk setup) and at most 20%, and the runtime says how
+much (`ENTRY_FLOOR`, `[최소 1계약 진입]`); the margin limit and the contract cap apply to it like to any entry. The sizing's liquidation check cannot bind here: one contract's isolated liquidation distance is
+equity / contract_size, five times the widest stop the 20% allows."""
 
 from __future__ import annotations
 
@@ -28,6 +37,10 @@ from ewbot.risk.sizing import size_contracts
 
 CANARY_MAX_RISK = 0.15  # user decision 2026-10-19 (Plan 3 spec amendment; spec 4.3 had 2%)
 FULL_RISK = RiskProfile("full", 0.10, 5.0)  # user decision 2026-11-05 (Plan 3 spec amendment; it was CONSERVATIVE 1% / 3x)
+# user decision 2026-11-18: when the 10% risk sizes less than one contract, FULL enters one contract whose risk is at most
+# this share of the account (it was skipped); the reason stage_contracts gives for such an entry is FULL_FLOOR
+FULL_MIN_ONE_MAX_RISK = 0.20
+FULL_FLOOR = "full: 1 (floor)"
 FULL_CAP_CONTRACTS = 3  # only while a manual intervention is still in force in FULL (stage.full_cap)
 MARGIN_ENTRY_MAX = 0.70  # spec 4.5: an entry whose overnight projection exceeds 70% is refused (FULL: reduced to fit, 2026-11-05)
 MARGIN_WARN = 0.80
@@ -116,6 +129,20 @@ def max_contracts_for_margin(price: float, side: int, product: ProductSpec, equi
     return max(0, math.floor(limit * equity / per + _EPS))
 
 
+def _full_floor(equity: float, entry: float, stop: float, risk_mult: float, cfg: BotConfig) -> tuple[int, str]:
+    """FULL, the frozen sizing gave 0: (1, FULL_FLOOR) when one contract is within FULL_RISK's leverage cap and risks at
+    most FULL_MIN_ONE_MAX_RISK of the account, else (0, why). `risk_mult` only has to be above 0."""
+    if risk_mult <= 0:
+        return 0, "size_contracts returned 0"
+    if cfg.costs.contract_size * entry > equity * FULL_RISK.max_leverage + _EPS:
+        return 0, (f"1 contract's notional {cfg.costs.contract_size * entry:.2f} USD > {FULL_RISK.max_leverage:g}x "
+                   f"of equity {equity:.2f}")
+    risk = risk_per_contract(entry, stop, cfg.costs)
+    if risk > FULL_MIN_ONE_MAX_RISK * equity:
+        return 0, f"1-contract risk {risk:.2f} USD > {FULL_MIN_ONE_MAX_RISK:.0%} of equity {equity:.2f}"
+    return 1, FULL_FLOOR
+
+
 def stage_contracts(
     stage: str,
     *,
@@ -143,7 +170,10 @@ def stage_contracts(
     if stage == "FULL":
         n = size_contracts(equity, entry, stop, direction, FULL_RISK, risk_mult, cfg.costs)
         if n == 0:
-            return 0, "size_contracts returned 0"
+            n, why = _full_floor(equity, entry, stop, risk_mult, cfg)
+            if n and full_cap is not None and n > full_cap:  # the cap holds the floor's contract like any other size
+                return full_cap, f"{why} capped at {full_cap}"
+            return n, why
         if full_cap is not None and n > full_cap:
             return full_cap, f"full: {n} capped at {full_cap}"
         return n, f"full: {n}"
