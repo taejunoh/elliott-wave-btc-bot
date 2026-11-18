@@ -96,6 +96,8 @@ Locally, with a worktree of the `paper` branch (`git worktree add ../paper-ledge
 | 경고 | strategy fingerprint change (new epoch), decision discrepancy (with its cause, see Frozen runtime environment), holdout data hash mismatch, run gap over 3 hours |
 | 실패 | the failed stage and the Actions log link (sent by `ewbot`; the workflow sends a fallback for checkout / setup / sync / push failures, step timeouts and cancellations) |
 
+The go-live block (daily summary, `report.html`, `ewbot paper status`) lists criteria 1–4. Since 2026-11-05 criterion 3 (out-of-sample trade count N/50) is shown for reference only (`참고용`): the live FULL promotion no longer uses it. The last line is the verdict on criteria 1, 2 and 4 only (`=> 기준 1·2·4: 충족`, or `미충족 (<numbers>)`), followed by `(실거래 단계는 live 봇의 관문으로 판단)`: the live stage is judged by the live bot's own gates. The block no longer says whether going live is possible.
+
 Each message has an id `kind:ts:trade_key`; an id is sent at most once per pushed ledger. A run killed after sending, or whose pushes all fail, may send it again in the next run, but a message is never lost. A failed send is retried 3 times and then kept pending for the next run.
 
 ## Strict fingerprint policy
