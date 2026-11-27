@@ -48971,6 +48971,38 @@
     "pending": 0,
     "errors": []
    }
+  },
+  {
+   "id": "20261127T215515Z",
+   "ts": 1795816515,
+   "status": "ok",
+   "last_bar_ts": 1795809600,
+   "data_sha256": "bb25c0e15741822802658e64e829c0e544fba235edbf94730dd6bf24b9e56526",
+   "holdout_data_ok": true,
+   "holdout_trades_recomputed": 36,
+   "epoch_id": 1,
+   "paper_trades": 0,
+   "count_total": 36,
+   "new_decisions": 0,
+   "new_discrepancies": 0,
+   "env": {
+    "python": "3.12.13",
+    "system": "Linux",
+    "machine": "x86_64",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "pyarrow": "25.0.1",
+    "uv_lock_sha256": "47a0a99def92af3825ff16a625de457da5a4313e366dfc5db029c45bfbd0a5ab",
+    "image_os": "ubuntu24",
+    "image_version": "20261122.23.1"
+   },
+   "env_sha256": "849298152f9f8e77cf650c798564ca5d125d7c2272e86b615a0d88a07dd73f18",
+   "warnings": [],
+   "notify": {
+    "sent": 0,
+    "pending": 0,
+    "errors": []
+   }
   }
  ],
  "sent_event_ids": [
